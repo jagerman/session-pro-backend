@@ -1,0 +1,27 @@
+# pgBackRest config for the Session Pro PRIMARY (database host), Option 2.
+#
+# The repository is remote (repo1-host); this host only ARCHIVES WAL to it via archive-push.
+# Backups themselves are initiated on the repository host (see repo-host-setup.sh). deploy.sh
+# renders this to /etc/pgbackrest/session_pro.conf and every pgbackrest invocation references it
+# explicitly with --config, so the packaged /etc/pgbackrest.conf stub (which carries a clashing
+# repo1-path) is never read. repo1-host-config points the repo host's remote helper at this same
+# path so it reads our file too. The cipher pass MUST match the repo host's.
+
+[global]
+repo1-host=@REPO_HOST@
+repo1-host-user=@REPO_HOST_USER@
+repo1-host-config=/etc/pgbackrest/session_pro.conf
+repo1-path=@REPO_PATH@
+repo1-cipher-type=aes-256-cbc
+repo1-cipher-pass=@CIPHER_PASS@
+compress-type=zst
+archive-async=y
+spool-path=/var/spool/pgbackrest
+log-path=/var/log/pgbackrest
+log-level-console=info
+log-level-file=detail
+
+[session_pro]
+pg1-path=@PG_DATA_DIR@
+pg1-port=@PG_PORT@
+pg1-socket-path=/var/run/postgresql
