@@ -60,6 +60,7 @@ VENV_DIR="$CODE_DIR/.venv"
 ETC_DIR="/etc/session-pro-backend"
 CONFIG_INI="$ETC_DIR/config.ini"
 KEYS_DIR="$ETC_DIR/keys"
+BACKEND_KEY_FILE="$ETC_DIR/key_ed25519"
 LOG_DIR="/var/log/pro-backend"
 VASSAL="/etc/uwsgi-emperor/vassals/pro-backend.ini"
 EMPEROR_INI="/etc/uwsgi-emperor/emperor.ini"
@@ -109,7 +110,7 @@ usermod -aG "$PRO_USER" www-data
 # --------------------------------------------------------------------------------------
 log "Creating directories"
 install -d -m 0755 -o "$PRO_USER" -g "$PRO_USER" "$CODE_DIR"
-install -d -m 0750 -o "$PRO_USER" -g "$PRO_USER" "$ETC_DIR"
+install -d -m 0750 -o root -g "$PRO_USER" "$ETC_DIR"
 install -d -m 0750 -o "$PRO_USER" -g "$PRO_USER" "$KEYS_DIR"
 install -d -m 0750 -o "$PRO_USER" -g "$PRO_USER" "$LOG_DIR"
 
@@ -189,6 +190,32 @@ if [[ "$(psql_admin -tAc "SELECT 1 FROM pg_database WHERE datname='${PG_DB}'")" 
 fi
 
 # --------------------------------------------------------------------------------------
+# 6b. Backend signing key (Ed25519). Loaded from disk by the app and NEVER stored in the DB, so it
+# is never in a DB backup. Root-owned + group-readable: the app reads it but its user cannot
+# overwrite its own signing key. deploy never generates a key: provide one via BACKEND_KEY_SRC=<file>
+# (make one with `session-router-config -k <file>`); an existing key is kept on re-runs, else deploy fails.
+# --------------------------------------------------------------------------------------
+log "Configuring backend signing key"
+if [[ -n "${BACKEND_KEY_SRC:-}" ]]; then
+    echo "Installing provided signing key from $BACKEND_KEY_SRC"
+    key_hex="$(tr -d '[:space:]' < "$BACKEND_KEY_SRC")"
+    if ! [[ "$key_hex" =~ ^[0-9a-fA-F]{128}$ ]]; then
+        echo "error: $BACKEND_KEY_SRC must contain 128 hex chars (a 64-byte libsodium ed25519 secret key)" >&2
+        exit 1
+    fi
+    printf '%s\n' "$key_hex" > "$BACKEND_KEY_FILE"
+elif [[ -f "$BACKEND_KEY_FILE" ]]; then
+    echo "Keeping existing signing key ($BACKEND_KEY_FILE)"
+else
+    echo "error: no signing key at $BACKEND_KEY_FILE and BACKEND_KEY_SRC is not set." >&2
+    echo "  Generate one with:  session-router-config -k <file>" >&2
+    echo "  then re-run with:   BACKEND_KEY_SRC=<file> $0" >&2
+    exit 1
+fi
+chown root:"$PRO_USER" "$BACKEND_KEY_FILE"
+chmod 0440 "$BACKEND_KEY_FILE"
+
+# --------------------------------------------------------------------------------------
 # 7. Application config (config.ini): install if absent, always fix db_url + platform toggles
 # --------------------------------------------------------------------------------------
 log "Writing application config"
@@ -200,6 +227,7 @@ DB_URL="postgresql:///${PG_DB}?host=/var/run/postgresql&port=${PG_PORT}&user=${P
 DB_URL_ESC="${DB_URL//&/\\&}"
 sed -i \
     -e "s|^db_url .*|db_url                 = ${DB_URL_ESC}|" \
+    -e "s|^backend_key_path .*|backend_key_path       = ${BACKEND_KEY_FILE}|" \
     -e "s|^with_platform_apple .*|with_platform_apple    = ${WITH_PLATFORM_APPLE}|" \
     -e "s|^with_platform_google .*|with_platform_google   = ${WITH_PLATFORM_GOOGLE}|" \
     "$CONFIG_INI"
@@ -337,6 +365,7 @@ Session Pro Backend deployed.
 
   Code:      $CODE_DIR   (user: $PRO_USER)
   Config:    $CONFIG_INI
+  Signing key: $BACKEND_KEY_FILE  (on disk only — NOT in the DB or its backups; back it up separately!)
   Cluster:   ${PG_VERSION}/${PG_CLUSTER}  port ${PG_PORT}  (dedicated; other clusters untouched)
   Vassal:    $VASSAL  (Emperor tyrant → runs as $PRO_USER)
   Logs:      $LOG_DIR/backend.log   (also: journalctl -u uwsgi-emperor)

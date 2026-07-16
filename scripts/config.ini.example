@@ -13,6 +13,13 @@
 ; e.g. postgresql:///session_pro?host=/var/run/postgresql&port=5433&user=pro-backend
 db_url                 =
 
+; Ed25519 proof-signing key, loaded from this file (128 hex chars = the libsodium secret key:
+; 32-byte seed + 32-byte public key). It is NEVER stored in the database. deploy.sh installs a key
+; you provide via BACKEND_KEY_SRC (generate one with `session-router-config -k <file>`); it never
+; generates a key itself. Back this file up SEPARATELY and securely — it is NOT covered by the
+; database backups. dev=true ignores it and uses a test key.
+backend_key_path       = /etc/session-pro-backend/key_ed25519
+
 ; dev=true uses a hardcoded DETERMINISTIC signing key — never enable on a real instance.
 dev                    = false
 unsafe_logging         = false

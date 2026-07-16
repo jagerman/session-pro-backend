@@ -7,6 +7,7 @@
 #   - removes the nginx vhost
 #   - drops the dedicated `session_pro` PostgreSQL cluster (ALL its data)
 #   - removes the app user, code, config, keys, logs, and the primary's pgBackRest config
+#     (the Ed25519 signing key is copied to /root first so a redeploy can reuse it)
 #
 # It does NOT touch shared packages (postgresql, nginx, pgbackrest) or any OTHER
 # clusters/databases on the box.
@@ -74,8 +75,20 @@ fi
 rm -f "$PGBR_CONF"
 rm -rf /var/spool/pgbackrest
 
-# 5. App user + files
+# 5. App user + files. The Ed25519 signing key is a credential, not DB state, and cannot be
+# recovered if lost. Losing it does NOT invalidate proofs already issued (clients keep verifying
+# against the pubkey they hold) — but no new proofs can be signed until a new key is rolled and its
+# pubkey shipped to every client app. So preserve a copy (root-only) before wiping, and tell the
+# operator how to reuse it on the next deploy.
 log "Removing app user and files"
+if [[ -f "$ETC_DIR/key_ed25519" ]]; then
+    key_backup="/root/session-pro-key_ed25519.$(date +%Y%m%d-%H%M%S).bak"
+    cp "$ETC_DIR/key_ed25519" "$key_backup"
+    chmod 0400 "$key_backup"
+    echo "Preserved the signing key at $key_backup"
+    echo "  Reuse it on redeploy:  BACKEND_KEY_SRC=$key_backup bash scripts/deploy.sh"
+    echo "  (delete that file if you truly want the key gone)"
+fi
 rm -rf "$CODE_DIR" "$ETC_DIR" "$LOG_DIR" "$DATA_DIR"
 if id "$PRO_USER" &>/dev/null; then
     deluser --quiet "$PRO_USER" 2>/dev/null || userdel "$PRO_USER" 2>/dev/null || true

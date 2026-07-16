@@ -87,13 +87,13 @@ class TestingContext:
         assert len(err.msg_list) == 0
         assert engine
 
-        # Retrieve the backend key
+        # Generate the backend signing key for this instance. The app loads its key externally now
+        # (never from the DB); expose it as self.backend_key for tests that verify signatures.
         self.db_engine    = engine
-        with self.connection() as conn:
-            runtime = backend.get_runtime(conn)
+        self.backend_key  = nacl.signing.SigningKey.generate()
 
         # Setup flask
-        self.flask_app    = server.init(testing_mode=True, database_url=database_url, server_x25519_skey=runtime.backend_key.to_curve25519_private_key())
+        self.flask_app    = server.init(testing_mode=True, database_url=database_url, backend_key=self.backend_key)
         self.flask_client = self.flask_app.test_client()
         return self
 
@@ -506,14 +506,16 @@ def test_server_add_payment_flow(monkeypatch):
         db_engine: sqlalchemy.engine.Engine | None = backend.bootstrap_db(database_url=db_url, err=err)
         assert not err.has(), f'{err.msg_list}'
         assert db_engine
-        # Setup local flask instance
+        # Setup local flask instance. The signing key is external now (not in the DB), so generate
+        # one for this test and hand it to the server; use it directly to verify signatures below.
+        backend_key:  nacl.signing.SigningKey = nacl.signing.SigningKey.generate()
         db_conn: sqlalchemy.engine.Connection = db_engine.connect()
         runtime                               = backend.get_runtime(db_conn)
-        flask_app:    flask.Flask             = server.init(testing_mode=True, database_url=db_url, server_x25519_skey=runtime.backend_key.to_curve25519_private_key())
+        flask_app:    flask.Flask             = server.init(testing_mode=True, database_url=db_url, backend_key=backend_key)
         flask_client: werkzeug.Client         = flask_app.test_client()
 
         # Setup keys for onion requests
-        server_x25519_skey = runtime.backend_key.to_curve25519_private_key()
+        server_x25519_skey = backend_key.to_curve25519_private_key()
         our_x25519_skey    = nacl.public.PrivateKey.generate()
         shared_key: bytes  = onion_req.make_shared_key(our_x25519_skey=our_x25519_skey, server_x25519_pkey=server_x25519_skey.public_key)
 
@@ -645,7 +647,7 @@ def test_server_add_payment_flow(monkeypatch):
                                                          result_rotating_pkey,
                                                          result_expiry_unix_ts_ms)
             runtime = backend.get_runtime(db_conn)
-            _ = runtime.backend_key.verify_key.verify(smessage=proof_hash, signature=result_sig)
+            _ = backend_key.verify_key.verify(smessage=proof_hash, signature=result_sig)
 
             with db.transaction(db_conn) as tx:
                 get_user: backend.GetUserAndPayments = backend.get_user_and_payments(tx, master_key.verify_key)
@@ -713,7 +715,7 @@ def test_server_add_payment_flow(monkeypatch):
                                                   result_gen_index_hash,
                                                   result_rotating_pkey,
                                                   result_expiry_unix_ts_ms)
-            _ = runtime.backend_key.verify_key.verify(smessage=proof_hash, signature=result_sig)
+            _ = backend_key.verify_key.verify(smessage=proof_hash, signature=result_sig)
 
             # Check that the expiry time does not exceed 31 days (we clamped to 30 days and if there's
             # overrun of 30 days we round up to 31 days)
@@ -801,7 +803,7 @@ def test_server_add_payment_flow(monkeypatch):
                                                          result_gen_index_hash,
                                                          result_rotating_pkey,
                                                          result_expiry_unix_ts_ms)
-            _ = runtime.backend_key.verify_key.verify(smessage=proof_hash, signature=result_sig)
+            _ = backend_key.verify_key.verify(smessage=proof_hash, signature=result_sig)
 
         curr_revocation_ticket: int = 0
 
@@ -1135,7 +1137,7 @@ def test_server_add_payment_flow(monkeypatch):
             runtime = backend.get_runtime(db_conn)
             proof: backend.ProSubscriptionProof = backend.generate_pro_proof(conn           = db_conn,
                                                                              version        = request_version,
-                                                                             signing_key    = runtime.backend_key,
+                                                                             signing_key    = backend_key,
                                                                              gen_index_salt = runtime.gen_index_salt,
                                                                              master_pkey    = master_key.verify_key,
                                                                              rotating_pkey  = rotating_key.verify_key,
@@ -1150,7 +1152,7 @@ def test_server_add_payment_flow(monkeypatch):
                                                   proof.gen_index_hash,
                                                   proof.rotating_pkey,
                                                   proof.expiry_unix_ts_ms)
-            _ = runtime.backend_key.verify_key.verify(smessage=proof_hash, signature=proof.sig)
+            _ = backend_key.verify_key.verify(smessage=proof_hash, signature=proof.sig)
 
 
             # NOTE: Try to generate a proof after the deadline (should fail)
@@ -1163,7 +1165,7 @@ def test_server_add_payment_flow(monkeypatch):
             runtime = backend.get_runtime(db_conn)
             proof = backend.generate_pro_proof(conn           = db_conn,
                                                version        = request_version,
-                                               signing_key    = runtime.backend_key,
+                                               signing_key    = backend_key,
                                                gen_index_salt = runtime.gen_index_salt,
                                                master_pkey    = master_key.verify_key,
                                                rotating_pkey  = rotating_key.verify_key,
@@ -1179,7 +1181,7 @@ def test_server_add_payment_flow(monkeypatch):
 
             failed: bool = False
             try:
-                _ = runtime.backend_key.verify_key.verify(smessage=proof_hash, signature=proof.sig)
+                _ = backend_key.verify_key.verify(smessage=proof_hash, signature=proof.sig)
             except:
                 failed = True
             assert err.has() and failed
@@ -1639,9 +1641,7 @@ def test_platform_apple():
 
         # NOTE: Check that the server signed our proof w/ their public key
         proof_hash: bytes = backend.build_proof_hash(result_version, result_gen_index_hash, result_rotating_pkey, result_expiry_unix_ts_ms)
-        with test.connection() as conn:
-            runtime = backend.get_runtime(conn)
-        _ = runtime.backend_key.verify_key.verify(smessage=proof_hash, signature=result_sig)
+        _ = test.backend_key.verify_key.verify(smessage=proof_hash, signature=result_sig)
 
     # The following is a sequence of notifications/events that transpired for the same account under
     # the same billing cycle (e.g. a subscribe, cancelling of subscription, then expiring). Since

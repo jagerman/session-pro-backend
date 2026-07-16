@@ -404,8 +404,9 @@ def parse_master_pkey(hex_str: str, err: base.ErrorSink) -> nacl.signing.VerifyK
 
 @dataclasses.dataclass
 class CLIConfig:
-    db_url:   str = ''
-    log_path: str = ''
+    db_url:           str = ''
+    backend_key_path: str = ''
+    log_path:         str = ''
 
 
 def require_config(args: argparse.Namespace) -> CLIConfig:
@@ -429,13 +430,15 @@ def require_config(args: argparse.Namespace) -> CLIConfig:
             if 'base' not in parser:
                 err.msg_list.append(f'Config file "{config_path}" is missing [base] section')
             else:
-                base_section          = parser['base']
-                result.db_url         = base_section.get('db_url', '')
-                result.log_path       = base_section.get('log_path', '')
-                base.DEV_BACKEND_MODE = base_section.getboolean('dev', fallback=False)
+                base_section            = parser['base']
+                result.db_url           = base_section.get('db_url', '')
+                result.backend_key_path = base_section.get('backend_key_path', '')
+                result.log_path         = base_section.get('log_path', '')
+                base.DEV_BACKEND_MODE   = base_section.getboolean('dev', fallback=False)
 
                 # Allow environment variable override
-                result.db_url = os.getenv('SESH_PRO_BACKEND_DB_URL', result.db_url)
+                result.db_url           = os.getenv('SESH_PRO_BACKEND_DB_URL', result.db_url)
+                result.backend_key_path = os.getenv('SESH_PRO_BACKEND_KEY_PATH', result.backend_key_path)
         except Exception as e:
             err.msg_list.append(f'Failed to parse config file: {e}')
 
@@ -816,11 +819,21 @@ def cmd_report_generate(args: argparse.Namespace) -> int:
 
 def cmd_db_info(args: argparse.Namespace) -> int:
     config = require_config(args)
+    # Best-effort load of the backend public key so `db info` can show it. The key lives on disk
+    # now (not in the DB) and may simply be unavailable wherever the CLI is run.
+    backend_pkey: nacl.signing.VerifyKey | None = None
+    if base.DEV_BACKEND_MODE:
+        backend_pkey = nacl.signing.SigningKey(base.DEV_BACKEND_DETERMINISTIC_SKEY).verify_key
+    elif config.backend_key_path:
+        try:
+            backend_pkey = backend.load_backend_signing_key(config.backend_key_path).verify_key
+        except Exception:
+            backend_pkey = None
     try:
         with db.open_database(config.db_url) as engine:
             with db.connection(engine) as conn:
                 err = base.ErrorSink()
-                info_str = backend.db_info_string(conn=conn, db_url=config.db_url, err=err)
+                info_str = backend.db_info_string(conn=conn, db_url=config.db_url, err=err, backend_pkey=backend_pkey)
                 if err.has():
                     print(f"ERROR: Failed to get DB info: {err.msg_list}", file=sys.stderr)
                     return 1
@@ -1282,15 +1295,19 @@ def cmd_voucher(args: argparse.Namespace) -> int:
 
                     print("Success: Unredeemed payment created")
 
-                    # Get the backend signing key from runtime
-                    runtime_result = db.query(tx.conn, "SELECT backend_key FROM runtime")
-                    runtime_row    = runtime_result.fetchone()
-                    if not runtime_row:
-                        print("ERROR: Could not load runtime from database", file=sys.stderr)
+                    # Load the backend signing key (from disk in production, or the deterministic dev
+                    # key in dev mode). It is no longer stored in the DB.
+                    if base.DEV_BACKEND_MODE:
+                        backend_key = nacl.signing.SigningKey(base.DEV_BACKEND_DETERMINISTIC_SKEY)
+                    elif not config.backend_key_path:
+                        print("ERROR: No backend signing key configured ([base] backend_key_path)", file=sys.stderr)
                         return 1
-
-                    backend_key_bytes = bytes(runtime_row[0])
-                    backend_key       = nacl.signing.SigningKey(backend_key_bytes)
+                    else:
+                        try:
+                            backend_key = backend.load_backend_signing_key(config.backend_key_path)
+                        except Exception as e:
+                            print(f"ERROR: Failed to load backend signing key: {e}", file=sys.stderr)
+                            return 1
 
                     # Step 2: Redeem the payment via add_pro_payment
                     print('\nStep 2: Redeeming payment and generating pro proof...')

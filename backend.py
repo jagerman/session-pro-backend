@@ -272,10 +272,6 @@ class RuntimeRow:
 
     The salt gets bootstrapped on creation of the DB and is stored to persist across sessions.
 
-    backend_key - Ed25519 key used to sign proofs.
-
-    The key gets bootstrapped on creation of the DB and is stored to persist across sessions.
-
     revocation_ticket - A monotonically increasing index that gets incremented everytime the
     revocation table has a row added or deleted (i.e. a new ticket is allocated when the table
     changes). This ticket's purpose is to be handed out to clients when they request the revocation
@@ -287,7 +283,6 @@ class RuntimeRow:
     '''
     gen_index:                                int                     = 0
     gen_index_salt:                           bytes                   = b''
-    backend_key:                              nacl.signing.SigningKey = nacl.signing.SigningKey(ZERO_BYTES32)
     last_expire_unix_ts_ms:                   int                     = 0
     apple_notification_checkpoint_unix_ts_ms: int                     = 0
     revocation_ticket:                        int                     = 0
@@ -300,10 +295,34 @@ class AllocatedGenID:
     gen_index:         int   = 0
     gen_index_salt:    bytes = b''
 
-def assert_backend_is_in_dev_mode(conn: sqlalchemy.engine.Connection):
-    runtime_row: RuntimeRow = get_runtime(conn)
-    assert bytes(runtime_row.backend_key) == base.DEV_BACKEND_DETERMINISTIC_SKEY, \
-            "Sanity check failed, developer mode was enabled but the key in the DB was not a development key. This is a special guard to prevent the user from activating developer mode in the wrong environment"
+def assert_backend_is_in_dev_mode(signing_key: nacl.signing.SigningKey):
+    assert bytes(signing_key) == base.DEV_BACKEND_DETERMINISTIC_SKEY, \
+            "Sanity check failed, developer mode was enabled but the loaded signing key is not the development key. This is a special guard to prevent the user from activating developer mode in the wrong environment"
+
+def load_backend_signing_key(path: str) -> nacl.signing.SigningKey:
+    '''Load the backend Ed25519 signing key from disk.
+
+    The file holds 128 hex characters (optionally followed by whitespace): the libsodium-style
+    64-byte secret key, i.e. the 32-byte seed followed by the 32-byte precomputed public key
+    (matching oxen-core's on-disk ed25519 key format). The key lives ONLY on disk, never in the
+    database (and therefore never in a DB backup). Raises on any problem; the caller must refuse to
+    start rather than run with a missing or malformed signing key.
+    '''
+    with open(path, 'r') as f:
+        text: str = f.read().strip()
+    if len(text) != 128 or any(c not in '0123456789abcdefABCDEF' for c in text):
+        raise ValueError(f'expected 128 hex characters (a 64-byte libsodium ed25519 secret key), got {len(text)}')
+    raw:  bytes = bytes.fromhex(text)
+    seed: bytes = raw[:32]
+    pub:  bytes = raw[32:]
+    skey = nacl.signing.SigningKey(seed)
+    if bytes(skey.verify_key) != pub:
+        raise ValueError('embedded public key does not match the seed; the key file is corrupt')
+    return skey
+
+def backend_signing_key_to_hex(skey: nacl.signing.SigningKey) -> str:
+    '''Serialise a signing key to the 128-hex libsodium-style representation (seed || public key).'''
+    return (bytes(skey) + bytes(skey.verify_key)).hex()
 
 def google_obfuscated_account_id_from_master_pkey(pkey: nacl.signing.VerifyKey) -> bytes:
     result: bytes = hashlib.sha256(bytes(pkey)).digest()
@@ -551,7 +570,6 @@ def get_pro_revocations_iterator_tx(tx: db.SQLTransaction) -> collections.abc.It
 def get_runtime_tx(tx: db.SQLTransaction) -> RuntimeRow:
     row = db.query_one(tx.conn, ("SELECT gen_index,"
                                  "gen_index_salt,"
-                                 "backend_key,"
                                  "last_expire_unix_ts_ms,"
                                  "apple_notification_checkpoint_unix_ts_ms,"
                                  "revocation_ticket FROM runtime"))
@@ -559,12 +577,9 @@ def get_runtime_tx(tx: db.SQLTransaction) -> RuntimeRow:
     if row:
         result.gen_index                                 = row[0]
         result.gen_index_salt                            = row[1]
-        backend_key: bytes                               = bytes(row[2])
-        assert len(backend_key)                         == len(ZERO_BYTES32)
-        result.backend_key                               = nacl.signing.SigningKey(backend_key)
-        result.last_expire_unix_ts_ms                    = row[3]
-        result.apple_notification_checkpoint_unix_ts_ms  = row[4]
-        result.revocation_ticket                         = row[5]
+        result.last_expire_unix_ts_ms                    = row[2]
+        result.apple_notification_checkpoint_unix_ts_ms  = row[3]
+        result.revocation_ticket                         = row[4]
     return result
 
 def get_runtime(conn: sqlalchemy.engine.Connection) -> RuntimeRow:
@@ -573,7 +588,7 @@ def get_runtime(conn: sqlalchemy.engine.Connection) -> RuntimeRow:
         result = get_runtime_tx(tx)
     return result
 
-def db_info_string(conn: sqlalchemy.engine.Connection, db_url: str, err: base.ErrorSink) -> str:
+def db_info_string(conn: sqlalchemy.engine.Connection, db_url: str, err: base.ErrorSink, backend_pkey: nacl.signing.VerifyKey | None = None) -> str:
     unredeemed_payments             = 0
     payments                        = 0
     users                           = 0
@@ -628,12 +643,13 @@ def db_info_string(conn: sqlalchemy.engine.Connection, db_url: str, err: base.Er
         lines.append('  Users/Revocs/Payments/Unredeemed: {}/{}/{}/{}'.format(users, revocations, payments, unredeemed_payments))
         lines.append('  U.Errors/Google/Apple Notifs.:    {}/{}/{}'.format(user_errors, google_notification_history, apple_notification_uuid_history))
         lines.append('  Gen Index:                        {}'.format(runtime.gen_index))
-        lines.append('  Backend Key:                      {}'.format(bytes(runtime.backend_key.verify_key).hex()))
+        backend_key_str = bytes(backend_pkey).hex() if backend_pkey is not None else 'n/a (loaded from disk at runtime)'
+        lines.append('  Backend Key:                      {}'.format(backend_key_str))
         result = '\n'.join(lines)
 
     return result
 
-def bootstrap_db(database_url: str, err: base.ErrorSink, backend_key: nacl.signing.SigningKey | None = None) -> sqlalchemy.engine.Engine | None:
+def bootstrap_db(database_url: str, err: base.ErrorSink) -> sqlalchemy.engine.Engine | None:
     """ Opens a database and bootstraps/migrates schema if needed. """
     conn:   sqlalchemy.engine.Connection | None = None
     result: sqlalchemy.engine.Engine     | None = None
@@ -664,7 +680,7 @@ def bootstrap_db(database_url: str, err: base.ErrorSink, backend_key: nacl.signi
                 tx.conn.connection.executescript(schema_sql)
 
             # NOTE: Version migration
-            target_db_version = 9
+            target_db_version = 10
             db_version = db.get_db_version(tx.conn, result)
 
             # NOTE: v0 is the nil state - DB never bootstrapped, teleport to target
@@ -706,6 +722,19 @@ def bootstrap_db(database_url: str, err: base.ErrorSink, backend_key: nacl.signi
                 db_version += 1
                 db.set_db_version(tx.conn, result, db_version)
 
+            if db_version == 9:
+                log.info(f'Migrating DB version from {db_version} => {db_version + 1}')
+                # The Ed25519 signing key is now loaded from disk, never stored in the DB. Storing it
+                # in the runtime row put a copy in every WAL record (MVCC rewrites the whole tuple on
+                # each gen_index bump, etc.) and thus in every backup. Drop the column on Postgres,
+                # the only persistent deployment. SQLite is dev/test-only and always bootstrapped
+                # fresh (the v0 teleport above skips migrations), so there is no on-disk SQLite DB at
+                # v9 to migrate here — and SQLite could not DROP COLUMN before 3.35 anyway.
+                if db.is_postgres(result):
+                    _ = db.query(tx.conn, ("ALTER TABLE runtime DROP COLUMN IF EXISTS backend_key"))
+                db_version += 1
+                db.set_db_version(tx.conn, result, db_version)
+
             # NOTE: Verify that the DB was migrated to the target version
             assert db_version == target_db_version
 
@@ -713,13 +742,10 @@ def bootstrap_db(database_url: str, err: base.ErrorSink, backend_key: nacl.signi
             row = db.query(tx.conn, ('SELECT EXISTS (SELECT 1 FROM runtime)')).fetchone()
             runtime_row_exists = bool(row[0]) if row else False
             if not runtime_row_exists:
-                if backend_key is None:
-                    backend_key = nacl.signing.SigningKey.generate()
-
                 _ = db.query(tx.conn, ('''
-                    INSERT INTO runtime (gen_index, gen_index_salt, backend_key, last_expire_unix_ts_ms, apple_notification_checkpoint_unix_ts_ms, revocation_ticket)
-                    VALUES (0, :salt, :backend_key, 0, 0, 0)
-                '''), salt=os.urandom(hashlib.blake2b.SALT_SIZE), backend_key=bytes(backend_key))
+                    INSERT INTO runtime (gen_index, gen_index_salt, last_expire_unix_ts_ms, apple_notification_checkpoint_unix_ts_ms, revocation_ticket)
+                    VALUES (0, :salt, 0, 0, 0)
+                '''), salt=os.urandom(hashlib.blake2b.SALT_SIZE))
     except Exception:
         err.msg_list.append(f"Failed to bootstrap DB tables: {traceback.format_exc()}")
     finally:
@@ -2000,7 +2026,7 @@ def verify_and_add_pro_payment(conn:                sqlalchemy.engine.Connection
     # without a valid payment.
     THIS_WAS_A_DEBUG_PAYMENT_THAT_THE_DB_MADE_A_FAKE_UNCLAIMED_PAYMENT_TO_REDEEM_DO_NOT_USE_IN_PRODUCTION: bool = False
     if base.DEV_BACKEND_MODE and (payment_tx.google_order_id.startswith('DEV.') or payment_tx.apple_tx_id.startswith('DEV.') or payment_tx.rangeproof_order_id.startswith('DEV.')):
-        assert_backend_is_in_dev_mode(conn)
+        assert_backend_is_in_dev_mode(signing_key)
 
         # Convert the user payment transaction into the backend native representation. Note that
         # this is testing code for the unit tests so for example for Apple we just provide stub data

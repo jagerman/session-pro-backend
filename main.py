@@ -45,6 +45,7 @@ class SessionWebhook:
 class ParsedArgs:
     ini_path:                                  str                             = ''
     db_url:                                    str                             = ''
+    backend_key_path:                          str                             = ''
     log_path:                                  str                             = ''
     dev:                                       bool                            = False
     unsafe_logging:                            bool                            = False
@@ -210,6 +211,7 @@ def parse_args(err: base.ErrorSink) -> ParsedArgs:
 
         base_section: configparser.SectionProxy    = ini_parser['base']
         result.db_url                              = base_section.get(option='db_url',                      fallback='')
+        result.backend_key_path                    = base_section.get(option='backend_key_path',            fallback='')
         result.log_path                            = base_section.get(option='log_path',                    fallback='')
         result.dev                                 = base_section.getboolean(option='dev',                  fallback=False)
         result.unsafe_logging                      = base_section.getboolean(option='unsafe_logging',       fallback=False)
@@ -273,6 +275,7 @@ def parse_args(err: base.ErrorSink) -> ParsedArgs:
 
     # NOTE: Get arguments from environment, they override .INI values if specified
     result.db_url                         = os.getenv('SESH_PRO_BACKEND_DB_URL',                             result.db_url)
+    result.backend_key_path               = os.getenv('SESH_PRO_BACKEND_KEY_PATH',                           result.backend_key_path)
     result.log_path                       = os.getenv('SESH_PRO_BACKEND_LOG_PATH',                           result.log_path)
     result.dev                            = base.os_get_boolean_env('SESH_PRO_BACKEND_DEV',                  result.dev)
     result.with_platform_apple            = base.os_get_boolean_env('SESH_PRO_BACKEND_WITH_PLATFORM_APPLE',  result.with_platform_apple)
@@ -376,14 +379,24 @@ def entry_point() -> flask.Flask:
             platform_google.log.addHandler(webhook_logger)
             platform_apple.log.addHandler(webhook_logger)
 
-    # NOTE: A developer backend generates a deterministic key for testing purposes
-    backend_key: nacl.signing.SigningKey | None = None
+    # NOTE: Load the backend Ed25519 signing key. Dev mode uses a deterministic key; otherwise it is
+    # loaded from disk and NEVER stored in the DB. The app does not (and its user should not be able
+    # to) write this file — deployment creates it — so a missing/unreadable key is a hard startup
+    # error rather than a silent regeneration that would invalidate every proof already issued.
     if parsed_args.dev:
-        DEV_BACKEND_DETERMINISTIC_SKEY = bytes([0xCD] * 32)
-        backend_key                    = nacl.signing.SigningKey(DEV_BACKEND_DETERMINISTIC_SKEY)
+        backend_key: nacl.signing.SigningKey = nacl.signing.SigningKey(base.DEV_BACKEND_DETERMINISTIC_SKEY)
+    else:
+        if not parsed_args.backend_key_path:
+            log.error('No backend signing key configured: set [base] backend_key_path (or SESH_PRO_BACKEND_KEY_PATH)')
+            sys.exit(1)
+        try:
+            backend_key = backend.load_backend_signing_key(parsed_args.backend_key_path)
+        except Exception as e:
+            log.error(f'Failed to load backend signing key from "{parsed_args.backend_key_path}": {e}')
+            sys.exit(1)
 
     # NOTE: Open the DB (create tables if necessary)
-    engine: sqlalchemy.engine.Engine | None = backend.bootstrap_db(database_url=parsed_args.db_url, err=err, backend_key=backend_key)
+    engine: sqlalchemy.engine.Engine | None = backend.bootstrap_db(database_url=parsed_args.db_url, err=err)
     if err.has():
         log.error(err.build())
         sys.exit(1)
@@ -392,10 +405,10 @@ def entry_point() -> flask.Flask:
     with db.connection(engine) as conn:
         # NOTE: Sanity check dev mode
         if base.DEV_BACKEND_MODE:
-            backend.assert_backend_is_in_dev_mode(conn)
+            backend.assert_backend_is_in_dev_mode(backend_key)
 
         # NOTE: Dump some startup diagnostics
-        info_string: str = backend.db_info_string(conn=conn, db_url=parsed_args.db_url, err=err)
+        info_string: str = backend.db_info_string(conn=conn, db_url=parsed_args.db_url, backend_pkey=backend_key.verify_key, err=err)
         if len(err.msg_list) > 0:
             log.error(f"{err.msg_list}")
             sys.exit(1)
@@ -496,8 +509,7 @@ def entry_point() -> flask.Flask:
         thread.start()
 
         # NOTE: Add flask to our global logger
-        runtime_row: backend.RuntimeRow = backend.get_runtime(conn)
-        result: flask.Flask = server.init(testing_mode=False, database_url=parsed_args.db_url, server_x25519_skey=runtime_row.backend_key.to_curve25519_private_key())
+        result: flask.Flask = server.init(testing_mode=False, database_url=parsed_args.db_url, backend_key=backend_key)
         if 1:
             _ = result.logger.addHandler(console_logger)
             if file_logger:

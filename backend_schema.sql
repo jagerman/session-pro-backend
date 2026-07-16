@@ -131,7 +131,6 @@ CREATE TABLE IF NOT EXISTS revocations (
 CREATE TABLE IF NOT EXISTS runtime (
     gen_index                                INTEGER NOT NULL, -- Next generation index to allocate to an updated user
     gen_index_salt                           BLOB NOT NULL,    -- BLAKE2B salt for hashing the gen_index in proofs
-    backend_key                              BLOB NOT NULL,    -- Ed25519 skey for signing proofs
     last_expire_unix_ts_ms                   INTEGER NOT NULL, -- Last time expire payments/revocs/users was called on the table
 
     -- Last time the DB has successfully handled notifications up to. This is to be used to

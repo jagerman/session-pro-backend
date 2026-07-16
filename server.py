@@ -592,6 +592,10 @@ class UserProStatus(enum.IntEnum):
 
 FLASK_CONFIG_DB_URL_KEY                            = 'session_pro_backend_db_url'
 
+# The backend Ed25519 signing key (nacl.signing.SigningKey), loaded from disk at startup. Kept in
+# the flask config rather than the DB so it never touches the database (or its backups).
+FLASK_CONFIG_BACKEND_SKEY_KEY                      = 'session_pro_backend_signing_key'
+
 # Name of the endpoints exposed on the server
 FLASK_ROUTE_ADD_PRO_PAYMENT                         = '/add_pro_payment'
 FLASK_ROUTE_GENERATE_PRO_PROOF                      = '/generate_pro_proof'
@@ -671,11 +675,12 @@ def get_db(flask_app: flask.Flask) -> collections.abc.Iterator[sqlalchemy.engine
     with db.open_database(database_url) as engine:
         yield engine
 
-def init(testing_mode: bool, database_url: str, server_x25519_skey: nacl.public.PrivateKey) -> flask.Flask:
+def init(testing_mode: bool, database_url: str, backend_key: nacl.signing.SigningKey) -> flask.Flask:
     result                                                      = flask.Flask(__name__)
     result.config['TESTING']                                    = testing_mode
     result.config[FLASK_CONFIG_DB_URL_KEY]                      = database_url
-    result.config[onion_req.FLASK_CONFIG_ONION_REQ_X25519_SKEY] = server_x25519_skey
+    result.config[FLASK_CONFIG_BACKEND_SKEY_KEY]                = backend_key
+    result.config[onion_req.FLASK_CONFIG_ONION_REQ_X25519_SKEY] = backend_key.to_curve25519_private_key()
     result.register_blueprint(flask_blueprint)
     result.register_blueprint(onion_req.flask_blueprint_v4)
     return result
@@ -739,8 +744,7 @@ def add_pro_payment():
     dev_add_pro_payment_args = backend.DevAddProPaymentArgs()
     if base.DEV_BACKEND_MODE:
         # NOTE: Sanity check dev mode
-        with get_db(flask.current_app) as engine:
-            backend.assert_backend_is_in_dev_mode(engine.connect())
+        backend.assert_backend_is_in_dev_mode(flask.current_app.config[FLASK_CONFIG_BACKEND_SKEY_KEY])
 
         plan_key     = 'dev_plan'
         duration_key = 'dev_duration_ms'
@@ -769,12 +773,11 @@ def add_pro_payment():
     redeemed_payment         = backend.RedeemPayment()
     with get_db(flask.current_app) as engine:
         with db.connection(engine) as conn:
-            runtime             = backend.get_runtime(conn)
             unix_ts_ms          = int(time_now() * 1000)
             redeemed_unix_ts_ms = backend.convert_unix_ts_ms_to_redeemed_unix_ts_ms(unix_ts_ms)
             redeemed_payment    = backend.verify_and_add_pro_payment(conn                = conn,
                                                                      version             = version,
-                                                                     signing_key         = runtime.backend_key,
+                                                                     signing_key         = flask.current_app.config[FLASK_CONFIG_BACKEND_SKEY_KEY],
                                                                      unix_ts_ms          = unix_ts_ms,
                                                                      redeemed_unix_ts_ms = redeemed_unix_ts_ms,
                                                                      master_pkey         = nacl.signing.VerifyKey(master_pkey_bytes),
@@ -843,7 +846,7 @@ def generate_pro_proof() -> flask.Response:
             runtime = backend.get_runtime(conn)
             proof   = backend.generate_pro_proof(conn           = conn,
                                                  version        = version,
-                                                 signing_key    = runtime.backend_key,
+                                                 signing_key    = flask.current_app.config[FLASK_CONFIG_BACKEND_SKEY_KEY],
                                                  gen_index_salt = runtime.gen_index_salt,
                                                  master_pkey    = nacl.signing.VerifyKey(master_pkey_bytes),
                                                  rotating_pkey  = nacl.signing.VerifyKey(rotating_pkey_bytes),
