@@ -72,27 +72,44 @@ log() { printf '\n=== %s ===\n' "$*"; }
 # --------------------------------------------------------------------------------------
 # 1. Packages
 # --------------------------------------------------------------------------------------
-# Prefer Debian-shipped libraries (leaner, security-updated, no compiler needed). flask,
-# pynacl, psycopg2 and uWSGI all come from apt; only the deps Debian lacks go in the venv.
+# Prefer Debian-shipped libraries (leaner, security-updated, no compiler needed). flask, pynacl,
+# psycopg2 and uWSGI come from apt; only the deps Debian lacks go in the venv.
 log "Installing packages"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
+
+# Two extra apt repositories must already be configured on this host — they are system-wide apt
+# config that the operator owns, not something this script edits (see docs/deploy.md, "Prerequisite
+# apt repositories"):
+#   * PGDG -> pgbackrest, pinned. Its version must match the repo host; the distro version differs
+#             across Debian releases (bookworm vs trixie) and would break remote backups.
+#   * oxen -> python3-session-util (the Session onion-request binding; pulls its own runtime lib).
+# Verify they actually provide what we need, and stop with instructions if not — rather than
+# installing a mismatched pgbackrest or dying cryptically half-way through.
+repo_error=0
+pgbackrest_candidate="$(apt-cache policy pgbackrest 2>/dev/null | awk '/Candidate:/ {print $2}')"
+if [[ "$pgbackrest_candidate" != *pgdg* ]]; then
+    echo "error: pgbackrest is not available from PGDG (candidate: ${pgbackrest_candidate:-none})." >&2
+    echo "       pgBackRest must match the repo host's version. Configure the PGDG apt repo + pin as" >&2
+    echo "       described in docs/deploy.md, run 'apt-get update', then re-run this script." >&2
+    repo_error=1
+fi
+session_util_candidate="$(apt-cache policy python3-session-util 2>/dev/null | awk '/Candidate:/ {print $2}')"
+if [[ -z "$session_util_candidate" || "$session_util_candidate" == "(none)" ]]; then
+    echo "error: python3-session-util is not available. Configure the oxen apt repo as described in" >&2
+    echo "       docs/deploy.md, run 'apt-get update', then re-run this script." >&2
+    repo_error=1
+fi
+[[ "$repo_error" -eq 0 ]] || exit 1
+
 apt-get install -y \
     ca-certificates curl git gnupg lsb-release rsync \
     python3 python3-venv python3-pip \
     python3-flask python3-nacl python3-psycopg2 \
     uwsgi-emperor uwsgi-plugin-python3 \
     postgresql postgresql-contrib pgbackrest \
+    python3-session-util \
     nginx
-
-# Oxen apt repository (libsession-util-dev + python3-session-util — no source builds, no fork).
-install -d -m 0755 /etc/apt/keyrings
-curl -fsSL https://deb.oxen.io/pub.gpg -o /etc/apt/keyrings/oxen.gpg
-chmod 0644 /etc/apt/keyrings/oxen.gpg
-echo "deb [signed-by=/etc/apt/keyrings/oxen.gpg] https://deb.oxen.io $(lsb_release -sc) main" \
-    > /etc/apt/sources.list.d/oxen.list
-apt-get update
-apt-get install -y libsession-util-dev python3-session-util
 
 # --------------------------------------------------------------------------------------
 # 2. Dedicated non-root system user

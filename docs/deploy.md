@@ -25,6 +25,8 @@ durability with point-in-time recovery. TLS is deliberately left to the operator
 - A Debian target host with root access (these servers ship without `sudo` — `deploy.sh` runs
   directly as root, and every command it invokes as another user uses `runuser`, not `sudo`).
 - A DNS name pointing at the host (for nginx `server_name` and, later, TLS).
+- **The PGDG and oxen apt repositories configured first** (see "Prerequisite apt repositories"
+  below). `deploy.sh` *checks* for them and refuses to run otherwise; it does not edit apt config.
 - **A running uWSGI tyrant Emperor** (`emperor-tyrant = true` + `cap = setgid,setuid`) — shared
   fleet infrastructure this script does *not* manage. It only drops a vassal in, and refuses to
   install if the Emperor isn't tyrant (the vassal must run unprivileged, not as root).
@@ -39,6 +41,42 @@ durability with point-in-time recovery. TLS is deliberately left to the operator
 - **For live platforms (optional at first):** Apple in-app-purchase key (`.p8`) + IDs, and/or
   a Google Cloud service-account JSON authorised to the Pub/Sub subscription. You can deploy
   with platforms disabled and add these later.
+
+### Prerequisite apt repositories
+
+`deploy.sh` installs `pgbackrest` from **PGDG** (pinned, so its version matches the repo host — the
+distro version drifts across Debian releases and mismatched versions break remote backups) and
+`python3-session-util` from the **oxen** repo. It does **not** create these repositories — they are
+system apt config you own — it only checks they provide those packages and stops with instructions
+if not. Set them up once per host (`$(lsb_release -sc)` fills in the codename — `bookworm`, `trixie`, …):
+
+```bash
+install -d -m 0755 /etc/apt/keyrings
+
+# PGDG — pinned so ONLY pgbackrest is taken from it (everything else stays on the distro):
+curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc -o /etc/apt/keyrings/pgdg.asc
+echo "deb [signed-by=/etc/apt/keyrings/pgdg.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -sc)-pgdg main" \
+    > /etc/apt/sources.list.d/pgdg.list
+cat > /etc/apt/preferences.d/pgdg.pref <<'EOF'
+Package: *
+Pin: origin apt.postgresql.org
+Pin-Priority: 1
+
+Package: pgbackrest
+Pin: origin apt.postgresql.org
+Pin-Priority: 600
+EOF
+
+# oxen — python3-session-util (the Session onion-request binding):
+curl -fsSL https://deb.oxen.io/pub.gpg -o /etc/apt/keyrings/oxen.gpg
+echo "deb [signed-by=/etc/apt/keyrings/oxen.gpg] https://deb.oxen.io $(lsb_release -sc) main" \
+    > /etc/apt/sources.list.d/oxen.list
+
+apt-get update
+apt-cache policy pgbackrest python3-session-util   # pgbackrest's candidate version must contain 'pgdg'
+```
+
+Both the primary and the repo host need PGDG (so pgbackrest versions match); only the primary needs oxen.
 
 ## Deploy
 
