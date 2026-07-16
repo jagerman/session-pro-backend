@@ -165,8 +165,9 @@ sudo apt install libsession-util-dev
 git clone https://github.com/oxen-io/libsession-python
 cd libsession-python && python -m pip install .
 
-# Install Python dependencies for the Session Pro Backend
-python -m pip install -r requirements.txt
+# Install Python dependencies for the Session Pro Backend (use requirements-dev.txt for a
+# dev checkout — it adds pytest and a pip uWSGI on top of the runtime requirements.txt)
+python -m pip install -r requirements-dev.txt
 
 # Run backend w/ a local Flask server in debug mode
 python -m flask --app main run --debug
@@ -269,130 +270,35 @@ format specifications and examples.
 
 # Deploy Guide
 
-Using `scripts/ansible_deploy.yml` we have an idempotent
-script that can set up a primary server to have a Session Pro Backend that is
-configured for Google and Apple app stores and persists the state onto
-a postgres database. The database is replicated using postgres replication to
-the secondary server, details of this are in the `ansible_deploy.yml`
-documentation.
+Deployment is handled by `scripts/deploy.sh` — an idempotent bash installer, run on the
+target host, that provisions the backend under a dedicated non-root user in its own
+PostgreSQL cluster (leaving other databases on the box untouched), behind nginx, with
+off-host [pgBackRest](https://pgbackrest.org) backups and point-in-time recovery.
 
-The secondary server is optional, opt out by not specifying the `replica_host.`
-to the ansible command.
-
-Start by cloning the session-pro-backend at
-https://github.com/session-foundation/session-pro-backend.git
-
-Setup a config.ini with the following values and stub lines (the stubs will
-be populated by the ansible script and transferred onto the primary server).
-
-```
-[base]
-db_url                     =
-dev                        = true
-with_platform_apple        = true
-with_platform_google       = true
-unsafe_logging             = true
-platform_testing_env       = true
-
-[apple]
-app_id                     =
-bundle_id                  =
-issuer_id                  =
-key_id                     =
-key_path                   =
-root_cert_ca_g2_path       =
-root_cert_ca_g3_path       =
-root_cert_path             =
-sandbox_env                =
-
-[google]
-cloud_app_credentials_path =
-cloud_project_id           =
-cloud_subscription_name    =
-package_name               =
-subscription_product_id    =
-```
-
-Then create a hosts.yml file in the working directory with the following
-contents. Note for ansible to access the machine ensure that SSH access is setup
-from the host to the target servers (primary and secondary).
-
-```yaml
-global:
-  hosts:
-    pro_backend:
-      ansible_host: <Primary Instance's IP address>
-      ansible_user: root
-```
-
-Then attain the Google and Apple secrets (see the `ansible_deploy.yml` file for
-where to retrieve/generate these secrets) to enable communications with the
-respective platforms:
-
-- Apple Key Path (P8 file)
-- Apple Key ID
-- Google Cloud App Default Credentials (ADC JSON file)
-
-Additionally you will need various pieces of metadata required for
-authenticating to these platforms. See the ansible script for more information
-on where to source these from. It's possible to disable these platforms by
-simply setting `with_platform_apple` and `with_platform_google` to false. Stub
-data can then be supplied to their respective fields.
-
-Then run the ansible command as follows (we assume config.ini and the
-secrets are in the current working directory and substituting in the necessary
-values, again see `ansible_deploy.yml` for documentation on all these fields and
-where to source them):
+See **[docs/deploy.md](docs/deploy.md)** for the full guide, prerequisites, and the
+disaster-recovery runbook. In brief:
 
 ```bash
-ansible-playbook -i hosts.yml playbook_pro_backend_pgsql.yml \
-  -e replica_host=<root@secondary_server_address> \
-  -e config_ini_path=<path/to/config.ini> \
-  \
-  -e apple_app_id=<string> \
-  -e apple_bundle_id=<string> \
-  -e apple_issuer_id=<string> \
-  -e apple_key_id=<key_id> \
-  -e apple_key_path=<path/to/your_apple_api_key.p8> \
-  -e apple_sandbox=false \
-  \
-  -e google_cloud_app_default_credentials_path=<path/to/your_google_adc_key.json> \
-  -e google_cloud_project_id=<string> \
-  -e google_cloud_subscription_name=<string> \
-  -e google_package_name=<com.your_company.app_name> \
-  -e google_subscription_product_id=<string> \
-  \
-  -e domain=<your.domain.com> \
-  -e email=<your@email.com>
+git clone https://github.com/session-foundation/session-pro-backend
+cd session-pro-backend
+cp scripts/deploy.env.example deploy.env   # set PRO_DOMAIN, PGBACKREST_REPO_HOST, platforms, ...
+./scripts/deploy.sh            # run as root
 ```
 
-You will be prompted for a password interactively which is the password to
-secure the postgres DB instance under. The password is reused to secure the
-secondary's server replicated database.
-
-After the script has ran to completion, the server(s) are now successfully
-provisioned and should be accepting requests. On the replica instance you can
-run this command to dump the database to stdout to check if the users table was
-replicated:
+TLS is left to the operator (e.g. `certbot --nginx -d <domain>`), and Apple/Google
+credentials can be added after the first deploy. Once DNS/TLS are up, smoke-test an
+unauthenticated endpoint:
 
 ```
-sudo -u postgres psql --port={{ pg_port }} -d {{ pg_db_name }} -c "SELECT * FROM users"
-```
-
-On the primary instance test one of the unauthenticated endpoints to ensure that
-it's visible and accessible publicly:
-
-```
-curl -X POST <your_server_address>/get_pro_revocations -H "Content-Type: application/json" -d '{"version": 0, "ticket": 0}'
+curl -X POST https://<your-domain>/get_pro_revocations -H "Content-Type: application/json" -d '{"version": 0, "ticket": 0}'
 ```
 # Architecture
 
 ![Overview of Session Pro](docs/Session_Pro_Overview_200_zoom_10_border.png)
 
-Provided in this repository is an [Ansible](scripts/ansible_deploy.yml) script
-that installs the Session Pro infrastructure onto the target server and is
-a useful, technical description of the various components that the backend
-relies on. In general, the backend is designed as a set of distinct layers that
+The deployment tooling (`scripts/deploy.sh` and [docs/deploy.md](docs/deploy.md)) doubles as
+a concrete, technical description of the various components that the backend relies on. In
+general, the backend is designed as a set of distinct layers that
 feed data to each other, which is loosely described by the following diagram (in
 reality the links between the layers are a bit more entangled but conceptually
 stands).

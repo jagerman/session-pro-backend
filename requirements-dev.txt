@@ -1,0 +1,8 @@
+# Development / test extras: the runtime deps plus tools not wanted in production.
+-r requirements.txt
+
+pytest
+
+# uWSGI for the local `uwsgi ...` example in the readme. In production uWSGI is provided by the
+# system uwsgi-emperor + uwsgi-plugin-python3 packages, not pip.
+uwsgi
