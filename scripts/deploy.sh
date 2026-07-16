@@ -249,16 +249,12 @@ sed -i \
     -e "s|^with_platform_google .*|with_platform_google   = ${WITH_PLATFORM_GOOGLE}|" \
     "$CONFIG_INI"
 
-# Apple public root certificates (only when Apple is enabled; the .p8 key + Google JSON are
-# secrets you place into $KEYS_DIR yourself).
-if [[ "$WITH_PLATFORM_APPLE" == "true" ]]; then
-    echo "Downloading Apple root certificates"
-    curl -fsSL https://www.apple.com/appleca/AppleIncRootCertificate.cer     -o "$KEYS_DIR/AppleIncRootCertificate.cer"
-    curl -fsSL https://www.apple.com/certificateauthority/AppleRootCA-G2.cer -o "$KEYS_DIR/AppleRootCA-G2.cer"
-    curl -fsSL https://www.apple.com/certificateauthority/AppleRootCA-G3.cer -o "$KEYS_DIR/AppleRootCA-G3.cer"
-    chown "$PRO_USER:$PRO_USER" "$KEYS_DIR"/Apple*.cer
-    chmod 0644 "$KEYS_DIR"/Apple*.cer
-fi
+# Apple root certificates, vendored in the repo (scripts/apple-certs/). The app-store-server-library
+# verifies Apple's signed payloads against these explicitly — they are NOT in the OS trust store —
+# so they must be present whenever Apple is enabled. Installed unconditionally: they are public,
+# static (they rotate about once a decade), and harmless when Apple is disabled. The .p8 key and
+# Google JSON, being secrets, are placed into $KEYS_DIR by the operator, not here.
+install -m 0644 -o "$PRO_USER" -g "$PRO_USER" "$SCRIPT_DIR"/apple-certs/*.cer "$KEYS_DIR/"
 
 # --------------------------------------------------------------------------------------
 # 8. uWSGI Emperor vassal (the Emperor itself is pre-existing shared infrastructure)
