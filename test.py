@@ -1496,6 +1496,71 @@ def dump_apple_signed_payloads(core: platform_apple.Core, body: AppleResponseBod
     print(f'{prefix}decoded_notification = platform_apple.DecodedNotification(body={prefix}body, tx_info={prefix}tx_info, renewal_info={prefix}renewal_info)')
     print(f'_ = platform_apple.handle_notification(decoded_notification={prefix}decoded_notification, conn=test.conn, err=err)')
 
+def test_apple_grace_period_stores_duration_not_absolute_date(pg_database):
+    """Regression: DID_FAIL_TO_RENEW / GRACE_PERIOD must store the grace *duration*
+    (gracePeriodExpiresDate - expiresDate), not the absolute gracePeriodExpiresDate.
+
+    gracePeriodExpiresDate is an absolute ms-epoch timestamp per the App Store Server API; storing it
+    straight into the duration field `grace_period_duration_ms` made `expiry + grace_period` land ~50
+    years in the future on any grace-period renewal failure. No prior test covered this path (every
+    scenario set gracePeriodExpiresDate = None)."""
+    err = base.ErrorSink()
+    with TestingContext(pg_database) as test:
+        original_tx_id = '2000001024993299'
+        tx_id          = '2000001025686313'
+        web_line_id    = '2000000113844706'
+        expires_ms     = 1759388947000
+        grace_len_ms   = 16 * base.MILLISECONDS_IN_DAY  # a duration, deliberately unlike an epoch
+
+        with test.connection() as conn:
+            # Given an ingested (unredeemed) Apple payment with grace defaulting to 0.
+            payment_tx                            = base.PaymentProviderTransaction()
+            payment_tx.provider                   = base.PaymentProvider.iOSAppStore
+            payment_tx.apple_original_tx_id       = original_tx_id
+            payment_tx.apple_tx_id                = tx_id
+            payment_tx.apple_web_line_order_tx_id = web_line_id
+            backend.add_unredeemed_payment(conn                              = conn,
+                                           payment_tx                        = payment_tx,
+                                           plan                              = base.ProPlan.OneMonth,
+                                           expiry_unix_ts_ms                 = expires_ms,
+                                           unredeemed_unix_ts_ms             = expires_ms - (30 * base.MILLISECONDS_IN_DAY),
+                                           platform_refund_expiry_unix_ts_ms = expires_ms,
+                                           platform_obfuscated_account_id    = '',
+                                           err                               = err)
+            assert not err.has(), err.msg_list
+
+            # When a GRACE_PERIOD failed-renewal notification arrives (gracePeriodExpiresDate absolute).
+            body                                = AppleResponseBodyV2DecodedPayload()
+            body_data                           = AppleData()
+            body_data.environment               = AppleEnvironment.SANDBOX
+            body.data                           = body_data
+            body.notificationType               = AppleNotificationTypeV2.DID_FAIL_TO_RENEW
+            body.subtype                        = AppleSubtype.GRACE_PERIOD
+            body.notificationUUID               = 'grace-period-regression-uuid'
+            body.signedDate                     = expires_ms
+
+            renewal_info                        = AppleJWSRenewalInfoDecodedPayload()
+            renewal_info.gracePeriodExpiresDate = expires_ms + grace_len_ms
+
+            tx_info                             = AppleJWSTransactionDecodedPayload()
+            tx_info.originalTransactionId       = original_tx_id
+            tx_info.transactionId               = tx_id
+            tx_info.webOrderLineItemId          = web_line_id
+            tx_info.expiresDate                 = expires_ms
+
+            decoded = platform_apple.DecodedNotification(body=body, tx_info=tx_info, renewal_info=renewal_info)
+            handled = platform_apple.handle_notification(decoded_notification=decoded, conn=conn, notification_retry_duration_ms=0, err=err)
+            assert not err.has(), err.msg_list
+            assert handled
+
+            # Then the stored value is the grace DURATION, not the absolute date,
+            payment_list = backend.get_payments_list(conn)
+            assert len(payment_list)                        == 1
+            assert payment_list[0].grace_period_duration_ms == grace_len_ms
+            assert payment_list[0].grace_period_duration_ms != renewal_info.gracePeriodExpiresDate  # the old bug
+            # and `expiry + grace` resolves to exactly gracePeriodExpiresDate.
+            assert payment_list[0].expiry_unix_ts_ms + payment_list[0].grace_period_duration_ms == renewal_info.gracePeriodExpiresDate
+
 def test_platform_apple(pg_database):
     err = base.ErrorSink()
 

@@ -754,12 +754,23 @@ def handle_notification_tx(decoded_notification: DecodedNotification, sql_tx: db
                     log.debug(f'{decoded_notification.body.notificationType.name} for {payment_tx_id_label(payment_tx)}: Grace period ended')
 
                 elif decoded_notification.body.subtype == AppleSubtype.GRACE_PERIOD:
-                    log.debug(f'{decoded_notification.body.notificationType.name} for {payment_tx_id_label(payment_tx)}: Auto-renewing = true, grace period = {renewal.gracePeriodExpiresDate}')
-                    _ = backend.update_payment_renewal_info_tx(tx                       = sql_tx,
-                                                               payment_tx               = payment_tx,
-                                                               grace_period_duration_ms = renewal.gracePeriodExpiresDate,
-                                                               auto_renewing            = True,
-                                                               err                      = err)
+                    # `gracePeriodExpiresDate` is an ABSOLUTE ms-epoch timestamp per the App Store
+                    # Server API ("the time when the Billing Grace Period expires"), NOT a duration.
+                    # `grace_period_duration_ms` is a duration, so store the grace *length* — the gap
+                    # between the subscription's expiry and the grace-period end — so that downstream
+                    # `expiry + grace_period` resolves to exactly `gracePeriodExpiresDate` (the date
+                    # the user's entitlement should end during grace). Storing the raw absolute date
+                    # here added an epoch (~1.7e12 ms, ~50 years) to the entitlement on every
+                    # grace-period renewal failure.
+                    if require_field(tx.expiresDate, f'{decoded_notification.body.notificationType.name} grace period is missing the transaction expiry date. {print_obj(tx)}', err):
+                        assert renewal.gracePeriodExpiresDate is not None and tx.expiresDate is not None
+                        grace_period_duration_ms = renewal.gracePeriodExpiresDate - tx.expiresDate
+                        log.debug(f'{decoded_notification.body.notificationType.name} for {payment_tx_id_label(payment_tx)}: Auto-renewing = true, grace period expires = {renewal.gracePeriodExpiresDate}, duration = {grace_period_duration_ms}')
+                        _ = backend.update_payment_renewal_info_tx(tx                       = sql_tx,
+                                                                   payment_tx               = payment_tx,
+                                                                   grace_period_duration_ms = grace_period_duration_ms,
+                                                                   auto_renewing            = True,
+                                                                   err                      = err)
                 else:
                     err.msg_list.append(f'Received TX: {print_obj(tx)}, with unrecognised subtype for a DID_FAIL_TO_RENEW notification')
 
