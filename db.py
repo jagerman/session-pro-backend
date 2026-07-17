@@ -170,15 +170,6 @@ def query_one(conn: psycopg.Connection, sql: str, *args: typing.Any, **kwargs: t
     return query(conn, sql, *args, **kwargs).fetchone()
 
 
-def get_db_version(conn: psycopg.Connection) -> int:
-    row = query_one(conn, 'SELECT version FROM schema_version')
-    return row[0] if row else 0
-
-
-def set_db_version(conn: psycopg.Connection, version: int) -> None:
-    _ = query(conn, 'UPDATE schema_version SET version = %s', version)
-
-
 def run_and_log_errors(callback: typing.Callable[[], typing.Any], log: logging.Logger, error_prefix: str) -> None:
     """Run `callback`, logging (and swallowing) any exception under `error_prefix`."""
     try:

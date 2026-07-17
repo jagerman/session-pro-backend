@@ -15,6 +15,7 @@ import platform_google_api
 import platform_google_types
 import base
 import db
+import migrations
 import psycopg
 import psycopg_pool
 
@@ -660,68 +661,7 @@ def bootstrap_db(database_url: str, err: base.ErrorSink) -> psycopg_pool.Connect
 
     try:
         with db.connection(result) as conn:
-            with db.transaction(conn) as tx:
-                # Execute the whole schema as one block (functions/triggers contain semicolons)
-                schema_path = os.path.join(os.path.dirname(__file__), 'backend_schema.pgsql')
-                with open(schema_path, 'r') as f:
-                    schema_sql = f.read()
-                _ = db.query(tx.conn, schema_sql)
-
-                # NOTE: Version migration
-                target_db_version = 10
-                db_version = db.get_db_version(tx.conn)
-
-                # NOTE: v0 is the nil state - DB never bootstrapped, teleport to target
-                if db_version == 0:
-                    db_version = target_db_version
-                    db.set_db_version(tx.conn, db_version)
-
-                # v5/v6 only ever altered the (now-retired) SQLite schema; on Postgres they were
-                # no-ops, so an existing PG database at those versions just advances the counter.
-                if db_version == 5:
-                    log.info(f'Migrating DB version from {db_version} => {db_version + 1}')
-                    db_version += 1
-                    db.set_db_version(tx.conn, db_version)
-
-                if db_version == 6:
-                    log.info(f'Migrating DB version from {db_version} => {db_version + 1}')
-                    db_version += 1
-                    db.set_db_version(tx.conn, db_version)
-
-                if db_version == 7:
-                    log.info(f'Migrating DB version from {db_version} => {db_version + 1}')
-                    # Add rangeproof_order_id column to payments table
-                    _ = db.query(tx.conn, "ALTER TABLE payments ADD COLUMN rangeproof_order_id TEXT")
-                    db_version += 1
-                    db.set_db_version(tx.conn, db_version)
-
-                if db_version == 8:
-                    log.info(f'Migrating DB version from {db_version} => {db_version + 1}')
-                    # Add creation_unix_ts_ms column to revocations table
-                    _ = db.query(tx.conn, "ALTER TABLE revocations ADD COLUMN creation_unix_ts_ms INTEGER NOT NULL DEFAULT 0")
-                    db_version += 1
-                    db.set_db_version(tx.conn, db_version)
-
-                if db_version == 9:
-                    log.info(f'Migrating DB version from {db_version} => {db_version + 1}')
-                    # The Ed25519 signing key is now loaded from disk, never stored in the DB. Storing
-                    # it in the runtime row put a copy in every WAL record (MVCC rewrites the whole
-                    # tuple on each gen_index bump, etc.) and thus in every backup. Drop the column.
-                    _ = db.query(tx.conn, "ALTER TABLE runtime DROP COLUMN IF EXISTS backend_key")
-                    db_version += 1
-                    db.set_db_version(tx.conn, db_version)
-
-                # NOTE: Verify that the DB was migrated to the target version
-                assert db_version == target_db_version
-
-                # NOTE: Initialize the runtime row (app global settings) with the default values
-                row = db.query_one(tx.conn, 'SELECT EXISTS (SELECT 1 FROM runtime)')
-                runtime_row_exists = bool(row[0]) if row else False
-                if not runtime_row_exists:
-                    _ = db.query(tx.conn, '''
-                        INSERT INTO runtime (gen_index, gen_index_salt, last_expire_unix_ts_ms, apple_notification_checkpoint_unix_ts_ms, revocation_ticket)
-                        VALUES (0, %s, 0, 0, 0)
-                    ''', os.urandom(hashlib.blake2b.SALT_SIZE))
+            migrations.apply_migrations(conn)
     except Exception:
         err.msg_list.append(f"Failed to bootstrap DB tables: {traceback.format_exc()}")
 

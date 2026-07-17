@@ -20,6 +20,9 @@ import nacl.signing
 import nacl.bindings
 import nacl.public
 import os
+import pathlib
+import pytest
+import re
 import time
 import werkzeug
 import dataclasses
@@ -33,10 +36,11 @@ import datetime
 import platform_google
 import platform_google_api
 import platform_google_types
-from platform_google_types import GoogleDuration, SubscriptionProductDetails 
+from platform_google_types import GoogleDuration, SubscriptionProductDetails
 from vendor import onion_req
 import backend
 import base
+import migrations
 import server
 import platform_apple
 import db
@@ -143,6 +147,36 @@ def test_dry_run_backup_rotation():
         "2024-11-15_000000_k.sql",
     }
     assert len(result.to_keep) == 8 and len(result.to_delete) == 3
+
+def test_migrations_bootstrap_and_idempotency(pg_database):
+    # bootstrap_db runs the schema/ migrations; every migration file should be recorded, the runtime
+    # row seeded exactly once, and a second pass must be a clean no-op (nothing re-run or duplicated).
+    schema_dir = pathlib.Path(migrations.__file__).parent / 'schema'
+    expected   = {p.name for p in schema_dir.iterdir() if re.match(r'^\d+_.*\.(sql|py)$', p.name)}
+    assert expected, 'expected some migration files to exist'
+
+    err  = base.ErrorSink()
+    pool = backend.bootstrap_db(database_url=pg_database(), err=err)
+    assert not err.msg_list, err.msg_list
+    assert pool
+
+    with db.connection(pool) as conn:
+        applied = {row[0] for row in db.query(conn, 'SELECT name FROM migrations_applied')}
+        assert applied == expected
+        assert db.query_one(conn, 'SELECT COUNT(*) FROM runtime')[0] == 1
+
+        # Idempotent: re-running applies nothing new and does not duplicate the runtime seed.
+        migrations.apply_migrations(conn)
+        assert {row[0] for row in db.query(conn, 'SELECT name FROM migrations_applied')} == expected
+        assert db.query_one(conn, 'SELECT COUNT(*) FROM runtime')[0] == 1
+    pool.close()
+
+def test_migrations_reject_duplicate_basename(tmp_path, monkeypatch):
+    (tmp_path / '005_foo.sql').write_text('SELECT 1;')
+    (tmp_path / '005_foo.py').write_text('def apply_005_foo(conn): pass\n')
+    monkeypatch.setattr(migrations, 'SCHEMA_DIR', tmp_path)
+    with pytest.raises(RuntimeError):
+        _ = migrations._migration_files()
 
 def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_database):
     monkeypatch.setattr(
