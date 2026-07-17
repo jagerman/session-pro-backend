@@ -33,16 +33,20 @@ assert len(ADD_PRO_PAYMENT_HASH_PERSONALISATION)              == hashlib.blake2b
 assert len(SET_PAYMENT_REFUND_REQUESTED_HASH_PERSONALISATION) == hashlib.blake2b.PERSON_SIZE
 assert len(GET_PRO_DETAILS_HASH_PERSONALISATION)              == hashlib.blake2b.PERSON_SIZE
 
-# Explicit column order for payments table queries
-# NOTE: This must match the column order expected by payment_row_from_tuple()
+# Explicit column order for payments table queries.
+# NOTE: This must match the column order expected by payment_row_from_tuple().
+# `master_pkey` lives only in `users` now, so payments reads come from `PAYMENTS_FROM` (payments LEFT
+# JOIN users) and pull the pkey from the joined users row — NULL for an unredeemed payment (user_id
+# NULL), exactly as the per-row column used to be.
 PAYMENTS_COLUMNS = (
-    "id, master_pkey, status, plan, payment_provider, auto_renewing, "
-    "unredeemed_unix_ts_ms, redeemed_unix_ts_ms, expiry_unix_ts_ms, "
-    "grace_period_duration_ms, platform_refund_expiry_unix_ts_ms, revoked_unix_ts_ms, "
-    "apple_original_tx_id, apple_tx_id, apple_web_line_order_tx_id, "
-    "google_payment_token, google_order_id, rangeproof_order_id, "
-    "refund_requested_unix_ts_ms, google_obfuscated_account_id, apple_app_account_token"
+    "p.id, u.master_pkey, p.status, p.plan, p.payment_provider, p.auto_renewing, "
+    "p.unredeemed_unix_ts_ms, p.redeemed_unix_ts_ms, p.expiry_unix_ts_ms, "
+    "p.grace_period_duration_ms, p.platform_refund_expiry_unix_ts_ms, p.revoked_unix_ts_ms, "
+    "p.apple_original_tx_id, p.apple_tx_id, p.apple_web_line_order_tx_id, "
+    "p.google_payment_token, p.google_order_id, p.rangeproof_order_id, "
+    "p.refund_requested_unix_ts_ms, p.google_obfuscated_account_id, p.apple_app_account_token"
 )
+PAYMENTS_FROM = "payments p LEFT JOIN users u ON u.id = p.user_id"
 
 @dataclasses.dataclass
 class DevAddProPaymentArgs:
@@ -456,7 +460,7 @@ def payment_row_from_tuple(row: SQLTablePaymentRowTuple) -> PaymentRow:
 def get_unredeemed_payments_list(conn: psycopg.Connection) -> list[PaymentRow]:
     result: list[PaymentRow] = []
     with db.transaction(conn):
-        rows = db.query(conn, f'SELECT {PAYMENTS_COLUMNS} FROM payments WHERE status = %s', int(base.PaymentStatus.Unredeemed.value))
+        rows = db.query(conn, f'SELECT {PAYMENTS_COLUMNS} FROM {PAYMENTS_FROM} WHERE p.status = %s', int(base.PaymentStatus.Unredeemed.value))
         for row in rows:
             item = payment_row_from_tuple(tuple(row))
             result.append(item)
@@ -465,7 +469,7 @@ def get_unredeemed_payments_list(conn: psycopg.Connection) -> list[PaymentRow]:
 def get_payments_list(conn: psycopg.Connection) -> list[PaymentRow]:
     result: list[PaymentRow] = []
     with db.transaction(conn):
-        rows = db.query(conn, f'SELECT {PAYMENTS_COLUMNS} FROM payments')
+        rows = db.query(conn, f'SELECT {PAYMENTS_COLUMNS} FROM {PAYMENTS_FROM}')
         for row in rows:
             item = payment_row_from_tuple(tuple(row))
             result.append(item)
@@ -474,9 +478,9 @@ def get_payments_list(conn: psycopg.Connection) -> list[PaymentRow]:
 def get_user_and_payments(tx: db.SQLTransaction, master_pkey: nacl.signing.VerifyKey) -> GetUserAndPayments:
     payments_it = db.query(tx.conn, f'''
         SELECT   {PAYMENTS_COLUMNS}
-        FROM     payments
-        WHERE    master_pkey = %s
-        ORDER BY unredeemed_unix_ts_ms DESC, id DESC
+        FROM     {PAYMENTS_FROM}
+        WHERE    p.user_id = (SELECT id FROM users WHERE master_pkey = %s)
+        ORDER BY p.unredeemed_unix_ts_ms DESC, p.id DESC
     ''', bytes(master_pkey))
 
     result      = GetUserAndPayments(payments_it=payments_it)
@@ -485,7 +489,7 @@ def get_user_and_payments(tx: db.SQLTransaction, master_pkey: nacl.signing.Verif
     row = db.query_one(tx.conn, '''
         SELECT COUNT(*)
         FROM   payments
-        WHERE  master_pkey = %s
+        WHERE  user_id = (SELECT id FROM users WHERE master_pkey = %s)
     ''', bytes(master_pkey))
     result.payments_count = row[0] if row else 0
     return result
@@ -874,12 +878,12 @@ def add_apple_revocation_tx(tx: db.SQLTransaction, apple_original_tx_id: str, re
     # modified, is indeed in a revoked/expired state (e.g. its idempotent to call this function) and
     # that entitlement has been revoked where necessary.
     rows_result = db.query(tx.conn, f'''
-    SELECT id, master_pkey, expiry_unix_ts_ms
-    FROM   payments
-    WHERE  apple_original_tx_id  = %(orig_tx)s AND
-           payment_provider      = %(provider)s AND
-           (status               = %(unredeemed)s OR status = %(redeemed)s OR status = %(expired)s OR status = %(revoked)s);
-    ''', 
+    SELECT p.id, u.master_pkey, p.expiry_unix_ts_ms
+    FROM   {PAYMENTS_FROM}
+    WHERE  p.apple_original_tx_id  = %(orig_tx)s AND
+           p.payment_provider      = %(provider)s AND
+           (p.status               = %(unredeemed)s OR p.status = %(redeemed)s OR p.status = %(expired)s OR p.status = %(revoked)s);
+    ''',
         orig_tx    = apple_original_tx_id,
         provider   = int(base.PaymentProvider.iOSAppStore.value),
         unredeemed = int(base.PaymentStatus.Unredeemed.value),
@@ -909,11 +913,11 @@ def add_google_revocation_tx(tx: db.SQLTransaction, google_payment_token: str, r
     # modified, is indeed in a revoked/expired state (e.g. its idempotent to call this function) and
     # that entitlement has been revoked where necessary.
     rows_result = db.query(tx.conn, f'''
-    SELECT id, master_pkey, expiry_unix_ts_ms
-    FROM   payments
-    WHERE  google_payment_token = %(token)s AND
-           payment_provider     = %(provider)s AND
-           (status              = %(unredeemed)s OR status = %(redeemed)s OR status = %(expired)s OR status = %(revoked)s)
+    SELECT p.id, u.master_pkey, p.expiry_unix_ts_ms
+    FROM   {PAYMENTS_FROM}
+    WHERE  p.google_payment_token = %(token)s AND
+           p.payment_provider     = %(provider)s AND
+           (p.status              = %(unredeemed)s OR p.status = %(redeemed)s OR p.status = %(expired)s OR p.status = %(revoked)s)
     ''',
         token=google_payment_token,
         provider   = int(base.PaymentProvider.GooglePlayStore.value),
@@ -950,7 +954,10 @@ def redeem_payment_tx(tx:                  db.SQLTransaction,
 
     result                   = RedeemPayment(status=RedeemPaymentStatus.Error)
     master_pkey_bytes: bytes = bytes(master_pkey)
-    fields                   = ['master_pkey = %(master_pkey)s', 'status = %(status)s', 'redeemed_unix_ts_ms = %(redeemed_unix_ts_ms)s']
+    # A redeem marks the matched unredeemed payment(s) Redeemed; user_id is linked separately once the
+    # users row is ensured (master_pkey lives only in users now). The UPDATEs RETURN their ids so we
+    # can link exactly those rows without re-matching the per-provider WHERE.
+    fields                   = ['status = %(status)s', 'redeemed_unix_ts_ms = %(redeemed_unix_ts_ms)s']
     set_expr                 = ', '.join(fields) # Create '<field0> = ?, <field1> = ?, ...'
 
     payment_tx_label     = _add_pro_payment_user_tx_log_label_safe(payment_tx)
@@ -983,8 +990,8 @@ def redeem_payment_tx(tx:                  db.SQLTransaction,
               AND  google_order_id              = %(order_id)s
               AND  status                       = %(where_status)s
               AND  google_obfuscated_account_id = %(account_id)s
+            RETURNING id
         ''', # SET values
-              master_pkey         = master_pkey_bytes,
               status              = int(base.PaymentStatus.Redeemed.value),
               redeemed_unix_ts_ms = redeemed_unix_ts_ms,
               # WHERE values
@@ -1001,8 +1008,8 @@ def redeem_payment_tx(tx:                  db.SQLTransaction,
               AND apple_tx_id             = %(tx_id)s
               AND status                  = %(where_status)s
               AND apple_app_account_token = %(account_token)s
+            RETURNING id
         ''', # SET fields
-              master_pkey         = master_pkey_bytes,
               status              = int(base.PaymentStatus.Redeemed.value),
               redeemed_unix_ts_ms = redeemed_unix_ts_ms,
               # WHERE fields
@@ -1017,8 +1024,8 @@ def redeem_payment_tx(tx:                  db.SQLTransaction,
             WHERE payment_provider    = %(provider)s
               AND rangeproof_order_id = %(rangeproof_order_id)s
               AND status              = %(where_status)s
+            RETURNING id
         ''', # SET fields
-              master_pkey         = master_pkey_bytes,
               status              = int(base.PaymentStatus.Redeemed.value),
               redeemed_unix_ts_ms = redeemed_unix_ts_ms,
               # WHERE fields
@@ -1029,11 +1036,29 @@ def redeem_payment_tx(tx:                  db.SQLTransaction,
         err.msg_list.append('Payment to register specifies an unknown payment provider')
         return result
 
-    rowcount = row_result.rowcount
+    redeemed_ids = [row[0] for row in row_result.fetchall()]
+    rowcount     = len(redeemed_ids)
     if rowcount >= 1:
         assert rowcount == 1
         if rowcount > 1:
             err.msg_list.append(f'Payment was redeemed for {base.maybe_obfuscate_bytes(master_pkey)} at {redeemed_unix_ts_ms/1000} but more than 1 row was updated, updated {rowcount}')
+
+        # master_pkey lives only in `users`: ensure the identity row exists, then link the
+        # just-redeemed payment(s) to it. The placeholder gen/expiry here are overwritten by
+        # _allocate_new_gen_id… below (which recomputes them from the now-linked payment set).
+        _ = db.query(tx.conn, '''
+            INSERT INTO users (master_pkey, gen_index, expiry_unix_ts_ms, grace_period_duration_ms, google_obfuscated_account_id, apple_app_account_token)
+            VALUES            (%(master_pkey)s, 0, 0, 0, %(google_id)s, %(apple_id)s)
+            ON CONFLICT (master_pkey) DO NOTHING
+        ''', master_pkey = master_pkey_bytes,
+             google_id   = google_obfuscated_account_id_from_master_pkey(master_pkey),
+             apple_id    = apple_obfuscated_account_id_from_master_pkey(master_pkey))
+        _ = db.query(tx.conn, '''
+            UPDATE payments
+            SET    user_id = (SELECT id FROM users WHERE master_pkey = %(master_pkey)s)
+            WHERE  id = ANY(%(ids)s)
+        ''', master_pkey = master_pkey_bytes, ids = redeemed_ids)
+
         # proofs will be given a new gen index hash. We used to revoke the old gen index hash
         # but there's no need for that and creates churn in the revoke list. The user will hold
         # onto their proof until it expires and simply request a new one.
@@ -1079,7 +1104,7 @@ def redeem_payment_tx(tx:                  db.SQLTransaction,
                   AND  google_payment_token = %(token)s
                   AND  google_order_id      = %(order_id)s
                   AND  status               > %(status)s
-                  AND  master_pkey          = %(master_pkey)s
+                  AND  user_id              = (SELECT id FROM users WHERE master_pkey = %(master_pkey)s)
             ''', provider    = int(payment_tx.provider.value),
                  token       = payment_tx.google_payment_token,
                  order_id    = payment_tx.google_order_id,
@@ -1092,7 +1117,7 @@ def redeem_payment_tx(tx:                  db.SQLTransaction,
                 WHERE  payment_provider = %(provider)s
                   AND  apple_tx_id      = %(tx_id)s
                   AND  status           > %(status)s
-                  AND  master_pkey      = %(master_pkey)s
+                  AND  user_id          = (SELECT id FROM users WHERE master_pkey = %(master_pkey)s)
             ''', provider    = int(payment_tx.provider.value),
                  tx_id       = payment_tx.apple_tx_id,
                  status      = int(base.PaymentStatus.Unredeemed.value),
@@ -1104,7 +1129,7 @@ def redeem_payment_tx(tx:                  db.SQLTransaction,
                 WHERE  payment_provider    = %(provider)s
                   AND  rangeproof_order_id = %(order_id)s
                   AND  status              > %(status)s
-                  AND  master_pkey         = %(master_pkey)s
+                  AND  user_id             = (SELECT id FROM users WHERE master_pkey = %(master_pkey)s)
             ''', provider    = int(payment_tx.provider.value),
                  order_id    = payment_tx.rangeproof_order_id,
                  status      = int(base.PaymentStatus.Unredeemed.value),
@@ -1153,9 +1178,8 @@ def _lookup_user_expiry_unix_ts_ms_with_grace_from_payments_table_tx(tx: db.SQLT
     result_set = db.query(tx.conn, ('''
         SELECT    expiry_unix_ts_ms, grace_period_duration_ms, auto_renewing, status, refund_requested_unix_ts_ms, payment_provider, apple_original_tx_id, google_order_id, rangeproof_order_id, revoked_unix_ts_ms
         FROM      payments
-        WHERE     master_pkey = %(master_pkey)s AND (status = %(status1)s OR status = %(status2)s OR status = %(status3)s)
+        WHERE     user_id = (SELECT id FROM users WHERE master_pkey = %(master_pkey)s) AND (status = %(status1)s OR status = %(status2)s OR status = %(status3)s)
         ORDER BY  id DESC
-        LIMIT     20
     '''), master_pkey = bytes(master_pkey),
           status1     = int(base.PaymentStatus.Redeemed.value),
           status2     = int(base.PaymentStatus.Revoked.value),
@@ -1191,8 +1215,8 @@ def _lookup_user_expiry_unix_ts_ms_with_grace_from_payments_table_tx(tx: db.SQLT
         # For apple they have a <original_transaction_id> that is shared across all transactions for
         # a given subscription.
         #
-        # Our SQL query sorts the rows by insertion order and grabs the top 20 and looks for the
-        # _latest_ instance of the transactions associated with the user and selects those.
+        # Our SQL query sorts the user's payments by insertion order and looks for the _latest_
+        # instance of the transactions associated with the user and selects those.
         seen_before = False
         if payment_provider == base.PaymentProvider.GooglePlayStore.value:
             order_split: list[str] = google_order_id.split('..')
@@ -1311,7 +1335,7 @@ def update_payment_renewal_info_tx(tx:                       db.SQLTransaction,
                 UPDATE    payments
                 SET       {sql_set_fields}
                 WHERE     google_payment_token = %(token)s AND google_order_id = %(order_id)s
-                RETURNING master_pkey
+                RETURNING (SELECT master_pkey FROM users WHERE users.id = payments.user_id)
             ''', token    = payment_tx.google_payment_token,
                  order_id = payment_tx.google_order_id,
                  **kwparams)
@@ -1321,7 +1345,7 @@ def update_payment_renewal_info_tx(tx:                       db.SQLTransaction,
                 UPDATE    payments
                 SET       {sql_set_fields}
                 WHERE     apple_original_tx_id = %(orig_tx_id)s AND apple_tx_id = %(tx_id)s AND apple_web_line_order_tx_id = %(line_order_tx_id)s
-                RETURNING master_pkey
+                RETURNING (SELECT master_pkey FROM users WHERE users.id = payments.user_id)
             ''', orig_tx_id       = payment_tx.apple_original_tx_id,
                  tx_id            = payment_tx.apple_tx_id,
                  line_order_tx_id = payment_tx.apple_web_line_order_tx_id,
@@ -1332,13 +1356,14 @@ def update_payment_renewal_info_tx(tx:                       db.SQLTransaction,
                 UPDATE    payments
                 SET       {sql_set_fields}
                 WHERE     rangeproof_order_id = %(rangeproof_order_id)s
-                RETURNING master_pkey
+                RETURNING (SELECT master_pkey FROM users WHERE users.id = payments.user_id)
             ''', rangeproof_order_id = payment_tx.rangeproof_order_id,
                  **kwparams)
 
 
-    # NOTE: Having `RETURNING master_pkey` seems to break rowcount and returns 0 even on
-    # row modification. We use fetchone instead
+    # NOTE: A `RETURNING` clause seems to break rowcount (returns 0 even on row modification), so we
+    # use fetchone instead. The RETURNING expression resolves the payment's owner master_pkey via the
+    # users FK (NULL if the payment isn't redeemed yet).
     assert result_set
     row    = typing.cast(tuple[bytes] | None, result_set.fetchone())
     result = row is not None
@@ -1550,18 +1575,18 @@ def add_unredeemed_payment_tx(tx:                                db.SQLTransacti
     result_set: db.Result | None = None
     if payment_tx.provider == base.PaymentProvider.GooglePlayStore:
         result_set = db.query(tx.conn, ('''
-            SELECT   master_pkey
-            FROM     payments
-            WHERE    payment_provider = %s AND google_payment_token = %s AND master_pkey IS NOT NULL
-            ORDER BY id DESC
+            SELECT   u.master_pkey
+            FROM     payments p JOIN users u ON u.id = p.user_id
+            WHERE    p.payment_provider = %s AND p.google_payment_token = %s
+            ORDER BY p.id DESC
             LIMIT    1
         '''), int(payment_tx.provider.value), payment_tx.google_payment_token)
     elif payment_tx.provider == base.PaymentProvider.iOSAppStore:
         result_set = db.query(tx.conn, ('''
-            SELECT   master_pkey
-            FROM     payments
-            WHERE    payment_provider = %s AND apple_original_tx_id = %s AND master_pkey IS NOT NULL
-            ORDER BY id DESC
+            SELECT   u.master_pkey
+            FROM     payments p JOIN users u ON u.id = p.user_id
+            WHERE    p.payment_provider = %s AND p.apple_original_tx_id = %s
+            ORDER BY p.id DESC
             LIMIT    1
         '''), int(payment_tx.provider.value), payment_tx.apple_original_tx_id)
     elif payment_tx.provider == base.PaymentProvider.Rangeproof:
@@ -2064,7 +2089,7 @@ def expire_by_unix_ts_ms(tx: db.SQLTransaction, unix_ts_ms: int) -> set[nacl.sig
         UPDATE    payments
         SET       status = %(status)s
         WHERE     %(unix_ts_ms)s >= expiry_unix_ts_ms AND (status = %(status1)s OR status = %(status2)s)
-        RETURNING master_pkey
+        RETURNING (SELECT master_pkey FROM users WHERE users.id = payments.user_id)
     '''), # SET values
           status     = int(base.PaymentStatus.Expired.value),
           # WHERE values
@@ -2182,7 +2207,7 @@ def expire_payments_revocations_and_users(conn: psycopg.Connection, unix_ts_ms: 
             result.revocations                        = rev_result.rowcount
 
             # Delete expired users
-            users_result                              = db.query(tx.conn, '''DELETE FROM users WHERE master_pkey NOT IN (SELECT master_pkey FROM payments)''')
+            users_result                              = db.query(tx.conn, '''DELETE FROM users WHERE id NOT IN (SELECT user_id FROM payments WHERE user_id IS NOT NULL)''')
             result.users                              = users_result.rowcount
 
             # Delete expired apple notification UUIDs
@@ -2238,7 +2263,7 @@ SELECT EXISTS (
     LEFT JOIN user_errors ue
         ON (p.payment_provider = {int(base.PaymentProvider.iOSAppStore.value)}     AND p.apple_original_tx_id = ue.payment_id)
         OR (p.payment_provider = {int(base.PaymentProvider.GooglePlayStore.value)} AND p.google_payment_token = ue.payment_id)
-    WHERE p.master_pkey = %s
+    WHERE p.user_id = (SELECT id FROM users WHERE master_pkey = %s)
     AND ue.payment_id IS NOT NULL
 ) AS has_error;
 '''), bytes(master_pkey))
@@ -2356,17 +2381,17 @@ def set_refund_requested_unix_ts_ms_tx(tx: db.SQLTransaction, payment_tx: UserPa
         row = None
         if payment_tx.provider == base.PaymentProvider.GooglePlayStore:
             row = db.query_one(tx.conn, '''
-                SELECT master_pkey
-                FROM   payments
-                WHERE  payment_provider = %(provider)s AND google_payment_token = %(token)s AND google_order_id = %(order_id)s
+                SELECT u.master_pkey
+                FROM   payments p JOIN users u ON u.id = p.user_id
+                WHERE  p.payment_provider = %(provider)s AND p.google_payment_token = %(token)s AND p.google_order_id = %(order_id)s
             ''', provider = int(payment_tx.provider.value),
                  token    = payment_tx.google_payment_token,
                  order_id = payment_tx.google_order_id)
         elif payment_tx.provider == base.PaymentProvider.iOSAppStore:
             row = db.query_one(tx.conn, '''
-                SELECT master_pkey
-                FROM   payments
-                WHERE  payment_provider = %s AND apple_tx_id = %s
+                SELECT u.master_pkey
+                FROM   payments p JOIN users u ON u.id = p.user_id
+                WHERE  p.payment_provider = %s AND p.apple_tx_id = %s
             ''', int(payment_tx.provider.value), payment_tx.apple_tx_id)
 
         if row:
@@ -2384,9 +2409,12 @@ def set_refund_requested_unix_ts_ms(conn: psycopg.Connection,
     return result
 
 def apple_add_notification_uuid_tx(tx: db.SQLTransaction, uuid: str, expiry_unix_ts_ms: int):
+    # uuid is the PRIMARY KEY; DO NOTHING keeps this idempotent (and crash-free) if the caller's
+    # prior existence check raced with a concurrent insert of the same notification.
     _ = db.query(tx.conn, ('''
         INSERT INTO apple_notification_uuid_history (uuid, expiry_unix_ts_ms)
         VALUES      (%s, %s)
+        ON CONFLICT (uuid) DO NOTHING
     '''), uuid, expiry_unix_ts_ms)
 
 def apple_notification_uuid_is_in_db_tx(tx: db.SQLTransaction, uuid: str) -> bool:
@@ -2497,7 +2525,7 @@ def generate_report_rows(conn: psycopg.Connection, period: ReportPeriod, limit: 
             end_ts = _get_period_end_ts_sql(it, period)
 
             result_set = db.query(tx_conn, f"""
-                SELECT COUNT(DISTINCT master_pkey) AS active
+                SELECT COUNT(DISTINCT user_id) AS active
                 FROM payments
                 WHERE {end_ts} >= unredeemed_unix_ts_ms
                   AND {end_ts} <= expiry_unix_ts_ms
