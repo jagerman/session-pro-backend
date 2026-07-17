@@ -75,11 +75,13 @@ class BackupRotationDryRun:
 class PaymentProviderData:
     id: int = 0
 
-class PaymentProvider(enum.Enum):
-    Nil             = 0
-    GooglePlayStore = 1
-    iOSAppStore     = 2
-    Rangeproof      = 3
+class PaymentProvider(enum.StrEnum):
+    # Values are the wire/DB `code` strings (see docs/pro-wire-protocol.md §1). Nil is an in-Python
+    # sentinel only — it is never a wire value and is never seeded into the payment_providers lookup.
+    Nil             = 'nil'
+    GooglePlayStore = 'google_play'
+    iOSAppStore     = 'app_store'
+    Rangeproof      = 'rangeproof'
 
 @dataclasses.dataclass
 class PaymentProviderTransaction:
@@ -98,20 +100,23 @@ class PaymentStatus(enum.IntEnum):
     Expired    = 3
     Revoked    = 4
 
-class ProPlan(enum.Enum):
+class ProPlan(enum.StrEnum):
     """Universal Pro Plan Identifier.
-    Enum is stored as an int in the database, existing entries must not be reordered or changed.
+
+    Values are the wire/DB `code` strings — compact billing-period codes (see
+    docs/pro-wire-protocol.md §1). Nil is an in-Python sentinel only (never a wire/DB value).
     """
-    Nil         = 0
-    OneMonth    = 1
-    ThreeMonth  = 2
-    TwelveMonth = 3
+    Nil         = 'nil'
+    OneMonth    = '1m'
+    ThreeMonth  = '3m'
+    TwelveMonth = '1y'
 
     @classmethod
     def from_string(cls, val: str):
+        # Accept either the member name ("OneMonth") or the code value ("1m"), case-insensitively.
         val_lower = val.lower()
         for it in ProPlan:
-            if it.name.lower() == val_lower:
+            if it.name.lower() == val_lower or it.value == val_lower:
                 return it
         return None
 
@@ -223,7 +228,7 @@ class AsyncSessionWebhookLogHandler(logging.Handler):
             self._submit_thread.join(timeout=2)
         super().close()
 
-def verify_payment_provider(payment_provider: PaymentProvider | int, err: ErrorSink | None) -> bool:
+def verify_payment_provider(payment_provider: PaymentProvider | str, err: ErrorSink | None) -> bool:
     result = False
     provider = PaymentProvider.Nil
     if isinstance(payment_provider, PaymentProvider):
@@ -359,24 +364,11 @@ def print_db_to_stdout_tx(conn: psycopg.Connection) -> None:
                         seconds = int(value)
                         days    = seconds / SECONDS_IN_DAY
                         content.append(f'{seconds} ({days:.2f} days)')
-                    elif col == 'payment_provider':
-                        value_int = int(value)
-                        if value_int == PaymentProvider.Nil.value:
-                            content.append(f' Nil ({value_int})')
-                        elif value_int == PaymentProvider.GooglePlayStore.value:
-                            content.append(f'Google Play Store ({value_int})')
-                        elif value_int == PaymentProvider.iOSAppStore.value:
-                            content.append(f'iOS App Store ({value_int})')
-                        elif value_int == PaymentProvider.Rangeproof.value:
-                            content.append(f'Rangeproof ({value_int})')
-                        else:
-                            content.append(f'Unknown ({value_int})')
                     elif table_name == 'payments' and col == 'status':
                         value_enum = PaymentStatus(value)
                         content.append(f'{value_enum.name} ({value_enum.value})')
-                    elif table_name == 'payments' and col == 'plan':
-                        value_enum = ProPlan(value)
-                        content.append(f'{value_enum.name} ({value_enum.value})')
+                    # payment_provider / plan are now FK ids into the lookup tables — print the raw id
+                    # (this is a debug dump; join the lookup tables by hand if you need the code).
                     elif table_name == 'payments' and col == 'auto_renewing':
                         content.append('Yes' if value else 'No' + f' ({value})')
                     else:

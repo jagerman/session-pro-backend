@@ -48,6 +48,11 @@ PAYMENTS_COLUMNS = (
 )
 PAYMENTS_FROM = "payments p LEFT JOIN users u ON u.id = p.user_id"
 
+# payments.payment_provider / .plan and user_errors.payment_provider store the string `code` directly
+# (the lookup tables payment_providers/pro_plans use the code as their PRIMARY KEY, FK'd for validity).
+# So there's no id indirection: the enum's `.value` IS the stored value, and reads map it straight back
+# via base.PaymentProvider(...)/base.ProPlan(...).
+
 @dataclasses.dataclass
 class DevAddProPaymentArgs:
     plan:          base.ProPlan = base.ProPlan.OneMonth
@@ -389,7 +394,7 @@ def make_add_pro_payment_hash(version:       int,
     hasher.update(bytes(master_pkey))
     hasher.update(bytes(rotating_pkey))
 
-    hasher.update(int(payment_tx.provider.value).to_bytes(length=1, byteorder='little'))
+    hasher.update(payment_tx.provider.value.encode('utf-8'))  # provider_code, UTF-8, undelimited (spec §3.2, Delta #10)
     if payment_tx.provider == base.PaymentProvider.GooglePlayStore:
         hasher.update(payment_tx.google_payment_token.encode('utf-8'))
         hasher.update(payment_tx.google_order_id.encode('utf-8'))
@@ -409,7 +414,7 @@ def make_set_payment_refund_requested_hash(version: int, master_pkey: nacl.signi
     hasher.update(bytes(master_pkey))
     hasher.update(unix_ts_ms.to_bytes(length=8, byteorder='little'))
     hasher.update(refund_requested_unix_ts_ms.to_bytes(length=8, byteorder='little'))
-    hasher.update(payment_tx.provider.value.to_bytes(length=1, byteorder='little'))
+    hasher.update(payment_tx.provider.value.encode('utf-8'))  # provider_code, UTF-8, undelimited (spec §3.3, Delta #10)
     match payment_tx.provider:
         case base.PaymentProvider.Rangeproof:
             pass
@@ -460,7 +465,7 @@ def payment_row_from_tuple(row: SQLTablePaymentRowTuple) -> PaymentRow:
 def get_unredeemed_payments_list(conn: psycopg.Connection) -> list[PaymentRow]:
     result: list[PaymentRow] = []
     with db.transaction(conn):
-        rows = db.query(conn, f'SELECT {PAYMENTS_COLUMNS} FROM {PAYMENTS_FROM} WHERE p.status = %s', int(base.PaymentStatus.Unredeemed.value))
+        rows = db.query(conn, f'SELECT {PAYMENTS_COLUMNS} FROM {PAYMENTS_FROM} WHERE p.status = %s ORDER BY p.id', int(base.PaymentStatus.Unredeemed.value))
         for row in rows:
             item = payment_row_from_tuple(tuple(row))
             result.append(item)
@@ -469,7 +474,7 @@ def get_unredeemed_payments_list(conn: psycopg.Connection) -> list[PaymentRow]:
 def get_payments_list(conn: psycopg.Connection) -> list[PaymentRow]:
     result: list[PaymentRow] = []
     with db.transaction(conn):
-        rows = db.query(conn, f'SELECT {PAYMENTS_COLUMNS} FROM {PAYMENTS_FROM}')
+        rows = db.query(conn, f'SELECT {PAYMENTS_COLUMNS} FROM {PAYMENTS_FROM} ORDER BY p.id')
         for row in rows:
             item = payment_row_from_tuple(tuple(row))
             result.append(item)
@@ -885,7 +890,7 @@ def add_apple_revocation_tx(tx: db.SQLTransaction, apple_original_tx_id: str, re
            (p.status               = %(unredeemed)s OR p.status = %(redeemed)s OR p.status = %(expired)s OR p.status = %(revoked)s);
     ''',
         orig_tx    = apple_original_tx_id,
-        provider   = int(base.PaymentProvider.iOSAppStore.value),
+        provider   = base.PaymentProvider.iOSAppStore.value,
         unredeemed = int(base.PaymentStatus.Unredeemed.value),
         redeemed   = int(base.PaymentStatus.Redeemed.value),
         expired    = int(base.PaymentStatus.Expired.value),
@@ -920,7 +925,7 @@ def add_google_revocation_tx(tx: db.SQLTransaction, google_payment_token: str, r
            (p.status              = %(unredeemed)s OR p.status = %(redeemed)s OR p.status = %(expired)s OR p.status = %(revoked)s)
     ''',
         token=google_payment_token,
-        provider   = int(base.PaymentProvider.GooglePlayStore.value),
+        provider   = base.PaymentProvider.GooglePlayStore.value,
         unredeemed = int(base.PaymentStatus.Unredeemed.value),
         redeemed   = int(base.PaymentStatus.Redeemed.value),
         expired    = int(base.PaymentStatus.Expired.value),
@@ -995,7 +1000,7 @@ def redeem_payment_tx(tx:                  db.SQLTransaction,
               status              = int(base.PaymentStatus.Redeemed.value),
               redeemed_unix_ts_ms = redeemed_unix_ts_ms,
               # WHERE values
-              provider            = int(payment_tx.provider.value),
+              provider            = payment_tx.provider.value,
               token               = payment_tx.google_payment_token,
               order_id            = payment_tx.google_order_id,
               where_status        = int(base.PaymentStatus.Unredeemed.value),
@@ -1013,7 +1018,7 @@ def redeem_payment_tx(tx:                  db.SQLTransaction,
               status              = int(base.PaymentStatus.Redeemed.value),
               redeemed_unix_ts_ms = redeemed_unix_ts_ms,
               # WHERE fields
-              provider            = int(payment_tx.provider.value),
+              provider            = payment_tx.provider.value,
               tx_id               = payment_tx.apple_tx_id,
               where_status        = int(base.PaymentStatus.Unredeemed.value),
               account_token       = apple_obfuscated_account_id_from_master_pkey(master_pkey))
@@ -1029,7 +1034,7 @@ def redeem_payment_tx(tx:                  db.SQLTransaction,
               status              = int(base.PaymentStatus.Redeemed.value),
               redeemed_unix_ts_ms = redeemed_unix_ts_ms,
               # WHERE fields
-              provider            = int(payment_tx.provider.value),
+              provider            = payment_tx.provider.value,
               rangeproof_order_id = payment_tx.rangeproof_order_id,
               where_status        = int(base.PaymentStatus.Unredeemed.value))
     else:
@@ -1105,7 +1110,7 @@ def redeem_payment_tx(tx:                  db.SQLTransaction,
                   AND  google_order_id      = %(order_id)s
                   AND  status               > %(status)s
                   AND  user_id              = (SELECT id FROM users WHERE master_pkey = %(master_pkey)s)
-            ''', provider    = int(payment_tx.provider.value),
+            ''', provider    = payment_tx.provider.value,
                  token       = payment_tx.google_payment_token,
                  order_id    = payment_tx.google_order_id,
                  status      = int(base.PaymentStatus.Unredeemed.value),
@@ -1118,7 +1123,7 @@ def redeem_payment_tx(tx:                  db.SQLTransaction,
                   AND  apple_tx_id      = %(tx_id)s
                   AND  status           > %(status)s
                   AND  user_id          = (SELECT id FROM users WHERE master_pkey = %(master_pkey)s)
-            ''', provider    = int(payment_tx.provider.value),
+            ''', provider    = payment_tx.provider.value,
                  tx_id       = payment_tx.apple_tx_id,
                  status      = int(base.PaymentStatus.Unredeemed.value),
                  master_pkey = master_pkey_bytes)
@@ -1130,7 +1135,7 @@ def redeem_payment_tx(tx:                  db.SQLTransaction,
                   AND  rangeproof_order_id = %(order_id)s
                   AND  status              > %(status)s
                   AND  user_id             = (SELECT id FROM users WHERE master_pkey = %(master_pkey)s)
-            ''', provider    = int(payment_tx.provider.value),
+            ''', provider    = payment_tx.provider.value,
                  order_id    = payment_tx.rangeproof_order_id,
                  status      = int(base.PaymentStatus.Unredeemed.value),
                  master_pkey = master_pkey_bytes)
@@ -1422,7 +1427,7 @@ def add_unredeemed_payment_tx(tx:                                db.SQLTransacti
             SELECT 1
             FROM payments
             WHERE payment_provider = %(provider)s AND google_payment_token = %(token)s AND google_order_id = %(order_id)s
-        ''', provider=int(payment_tx.provider.value), token=payment_tx.google_payment_token, order_id=payment_tx.google_order_id)
+        ''', provider=payment_tx.provider.value, token=payment_tx.google_payment_token, order_id=payment_tx.google_order_id)
 
         record = result_set.fetchone()
         if not record:
@@ -1446,7 +1451,7 @@ def add_unredeemed_payment_tx(tx:                                db.SQLTransacti
                 INSERT INTO payments ({stmt_fields})
                 VALUES ({stmt_values})
             ''', {f: v for f, v in zip(fields, [
-                  int(plan.value),
+                  plan.value,
                   payment_tx.provider.value,
                   payment_tx.google_payment_token,
                   payment_tx.google_order_id,
@@ -1473,7 +1478,7 @@ def add_unredeemed_payment_tx(tx:                                db.SQLTransacti
                 SELECT 1
                 FROM payments
                 WHERE payment_provider = %(provider)s AND apple_original_tx_id = %(orig_tx_id)s AND apple_tx_id = %(tx_id)s AND apple_web_line_order_tx_id = %(line_order_tx_id)s
-        ''', provider=int(payment_tx.provider.value),
+        ''', provider=payment_tx.provider.value,
               orig_tx_id=payment_tx.apple_original_tx_id,
               tx_id=payment_tx.apple_tx_id,
               line_order_tx_id=payment_tx.apple_web_line_order_tx_id)
@@ -1500,8 +1505,8 @@ def add_unredeemed_payment_tx(tx:                                db.SQLTransacti
                 INSERT INTO payments ({stmt_fields})
                 VALUES ({stmt_values})
             ''', {f: v for f, v in zip(fields, [
-                  int(plan.value),
-                  int(payment_tx.provider.value),
+                  plan.value,
+                  payment_tx.provider.value,
                   payment_tx.apple_original_tx_id,
                   payment_tx.apple_tx_id,
                   payment_tx.apple_web_line_order_tx_id,
@@ -1520,7 +1525,7 @@ def add_unredeemed_payment_tx(tx:                                db.SQLTransacti
                 SELECT 1
                 FROM payments
                 WHERE payment_provider = %s AND rangeproof_order_id = %s
-        ''', int(payment_tx.provider.value), payment_tx.rangeproof_order_id)
+        ''', payment_tx.provider.value, payment_tx.rangeproof_order_id)
 
         record = result_set.fetchone()
         if not record:
@@ -1542,8 +1547,8 @@ def add_unredeemed_payment_tx(tx:                                db.SQLTransacti
                 INSERT INTO payments ({stmt_fields})
                 VALUES ({stmt_values})
             ''', {f: v for f, v in zip(fields, [
-                  int(plan.value),
-                  int(payment_tx.provider.value),
+                  plan.value,
+                  payment_tx.provider.value,
                   payment_tx.rangeproof_order_id,
                   int(base.PaymentStatus.Unredeemed.value),
                   expiry_unix_ts_ms,
@@ -1580,7 +1585,7 @@ def add_unredeemed_payment_tx(tx:                                db.SQLTransacti
             WHERE    p.payment_provider = %s AND p.google_payment_token = %s
             ORDER BY p.id DESC
             LIMIT    1
-        '''), int(payment_tx.provider.value), payment_tx.google_payment_token)
+        '''), payment_tx.provider.value, payment_tx.google_payment_token)
     elif payment_tx.provider == base.PaymentProvider.iOSAppStore:
         result_set = db.query(tx.conn, ('''
             SELECT   u.master_pkey
@@ -1588,7 +1593,7 @@ def add_unredeemed_payment_tx(tx:                                db.SQLTransacti
             WHERE    p.payment_provider = %s AND p.apple_original_tx_id = %s
             ORDER BY p.id DESC
             LIMIT    1
-        '''), int(payment_tx.provider.value), payment_tx.apple_original_tx_id)
+        '''), payment_tx.provider.value, payment_tx.apple_original_tx_id)
     elif payment_tx.provider == base.PaymentProvider.Rangeproof:
         # TODO: There is currently no auto-redeeming for Rangeproof payments. These are currently
         # granted to a user directly by creating a voucher payment attributed under their master pro
@@ -2261,8 +2266,8 @@ SELECT EXISTS (
     SELECT 1
     FROM payments p
     LEFT JOIN user_errors ue
-        ON (p.payment_provider = {int(base.PaymentProvider.iOSAppStore.value)}     AND p.apple_original_tx_id = ue.payment_id)
-        OR (p.payment_provider = {int(base.PaymentProvider.GooglePlayStore.value)} AND p.google_payment_token = ue.payment_id)
+        ON (p.payment_provider = '{base.PaymentProvider.iOSAppStore.value}'     AND p.apple_original_tx_id = ue.payment_id)
+        OR (p.payment_provider = '{base.PaymentProvider.GooglePlayStore.value}' AND p.google_payment_token = ue.payment_id)
     WHERE p.user_id = (SELECT id FROM users WHERE master_pkey = %s)
     AND ue.payment_id IS NOT NULL
 ) AS has_error;
@@ -2300,7 +2305,7 @@ def get_payment_tx(tx:          db.SQLTransaction,
             SELECT *
             FROM payments
             WHERE payment_provider = %(provider)s AND google_payment_token = %(token)s AND google_order_id = %(order_id)s
-        ''', provider  = int(payment_tx.provider.value),
+        ''', provider  = payment_tx.provider.value,
               token    = payment_tx.google_payment_token,
               order_id = payment_tx.google_order_id)
 
@@ -2314,7 +2319,7 @@ def get_payment_tx(tx:          db.SQLTransaction,
                 SELECT *
                 FROM payments
                 WHERE payment_provider = %(provider)s AND apple_original_tx_id = %(orig_tx_id)s AND apple_tx_id = %(tx_id)s AND apple_web_line_order_tx_id = %(line_order_tx_id)s
-        ''', provider          = int(payment_tx.provider.value),
+        ''', provider          = payment_tx.provider.value,
               orig_tx_id       = payment_tx.apple_original_tx_id,
               tx_id            = payment_tx.apple_tx_id,
               line_order_tx_id = payment_tx.apple_web_line_order_tx_id)
@@ -2328,7 +2333,7 @@ def get_payment_tx(tx:          db.SQLTransaction,
                 SELECT *
                 FROM payments
                 WHERE payment_provider = %s AND rangeproof_order_id = %s
-        ''', int(payment_tx.provider.value), payment_tx.rangeproof_order_id)
+        ''', payment_tx.provider.value, payment_tx.rangeproof_order_id)
 
         record = result_set.fetchone()
         if record:
@@ -2356,7 +2361,7 @@ def set_refund_requested_unix_ts_ms_tx(tx: db.SQLTransaction, payment_tx: UserPa
             SET    refund_requested_unix_ts_ms = %(ts)s
             WHERE  payment_provider = %(provider)s AND google_payment_token = %(token)s AND google_order_id = %(order_id)s
         ''', ts        = unix_ts_ms,
-            provider = int(payment_tx.provider.value),
+            provider = payment_tx.provider.value,
             token    = payment_tx.google_payment_token,
             order_id = payment_tx.google_order_id)
     elif payment_tx.provider == base.PaymentProvider.iOSAppStore:
@@ -2365,7 +2370,7 @@ def set_refund_requested_unix_ts_ms_tx(tx: db.SQLTransaction, payment_tx: UserPa
             SET    refund_requested_unix_ts_ms = %(ts)s
             WHERE  payment_provider = %(provider)s AND apple_tx_id = %(tx_id)s
         ''', ts        = unix_ts_ms,
-              provider = int(payment_tx.provider.value),
+              provider = payment_tx.provider.value,
               tx_id    = payment_tx.apple_tx_id)
 
     assert rows and (rows.rowcount == 0 or rows.rowcount == 1)
@@ -2384,7 +2389,7 @@ def set_refund_requested_unix_ts_ms_tx(tx: db.SQLTransaction, payment_tx: UserPa
                 SELECT u.master_pkey
                 FROM   payments p JOIN users u ON u.id = p.user_id
                 WHERE  p.payment_provider = %(provider)s AND p.google_payment_token = %(token)s AND p.google_order_id = %(order_id)s
-            ''', provider = int(payment_tx.provider.value),
+            ''', provider = payment_tx.provider.value,
                  token    = payment_tx.google_payment_token,
                  order_id = payment_tx.google_order_id)
         elif payment_tx.provider == base.PaymentProvider.iOSAppStore:
@@ -2392,7 +2397,7 @@ def set_refund_requested_unix_ts_ms_tx(tx: db.SQLTransaction, payment_tx: UserPa
                 SELECT u.master_pkey
                 FROM   payments p JOIN users u ON u.id = p.user_id
                 WHERE  p.payment_provider = %s AND p.apple_tx_id = %s
-            ''', int(payment_tx.provider.value), payment_tx.apple_tx_id)
+            ''', payment_tx.provider.value, payment_tx.apple_tx_id)
 
         if row:
             master_pkey = nacl.signing.VerifyKey(bytes(row[0]))
@@ -2551,42 +2556,42 @@ def generate_report_rows(conn: psycopg.Connection, period: ReportPeriod, limit: 
             tx_conn           = tx.conn,
             period            = period,
             unix_ts_ms_column = "unredeemed_unix_ts_ms",
-            where_clause      = f"plan = {base.ProPlan.OneMonth.value}",
+            where_clause      = f"plan = '{base.ProPlan.OneMonth.value}'",
         )
 
         plan_3m: dict[str, int] = fetch_counts(
             tx_conn           = tx.conn,
             period            = period,
             unix_ts_ms_column = "unredeemed_unix_ts_ms",
-            where_clause      = f"plan = {base.ProPlan.ThreeMonth.value}",
+            where_clause      = f"plan = '{base.ProPlan.ThreeMonth.value}'",
         )
 
         plan_12m: dict[str, int] = fetch_counts(
             tx_conn           = tx.conn,
             period            = period,
             unix_ts_ms_column = "unredeemed_unix_ts_ms",
-            where_clause      = f"plan = {base.ProPlan.TwelveMonth.value}",
+            where_clause      = f"plan = '{base.ProPlan.TwelveMonth.value}'",
         )
 
         google: dict[str, int] = fetch_counts(
             tx_conn           = tx.conn,
             period            = period,
             unix_ts_ms_column = "unredeemed_unix_ts_ms",
-            where_clause      = f"payment_provider = {base.PaymentProvider.GooglePlayStore.value}",
+            where_clause      = f"payment_provider = '{base.PaymentProvider.GooglePlayStore.value}'",
         )
 
         apple: dict[str, int] = fetch_counts(
             tx_conn           = tx.conn,
             period            = period,
             unix_ts_ms_column = "unredeemed_unix_ts_ms",
-            where_clause      = f"payment_provider = {base.PaymentProvider.iOSAppStore.value}",
+            where_clause      = f"payment_provider = '{base.PaymentProvider.iOSAppStore.value}'",
         )
 
         rangeproof: dict[str, int] = fetch_counts(
             tx_conn           = tx.conn,
             period            = period,
             unix_ts_ms_column = "unredeemed_unix_ts_ms",
-            where_clause      = f"payment_provider = {base.PaymentProvider.Rangeproof.value}",
+            where_clause      = f"payment_provider = '{base.PaymentProvider.Rangeproof.value}'",
         )
 
         new_subs: dict[str, int] = fetch_counts(

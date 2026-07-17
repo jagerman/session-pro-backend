@@ -3739,7 +3739,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
         item_order_id                          = base.json_dict_require_str(item, "google_order_id", err)
         item_payment_token                     = base.json_dict_require_str(item, "google_payment_token", err)
         item_grace_duration_ms                 = base.json_dict_require_int(item, "grace_period_duration_ms", err)
-        item_payment_provider                  = base.json_dict_require_int_coerce_to_enum(item, "payment_provider", base.PaymentProvider, err)
+        item_payment_provider                  = base.json_dict_require_str_coerce_to_enum(item, "payment_provider", base.PaymentProvider, err)
         item_platform_refund_expiry_unix_ts_ms = base.json_dict_require_int(item, "platform_refund_expiry_unix_ts_ms", err)
         item_redeemed_unix_ts_ms               = base.json_dict_require_int(item, "redeemed_unix_ts_ms", err)
         item_revoked_unix_ts_ms                = base.json_dict_require_int(item, "revoked_unix_ts_ms", err)

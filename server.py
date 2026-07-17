@@ -700,7 +700,7 @@ def add_pro_payment():
     master_sig:       str                       = base.json_dict_require_str(d=get.json,   key='master_sig',    err=err)
     rotating_sig:     str                       = base.json_dict_require_str(d=get.json,   key='rotating_sig',  err=err)
     payment_tx:       dict[str, base.JSONValue] = base.json_dict_require_obj(d=get.json,   key='payment_tx',    err=err)
-    payment_provider: int                       = base.json_dict_require_int(d=payment_tx, key='provider',      err=err)
+    payment_provider: str                       = base.json_dict_require_str(d=payment_tx, key='provider',      err=err)
     if len(err.msg_list):
         return make_error_response(status=RESPONSE_PARSE_ERROR, errors=err.msg_list)
 
@@ -1007,8 +1007,8 @@ def get_pro_details():
                         if payment.payment_provider == base.PaymentProvider.GooglePlayStore:
                             items.append({
                                 'status':                               int(payment.status.value),
-                                'plan':                                 int(payment.plan.value),
-                                'payment_provider':                     int(payment.payment_provider.value),
+                                'plan':                                 payment.plan.value,
+                                'payment_provider':                     payment.payment_provider.value,
                                 'auto_renewing':                        payment.auto_renewing,
                                 'unredeemed_unix_ts_ms':                payment.unredeemed_unix_ts_ms,
                                 'redeemed_unix_ts_ms':                  payment.redeemed_unix_ts_ms if payment.redeemed_unix_ts_ms else 0,
@@ -1023,8 +1023,8 @@ def get_pro_details():
                         elif payment.payment_provider == base.PaymentProvider.iOSAppStore:
                             items.append({
                                 'status':                               int(payment.status.value),
-                                'plan':                                 int(payment.plan.value),
-                                'payment_provider':                     int(payment.payment_provider.value),
+                                'plan':                                 payment.plan.value,
+                                'payment_provider':                     payment.payment_provider.value,
                                 'auto_renewing':                        payment.auto_renewing,
                                 'unredeemed_unix_ts_ms':                payment.unredeemed_unix_ts_ms,
                                 'redeemed_unix_ts_ms':                  payment.redeemed_unix_ts_ms if payment.redeemed_unix_ts_ms else 0,
@@ -1040,8 +1040,8 @@ def get_pro_details():
                         elif payment.payment_provider == base.PaymentProvider.Rangeproof:
                             items.append({
                                 'status':                               int(payment.status.value),
-                                'plan':                                 int(payment.plan.value),
-                                'payment_provider':                     int(payment.payment_provider.value),
+                                'plan':                                 payment.plan.value,
+                                'payment_provider':                     payment.payment_provider.value,
                                 'auto_renewing':                        payment.auto_renewing,
                                 'unredeemed_unix_ts_ms':                payment.unredeemed_unix_ts_ms,
                                 'redeemed_unix_ts_ms':                  payment.redeemed_unix_ts_ms if payment.redeemed_unix_ts_ms else 0,
@@ -1096,7 +1096,7 @@ def set_payment_refund_requested():
     payment_tx:                  dict[str, base.JSONValue] = base.json_dict_require_obj(d=get.json,   key='payment_tx',                  err=err)
     unix_ts_ms:                  int                       = base.json_dict_require_int(d=get.json,   key='unix_ts_ms',                  err=err)
     refund_requested_unix_ts_ms: int                       = base.json_dict_require_int(d=get.json,   key='refund_requested_unix_ts_ms', err=err)
-    payment_provider:            int                       = base.json_dict_require_int(d=payment_tx, key='provider',                    err=err)
+    payment_provider:            str                       = base.json_dict_require_str(d=payment_tx, key='provider',                    err=err)
     if len(err.msg_list):
         return make_error_response(status=RESPONSE_PARSE_ERROR, errors=err.msg_list)
 

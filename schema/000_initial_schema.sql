@@ -16,14 +16,30 @@ CREATE TABLE IF NOT EXISTS users (
     apple_app_account_token      TEXT    NOT NULL DEFAULT ''
 );
 
+-- Enumerated value sets. The code string is the canonical value used in Python, on the wire, and in the
+-- signed request hashes, so it is the PRIMARY KEY (no surrogate id): children FK the code directly, and
+-- a new provider/plan is an additive INSERT (never an ALTER TYPE). Seeds are idempotent so re-applying
+-- the baseline against a pre-ledger database is a no-op.
+CREATE TABLE IF NOT EXISTS payment_providers (
+    code TEXT PRIMARY KEY
+);
+INSERT INTO payment_providers (code) VALUES ('google_play'), ('app_store'), ('rangeproof')
+    ON CONFLICT (code) DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS pro_plans (
+    code TEXT PRIMARY KEY
+);
+INSERT INTO pro_plans (code) VALUES ('1m'), ('3m'), ('1y')
+    ON CONFLICT (code) DO NOTHING;
+
 -- A payment is ingested UNREDEEMED (user_id NULL) before any identity is attached; at redemption the
 -- master_pkey becomes known, its users row is upserted, and user_id is backfilled here.
 CREATE TABLE IF NOT EXISTS payments (
     id                                BIGINT  GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     user_id                           BIGINT  REFERENCES users(id),   -- NULL until redeemed
     status                            INTEGER NOT     NULL,
-    plan                              INTEGER NOT     NULL,
-    payment_provider                  INTEGER NOT     NULL,
+    plan                              TEXT    NOT     NULL REFERENCES pro_plans(code),
+    payment_provider                  TEXT    NOT     NULL REFERENCES payment_providers(code),
     auto_renewing                     BOOLEAN NOT     NULL DEFAULT FALSE,
     unredeemed_unix_ts_ms             BIGINT  NOT     NULL,
 
@@ -73,7 +89,7 @@ CREATE TABLE IF NOT EXISTS google_notification_history (
 
 CREATE TABLE IF NOT EXISTS user_errors (
     payment_id         TEXT NOT NULL,
-    payment_provider   INTEGER NOT NULL,
+    payment_provider   TEXT NOT NULL REFERENCES payment_providers(code),
     unix_ts_ms         BIGINT NOT NULL,
     UNIQUE(payment_id, payment_provider)
 );

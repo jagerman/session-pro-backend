@@ -323,7 +323,7 @@ def parse_set_user_error_arg(arg: str, err: base.ErrorSink) -> list[tuple[base.P
         payment_provider = base.PaymentProvider.Nil
 
         try:
-            payment_provider = base.PaymentProvider(int(payment_provider_str))
+            payment_provider = base.PaymentProvider(payment_provider_str)
         except Exception:
             err.msg_list.append(f'Failed to parse payment provider ({payment_provider_str}) for item {item}')
             return result
@@ -359,7 +359,7 @@ def parse_payment_id_list(arg: str, err: base.ErrorSink) -> list[tuple[base.Paym
         payment_provider_str = payment_provider_str.strip()
 
         try:
-            payment_provider = base.PaymentProvider(int(payment_provider_str))
+            payment_provider = base.PaymentProvider(payment_provider_str)
         except Exception:
             err.msg_list.append(f'Failed to parse payment provider ({payment_provider_str}) for item {item}')
             return result
