@@ -7,7 +7,7 @@ it and process said payments into the database layer (backend.py)
 import json
 import traceback
 import logging
-import sqlalchemy
+import psycopg
 import threading
 import dataclasses
 import typing
@@ -263,7 +263,7 @@ def thread_entry_point(context: ThreadContext, app_credentials_path: str, cloud_
                                                                                       expiry_unix_ts_ms = parse.event_time_ms + base.MILLISECONDS_IN_DAY * 8,
                                                                                       payload           = google.pubsub_v1.types.ReceivedMessage.to_json(it))
 
-                            db.retry_on_database_locked(add_notification_id_to_db, log, "Add Google notification ID to DB failed")
+                            db.run_and_log_errors(add_notification_id_to_db, log, "Add Google notification ID to DB failed")
                             if err.has():
                                 log.warning(f'Discarding message #{index}, attempting to add notification to DB but it repeatedly failed (message was published at {base.readable_unix_ts_ms(it.message.publish_time.ToMilliseconds())}. Message was:\n{base.maybe_obfuscate(str(it))}\nReason was:\n{err.build()}')
                                 continue
@@ -383,7 +383,7 @@ def set_purchase_grace_period_duration(tx_payment: base.PaymentProviderTransacti
     if not success:
         err.msg_list.append(f'Failed to update grace period duration for purchase_token: {base.maybe_obfuscate(tx_payment.google_payment_token)} and order_id: {base.maybe_obfuscate(tx_payment.google_order_id)}')
 
-def validate_no_existing_purchase_token_error(purchase_token: str, conn: sqlalchemy.engine.Connection, err: base.ErrorSink):
+def validate_no_existing_purchase_token_error(purchase_token: str, conn: psycopg.Connection, err: base.ErrorSink):
     result = backend.has_user_error(conn=conn, payment_provider=base.PaymentProvider.GooglePlayStore, payment_id=purchase_token)
     if result:
         err.msg_list.append(f"Received RTDN notification for already errored purchase token: {base.maybe_obfuscate(purchase_token)}")

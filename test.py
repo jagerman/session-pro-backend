@@ -25,7 +25,8 @@ import werkzeug
 import dataclasses
 import typing
 import enum
-import sqlalchemy
+import psycopg
+import psycopg_pool
 import traceback
 import datetime
 
@@ -63,7 +64,7 @@ class TestingContext:
     `with` context such that the DB is closed on scope exit.
     Tests have a fresh DB to work with for each `with` context and each chunk of tests to execute.
     """
-    db_engine:            sqlalchemy.engine.Engine
+    db_engine:            psycopg_pool.ConnectionPool
     flask_app:            flask.Flask
     flask_client:         werkzeug.Client
     platform_testing_env: bool = False
@@ -84,7 +85,7 @@ class TestingContext:
 
         # Bootstrap DB
         err                                     = base.ErrorSink()
-        engine: sqlalchemy.engine.Engine | None = backend.bootstrap_db(database_url=database_url, err=err)
+        engine: psycopg_pool.ConnectionPool | None = backend.bootstrap_db(database_url=database_url, err=err)
         assert len(err.msg_list) == 0
         assert engine
 
@@ -102,18 +103,15 @@ class TestingContext:
                  exc_type: object | None,
                  exc_value: object | None,
                  traceback: traceback.TracebackException | None):
-        self.db_engine.dispose()
+        self.db_engine.close()
         base.PLATFORM_TESTING_ENV                    = False
         base.DEFAULT_GOOGLE_GRACE_PERIOD_DURATION_MS = base.DEFAULT_APPLE_GRACE_PERIOD_DURATION_MS
         return False
 
     @contextlib.contextmanager
-    def connection(self) -> collections.abc.Iterator[sqlalchemy.engine.Connection]:
-        conn = self.db_engine.connect()
-        try:
+    def connection(self) -> collections.abc.Iterator[psycopg.Connection]:
+        with db.connection(self.db_engine) as conn:
             yield conn
-        finally:
-            conn.close()
 
 def test_dry_run_backup_rotation():
     now = datetime.datetime(2025, 6, 1, 12, 0, 0)
@@ -163,7 +161,7 @@ def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_d
 
     # Setup DB
     err                                        = base.ErrorSink()
-    db_engine: sqlalchemy.engine.Engine | None = backend.bootstrap_db(database_url=pg_database(), err=err)
+    db_engine: psycopg_pool.ConnectionPool | None = backend.bootstrap_db(database_url=pg_database(), err=err)
     assert len(err.msg_list) == 0, f'{err.msg_list}'
     assert db_engine
 
@@ -200,7 +198,7 @@ def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_d
                  payment_provider         = base.PaymentProvider.GooglePlayStore)
     ]
 
-    db_conn: sqlalchemy.engine.Connection = db_engine.connect()
+    db_conn: psycopg.Connection = db_engine.getconn()
     for index, it in enumerate(scenarios):
         # Add the "unredeemed" version of the payment, e.g. mock the notification from
         # IOS App Store/Google Play Store
@@ -505,13 +503,13 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
     with contextlib.nullcontext():
         db_url                                     = pg_database()
         err                                        = base.ErrorSink()
-        db_engine: sqlalchemy.engine.Engine | None = backend.bootstrap_db(database_url=db_url, err=err)
+        db_engine: psycopg_pool.ConnectionPool | None = backend.bootstrap_db(database_url=db_url, err=err)
         assert not err.has(), f'{err.msg_list}'
         assert db_engine
         # Setup local flask instance. The signing key is external now (not in the DB), so generate
         # one for this test and hand it to the server; use it directly to verify signatures below.
         backend_key:  nacl.signing.SigningKey = nacl.signing.SigningKey.generate()
-        db_conn: sqlalchemy.engine.Connection = db_engine.connect()
+        db_conn: psycopg.Connection = db_engine.getconn()
         runtime                               = backend.get_runtime(db_conn)
         flask_app:    flask.Flask             = server.init(testing_mode=True, database_url=db_url, backend_key=backend_key)
         flask_client: werkzeug.Client         = flask_app.test_client()
@@ -850,7 +848,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
 
             # Flask did some writes using an independent connection so those writes are made visible by
             # refreshing the connection and updating the "snapshot" that the following code sees.
-            db_conn = db_engine.connect()
+            db_conn = db_engine.getconn()
 
             # Grab the generation index, and then calculate the expected generation index hash
             gen_index = 0

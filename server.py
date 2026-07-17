@@ -567,7 +567,7 @@ import json
 import nacl.bindings
 import nacl.public
 import nacl.signing
-import sqlalchemy
+import psycopg_pool
 import time
 import typing
 import logging
@@ -670,7 +670,7 @@ def get_json_from_flask_request(request: flask.Request) -> GetJSONFromFlaskReque
     return result
 
 @contextlib.contextmanager
-def get_db(flask_app: flask.Flask) -> collections.abc.Iterator[sqlalchemy.engine.Engine]:
+def get_db(flask_app: flask.Flask) -> collections.abc.Iterator[psycopg_pool.ConnectionPool]:
     database_url = typing.cast(str, flask_app.config[FLASK_CONFIG_DB_URL_KEY])
     with db.open_database(database_url) as engine:
         yield engine

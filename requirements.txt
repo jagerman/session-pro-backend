@@ -2,18 +2,18 @@
 #
 # The deployment installs this into a --system-site-packages virtualenv, so pip treats whatever
 # Debian already provides as "already satisfied" and installs ONLY what the system lacks. That is
-# why flask, pynacl and psycopg2 are left unpinned — the Debian-packaged versions are fine and
-# get skipped on the server; a plain dev venv just installs current releases.
+# why flask and pynacl are left unpinned — the Debian-packaged versions are fine and get skipped on
+# the server; a plain dev venv just installs current releases.
 #
-# sqlalchemy is bounded to the 2.0.x series (the code uses 2.0-only API; Debian ships 1.4 which
-# cannot run it) and is temporary — removed entirely in the Phase 2 refactor. The Apple/Google
-# SDKs use compatible-release (~=) ranges so fixes flow in without a breaking major.
+# The DB layer is raw psycopg 3 (+ its connection pool); psycopg/psycopg-pool carry lower bounds for
+# the 3.x API the code relies on (conn.transaction(), pool check_connection). The Apple/Google SDKs
+# use compatible-release (~=) ranges so fixes flow in without a breaking major.
 #
 # Dev/test-only extras (pytest, a pip uWSGI for the local example) live in requirements-dev.txt.
 flask
 pynacl
-psycopg2
-sqlalchemy~=2.0.0
+psycopg~=3.1
+psycopg-pool~=3.2
 app-store-server-library~=1.9
 google-cloud-pubsub~=2.31
 google-api-python-client~=2.181

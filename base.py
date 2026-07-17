@@ -20,7 +20,7 @@ import typing_extensions
 import urllib.request
 
 import db
-import sqlalchemy
+import psycopg
 
 # NOTE: Constants
 SECONDS_IN_DAY:        int     = 60 * 60 * 24
@@ -302,23 +302,16 @@ def print_unicode_table(rows: list[list[str]]) -> None:
     bottom += '┘'
     print(bottom)
 
-def print_db_to_stdout_tx(conn: sqlalchemy.engine.Connection) -> None:
+def print_db_to_stdout_tx(conn: psycopg.Connection) -> None:
     table_strings: list[TableStrings] = []
 
-    # Detect database type and use appropriate table listing query
-    if db.is_postgres(conn.engine):
-        result = conn.execute(sqlalchemy.text("SELECT tablename FROM pg_tables WHERE schemaname='public'"))
-        tables = typing.cast(list[tuple[str]], result.fetchall())
-        table_names = [table[0] for table in tables]
-    else:
-        result = conn.execute(sqlalchemy.text('SELECT name FROM sqlite_master WHERE type="table"'))
-        tables = typing.cast(list[tuple[str]], result.fetchall())
-        table_names = [table[0] for table in tables]
+    result = db.query(conn, "SELECT tablename FROM pg_tables WHERE schemaname='public'")
+    table_names = [row[0] for row in result.fetchall()]
 
     for table_name in table_names:
-        result = conn.execute(sqlalchemy.text(f'SELECT * FROM {table_name}'))
+        result = db.query(conn, f'SELECT * FROM {table_name}')
         rows = result.fetchall()
-        column_names: list[str] = list(result.keys())
+        column_names: list[str] = result.columns
 
         table_str: TableStrings = TableStrings()
         table_str.name          = table_name
@@ -395,7 +388,7 @@ def print_db_to_stdout_tx(conn: sqlalchemy.engine.Connection) -> None:
         print(f'Table: {it.name}')
         print_unicode_table(it.contents)
 
-def print_db_to_stdout(conn: sqlalchemy.engine.Connection) -> None:
+def print_db_to_stdout(conn: psycopg.Connection) -> None:
     with db.transaction(conn):
         print_db_to_stdout_tx(conn)
 

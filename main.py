@@ -19,9 +19,7 @@ import logging.handlers
 import configparser
 import sys
 import dataclasses
-import traceback
-import sqlite3
-import sqlalchemy.engine
+import psycopg_pool
 
 import base
 import backend
@@ -136,66 +134,10 @@ def backend_maintenance_thread_entry_point(db_url: str):
                 else:
                     log.error(f'Daily pruning for {yesterday_str} failed due to an unknown DB error')
 
-            # NOTE: Do backup rotation
-            db_file_path: str | None = db.file_path_from_sqlite_url(db_url)
-            if db_file_path:
-                dry_run: base.BackupRotationDryRun = base.backup_rotation_dry_run(base_file_path=pathlib.Path(db_file_path), now=datetime.datetime.now())
-                if len(dry_run.to_delete):
-                    msg = 'Rotating backups and deleting:\n'
-                    for index, it in enumerate(dry_run.to_delete):
-                        if index:
-                            msg += '\n'
-                        msg += f'  [{index:02d}] {it}'
-                    log.info(msg)
-
-                    for it in dry_run.to_delete:
-                        it.unlink()
-
-                    for it in webhook_loggers:
-                        it.emit_text(msg)
-
-                # NOTE: Do a backup of the DB (SQLite only) and generate reports
-                backup_db_path: str = base.backup_file_path(pathlib.Path(db_file_path), next_day_date)
-                with db.open_database(db_url) as engine:
-                    with db.connection(engine) as conn:
-                        def progress(status: int, remaining: int, total: int):
-                            log.info(f"Progress callback: status={status}, remaining={remaining}, total={total}")
-
-                        dest_sql_conn = sqlite3.connect(backup_db_path)
-                        try:
-                            log.info(f"Backing up: {db_url} → {backup_db_path}")
-                            conn.connection.backup(dest_sql_conn, pages=128, progress=progress, sleep=1)
-                            log.info("Backup completed successfully!")
-                            for it in webhook_loggers:
-                                it.emit_text(f'Backed up DB successfully {db_url} -> {backup_db_path}')
-                        except KeyboardInterrupt:
-                            log.warning("Backup cancelled by user.")
-                        except Exception:
-                            log.error(f"Backup failed: {traceback.format_exc()}")
-                        finally:
-                            dest_sql_conn.close()
-
-                        # NOTE: Generate the reports
-                        if len(webhook_loggers):
-                            daily_report: list[backend.ReportRow] = backend.generate_report_rows(conn, backend.ReportPeriod.Daily, 7)
-                            daily_report_str   = backend.generate_report_str(backend.ReportPeriod.Daily, daily_report, backend.ReportType.Human)
-                            weekly_report_str  = ''
-                            monthly_report_str = ''
-                            if next_day_date.weekday() == 0:
-                                weekly_report: list[backend.ReportRow] = backend.generate_report_rows(conn, backend.ReportPeriod.Weekly, 4)
-                                weekly_report_str                      = backend.generate_report_str(backend.ReportPeriod.Weekly, weekly_report, backend.ReportType.Human)
-
-                            if next_day_date.day == 1:
-                                monthly_report: list[backend.ReportRow] = backend.generate_report_rows(conn, backend.ReportPeriod.Monthly, 3)
-                                monthly_report_str                      = backend.generate_report_str(backend.ReportPeriod.Monthly, monthly_report, backend.ReportType.Human)
-
-                            for it in webhook_loggers:
-                                if len(daily_report_str):
-                                    it.emit_text(daily_report_str)
-                                if len(weekly_report_str):
-                                    it.emit_text(weekly_report_str)
-                                if len(monthly_report_str):
-                                    it.emit_text(monthly_report_str)
+            # TODO: Backups now run out-of-process via pgBackRest, and the periodic report
+            # generation + webhook dispatch that used to live here was gated behind the SQLite
+            # backup path (so it never ran on Postgres). Re-wire PG report generation here as a
+            # deliberate follow-up rather than carrying the dead SQLite code.
 
 def parse_args(err: base.ErrorSink) -> ParsedArgs:
     # NOTE: Parse .INI file if present and get arguments for it
@@ -396,7 +338,7 @@ def entry_point() -> flask.Flask:
             sys.exit(1)
 
     # NOTE: Open the DB (create tables if necessary)
-    engine: sqlalchemy.engine.Engine | None = backend.bootstrap_db(database_url=parsed_args.db_url, err=err)
+    engine: psycopg_pool.ConnectionPool | None = backend.bootstrap_db(database_url=parsed_args.db_url, err=err)
     if err.has():
         log.error(err.build())
         sys.exit(1)
