@@ -93,12 +93,15 @@ class PaymentProviderTransaction:
     google_order_id:            str = ''
     rangeproof_order_id:        str = ''
 
-class PaymentStatus(enum.IntEnum):
-    Nil        = 0
-    Unredeemed = 1
-    Redeemed   = 2
-    Expired    = 3
-    Revoked    = 4
+class PaymentStatus(enum.StrEnum):
+    # A DERIVED display value (wire/logging), NOT a stored column — computed from a payment's
+    # redeemed/revoked/expiry timestamps against a caller-supplied clock (see
+    # backend.derive_payment_status). Values are the wire `code`s (docs/pro-wire-protocol.md §1).
+    Nil        = 'nil'
+    Unredeemed = 'unredeemed'
+    Redeemed   = 'redeemed'
+    Expired    = 'expired'
+    Revoked    = 'revoked'
 
 class ProPlan(enum.StrEnum):
     """Universal Pro Plan Identifier.

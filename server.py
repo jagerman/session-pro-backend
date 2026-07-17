@@ -987,26 +987,27 @@ def get_pro_details():
                 payments_total                       = get_user.payments_count
                 refund_requested_unix_ts_ms          = get_user.user.refund_requested_unix_ts_ms
 
-                # NOTE: Collect payment history
+                # NOTE: Collect payment history. Each item's status is derived against the *request*
+                # timestamp `unix_ts_ms` (client's signed clock, anti-replay-bounded to ≈now) — the same
+                # clock the user-level active/expired decision below uses. Deliberately NOT a second
+                # `time.time()` read: two clocks in one response could disagree by the request's
+                # in-flight time and report user-level "Active" alongside an "expired" item.
                 if count > 0:
                     for row in get_user.payments_it:
                         if len(items) >= count:
                             break
 
-                        row_tuple: backend.SQLTablePaymentRowTuple = tuple(row)
-                        payment:   backend.PaymentRow              = backend.payment_row_from_tuple(row_tuple)
+                        payment: backend.PaymentRow = backend.payment_row_from_dict(row)
 
-                        # NOTE: We do not return unredeemed payments. This payment token/tx IDs are
-                        # confidential until the user actually registers the token themselves which they
-                        # should witness from the payment provider independently from us so there should be
-                        # no need to reveal this to the user until they've confirmed their own receipt of
-                        # it.
-                        if payment.status == base.PaymentStatus.Unredeemed:
+                        # NOTE: We do not return unredeemed payments. Their token/tx IDs are
+                        # confidential until the user registers them from their own receipt. (payments_it
+                        # filters by user_id, which only redeemed payments have, so this is defensive.)
+                        if payment.redeemed_unix_ts_ms is None:
                             continue
 
                         if payment.payment_provider == base.PaymentProvider.GooglePlayStore:
                             items.append({
-                                'status':                               int(payment.status.value),
+                                'status':                               backend.derive_payment_status(payment, unix_ts_ms).value,
                                 'plan':                                 payment.plan.value,
                                 'payment_provider':                     payment.payment_provider.value,
                                 'auto_renewing':                        payment.auto_renewing,
@@ -1022,7 +1023,7 @@ def get_pro_details():
                             })
                         elif payment.payment_provider == base.PaymentProvider.iOSAppStore:
                             items.append({
-                                'status':                               int(payment.status.value),
+                                'status':                               backend.derive_payment_status(payment, unix_ts_ms).value,
                                 'plan':                                 payment.plan.value,
                                 'payment_provider':                     payment.payment_provider.value,
                                 'auto_renewing':                        payment.auto_renewing,
@@ -1039,7 +1040,7 @@ def get_pro_details():
                             })
                         elif payment.payment_provider == base.PaymentProvider.Rangeproof:
                             items.append({
-                                'status':                               int(payment.status.value),
+                                'status':                               backend.derive_payment_status(payment, unix_ts_ms).value,
                                 'plan':                                 payment.plan.value,
                                 'payment_provider':                     payment.payment_provider.value,
                                 'auto_renewing':                        payment.auto_renewing,

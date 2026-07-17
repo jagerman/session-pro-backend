@@ -697,10 +697,10 @@ def cmd_revoke_list(args: argparse.Namespace) -> int:
 
                     eligible_count = 0
                     list_label = ''
+                    now_ms = int(time.time() * 1000)
 
                     for row in user_and_payments.payments_it:
-                        faux_row_id = 0
-                        payment: backend.PaymentRow = backend.payment_row_from_tuple((faux_row_id, *row))
+                        payment: backend.PaymentRow = backend.payment_row_from_dict(row)
 
                         plan_label = ''
                         match payment.plan:
@@ -716,10 +716,11 @@ def cmd_revoke_list(args: argparse.Namespace) -> int:
                             case base.PaymentProvider.iOSAppStore:     payment_id = f'{payment.apple.original_tx_id}'
                             case base.PaymentProvider.Rangeproof:      payment_id = f'{payment.rangeproof_order_id}'
 
-                        if payment.status == base.PaymentStatus.Expired or int(time.time() * 1000) >= payment.expiry_unix_ts_ms:
+                        if now_ms >= payment.expiry_unix_ts_ms:
                             continue
 
-                        list_label += f'\n    {eligible_count:02d} RevokeID={payment.payment_provider.name}-{payment_id}; Status={payment.status.name}; Plan={plan_label}; Unredeemed={base.readable_unix_ts_ms(payment.unredeemed_unix_ts_ms)}; Expiry={base.readable_unix_ts_ms(payment.expiry_unix_ts_ms)};'
+                        status_label = backend.derive_payment_status(payment, now_ms).name
+                        list_label += f'\n    {eligible_count:02d} RevokeID={payment.payment_provider.name}-{payment_id}; Status={status_label}; Plan={plan_label}; Unredeemed={base.readable_unix_ts_ms(payment.unredeemed_unix_ts_ms)}; Expiry={base.readable_unix_ts_ms(payment.expiry_unix_ts_ms)};'
                         eligible_count += 1
 
                     print(f"User {args.master_pkey} has {eligible_count} revocable payments{list_label}")

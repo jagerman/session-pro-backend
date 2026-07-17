@@ -30,6 +30,7 @@ import typing
 
 import psycopg
 import psycopg_pool
+from psycopg.rows import dict_row as dict_row  # re-exported: pass as query(..., row_factory=db.dict_row)
 
 # Pools are cached by DSN: production drives a single DSN (so a single pool), while the
 # test suite spins up many throwaway databases (a pool each). The lock guards the cache;
@@ -160,14 +161,17 @@ def _params(args: tuple[typing.Any, ...], kwargs: dict[str, typing.Any]) -> typi
     return args or None
 
 
-def query(conn: psycopg.Connection, sql: str, *args: typing.Any, **kwargs: typing.Any) -> Result:
-    with conn.cursor() as cursor:
+def query(conn: psycopg.Connection, sql: str, *args: typing.Any, row_factory: typing.Any = None, **kwargs: typing.Any) -> Result:
+    # row_factory (e.g. db.dict_row) makes rows accessed by column name rather than position; default
+    # is psycopg's tuple rows.
+    cursor = conn.cursor(row_factory=row_factory) if row_factory is not None else conn.cursor()
+    with cursor:
         _ = cursor.execute(sql, _params(args, kwargs))
         return Result(cursor)
 
 
-def query_one(conn: psycopg.Connection, sql: str, *args: typing.Any, **kwargs: typing.Any) -> typing.Any | None:
-    return query(conn, sql, *args, **kwargs).fetchone()
+def query_one(conn: psycopg.Connection, sql: str, *args: typing.Any, row_factory: typing.Any = None, **kwargs: typing.Any) -> typing.Any | None:
+    return query(conn, sql, *args, row_factory=row_factory, **kwargs).fetchone()
 
 
 def run_and_log_errors(callback: typing.Callable[[], typing.Any], log: logging.Logger, error_prefix: str) -> None:

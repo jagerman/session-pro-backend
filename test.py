@@ -60,6 +60,15 @@ from appstoreserverlibrary.models.RevocationReason             import Revocation
 from appstoreserverlibrary.models.AutoRenewStatus              import AutoRenewStatus              as AppleAutoRenewStatus
 from appstoreserverlibrary.models.ConsumptionRequestReason     import ConsumptionRequestReason     as AppleConsumptionRequestReason
 
+def derived_status(payment: backend.PaymentRow, at_unix_ts_ms: int | None = None) -> base.PaymentStatus:
+    """A payment's status is derived from its timestamps, not stored (see backend.derive_payment_status).
+
+    These assertions check the *latched* facts — redeemed / revoked / unredeemed — which do not depend
+    on the observation time (revoked short-circuits; ingest is always before expiry), so by default we
+    observe at the payment's ingest instant. Pass `at_unix_ts_ms` to probe the one time-relative
+    boundary, expiry, explicitly (e.g. `expiry_unix_ts_ms` to assert Expired)."""
+    return backend.derive_payment_status(payment, payment.unredeemed_unix_ts_ms if at_unix_ts_ms is None else at_unix_ts_ms)
+
 @dataclasses.dataclass
 class TestingContext:
     """
@@ -254,7 +263,7 @@ def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_d
 
         unredeemed_payment_list: list[backend.PaymentRow] = backend.get_unredeemed_payments_list(db_conn)
         assert len(unredeemed_payment_list)                       == 1
-        assert unredeemed_payment_list[0].status                  == base.PaymentStatus.Unredeemed
+        assert derived_status(unredeemed_payment_list[0])                  == base.PaymentStatus.Unredeemed
         assert unredeemed_payment_list[0].payment_provider        == it.payment_provider
         assert unredeemed_payment_list[0].unredeemed_unix_ts_ms   == unix_ts_ms
         assert unredeemed_payment_list[0].redeemed_unix_ts_ms     == None
@@ -507,7 +516,7 @@ def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_d
 
             payments_list: list[backend.PaymentRow]           = backend.get_payments_list(db_conn)
             assert len(payments_list)                        == 4
-            assert payments_list[2].status                   == base.PaymentStatus.Redeemed
+            assert derived_status(payments_list[2])                   == base.PaymentStatus.Redeemed
             assert payments_list[2].google_order_id          == auto_redeem_scenarios[0].google_order_id
             assert payments_list[2].google_payment_token     == auto_redeem_google_payment_token
             assert payments_list[2].master_pkey              == bytes(auto_redeem_user_master_key.verify_key)
@@ -515,7 +524,7 @@ def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_d
             assert payments_list[2].auto_renewing            == True
             assert payments_list[2].grace_period_duration_ms == auto_redeem_scenarios[0].grace_period_duration_ms
 
-            assert payments_list[3].status                   == base.PaymentStatus.Redeemed
+            assert derived_status(payments_list[3])                   == base.PaymentStatus.Redeemed
             assert payments_list[3].google_order_id          == auto_redeem_scenarios[1].google_order_id
             assert payments_list[3].google_payment_token     == auto_redeem_google_payment_token
             assert payments_list[3].master_pkey              == bytes(auto_redeem_user_master_key.verify_key)
@@ -1611,7 +1620,7 @@ def test_platform_apple(pg_database):
             unredeemed_list: list[backend.PaymentRow]             = backend.get_unredeemed_payments_list(conn)
             assert len(unredeemed_list)                          == 1
             assert unredeemed_list[0].master_pkey                == None
-            assert unredeemed_list[0].status                     == base.PaymentStatus.Unredeemed
+            assert derived_status(unredeemed_list[0])                     == base.PaymentStatus.Unredeemed
             assert unredeemed_list[0].payment_provider           == base.PaymentProvider.iOSAppStore
             assert unredeemed_list[0].apple.original_tx_id       == tx_info.originalTransactionId
             assert unredeemed_list[0].apple.tx_id                == tx_info.transactionId
@@ -1808,7 +1817,7 @@ def test_platform_apple(pg_database):
                 unredeemed_list                                              = backend.get_unredeemed_payments_list(conn)
                 assert len(unredeemed_list)                                 == 1
                 assert unredeemed_list[0].master_pkey                       == None
-                assert unredeemed_list[0].status                            == base.PaymentStatus.Unredeemed
+                assert derived_status(unredeemed_list[0])                            == base.PaymentStatus.Unredeemed
                 assert unredeemed_list[0].plan                              == base.ProPlan.OneMonth
                 assert unredeemed_list[0].payment_provider                  == base.PaymentProvider.iOSAppStore
                 assert unredeemed_list[0].auto_renewing                     == True
@@ -1941,7 +1950,7 @@ def test_platform_apple(pg_database):
                 payment_list                                               = backend.get_payments_list(conn)
                 assert len(payment_list)                                 == 1
                 assert payment_list[0].master_pkey                       == None
-                assert payment_list[0].status                            == base.PaymentStatus.Unredeemed
+                assert derived_status(payment_list[0])                            == base.PaymentStatus.Unredeemed
                 assert payment_list[0].plan                              == base.ProPlan.OneMonth
                 assert payment_list[0].payment_provider                  == base.PaymentProvider.iOSAppStore
                 assert payment_list[0].auto_renewing                     == False
@@ -2077,7 +2086,7 @@ def test_platform_apple(pg_database):
                 payment_list                                              = backend.get_payments_list(conn)
                 assert len(payment_list)                                 == 1
                 assert payment_list[0].master_pkey                       == None
-                assert payment_list[0].status                            == base.PaymentStatus.Unredeemed
+                assert derived_status(payment_list[0])                            == base.PaymentStatus.Unredeemed
                 assert payment_list[0].plan                              == base.ProPlan.OneMonth
                 assert payment_list[0].payment_provider                  == base.PaymentProvider.iOSAppStore
                 assert payment_list[0].unredeemed_unix_ts_ms             == tx_info.purchaseDate
@@ -2099,7 +2108,7 @@ def test_platform_apple(pg_database):
 
                 assert len(payment_list)                                 == 1
                 assert payment_list[0].master_pkey                       == None
-                assert payment_list[0].status                            == base.PaymentStatus.Expired
+                assert derived_status(payment_list[0], payment_list[0].expiry_unix_ts_ms)                            == base.PaymentStatus.Expired
                 assert payment_list[0].plan                              == base.ProPlan.OneMonth
                 assert payment_list[0].payment_provider                  == base.PaymentProvider.iOSAppStore
                 assert payment_list[0].unredeemed_unix_ts_ms             == tx_info.purchaseDate
@@ -2879,7 +2888,7 @@ def test_platform_apple(pg_database):
 
             assert len(unredeemed_payment_list)                                 == 1
             assert unredeemed_payment_list[0].master_pkey                       == None
-            assert unredeemed_payment_list[0].status                            == base.PaymentStatus.Unredeemed
+            assert derived_status(unredeemed_payment_list[0])                            == base.PaymentStatus.Unredeemed
             assert unredeemed_payment_list[0].plan                              == base.ProPlan.ThreeMonth
             assert unredeemed_payment_list[0].payment_provider                  == base.PaymentProvider.iOSAppStore
             assert unredeemed_payment_list[0].auto_renewing                     == True
@@ -2922,7 +2931,7 @@ def test_platform_apple(pg_database):
 
             assert len(payment_list)                                 == 1
             assert payment_list[0].master_pkey                       == bytes(master_key.verify_key)
-            assert payment_list[0].status                            == base.PaymentStatus.Redeemed
+            assert derived_status(payment_list[0])                            == base.PaymentStatus.Redeemed
             assert payment_list[0].plan                              == base.ProPlan.ThreeMonth
             assert payment_list[0].payment_provider                  == base.PaymentProvider.iOSAppStore
             assert payment_list[0].auto_renewing                     == True
@@ -2953,7 +2962,7 @@ def test_platform_apple(pg_database):
             # NOTE: Check the previous payment was refunded
             assert len(payment_list)                                 == 2
             assert payment_list[0].master_pkey                       == bytes(master_key.verify_key)
-            assert payment_list[0].status                            == base.PaymentStatus.Revoked
+            assert derived_status(payment_list[0])                            == base.PaymentStatus.Revoked
             assert payment_list[0].plan                              == base.ProPlan.ThreeMonth
             assert payment_list[0].payment_provider                  == base.PaymentProvider.iOSAppStore
             assert payment_list[0].auto_renewing                     == False
@@ -2987,7 +2996,7 @@ def test_platform_apple(pg_database):
 
             # NOTE: Check the details of the auto-redeemed payment
             assert payment_list[1].master_pkey                       == bytes(master_key.verify_key)
-            assert payment_list[1].status                            == base.PaymentStatus.Redeemed
+            assert derived_status(payment_list[1])                            == base.PaymentStatus.Redeemed
             assert payment_list[1].plan                              == base.ProPlan.OneMonth
             assert payment_list[1].payment_provider                  == base.PaymentProvider.iOSAppStore
             assert payment_list[1].auto_renewing                     == True
@@ -3020,7 +3029,7 @@ def test_platform_apple(pg_database):
             payment_list                              = backend.get_payments_list(conn)
             assert len(payment_list)                 == 2
             assert payment_list[-1].master_pkey      == bytes(master_key.verify_key)
-            assert payment_list[-1].status           == base.PaymentStatus.Redeemed
+            assert derived_status(payment_list[-1])           == base.PaymentStatus.Redeemed
             assert payment_list[-1].plan             == base.ProPlan.OneMonth
             assert payment_list[-1].payment_provider == base.PaymentProvider.iOSAppStore
 
@@ -3052,7 +3061,7 @@ def test_platform_apple(pg_database):
             payment_list                                              = backend.get_payments_list(conn)
             assert len(payment_list) == 2
             assert payment_list[0].master_pkey                       == bytes(master_key.verify_key)
-            assert payment_list[0].status                            == base.PaymentStatus.Revoked
+            assert derived_status(payment_list[0])                            == base.PaymentStatus.Revoked
             assert payment_list[0].plan                              == base.ProPlan.ThreeMonth
             assert payment_list[0].payment_provider                  == base.PaymentProvider.iOSAppStore
             assert payment_list[0].auto_renewing                     == False
@@ -3073,7 +3082,7 @@ def test_platform_apple(pg_database):
                 assert len(unredeemed_payment_list) == 0
 
             assert payment_list[-1].master_pkey                       == bytes(master_key.verify_key)
-            assert payment_list[-1].status                            == base.PaymentStatus.Redeemed
+            assert derived_status(payment_list[-1])                            == base.PaymentStatus.Redeemed
             assert payment_list[-1].plan                              == base.ProPlan.OneMonth
             assert payment_list[-1].payment_provider                  == base.PaymentProvider.iOSAppStore
             assert payment_list[-1].auto_renewing                     == True
@@ -3109,7 +3118,7 @@ def test_platform_apple(pg_database):
             assert len(payment_list) == 2
 
             assert payment_list[-1].master_pkey                       == bytes(master_key.verify_key)
-            assert payment_list[-1].status                            == base.PaymentStatus.Redeemed
+            assert derived_status(payment_list[-1])                            == base.PaymentStatus.Redeemed
             assert payment_list[-1].plan                              == base.ProPlan.OneMonth
             assert payment_list[-1].payment_provider                  == base.PaymentProvider.iOSAppStore
             assert payment_list[-1].auto_renewing                     == False
@@ -3491,7 +3500,7 @@ def test_platform_apple(pg_database):
             # user flow up to this point via other tests.
             payments: list[backend.PaymentRow] = backend.get_payments_list(conn)
             assert len(payments) == 1
-            assert payments[0].status                     == base.PaymentStatus.Revoked
+            assert derived_status(payments[0])                     == base.PaymentStatus.Revoked
             assert payments[0].apple.original_tx_id       == e00_sub_to_3_months_tx_info.originalTransactionId
             assert payments[0].apple.tx_id                == e00_sub_to_3_months_tx_info.transactionId
             assert payments[0].apple.web_line_order_tx_id == e00_sub_to_3_months_tx_info.webOrderLineItemId
@@ -3661,7 +3670,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
                     found = True
                     assert isinstance(unredeemed_payment, backend.PaymentRow)
                     assert unredeemed_payment.master_pkey                       == None
-                    assert unredeemed_payment.status                            == base.PaymentStatus.Unredeemed
+                    assert derived_status(unredeemed_payment)                            == base.PaymentStatus.Unredeemed
                     assert unredeemed_payment.plan                              == plan
                     assert unredeemed_payment.payment_provider                  == base.PaymentProvider.GooglePlayStore
                     assert unredeemed_payment.redeemed_unix_ts_ms               == None
@@ -3681,7 +3690,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             payment = payments[-1]
             assert isinstance(payment, backend.PaymentRow)
             assert payment.master_pkey                                                     == bytes(user_ctx.master_key.verify_key)
-            assert payment.status                                                          == base.PaymentStatus.Redeemed
+            assert derived_status(payment)                                                          == base.PaymentStatus.Redeemed
             assert payment.plan                                                            == plan
             assert payment.payment_provider                                                == base.PaymentProvider.GooglePlayStore
             assert payment.redeemed_unix_ts_ms is not None and payment.redeemed_unix_ts_ms == redeemed_ts_ms_rounded
@@ -3743,7 +3752,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
         item_platform_refund_expiry_unix_ts_ms = base.json_dict_require_int(item, "platform_refund_expiry_unix_ts_ms", err)
         item_redeemed_unix_ts_ms               = base.json_dict_require_int(item, "redeemed_unix_ts_ms", err)
         item_revoked_unix_ts_ms                = base.json_dict_require_int(item, "revoked_unix_ts_ms", err)
-        item_status                            = base.json_dict_require_int_coerce_to_enum(item, "status", base.PaymentStatus, err)
+        item_status                            = base.json_dict_require_str_coerce_to_enum(item, "status", base.PaymentStatus, err)
         assert not err.has()
         assert item_expiry_unix_ts                    == tx.expiry_unix_ts_ms, res_items
         assert item_order_id                          == tx.order_id
@@ -4986,14 +4995,14 @@ current_state={'kind': 'androidpublisher#subscriptionPurchaseV2', 'startTime': '
         with ctx.connection() as conn:
             unredeemed_payments = backend.get_unredeemed_payments_list(conn)
         for payment in unredeemed_payments:
-            assert payment.status == base.PaymentStatus.Unredeemed
+            assert derived_status(payment) == base.PaymentStatus.Unredeemed
 
         """2. Developer refunds subscription (removing entitlement)"""
         _ = test_notification(refund_a, ctx)
         with ctx.connection() as conn:
             unredeemed_payments = backend.get_unredeemed_payments_list(conn)
         for payment in unredeemed_payments:
-            assert payment.status == base.PaymentStatus.Revoked
+            assert derived_status(payment) == base.PaymentStatus.Revoked
         _ = test_notification(refund_b, ctx)
         for payment in unredeemed_payments:
-            assert payment.status == base.PaymentStatus.Revoked
+            assert derived_status(payment) == base.PaymentStatus.Revoked

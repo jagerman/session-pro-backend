@@ -37,7 +37,9 @@ INSERT INTO pro_plans (code) VALUES ('1m'), ('3m'), ('1y')
 CREATE TABLE IF NOT EXISTS payments (
     id                                BIGINT  GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     user_id                           BIGINT  REFERENCES users(id),   -- NULL until redeemed
-    status                            INTEGER NOT     NULL,
+    -- No `status` column: it is derived from the timestamps below (redeemed/revoked/expiry) — see
+    -- backend.derive_payment_status. redeemed_unix_ts_ms IS NULL = unredeemed; revoked_unix_ts_ms
+    -- IS NOT NULL = revoked; now >= expiry_unix_ts_ms = expired.
     plan                              TEXT    NOT     NULL REFERENCES pro_plans(code),
     payment_provider                  TEXT    NOT     NULL REFERENCES payment_providers(code),
     auto_renewing                     BOOLEAN NOT     NULL DEFAULT FALSE,
