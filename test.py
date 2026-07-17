@@ -1,8 +1,9 @@
 '''
 Testing module for the Session Pro Backend, testing internal and public APIs.
 
-The backend tests call the DB APIs directly to test the outcome on the tables in the SQLite
-database.
+The backend tests call the DB APIs directly to test the outcome on the tables in the database.
+Each test (and each TestingContext) runs against a fresh, throwaway PostgreSQL database minted by
+the `pg_database` fixture on an ephemeral cluster (see conftest.py).
 
 The server tests spins up a local Flask instance as per
 (https://flask.palletsprojects.com/en/stable/testing/#sending-requests-with-the-test-client) and
@@ -19,7 +20,6 @@ import nacl.signing
 import nacl.bindings
 import nacl.public
 import os
-import tempfile
 import time
 import werkzeug
 import dataclasses
@@ -67,9 +67,10 @@ class TestingContext:
     flask_app:            flask.Flask
     flask_client:         werkzeug.Client
     platform_testing_env: bool = False
-    temp_file_path:       str  = ''
+    db_url_factory:       typing.Callable[[], str] | None = None
 
-    def __init__(self, platform_testing_env: bool = False):
+    def __init__(self, db_url_factory: typing.Callable[[], str], platform_testing_env: bool = False):
+        self.db_url_factory       = db_url_factory
         self.platform_testing_env = platform_testing_env
 
     def __enter__(self):
@@ -77,9 +78,9 @@ class TestingContext:
         if base.PLATFORM_TESTING_ENV:
             base.DEFAULT_GOOGLE_GRACE_PERIOD_DURATION_MS = platform_google_api.testing_grace_period_duration_ms
 
-        # Create temp file for database
-        self.temp_file_path = tempfile.NamedTemporaryFile(suffix='.db', delete=False).name
-        database_url        = f"sqlite:///{self.temp_file_path}"
+        # Mint a fresh database on the ephemeral PostgreSQL cluster
+        assert self.db_url_factory is not None
+        database_url = self.db_url_factory()
 
         # Bootstrap DB
         err                                     = base.ErrorSink()
@@ -102,7 +103,6 @@ class TestingContext:
                  exc_value: object | None,
                  traceback: traceback.TracebackException | None):
         self.db_engine.dispose()
-        os.unlink(self.temp_file_path)
         base.PLATFORM_TESTING_ENV                    = False
         base.DEFAULT_GOOGLE_GRACE_PERIOD_DURATION_MS = base.DEFAULT_APPLE_GRACE_PERIOD_DURATION_MS
         return False
@@ -146,7 +146,7 @@ def test_dry_run_backup_rotation():
     }
     assert len(result.to_keep) == 8 and len(result.to_delete) == 3
 
-def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch):
+def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_database):
     monkeypatch.setattr(
         "platform_google_api.subscription_v1_acknowledge",
         lambda *args, **kwargs: None
@@ -163,7 +163,7 @@ def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch):
 
     # Setup DB
     err                                        = base.ErrorSink()
-    db_engine: sqlalchemy.engine.Engine | None = backend.bootstrap_db(database_url="sqlite:///file:test_same_user?mode=memory&cache=shared&uri=true", err=err)
+    db_engine: sqlalchemy.engine.Engine | None = backend.bootstrap_db(database_url=pg_database(), err=err)
     assert len(err.msg_list) == 0, f'{err.msg_list}'
     assert db_engine
 
@@ -491,7 +491,7 @@ def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch):
             assert payments_list[3].auto_renewing            == True
             assert payments_list[3].grace_period_duration_ms == auto_redeem_scenarios[1].grace_period_duration_ms
 
-def test_server_add_payment_flow(monkeypatch):
+def test_server_add_payment_flow(monkeypatch, pg_database):
     monkeypatch.setattr(
         "platform_google_api.subscription_v1_acknowledge",
         lambda *args, **kwargs: None
@@ -500,8 +500,10 @@ def test_server_add_payment_flow(monkeypatch):
     dummy_sub_v2_data = platform_google_types.SubscriptionV2Data()
     monkeypatch.setattr("platform_google_api.fetch_subscription_v2_details", lambda *args, **kwargs: dummy_sub_v2_data)
 
-    with tempfile.NamedTemporaryFile(suffix='.db', delete=False) as db_tmp_file:
-        db_url                                     = "sqlite:///" + db_tmp_file.name
+    # nullcontext keeps this test's (large) body indented as-is now that the SQLite
+    # temp-file context is gone; the fresh PG database is dropped by the pg_database fixture.
+    with contextlib.nullcontext():
+        db_url                                     = pg_database()
         err                                        = base.ErrorSink()
         db_engine: sqlalchemy.engine.Engine | None = backend.bootstrap_db(database_url=db_url, err=err)
         assert not err.has(), f'{err.msg_list}'
@@ -1453,7 +1455,7 @@ def dump_apple_signed_payloads(core: platform_apple.Core, body: AppleResponseBod
     print(f'{prefix}decoded_notification = platform_apple.DecodedNotification(body={prefix}body, tx_info={prefix}tx_info, renewal_info={prefix}renewal_info)')
     print(f'_ = platform_apple.handle_notification(decoded_notification={prefix}decoded_notification, conn=test.conn, err=err)')
 
-def test_platform_apple():
+def test_platform_apple(pg_database):
     err = base.ErrorSink()
 
     # NOTE: These tests were using the old debug product id, "com.getsession.org.pro_sub" which was
@@ -1465,7 +1467,7 @@ def test_platform_apple():
     # intended to test, is still being tested despite changing the productId from 1 week to 1 month.
 
     # NOTE: Did renew notification
-    with TestingContext() as test:
+    with TestingContext(pg_database) as test:
         # NOTE: Original payload (requires keys to decrypt)
         if 0:
             core:                      platform_apple.Core       = platform_apple.init()
@@ -1654,7 +1656,7 @@ def test_platform_apple():
     #
     # This was done by executing these sequences in the time-frame that a subscription is active for
     # on Apple's sandbox environment.
-    with TestingContext() as test:
+    with TestingContext(pg_database) as test:
         if 1: # Subscribe notification
             # NOTE: Original payload (requires keys to decrypt)
             if 0:
@@ -2087,7 +2089,7 @@ def test_platform_apple():
     #  - 4 [DID_CHANGE_RENEWAL_PREF]                             Cancel the downgrade (we are now back at 1wk subscription)
     #  - 5 [DID_CHANGE_RENEWAL_STATUS, sub: AUTO_RENEW_DISABLED] Disable auto-renew
     #  - 6 [EXPIRED,                   sub: VOLUNTARY]           ??
-    with TestingContext() as test:
+    with TestingContext(pg_database) as test:
         # NOTE: Original payload (this requires keys to decrypt)
         if 0:
             e00_sub_to_3_months: dict[str, base.JSONValue] = json.loads('''
@@ -3105,7 +3107,7 @@ def test_platform_apple():
     #
     #  - 1 [APPLE CONSUMPTION REQUEST, sub: ??] No-op
     #  - 2 [APPLE REFUND,              sub: ??] Disable auto-renew
-    with TestingContext() as test:
+    with TestingContext(pg_database) as test:
         # NOTE: Original payload (this requires keys to decrypt)
         if 0:
             e00_sub_to_3_months: dict[str, base.JSONValue] = json.loads('''
@@ -3463,8 +3465,8 @@ def test_platform_apple():
             assert payments[0].apple.web_line_order_tx_id == e00_sub_to_3_months_tx_info.webOrderLineItemId
             assert payments[0].revoked_unix_ts_ms         == e02_apple_refund_tx_info.revocationDate
 
-def test_google_platform_handle_notification(monkeypatch):
-    with TestingContext() as ctx:
+def test_google_platform_handle_notification(monkeypatch, pg_database):
+    with TestingContext(pg_database) as ctx:
         _ = platform_google.init(cloud_project_id                  = 'loki-5a81e',
                                   package_name                      = 'network.loki.messenger',
                                   cloud_subscription_name           = 'session-pro-sub',
@@ -3744,7 +3746,7 @@ def test_google_platform_handle_notification(monkeypatch):
         assert_pro_details(tx=tx, pro_status=server.UserProStatus.Active, payment_status=base.PaymentStatus.Redeemed, auto_renew=True, grace_duration_ms=base.DEFAULT_GOOGLE_GRACE_PERIOD_DURATION_MS, redeemed_ts_ms_rounded=redeemed_ts_ms_rounded, platform_refund_expiry_unix_ts_ms=platform_refund_expiry_unix_tx_ms, user_ctx=user_ctx, ctx=ctx)
         return tx, platform_refund_expiry_unix_tx_ms, redeemed_ts_ms_rounded
 
-    with TestingContext(platform_testing_env=True) as ctx:
+    with TestingContext(pg_database, platform_testing_env=True) as ctx:
         """
         1. User purchases 1-month subscription
         2. User cancels
@@ -3825,7 +3827,7 @@ current_state={'kind': 'androidpublisher#subscriptionPurchaseV2', 'startTime': '
                            revoke_unix_ts_ms                 = refund_tx.event_ms,
                            unix_ts_ms                        = refund_tx.event_ms + 1)
 
-    with TestingContext(platform_testing_env=True) as ctx:
+    with TestingContext(pg_database, platform_testing_env=True) as ctx:
         """
         1. User purchases 1-month subscription
         2. User enters grace period as subscription fails to renew
@@ -3951,7 +3953,7 @@ current_state={'kind': 'androidpublisher#subscriptionPurchaseV2', 'startTime': '
                            ctx                               = ctx,
                            unix_ts_ms                        = tx_expire.event_ms)
 
-    with TestingContext(platform_testing_env=True) as ctx:
+    with TestingContext(pg_database, platform_testing_env=True) as ctx:
         """
         1. User purchases 1-month subscription
         2. User renews 1-month subscription
@@ -4157,7 +4159,7 @@ current_state={'kind': 'androidpublisher#subscriptionPurchaseV2', 'startTime': '
                             ctx=ctx,
                             unix_ts_ms=tx_grace.event_ms + test_product_details.grace_period.milliseconds)
 
-    with TestingContext(platform_testing_env=True) as ctx:
+    with TestingContext(pg_database, platform_testing_env=True) as ctx:
         """
         1. User purchases 1-month subscription
         2. User enters grace period as they fail to renew
@@ -4230,7 +4232,7 @@ current_state={'kind': 'androidpublisher#subscriptionPurchaseV2', 'startTime': '
         user_ctx=user_ctx, ctx=ctx,
         unix_ts_ms=tx_grace.event_ms + test_product_details.grace_period.milliseconds)
 
-    with TestingContext(platform_testing_env=True) as ctx:
+    with TestingContext(pg_database, platform_testing_env=True) as ctx:
         """
         1. User purchases 1-month subscription
         2. User enters grace period as they fail to renew
@@ -4327,7 +4329,7 @@ current_state={'kind': 'androidpublisher#subscriptionPurchaseV2', 'startTime': '
             ctx=ctx,
             unix_ts_ms=tx_grace.event_ms + test_product_details.grace_period.milliseconds)
 
-    with TestingContext(platform_testing_env=True) as ctx:
+    with TestingContext(pg_database, platform_testing_env=True) as ctx:
         """
         1. User purchases 1-month subscription
         2. User enters grace period as they fail to renew
@@ -4429,7 +4431,7 @@ current_state={'kind': 'androidpublisher#subscriptionPurchaseV2', 'startTime': '
                           user_ctx                          = user_ctx,
                           ctx                               = ctx)
 
-    with TestingContext(platform_testing_env=True) as ctx:
+    with TestingContext(pg_database, platform_testing_env=True) as ctx:
         """
         1. User purchases 1-month subscription
         2. User changes to 3-month plan
@@ -4499,7 +4501,7 @@ current_state={'kind': 'androidpublisher#subscriptionPurchaseV2', 'startTime': '
                           user_ctx                          = user_ctx,
                           ctx                               = ctx)
 
-    with TestingContext(platform_testing_env=True) as ctx:
+    with TestingContext(pg_database, platform_testing_env=True) as ctx:
         """
         1. User purchases 1-month subscription
         2. User changes to 3-month plan
@@ -4596,7 +4598,7 @@ current_state={'kind': 'androidpublisher#subscriptionPurchaseV2', 'startTime': '
                           ctx                               = ctx)
 
 
-    with TestingContext(platform_testing_env=True) as ctx:
+    with TestingContext(pg_database, platform_testing_env=True) as ctx:
         """
         1. User purchases 1-month subscription
         2. User changes to 3-month plan
@@ -4714,7 +4716,7 @@ current_state={'kind': 'androidpublisher#subscriptionPurchaseV2', 'startTime': '
                           ctx                               = ctx)
 
 
-    with TestingContext(platform_testing_env=True) as ctx:
+    with TestingContext(pg_database, platform_testing_env=True) as ctx:
         """
         1. User purchases 1-month subscription
         2. User changes to 3-month plan
@@ -4807,7 +4809,7 @@ current_state={'kind': 'androidpublisher#subscriptionPurchaseV2', 'startTime': '
                           ctx                               = ctx)
 
 
-    with TestingContext(platform_testing_env=True) as ctx:
+    with TestingContext(pg_database, platform_testing_env=True) as ctx:
         """
         1. User purchases 3-month subscription
         2. Renews
@@ -4815,7 +4817,7 @@ current_state={'kind': 'androidpublisher#subscriptionPurchaseV2', 'startTime': '
         3. Expires
         """
 
-    with TestingContext(platform_testing_env=True) as ctx:
+    with TestingContext(pg_database, platform_testing_env=True) as ctx:
         """
         1. User purchases 12-month subscription
         2. Renews
@@ -4823,21 +4825,21 @@ current_state={'kind': 'androidpublisher#subscriptionPurchaseV2', 'startTime': '
         3. Expires
         """
 
-    with TestingContext(platform_testing_env=True) as ctx:
+    with TestingContext(pg_database, platform_testing_env=True) as ctx:
         """
         1. User purchases 3-month subscription
         2. User changes to 1-month subscription
         3. Renews
         """
 
-    with TestingContext(platform_testing_env=True) as ctx:
+    with TestingContext(pg_database, platform_testing_env=True) as ctx:
         """
         1. User purchases 12-month subscription
         2. User changes to 1-month subscription
         3. Renews
         """
 
-    with TestingContext(platform_testing_env=True) as ctx:
+    with TestingContext(pg_database, platform_testing_env=True) as ctx:
         """
         1. User purchases 1-month subscription
         2. Developer refunds subscription (removing entitlement)
@@ -4890,7 +4892,7 @@ current_state={'kind': 'androidpublisher#subscriptionPurchaseV2', 'startTime': '
             unix_ts_ms=tx_refund_a.event_ms + 1, # +1 to increment us over the threshold to be expired
             revoke_unix_ts_ms=tx_refund_a.event_ms)
 
-    with TestingContext(platform_testing_env=True) as ctx:
+    with TestingContext(pg_database, platform_testing_env=True) as ctx:
         """
         1. User purchases 1-month subscription
         2. Developer refunds subscription (removing entitlement)
@@ -4898,7 +4900,7 @@ current_state={'kind': 'androidpublisher#subscriptionPurchaseV2', 'startTime': '
         4. User renews
         """
 
-    with TestingContext(platform_testing_env=True) as ctx:
+    with TestingContext(pg_database, platform_testing_env=True) as ctx:
         """
         1. User purchases 12-month subscription
         2. Developer refunds subscription (removing entitlement)
@@ -4907,7 +4909,7 @@ current_state={'kind': 'androidpublisher#subscriptionPurchaseV2', 'startTime': '
         """
 
 
-    with TestingContext(platform_testing_env=True) as ctx:
+    with TestingContext(pg_database, platform_testing_env=True) as ctx:
         """
         1. User purchases 1-month subscription, but does not redeem it.
         2. Developer refunds subscription (removing entitlement)
