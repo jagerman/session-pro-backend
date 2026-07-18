@@ -108,15 +108,15 @@ class ExpireResult:
 
 @dataclasses.dataclass
 class ProSubscriptionProof:
-    version:        int                    = 0
     gen_index_hash: bytes                  = b''
     rotating_pkey:  nacl.signing.VerifyKey = nacl.signing.VerifyKey(ZERO_BYTES32)
     expires_at:     datetime.datetime      = base.EPOCH
     sig:            bytes                  = b''
 
     def to_dict(self) -> dict[str, str | int]:
+        # No `version` field (Q11 / wire spec Delta #11): a new proof shape would get a new
+        # personalisation, not a body version marker.
         result = {
-            "version":        self.version,
             "gen_index_hash": self.gen_index_hash.hex(),
             "rotating_pkey":  bytes(self.rotating_pkey).hex(),
             # Proof expiry is day-aligned, so integer seconds is exact (wire spec §2).
@@ -361,12 +361,11 @@ def make_gen_index_hash(gen_index: int, gen_index_salt: bytes) -> bytes:
     result = hasher.digest()
     return result
 
-def make_add_pro_payment_hash(version:       int,
-                              master_pkey:   nacl.signing.VerifyKey,
+def make_add_pro_payment_hash(master_pkey:   nacl.signing.VerifyKey,
                               rotating_pkey: nacl.signing.VerifyKey,
                               payment_tx:    UserPaymentTransaction) -> bytes:
     hasher: hashlib.blake2b = make_blake2b_hasher(personalisation=ADD_PRO_PAYMENT_HASH_PERSONALISATION)
-    hasher.update(version.to_bytes(length=1, byteorder='little'))
+    # No version byte (Q11 / wire spec Delta #11): the personalisation + endpoint already domain-separate.
     hasher.update(bytes(master_pkey))
     hasher.update(bytes(rotating_pkey))
 
@@ -384,9 +383,9 @@ def make_add_pro_payment_hash(version:       int,
     result: bytes = hasher.digest()
     return result
 
-def make_set_payment_refund_requested_hash(version: int, master_pkey: nacl.signing.VerifyKey, request_at: datetime.datetime, refund_requested_at: datetime.datetime, payment_tx: UserPaymentTransaction) -> bytes:
+def make_set_payment_refund_requested_hash(master_pkey: nacl.signing.VerifyKey, request_at: datetime.datetime, refund_requested_at: datetime.datetime, payment_tx: UserPaymentTransaction) -> bytes:
     hasher: hashlib.blake2b = make_blake2b_hasher(personalisation=SET_PAYMENT_REFUND_REQUESTED_HASH_PERSONALISATION)
-    hasher.update(version.to_bytes(length=1, byteorder='little'))
+    # No version byte (Q11 / wire spec Delta #11).
     hasher.update(bytes(master_pkey))
     # Signed timestamps are integer seconds, 8-byte LE (wire spec §1/§3.3).
     hasher.update(base.unix_seconds_from_datetime(request_at).to_bytes(length=8, byteorder='little'))
@@ -405,9 +404,9 @@ def make_set_payment_refund_requested_hash(version: int, master_pkey: nacl.signi
     result: bytes = hasher.digest()
     return result
 
-def make_get_pro_details_hash(version: int, master_pkey: nacl.signing.VerifyKey, request_at: datetime.datetime, count: int) -> bytes:
+def make_get_pro_details_hash(master_pkey: nacl.signing.VerifyKey, request_at: datetime.datetime, count: int) -> bytes:
     hasher: hashlib.blake2b = make_blake2b_hasher(personalisation=GET_PRO_DETAILS_HASH_PERSONALISATION)
-    hasher.update(version.to_bytes(length=1, byteorder='little'))
+    # No version byte (Q11 / wire spec Delta #11).
     hasher.update(bytes(master_pkey))
     hasher.update(base.unix_seconds_from_datetime(request_at).to_bytes(length=8, byteorder='little'))
     hasher.update(count.to_bytes(length=4, byteorder='little'))
@@ -1617,28 +1616,26 @@ def _allocate_new_gen_id_if_master_pkey_has_payments(tx: db.SQLTransaction, mast
 
     return result
 
-def make_generate_pro_proof_hash(version:       int,
-                                 master_pkey:   nacl.signing.VerifyKey,
+def make_generate_pro_proof_hash(master_pkey:   nacl.signing.VerifyKey,
                                  rotating_pkey: nacl.signing.VerifyKey,
                                  request_at:    datetime.datetime) -> bytes:
     '''Make the hash to sign for a pre-existing subscription by authorising
     a new rotating_pkey to be used for the Session Pro subscription associated
     with master_pkey'''
     hasher: hashlib.blake2b = make_blake2b_hasher(personalisation=GENERATE_PROOF_HASH_PERSONALISATION)
-    hasher.update(version.to_bytes(length=1, byteorder='little'))
+    # No version byte (Q11 / wire spec Delta #11).
     hasher.update(bytes(master_pkey))
     hasher.update(bytes(rotating_pkey))
     hasher.update(base.unix_seconds_from_datetime(request_at).to_bytes(length=8, byteorder='little'))
     result: bytes = hasher.digest()
     return result
 
-def build_proof_hash(version:        int,
-                     gen_index_hash: bytes,
+def build_proof_hash(gen_index_hash: bytes,
                      rotating_pkey:  nacl.signing.VerifyKey,
                      expires_at:     datetime.datetime) -> bytes:
     '''Make the hash to the backend signs for to certify the proof'''
     hasher: hashlib.blake2b = make_blake2b_hasher(personalisation=BUILD_PROOF_HASH_PERSONALISATION)
-    hasher.update(version.to_bytes(length=1, byteorder='little'))
+    # No version byte (Q11 / wire spec Delta #11).
     hasher.update(gen_index_hash)
     hasher.update(bytes(rotating_pkey))
     hasher.update(base.unix_seconds_from_datetime(expires_at).to_bytes(length=8, byteorder='little'))
@@ -1660,13 +1657,11 @@ def build_proof(gen_index:      int,
                 gen_index_salt: bytes) -> ProSubscriptionProof:
     assert len(gen_index_salt) == hashlib.blake2b.SALT_SIZE
     result: ProSubscriptionProof = ProSubscriptionProof()
-    result.version               = 0
     result.gen_index_hash        = make_gen_index_hash(gen_index=gen_index, gen_index_salt=gen_index_salt)
     result.rotating_pkey         = rotating_pkey
     result.expires_at     = expires_at
 
-    hash_to_sign: bytes = build_proof_hash(version           = result.version,
-                                           gen_index_hash    = result.gen_index_hash,
+    hash_to_sign: bytes = build_proof_hash(gen_index_hash    = result.gen_index_hash,
                                            rotating_pkey     = result.rotating_pkey,
                                            expires_at = result.expires_at)
     result.sig = signing_key.sign(hash_to_sign).signature
@@ -1721,7 +1716,6 @@ def internal_verify_add_payment_and_get_proof_common_arguments(signing_key:   na
     return result
 
 def add_pro_payment_tx(tx:                  db.SQLTransaction,
-                       version:             int,
                        signing_key:         nacl.signing.SigningKey,
                        request_at:          datetime.datetime,
                        redeemed_at: datetime.datetime,
@@ -1778,7 +1772,7 @@ def add_pro_payment_tx(tx:                  db.SQLTransaction,
                 return result
 
             payment_tx_label = _add_pro_payment_user_tx_log_label_safe(payment_tx)
-            log.info(f'Google ack. payment check (dev={base.DEV_BACKEND_MODE}, version={version}, master={base.maybe_obfuscate_bytes(master_pkey)}, payment={payment_tx_label}, acked={sub_data.acknowledgement_state})')
+            log.info(f'Google ack. payment check (dev={base.DEV_BACKEND_MODE}, master={base.maybe_obfuscate_bytes(master_pkey)}, payment={payment_tx_label}, acked={sub_data.acknowledgement_state})')
 
             if sub_data.acknowledgement_state != platform_google_types.SubscriptionsV2AcknowledgementState.ACKNOWLEDGED:
                 platform_google_api.subscription_v1_acknowledge(purchase_token=payment_tx.google_payment_token, err=err)
@@ -1789,7 +1783,6 @@ def add_pro_payment_tx(tx:                  db.SQLTransaction,
 
 
 def add_pro_payment(conn:                psycopg.Connection,
-                    version:             int,
                     signing_key:         nacl.signing.SigningKey,
                     request_at:          datetime.datetime,
                     redeemed_at: datetime.datetime,
@@ -1801,7 +1794,6 @@ def add_pro_payment(conn:                psycopg.Connection,
     result = RedeemPayment()
     with db.transaction(conn) as tx:
         result = add_pro_payment_tx(tx,
-                                     version,
                                      signing_key,
                                      request_at,
                                      redeemed_at,
@@ -1813,7 +1805,6 @@ def add_pro_payment(conn:                psycopg.Connection,
     return result
 
 def verify_and_add_pro_payment(conn:                psycopg.Connection,
-                               version:             int,
                                signing_key:         nacl.signing.SigningKey,
                                request_at:          datetime.datetime,
                                redeemed_at: datetime.datetime,
@@ -1835,7 +1826,7 @@ def verify_and_add_pro_payment(conn:                psycopg.Connection,
     """
 
     payment_tx_label = _add_pro_payment_user_tx_log_label_safe(payment_tx)
-    log.info(f'Add payment (dev={base.DEV_BACKEND_MODE}, version={version}, redeemed={base.readable(redeemed_at)}, master={base.maybe_obfuscate_bytes(master_pkey)}, payment={payment_tx_label})')
+    log.info(f'Add payment (dev={base.DEV_BACKEND_MODE}, redeemed={base.readable(redeemed_at)}, master={base.maybe_obfuscate_bytes(master_pkey)}, payment={payment_tx_label})')
 
     result        = RedeemPayment()
     result.status = RedeemPaymentStatus.Error
@@ -1922,8 +1913,7 @@ def verify_and_add_pro_payment(conn:                psycopg.Connection,
                                             err                      = err)
 
     # Verify some of the request parameters
-    hash_to_sign: bytes = make_add_pro_payment_hash(version       = version,
-                                                    master_pkey   = master_pkey,
+    hash_to_sign: bytes = make_add_pro_payment_hash(master_pkey   = master_pkey,
                                                     rotating_pkey = rotating_pkey,
                                                     payment_tx    = payment_tx)
 
@@ -1934,16 +1924,11 @@ def verify_and_add_pro_payment(conn:                psycopg.Connection,
                                                                    master_sig    = master_sig,
                                                                    rotating_sig  = rotating_sig,
                                                                    err           = err)
-    # Then verify version and time
-    if version != 0:
-        err.msg_list.append(f'Unrecognised version {version} was given')
-
     if len(err.msg_list) > 0:
         return result
 
     # Pre-verification steps complete, continue to add the payment
     result = add_pro_payment(conn,
-                             version,
                              signing_key,
                              request_at,
                              redeemed_at,
@@ -2012,7 +1997,6 @@ def round_datetime_to_next_day_with_platform_testing_support(payment_provider: b
     return base.round_datetime_to_next_day(at)
 
 def generate_pro_proof(conn: psycopg.Connection,
-                       version:        int,
                        signing_key:    nacl.signing.SigningKey,
                        gen_index_salt: bytes,
                        master_pkey:    nacl.signing.VerifyKey,
@@ -2022,11 +2006,10 @@ def generate_pro_proof(conn: psycopg.Connection,
                        rotating_sig:   bytes,
                        err:            base.ErrorSink) -> ProSubscriptionProof:
     result: ProSubscriptionProof = ProSubscriptionProof()
-    log.info(f'Get pro proof (version={version}, master={base.maybe_obfuscate_bytes(master_pkey)}, ts={base.readable(request_at)})')
+    log.info(f'Get pro proof (master={base.maybe_obfuscate_bytes(master_pkey)}, ts={base.readable(request_at)})')
 
     # Verify some of the request parameters
-    hash_to_sign: bytes = make_generate_pro_proof_hash(version       = version,
-                                                       master_pkey   = master_pkey,
+    hash_to_sign: bytes = make_generate_pro_proof_hash(master_pkey   = master_pkey,
                                                        rotating_pkey = rotating_pkey,
                                                        request_at    = request_at)
 
@@ -2037,12 +2020,6 @@ def generate_pro_proof(conn: psycopg.Connection,
                                                                    master_sig    = master_sig,
                                                                    rotating_sig  = rotating_sig,
                                                                    err           = err)
-    if len(err.msg_list) > 0:
-        return result
-
-    # Then verify version
-    if version != 0:
-        err.msg_list.append(f'Unrecognised version {version} was given')
     if len(err.msg_list) > 0:
         return result
 

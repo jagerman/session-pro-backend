@@ -62,7 +62,6 @@ COMMAND FORMATS DETAILED:
     Optional:
       --master-skey <hex>       64-char hex master secret key (generates new if omitted)
       --rotating-skey <hex>     64-char hex rotating secret key (generates new if omitted)
-      --version <int>           Request version (default: 0)
       --dev-plan <1M|3M|12M>    Subscription plan (1M/3M/12M)
       --dev-duration-ms <ms>    Override duration in milliseconds
       --dev-auto-renewing       Set auto-renewing to true (default: false)
@@ -91,7 +90,6 @@ COMMAND FORMATS DETAILED:
 
     Optional:
       --refund-requested-ts <s>           Unix timestamp (seconds) for refund (default: now + 1s)
-      --version <int>                     Request version (default: 0)
 
     Examples:
       python cli.py server set-payment-refund-requested --url http://localhost:8000 --provider google --master-skey abcdef... --payment-token tok123 --order-id DEV.abc123
@@ -105,7 +103,6 @@ COMMAND FORMATS DETAILED:
 
     Optional:
       --ticket <int>  Revocation ticket to query from (default: 0)
-      --version <int> Request version (default: 0)
 
     Examples:
       python cli.py server get-pro-revocations --url http://localhost:8000
@@ -120,7 +117,6 @@ COMMAND FORMATS DETAILED:
 
     Optional:
       --count <n>     Number of payments to retrieve (default: 10)
-      --version <int> Request version (default: 0)
 
     Examples:
       python cli.py server get-pro-details --url http://localhost:8000 --master-skey abcdef...
@@ -135,7 +131,6 @@ COMMAND FORMATS DETAILED:
       --rotating-skey <hex>   64-char hex rotating secret key
 
     Optional:
-      --version <int>         Request version (default: 0)
 
     Examples:
       python cli.py server generate-pro-proof --url http://localhost:8000 --master-skey abcdef... --rotating-skey fedcba...
@@ -914,7 +909,6 @@ def cmd_server_add_pro_payment(args: argparse.Namespace) -> int:
 
     # Compute hash using backend function
     hash_bytes = backend.make_add_pro_payment_hash(
-        version       = args.version,
         master_pkey   = master_skey.verify_key,
         rotating_pkey = rotating_skey.verify_key,
         payment_tx    = payment_tx_obj
@@ -922,7 +916,6 @@ def cmd_server_add_pro_payment(args: argparse.Namespace) -> int:
 
     # Build request
     request_body = {
-        'version':       args.version,
         'master_pkey':   bytes(master_skey.verify_key).hex(),
         'rotating_pkey': bytes(rotating_skey.verify_key).hex(),
         'master_sig':    bytes(master_skey.sign(hash_bytes).signature).hex(),
@@ -1023,11 +1016,10 @@ def cmd_server_set_payment_refund_requested(args: argparse.Namespace) -> int:
         print(f"ERROR: Unsupported payment provider: {args.provider}", file=sys.stderr)
         return 1
 
-    hash_bytes: bytes = backend.make_set_payment_refund_requested_hash(args.version, master_skey.verify_key, base.datetime_from_unix_seconds(now_ts), base.datetime_from_unix_seconds(refund_ts), payment_tx)
+    hash_bytes: bytes = backend.make_set_payment_refund_requested_hash(master_skey.verify_key, base.datetime_from_unix_seconds(now_ts), base.datetime_from_unix_seconds(refund_ts), payment_tx)
 
     # Build request
     request_body = {
-        'version': args.version,
         'master_pkey': bytes(master_skey.verify_key).hex(),
         'master_sig': bytes(master_skey.sign(hash_bytes).signature).hex(),
         'ts': now_ts,
@@ -1065,7 +1057,6 @@ def cmd_server_get_pro_revocations(args: argparse.Namespace) -> int:
     import urllib.error
 
     request_body = {
-        'version': args.version,
         'ticket': args.ticket
     }
 
@@ -1110,7 +1101,6 @@ def cmd_server_get_pro_details(args: argparse.Namespace) -> int:
 
     # Compute hash
     hash_bytes = backend.make_get_pro_details_hash(
-        version=args.version,
         master_pkey=master_skey.verify_key,
         request_at=base.datetime_from_unix_seconds(ts),
         count=args.count
@@ -1118,7 +1108,6 @@ def cmd_server_get_pro_details(args: argparse.Namespace) -> int:
 
     # Build request
     request_body = {
-        'version': args.version,
         'master_pkey': bytes(master_skey.verify_key).hex(),
         'master_sig': bytes(master_skey.sign(hash_bytes).signature).hex(),
         'ts': ts,
@@ -1173,7 +1162,6 @@ def cmd_server_generate_pro_proof(args: argparse.Namespace) -> int:
 
     # Compute hash
     hash_bytes = backend.make_generate_pro_proof_hash(
-        version=args.version,
         master_pkey=master_skey.verify_key,
         rotating_pkey=rotating_skey.verify_key,
         request_at=base.datetime_from_unix_seconds(ts)
@@ -1181,7 +1169,6 @@ def cmd_server_generate_pro_proof(args: argparse.Namespace) -> int:
 
     # Build request
     request_body = {
-        'version': args.version,
         'master_pkey': bytes(master_skey.verify_key).hex(),
         'rotating_pkey': bytes(rotating_skey.verify_key).hex(),
         'master_sig': bytes(master_skey.sign(hash_bytes).signature).hex(),
@@ -1317,7 +1304,6 @@ def cmd_voucher(args: argparse.Namespace) -> int:
                     err = base.ErrorSink()
                     redeem_result = backend.add_pro_payment_tx(
                         tx                  = tx,
-                        version             = 0,
                         signing_key         = backend_key,
                         request_at          = request_at,
                         redeemed_at         = backend.to_redeemed_at(request_at),
@@ -1379,7 +1365,6 @@ def main() -> int:
     _                       = server_add_pro_payment.add_argument('--provider',          required=True, choices=['google', 'apple', 'rangeproof'], help='Payment provider')
     _                       = server_add_pro_payment.add_argument('--master-skey',                                                                 help='64-char hex master secret key (generates new if omitted)')
     _                       = server_add_pro_payment.add_argument('--rotating-skey',                                                               help='64-char hex rotating secret key (generates new if omitted)')
-    _                       = server_add_pro_payment.add_argument('--version',           type=int, default=0,                                      help='Request version (default: 0)')
     _                       = server_add_pro_payment.add_argument('--dev-plan',                         choices=['1M', '3M', '12M'],               help='Subscription plan (1M/3M/12M)')
     _                       = server_add_pro_payment.add_argument('--dev-duration-ms',   type=int,                                                 help='Override duration in milliseconds')
     _                       = server_add_pro_payment.add_argument('--dev-auto-renewing', action='store_true',                                      help='Set auto-renewing to true (default: false)')
@@ -1393,27 +1378,23 @@ def main() -> int:
     _                       = server_set_refund.add_argument('--order-id',                                                                help='Google: order ID')
     _                       = server_set_refund.add_argument('--tx-id',                                                                   help='Apple: transaction ID')
     _                       = server_set_refund.add_argument('--refund-requested-ts',         type=int,                                   help='Unix timestamp (seconds) for refund (default: now + 1s)')
-    _                       = server_set_refund.add_argument('--version',                     type=int,      default=0,                   help='Request version (default: 0)')
 
     # get-pro-revocations endpoint
     server_get_revocations  = server_subparsers.add_parser('get-pro-revocations',                          help='Get pro revocations. Mirrors /get_pro_revocations')
     _                       = server_get_revocations.add_argument('--url',     required=True,              help='Server URL (e.g., http://localhost:8000)')
     _                       = server_get_revocations.add_argument('--ticket',  type=int, default=0,        help='Revocation ticket to query from (default: 0)')
-    _                       = server_get_revocations.add_argument('--version', type=int, default=0,        help='Request version (default: 0)')
 
     # get-pro-details endpoint
     server_get_details      = server_subparsers.add_parser('get-pro-details',                              help='Get pro details. Mirrors /get_pro_details')
     _                       = server_get_details.add_argument('--url',         required=True,              help='Server URL (e.g., http://localhost:8000)')
     _                       = server_get_details.add_argument('--master-skey', required=True,              help='64-char hex master secret key for signing')
     _                       = server_get_details.add_argument('--count',       type=int, default=10,       help='Number of payments to retrieve (default: 10)')
-    _                       = server_get_details.add_argument('--version',     type=int, default=0,        help='Request version (default: 0)')
 
     # generate-pro-proof endpoint
     server_gen_proof        = server_subparsers.add_parser('generate-pro-proof',                           help='Generate pro proof. Mirrors /generate_pro_proof')
     _                       = server_gen_proof.add_argument('--url',           required=True,              help='Server URL (e.g., http://localhost:8000)')
     _                       = server_gen_proof.add_argument('--master-skey',   required=True,              help='64-char hex master secret key')
     _                       = server_gen_proof.add_argument('--rotating-skey', required=True,              help='64-char hex rotating secret key')
-    _                       = server_gen_proof.add_argument('--version',       type=int, default=0,        help='Request version (default: 0)')
 
     # Voucher command (creates Rangeproof voucher and auto-redeems it)
     voucher_parser          = subparsers.add_parser('voucher',                                                             help='Create a Rangeproof voucher payment (requires --config)')

@@ -6,7 +6,6 @@ hardcoded Ed25519 keypair (secret = [0xcd * 32]):
   Get Pro Proof
   Request:
   {
-   "version": 0,
    "master_pkey": "162c30675ecc72ad17ef57e749a54284812cc178b1d2f31cfb3260f1f7594dc5",
    "rotating_pkey": "ecd0e9c371b5e1d9e116ba4d29b057e458c8b4bca40b5b3fea1cd5d5e89ae7b7",
    "ts": 1762407212,
@@ -18,8 +17,7 @@ hardcoded Ed25519 keypair (secret = [0xcd * 32]):
     "expiry_ts": 1762473660,
     "gen_index_hash": "b330d8a3679ba0016169907bed1f49fa7d5ed8e1a73042197dd2949fecc7d174",
     "rotating_pkey": "ecd0e9c371b5e1d9e116ba4d29b057e458c8b4bca40b5b3fea1cd5d5e89ae7b7",
-    "sig": "4537d985f6ec0134ed80537affd04be10f44a0f658cf26c6a3f48da43f5056a51b1ae48d2287bbed72e72c92ea87253357d466c7319c7d3514b081f9f1337d0e",
-    "version": 0
+    "sig": "4537d985f6ec0134ed80537affd04be10f44a0f658cf26c6a3f48da43f5056a51b1ae48d2287bbed72e72c92ea87253357d466c7319c7d3514b081f9f1337d0e"
    },
    "status": 0
   }
@@ -27,7 +25,6 @@ hardcoded Ed25519 keypair (secret = [0xcd * 32]):
 The produced Session Pro Proof should be verifiable by invoking this utility as per:
 
   python verify_pro_proof.py \
-          --version 0 \
           --gen-index-hash b330d8a3679ba0016169907bed1f49fa7d5ed8e1a73042197dd2949fecc7d174 \
           --rotating-pubkey ecd0e9c371b5e1d9e116ba4d29b057e458c8b4bca40b5b3fea1cd5d5e89ae7b7 \
           --expiry-ts 1762473660 \
@@ -49,7 +46,6 @@ import hashlib
 import argparse
 
 parser = argparse.ArgumentParser(description='Verify the given signature signed the Session Pro Proof elements (gen-index-hash, rotating-pkey, expiry-ts)')
-_ = parser.add_argument('--version',        type=int, required=True, help='Proof version')
 _ = parser.add_argument('--gen-index-hash', type=str, required=True, help='32-byte gen index hash (in hex)')
 _ = parser.add_argument('--rotating-pkey',  type=str, required=True, help='32-byte Ed25519 rotating public key (in hex)')
 _ = parser.add_argument('--expiry-ts',      type=int, required=True, help='Expiry timestamp (UNIX seconds)')
@@ -62,7 +58,7 @@ hash_result: bytes = b''
 if 1:
     personalization = b"ProProof________"
     h = hashlib.blake2b(person=personalization, digest_size=32)
-    h.update(args.version.to_bytes(byteorder='little', length=1))
+    # No version byte (Q11): the personalisation domain-separates the digest.
 
     # Strip 0x prefix if present and convert from hex
     gen_hash      = args.gen_index_hash[2:] if args.gen_index_hash.startswith('0x') else args.gen_index_hash

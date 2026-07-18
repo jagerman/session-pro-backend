@@ -14,7 +14,7 @@ Overview
 API
   All response endpoints follow the basic structure for success and failure respectively:
 
-  { "status": 0, "result": { "version": 0, <content...> }}                          // On success
+  { "status": 0, "result": { <content...> }}                          // On success
   { "status": 1, "errors": [ "1st reason for error", "2nd reason for error", ... ]} // On failure
 
   Which means that calling code should conditionally handle a root level `result` or `errors` type
@@ -34,8 +34,8 @@ API
       The embedded `master_sig` and `rotating_sig` signature must sign over a 32 byte hash of the
       request components (in little endian) for example:
 
-        google_hash = blake2b32(person='ProAddPayment___', version || master_pkey || rotating_pkey || payment_tx.provider || payment_tx.google_payment_token || payment_tx.google_order_id)
-        apple_hash  = blake2b32(person='ProAddPayment___', version || master_pkey || rotating_pkey || payment_tx.provider || payment_tx.apple_tx_id)
+        google_hash = blake2b32(person='ProAddPayment___', master_pkey || rotating_pkey || payment_tx.provider || payment_tx.google_payment_token || payment_tx.google_order_id)
+        apple_hash  = blake2b32(person='ProAddPayment___', master_pkey || rotating_pkey || payment_tx.provider || payment_tx.apple_tx_id)
 
       This request will fail if the Session Pro backend has not witnessed the equivalent payment
       independently from the storefront that the payment originally came from.
@@ -45,7 +45,6 @@ API
       Backend.
 
     Request
-      version:       1 byte, current version of the request which should be 0
       master_pkey:   32 byte Ed25519 master Session Pro public key derived deterministically from
                      the Session Account seed in hex to get pro status for
       rotating_pkey: 32 byte Ed25519 public key to pair to the pro proof in hex
@@ -70,7 +69,6 @@ API
     Response
       result: Result object with the pro proof, only set if status was success otherwise there will
               be an error array as aforementioned.
-        version:           1 byte version value from the request
         expiry_ts: 8 byte UNIX time-stamp of when the proof will expire
         gen_index_hash:    32 byte hash of the internal generation index that has been allocated to
                            the user. This hash is the unique identifier for all Session Pro Proofs
@@ -96,7 +94,6 @@ API
     Example
       Request
       {
-       "version": 0,
        "master_pkey": "162c30675ecc72ad17ef57e749a54284812cc178b1d2f31cfb3260f1f7594dc5",
        "rotating_pkey": "ecd0e9c371b5e1d9e116ba4d29b057e458c8b4bca40b5b3fea1cd5d5e89ae7b7",
        "master_sig": "63204c239ab4a8b2ec06b591b7a845bab13c5189389a5af216d5f97d48c71b9ed4378bb576da029774775d727c54bd48372f6bd7e565f90d6138b94e803caf06",
@@ -114,8 +111,7 @@ API
         "expiry_ts": 1762407280,
         "gen_index_hash": "2caeefdd95a0ce0dfbdbdeca987e7cdd7cb40fb40de55282931740c56ca40245",
         "rotating_pkey": "ecd0e9c371b5e1d9e116ba4d29b057e458c8b4bca40b5b3fea1cd5d5e89ae7b7",
-        "sig": "51d2ea19a4e26ea4181214ce8f72ea1f8c9b3b53a911399a3a63713272211aec481c40d6ab65f91f71ef093bbda608f037aafba73482a304db6fe30f1806130b",
-        "version": 0
+        "sig": "51d2ea19a4e26ea4181214ce8f72ea1f8c9b3b53a911399a3a63713272211aec481c40d6ab65f91f71ef093bbda608f037aafba73482a304db6fe30f1806130b"
        },
        "status": 0
       }
@@ -130,7 +126,7 @@ API
       The embedded `master_sig` and `rotating_sig` signature must sign over a 32 byte hash of the
       request components (in little endian):
 
-        hash = blake2b32(person='ProGenerateProof', version || master_pkey || rotating_pkey || ts)
+        hash = blake2b32(person='ProGenerateProof', master_pkey || rotating_pkey || ts)
 
       Once the response has been received, the caller should store the proof offline and embed it
       into their messages on the Session Protocol, signing the message with their rotating secret
@@ -141,10 +137,9 @@ API
       signature in the response signs over a 32 byte hash of the following response components (in
       little endian):
 
-        hash = blake2b32(person='ProProof________', version || gen_index_hash || rotating_pkey || expiry_ts)
+        hash = blake2b32(person='ProProof________', gen_index_hash || rotating_pkey || expiry_ts)
 
     Request
-      version:       1 byte, current version of the request which should be 0
       master_pkey:   32 byte Ed25519 master Session Pro public key derived deterministically from
                      the Session Account seed in hex to get pro status for
       rotating_pkey: 32 byte Ed25519 public key to pair to the pro proof in hex
@@ -160,7 +155,6 @@ API
       status:    Response status, either RESPONSE_SUCCESS, RESPONSE_PARSE_ERROR or
                  RESPONSE_GENERIC_ERROR
       result:
-        version:           1 byte version value from the request
         expiry_ts: 8 byte UNIX timestamp of when the proof will expire
         gen_index_hash:    32 byte hash of the internal generation index that has been allocated to
                            the user.
@@ -172,7 +166,6 @@ API
     Examples
       Request
       {
-        "version": 0,
         "master_pkey": "2a87bf679678fe7ccad36ae081de58ee327f1a6706d1f2b2ecda52219b7ee8bf",
         "rotating_pkey": "67917f7507c58880c50e249afecb2fe4a236d422c7e05b04d4fbf46e30c965d5",
         "ts": 1755648412,
@@ -186,8 +179,7 @@ API
           "expiry_ts": 1758412800,
           "gen_index_hash": "084563482babfdf1acda66fcef7c70ad835e148ab98f26371ce9e4abef6104d7",
           "rotating_pkey": "67917f7507c58880c50e249afecb2fe4a236d422c7e05b04d4fbf46e30c965d5",
-          "sig": "a1ea79c2a274afc0a61e5946976297b42e1dcfdbde29f007c8fe43d2e616fc7e5db5865d05212e392a6395fabe1ed69f976fb19c25f4640df5b89a5870739e0e",
-          "version": 0
+          "sig": "a1ea79c2a274afc0a61e5946976297b42e1dcfdbde29f007c8fe43d2e616fc7e5db5865d05212e392a6395fabe1ed69f976fb19c25f4640df5b89a5870739e0e"
         },
         "status": 0
       }
@@ -222,7 +214,6 @@ API
       mandated revocations, e.g.: rare).
 
     Request
-      version: 1 byte, current version of the request which should be 0
       ticket:  4 byte monotonic integer that represents the current iteration of the revocation list
                held by the caller. Initially callers will set this to 0 if they do not know the
                latest ticket. In subsequent requests the latest known `ticket` should be passed in
@@ -248,7 +239,7 @@ API
 
     Examples
       Request
-      { "version": 0, "ticket": 0 }
+      { "ticket": 0 }
 
       Response
       {
@@ -261,8 +252,7 @@ API
             }
           ],
           "ticket": 1,
-          "retry_in": 86400,
-          "version": 0
+          "retry_in": 86400
         },
         "status": 0
       }
@@ -280,7 +270,7 @@ API
       The embedded `master_sig` signature must sign over the 32 byte hash of the requests contents
       (in little endian):
 
-        hash = blake2b32(person='ProGetProDetReq_', version || master_pkey || ts || count)
+        hash = blake2b32(person='ProGetProDetReq_', master_pkey || ts || count)
 
       TODO: In future we plan to prune payment history after some legally required threshold such as
       a year.
@@ -290,7 +280,6 @@ API
       have
 
     Request
-      version:     1 byte, current version of the request which should be 0
       master_pkey: 32 byte Ed25519 master Session Pro public key derived deterministically from
                    the Session Account seed in hex to get pro status for
       master_sig:  64 byte signature over the hash of the contents of the request proving that the
@@ -429,7 +418,6 @@ API
     Examples
       Request
       {
-        "version": 0,
         "master_pkey": "8ddc57b457fca85d2184813ea18a048f64a35ab0e693d4a0a3e4f8ee87ff3360",
         "master_sig": "37495dfab72772ebf4e4bf213b0a1c46e8e044ef3e4360ff8ef04ee8a7daf2178a716447de6f938d0e7865be31735fb2db2d1213dc35c02dfe253aac77fb2a0d",
         "ts": 1755653705,
@@ -462,8 +450,7 @@ API
           "refund_requested_ts": 0,
           "payments_total": 1,
           "status": 1,
-          "error_report": 0,
-          "version": 0
+          "error_report": 0
         },
         "status": 0
       }
@@ -498,11 +485,10 @@ API
       The embedded `master_sig` signature must sign over the 32 byte hash of the requests contents
       (in little endian):
 
-        google_hash = blake2b32(person='ProSetRefundReq_', version || master_pkey || ts || refund_requested_ts || payment_tx.provider || payment_tx.google_payment_token || payment_tx.google_order_id)
-        apple_hash  = blake2b32(person='ProSetRefundReq_', version || master_pkey || ts || refund_requested_ts || payment_tx.provider || payment_tx.apple_tx_id)
+        google_hash = blake2b32(person='ProSetRefundReq_', master_pkey || ts || refund_requested_ts || payment_tx.provider || payment_tx.google_payment_token || payment_tx.google_order_id)
+        apple_hash  = blake2b32(person='ProSetRefundReq_', master_pkey || ts || refund_requested_ts || payment_tx.provider || payment_tx.apple_tx_id)
 
     Request
-      version:                     1 byte, current version of the request which should be 0
       master_pkey:                 32 byte Ed25519 master Session Pro public key derived
                                    deterministically from the Session Account seed in hex to get pro
                                    status for
@@ -529,13 +515,11 @@ API
       status:    Response status, either RESPONSE_SUCCESS, RESPONSE_PARSE_ERROR or
                  RESPONSE_GENERIC_ERROR
       result:
-        version: 1 byte version value from the request
         updated: True if a payment was found matching the given payment information and that the
                  refund request unix timestamp was set
     Examples
       Request
       {
-        "version": 0,
         "master_pkey": "8ddc57b457fca85d2184813ea18a048f64a35ab0e693d4a0a3e4f8ee87ff3360",
         "master_sig": "37495dfab72772ebf4e4bf213b0a1c46e8e044ef3e4360ff8ef04ee8a7daf2178a716447de6f938d0e7865be31735fb2db2d1213dc35c02dfe253aac77fb2a0d",
         "ts": 1755653705,
@@ -550,8 +534,7 @@ API
       Response
       {
        "result": {
-        "version": 0
-        "updated": true,
+        "updated": true
        },
        "status": 0
       }
@@ -695,7 +678,6 @@ def add_pro_payment():
 
     # Extract values from JSON
     err                                         = base.ErrorSink()
-    version:          int                       = base.json_dict_require_int(d=get.json,   key='version',       err=err)
     master_pkey:      str                       = base.json_dict_require_str(d=get.json,   key='master_pkey',   err=err)
     rotating_pkey:    str                       = base.json_dict_require_str(d=get.json,   key='rotating_pkey', err=err)
     master_sig:       str                       = base.json_dict_require_str(d=get.json,   key='master_sig',    err=err)
@@ -706,8 +688,6 @@ def add_pro_payment():
         return make_error_response(status=RESPONSE_PARSE_ERROR, errors=err.msg_list)
 
     # Parse and validate values
-    if version != 0:
-        err.msg_list.append(f'Unrecognised version passed: {version}')
     _ = base.verify_payment_provider(payment_provider=payment_provider, err=err)
 
     # Build payment TX
@@ -779,7 +759,6 @@ def add_pro_payment():
             request_at          = base.datetime_from_unix_ms(int(time_now() * 1000))
             redeemed_at         = backend.to_redeemed_at(request_at)
             redeemed_payment    = backend.verify_and_add_pro_payment(conn                = conn,
-                                                                     version             = version,
                                                                      signing_key         = flask.current_app.config[FLASK_CONFIG_BACKEND_SKEY_KEY],
                                                                      request_at          = request_at,
                                                                      redeemed_at         = redeemed_at,
@@ -812,7 +791,6 @@ def generate_pro_proof() -> flask.Response:
 
     # Extract values from JSON
     err                = base.ErrorSink()
-    version:       int = base.json_dict_require_int(d=get.json, key='version',       err=err)
     master_pkey:   str = base.json_dict_require_str(d=get.json, key='master_pkey',   err=err)
     rotating_pkey: str = base.json_dict_require_str(d=get.json, key='rotating_pkey', err=err)
     ts:            int = base.json_dict_require_int(d=get.json, key='ts',            err=err)
@@ -822,8 +800,6 @@ def generate_pro_proof() -> flask.Response:
         return make_error_response(status=RESPONSE_PARSE_ERROR, errors=err.msg_list)
 
     # Parse and validate values
-    if version != 0:
-        err.msg_list.append(f'Unrecognised version passed: {version}')
     master_pkey_bytes   = base.hex_to_bytes(hex=master_pkey,   label='Master public key',      hex_len=nacl.bindings.crypto_sign_PUBLICKEYBYTES * 2, err=err)
     rotating_pkey_bytes = base.hex_to_bytes(hex=rotating_pkey, label='Rotating public key',    hex_len=nacl.bindings.crypto_sign_PUBLICKEYBYTES * 2, err=err)
     master_sig_bytes    = base.hex_to_bytes(hex=master_sig,    label='Master key signature',   hex_len=nacl.bindings.crypto_sign_BYTES * 2,          err=err)
@@ -848,7 +824,6 @@ def generate_pro_proof() -> flask.Response:
         with db.connection(engine) as conn:
             runtime = backend.get_runtime(conn)
             proof   = backend.generate_pro_proof(conn           = conn,
-                                                 version        = version,
                                                  signing_key    = flask.current_app.config[FLASK_CONFIG_BACKEND_SKEY_KEY],
                                                  gen_index_salt = runtime.gen_index_salt,
                                                  master_pkey    = nacl.signing.VerifyKey(master_pkey_bytes),
@@ -873,14 +848,11 @@ def get_pro_revocations():
 
     # Extract values from JSON
     err          = base.ErrorSink()
-    version: int = base.json_dict_require_int(d=get.json, key='version', err=err)
     ticket:  int = base.json_dict_require_int(d=get.json, key='ticket',  err=err)
     if len(err.msg_list):
         return make_error_response(status=RESPONSE_PARSE_ERROR, errors=err.msg_list)
 
     # Parse and validate values
-    if version != 0:
-        err.msg_list.append(f'Unrecognised version passed: {version}')
 
     if len(err.msg_list):
         return make_error_response(status=RESPONSE_PARSE_ERROR, errors=err.msg_list)
@@ -913,7 +885,6 @@ def get_pro_revocations():
                 return make_error_response(status=RESPONSE_GENERIC_ERROR, errors=err.msg_list)
 
             result = make_success_response(dict_result={
-                'version':  version,
                 'ticket':   revocation_ticket,
                 'items':    revocation_items,
                 'retry_in': RETRY_IN,
@@ -929,7 +900,6 @@ def get_pro_details():
 
     # Extract values from JSON
     err               = base.ErrorSink()
-    version:     int  = base.json_dict_require_int(d=get.json,  key='version',     err=err)
     master_pkey: str  = base.json_dict_require_str(d=get.json,  key='master_pkey', err=err)
     master_sig:  str  = base.json_dict_require_str(d=get.json,  key='master_sig',  err=err)
     ts:          int  = base.json_dict_require_int(d=get.json,  key='ts',          err=err)
@@ -938,8 +908,6 @@ def get_pro_details():
         return make_error_response(status=RESPONSE_PARSE_ERROR, errors=err.msg_list)
 
     # Parse and validate values
-    if version != 0:
-        err.msg_list.append(f'Unrecognised version passed: {version}')
     master_pkey_bytes = base.hex_to_bytes(hex=master_pkey, label='Master public key',    hex_len=nacl.bindings.crypto_sign_PUBLICKEYBYTES * 2, err=err)
     master_sig_bytes  = base.hex_to_bytes(hex=master_sig,  label='Master key signature', hex_len=nacl.bindings.crypto_sign_BYTES * 2,          err=err)
 
@@ -960,7 +928,7 @@ def get_pro_details():
 
     # Validate the signature
     master_pkey_nacl      = nacl.signing.VerifyKey(master_pkey_bytes)
-    hash_to_verify: bytes = backend.make_get_pro_details_hash(version=version, master_pkey=master_pkey_nacl, request_at=request_at, count=count)
+    hash_to_verify: bytes = backend.make_get_pro_details_hash(master_pkey=master_pkey_nacl, request_at=request_at, count=count)
     try:
         _ = master_pkey_nacl.verify(smessage=hash_to_verify, signature=master_sig_bytes)
     except Exception as e:
@@ -1051,7 +1019,6 @@ def get_pro_details():
                         user_pro_status = UserProStatus.Expired
 
             dict_result = {
-                'version':               0,
                 'status':                int(user_pro_status.value),
                 'auto_renewing':         auto_renewing,
                 'expiry_ts':             expiry_ts,
@@ -1077,7 +1044,6 @@ def set_payment_refund_requested():
 
     # Extract values from JSON
     err                                                    = base.ErrorSink()
-    version:                     int                       = base.json_dict_require_int(d=get.json,   key='version',                     err=err)
     master_pkey:                 str                       = base.json_dict_require_str(d=get.json,   key='master_pkey',                 err=err)
     master_sig:                  str                       = base.json_dict_require_str(d=get.json,   key='master_sig',                  err=err)
     payment_tx:          dict[str, base.JSONValue] = base.json_dict_require_obj(d=get.json,   key='payment_tx',          err=err)
@@ -1088,8 +1054,6 @@ def set_payment_refund_requested():
         return make_error_response(status=RESPONSE_PARSE_ERROR, errors=err.msg_list)
 
     # Parse and validate values
-    if version != 0:
-        err.msg_list.append(f'Unrecognised version passed: {version}')
     master_pkey_bytes = base.hex_to_bytes(hex=master_pkey, label='Master public key',    hex_len=nacl.bindings.crypto_sign_PUBLICKEYBYTES * 2, err=err)
     master_sig_bytes  = base.hex_to_bytes(hex=master_sig,  label='Master key signature', hex_len=nacl.bindings.crypto_sign_BYTES * 2,          err=err)
 
@@ -1127,8 +1091,7 @@ def set_payment_refund_requested():
 
     # Validate the signature
     master_pkey_nacl      = nacl.signing.VerifyKey(master_pkey_bytes)
-    hash_to_verify: bytes = backend.make_set_payment_refund_requested_hash(version             = version,
-                                                                           master_pkey         = master_pkey_nacl,
+    hash_to_verify: bytes = backend.make_set_payment_refund_requested_hash(master_pkey         = master_pkey_nacl,
                                                                            request_at          = request_at,
                                                                            refund_requested_at = refund_requested_at,
                                                                            payment_tx          = user_payment)
@@ -1147,5 +1110,5 @@ def set_payment_refund_requested():
                                                    payment_tx          = user_payment,
                                                    refund_requested_at = refund_requested_at if refund_requested_ts else None)
 
-            result = make_success_response(dict_result={'version': 0, 'updated': updated})
+            result = make_success_response(dict_result={'updated': updated})
             return result

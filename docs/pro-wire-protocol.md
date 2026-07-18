@@ -60,6 +60,10 @@
     not `"12m"`). **Display/accounting only** (never computed with); recurrence is the separate
     `auto_renewing` field, *not* part of this code. Client maps/parses it for display; backend groups by it.
   - A `nil`/unset value is never valid on the wire — every stored row has a real code.
+- **No `version` field or version byte, anywhere** (Delta #11). Neither the signed digests (§2/§3) nor
+  any request/response body carries a version. Messages are domain-separated by their **personalisation**
+  (in the hash) and the **endpoint** (on the wire); a new message shape earns a **new endpoint**, not a
+  `"version"` discriminator in a shared body.
 
 ## 2. The Pro proof (signed by the backend)
 
@@ -68,19 +72,19 @@ verified offline**; it carries **no user identity**.
 
 **Wire (JSON):**
 ```
-{ "version": 0,
-  "revocation_tag": "<64 hex>",   // opaque 32-byte value; see §2.1
+{ "revocation_tag": "<64 hex>",   // opaque 32-byte value; see §2.1
   "rotating_pkey":  "<64 hex>",   // Ed25519 public key the proof entitles
   "expiry_ts": <int>,             // seconds; entitlement valid until this instant
   "sig": "<128 hex>" }            // Ed25519 over the digest below
 ```
+There is **no `version` field** (§1, Delta #11): a new proof shape gets a new personalisation, not a
+body version marker.
 
 **Signed digest** — `sig = Ed25519(backend_key, H)` where
 ```
 H = BLAKE2b-256(
       person = "ProProof________",              # 16 bytes
-      version  .to_bytes(1,  'little')
-   ‖  revocation_tag                             # 32 bytes, raw
+      revocation_tag                             # 32 bytes, raw
    ‖  rotating_pkey                              # 32 bytes, raw
    ‖  expiry_ts.to_bytes(8,  'little'))          # seconds
 ```
@@ -98,26 +102,28 @@ client can or should compute.)
 
 Each request is authorised by an Ed25519 signature from the account **master key** over a
 personalised BLAKE2b-256 digest. Field order and widths are exact. `ts` is the caller's clock
-(backend accepts it within a tolerance window, currently ±70 s).
+(backend accepts it within a tolerance window, currently ±70 s). **No digest carries a `version`
+prefix** and no request body carries a `version` field (§1, Delta #11) — the personalisation + the
+endpoint already domain-separate each message; a new request shape gets a new endpoint.
 
 **3.1 generate-proof** — person `ProGenerateProof`
 ```
-version(1) ‖ master_pkey(32) ‖ rotating_pkey(32) ‖ ts(8)
+master_pkey(32) ‖ rotating_pkey(32) ‖ ts(8)
 ```
 
 **3.2 add-payment** — person `ProAddPayment___`  (note: **no timestamp**)
 ```
-version(1) ‖ master_pkey(32) ‖ rotating_pkey(32) ‖ provider_code ‖ payment_id (§3.5)
+master_pkey(32) ‖ rotating_pkey(32) ‖ provider_code ‖ payment_id (§3.5)
 ```
 
 **3.3 set-refund-requested** — person `ProSetRefundReq_`  (note: **no rotating_pkey**, two timestamps)
 ```
-version(1) ‖ master_pkey(32) ‖ ts(8) ‖ refund_requested_ts(8) ‖ provider_code ‖ payment_id (§3.5)
+master_pkey(32) ‖ ts(8) ‖ refund_requested_ts(8) ‖ provider_code ‖ payment_id (§3.5)
 ```
 
 **3.4 get-pro-details** — person `ProGetProDetReq_`
 ```
-version(1) ‖ master_pkey(32) ‖ ts(8) ‖ count(4)
+master_pkey(32) ‖ ts(8) ‖ count(4)
 ```
 
 **3.5 payment_id** — one **opaque UTF-8 string** identifying the payment, appended verbatim for add-payment
@@ -146,11 +152,10 @@ Beyond that, structure is a private contract between the provider's client flow 
 Poll endpoint; response is JSON and **not signed** (fetched over TLS/onion). The client sends its
 last-seen `ticket`; the backend returns the full list only if the ticket advanced.
 
-**Request:** `{ "version": 0, "ticket": <int64> }`
+**Request:** `{ "ticket": <int64> }`  (no `version` field — §1, Delta #11)
 **Response:**
 ```
-{ "version": 0,
-  "ticket":     <int64>,   // int64 type; VALUE stays « 2^53, so a JSON number (see §1); restore-safe
+{ "ticket":     <int64>,   // int64 type; VALUE stays « 2^53, so a JSON number (see §1); restore-safe
   "retry_in":   <int>,     // recommended poll interval / throttle (seconds)
   "retain_for": <int>,     // seconds a client should keep each entry after seeing it (≈ the max
                            //   proof-validity window, ~30d). Sent, not hardcoded, so it can vary.
@@ -230,6 +235,14 @@ a `_ts` marker, durations `…_duration`. Audit every response key against both 
     `code`). `status`/`plan` are wire-only (unsigned responses) → easy. **`provider` is also in the
     add-payment / set-refund signed hashes** (was a 1-byte int, now the UTF-8 `provider_code`), so that's
     a **both-sides-flip**. `plan` is `"1m"/"3m"/"1y"` (period code, not a lookup of tiers-with-attributes).
+11. **Drop `version` entirely — from every signed digest AND the JSON wire** (Q11) — *both-sides-flip*.
+    The leading `version(1)` byte is removed from all five signed digests (§2 proof + §3.1–3.4 requests),
+    and the `version` field is removed from every request body, every response, and the proof object.
+    Rationale: a signed digest is already domain-separated by its **personalisation** and the **endpoint**
+    it is sent to, and the version was always `0` with no party negotiating it — so it bought no
+    forward-compat, only dead weight in every digest and body. If a request's meaning ever needs to change,
+    the lever is a **new endpoint** (or a new personalisation), not a body version marker. Backend +
+    libsession remove it in lockstep.
 
 ## Open (coordination)
 - **Spec home:** this file, in the backend repo (`docs/pro-wire-protocol.md`), is proposed as the
