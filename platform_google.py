@@ -4,6 +4,7 @@ asynchronous fetching operation from Google to monitor for new payments, parsing
 it and process said payments into the database layer (backend.py)
 '''
 
+import datetime
 import json
 import traceback
 import logging
@@ -232,7 +233,7 @@ def thread_entry_point(context: ThreadContext, app_credentials_path: str, cloud_
                         parse:        ParsedNotification = parse_notification(message_data, err);
                         message_id:   int                = int(it.message.message_id)
                         if err.has():
-                            log.warning(f'Discarding message #{index} because we encountered an error parsing it (message was published at {base.readable_unix_ts_ms(it.message.publish_time.ToMilliseconds())}. Message was:\n{base.maybe_obfuscate(str(it))}\nReason was:\n{err.build()}')
+                            log.warning(f'Discarding message #{index} because we encountered an error parsing it (message was published at {base.readable(base.datetime_from_unix_ms(it.message.publish_time.ToMilliseconds()))}. Message was:\n{base.maybe_obfuscate(str(it))}\nReason was:\n{err.build()}')
                         else:
                             is_new_message = True
                             for sort_it in sorted_msg_list:
@@ -260,12 +261,12 @@ def thread_entry_point(context: ThreadContext, app_credentials_path: str, cloud_
                                                 # important.
                                                 backend.google_add_notification_id_tx(tx                = tx,
                                                                                       message_id        = message_id,
-                                                                                      expiry_unix_ts_ms = parse.event_time_ms + base.MILLISECONDS_IN_DAY * 8,
+                                                                                      expires_at = base.datetime_from_unix_ms(parse.event_time_ms + base.MILLISECONDS_IN_DAY * 8),
                                                                                       payload           = google.pubsub_v1.types.ReceivedMessage.to_json(it))
 
                             db.run_and_log_errors(add_notification_id_to_db, log, "Add Google notification ID to DB failed")
                             if err.has():
-                                log.warning(f'Discarding message #{index}, attempting to add notification to DB but it repeatedly failed (message was published at {base.readable_unix_ts_ms(it.message.publish_time.ToMilliseconds())}. Message was:\n{base.maybe_obfuscate(str(it))}\nReason was:\n{err.build()}')
+                                log.warning(f'Discarding message #{index}, attempting to add notification to DB but it repeatedly failed (message was published at {base.readable(base.datetime_from_unix_ms(it.message.publish_time.ToMilliseconds()))}. Message was:\n{base.maybe_obfuscate(str(it))}\nReason was:\n{err.build()}')
                                 continue
 
                             if is_new_message:
@@ -344,7 +345,7 @@ def thread_entry_point(context: ThreadContext, app_credentials_path: str, cloud_
                                 # for the out-of-order messages that this message is dependent on to arrive,
                                 # get sorted into order and then executed successfully.
                                 msg.increase_retry_delay(now)
-                                log.error(f'Failed to handle message, retrying in {msg.curr_retry_delay_s}s (message was emitted at {base.readable_unix_ts_ms(msg.event_unix_ts_ms)}). Reason was\n{err.build()}\nMessage was\n{base.maybe_obfuscate(str(msg.raw))}')
+                                log.error(f'Failed to handle message, retrying in {msg.curr_retry_delay_s}s (message was emitted at {base.readable(base.datetime_from_unix_ms(msg.event_unix_ts_ms))}). Reason was\n{err.build()}\nMessage was\n{base.maybe_obfuscate(str(msg.raw))}')
 
                     # NOTE: Acknowledge the messages we handled successfully to stop Google from
                     # resending it to us
@@ -363,12 +364,12 @@ def thread_entry_point(context: ThreadContext, app_credentials_path: str, cloud_
                 except Exception:
                     log.error(f'Google notification handling failed. Error was {traceback.format_exc()}')
 
-def _update_payment_renewal_info(tx_payment: base.PaymentProviderTransaction, auto_renewing: bool | None, grace_period_duration_ms: int | None, tx: db.SQLTransaction, err: base.ErrorSink)-> bool:
+def _update_payment_renewal_info(tx_payment: base.PaymentProviderTransaction, auto_renewing: bool | None, grace_period: datetime.timedelta | None, tx: db.SQLTransaction, err: base.ErrorSink)-> bool:
     assert len(tx_payment.google_payment_token) > 0 and len(tx_payment.google_order_id) > 0 and not err.has()
     return backend.update_payment_renewal_info_tx(
         tx                       = tx,
         payment_tx               = tx_payment,
-        grace_period_duration_ms = grace_period_duration_ms,
+        grace_period = grace_period,
         auto_renewing            = auto_renewing,
         err                      = err,
     )
@@ -378,8 +379,8 @@ def set_payment_auto_renew(tx_payment: base.PaymentProviderTransaction, auto_ren
     if not success:
         err.msg_list.append(f'Failed to update auto_renew flag for purchase_token: {base.maybe_obfuscate(tx_payment.google_payment_token)} and order_id: {base.maybe_obfuscate(tx_payment.google_order_id)}')
 
-def set_purchase_grace_period_duration(tx_payment: base.PaymentProviderTransaction, grace_period_duration_ms: int, tx: db.SQLTransaction, err: base.ErrorSink):
-    success = _update_payment_renewal_info(tx_payment, None, grace_period_duration_ms, tx, err)
+def set_purchase_grace_period_duration(tx_payment: base.PaymentProviderTransaction, grace_period: datetime.timedelta, tx: db.SQLTransaction, err: base.ErrorSink):
+    success = _update_payment_renewal_info(tx_payment, None, grace_period, tx, err)
     if not success:
         err.msg_list.append(f'Failed to update grace period duration for purchase_token: {base.maybe_obfuscate(tx_payment.google_payment_token)} and order_id: {base.maybe_obfuscate(tx_payment.google_order_id)}')
 
@@ -428,8 +429,8 @@ def handle_subscription_notification(tx_payment: base.PaymentProviderTransaction
                     obfuscated_external_account_id: bytes = require_obfuscated_external_account_id(tx_event, err)
                     if not err.has():
                         # NOTE: Acknowledge the payment
-                        expiry:        str = base.readable_unix_ts_ms(tx_event.expiry_time.unix_milliseconds)
-                        unredeemed:    str = base.readable_unix_ts_ms(tx_event.event_ts_ms)
+                        expiry:        str = base.readable(base.datetime_from_unix_ms(tx_event.expiry_time.unix_milliseconds))
+                        unredeemed:    str = base.readable(base.datetime_from_unix_ms(tx_event.event_ts_ms))
                         payment_label: str = backend.payment_provider_tx_log_label_safe(tx_payment)
                         log.info(f'{tx_event.notification.name}+{tx_event.subscription_state.name}; (linked_token={base.maybe_obfuscate(tx_event.linked_purchase_token)}, plan={tx_event.pro_plan.name}, payment={payment_label}, unredeemed={unredeemed}, expiry={expiry})')
 
@@ -444,16 +445,16 @@ def handle_subscription_notification(tx_payment: base.PaymentProviderTransaction
                             # valid for a purchase token and void that.
                             _ = backend.add_google_revocation_tx(tx                   = tx,
                                                                  google_payment_token = tx_event.linked_purchase_token,
-                                                                 revoke_unix_ts_ms    = tx_event.event_ts_ms,
+                                                                 revoke_at    = base.datetime_from_unix_ms(tx_event.event_ts_ms),
                                                                  err                  = err)
                         # NOTE: Register the payment
                         backend.add_unredeemed_payment_tx(
                             tx                                = tx,
                             payment_tx                        = tx_payment,
                             plan                              = tx_event.pro_plan,
-                            expiry_unix_ts_ms                 = tx_event.expiry_time.unix_milliseconds,
-                            unredeemed_unix_ts_ms             = tx_event.event_ts_ms,
-                            platform_refund_expiry_unix_ts_ms = tx_event.event_ts_ms + platform_google_api.refund_deadline_duration_ms,
+                            expires_at                 = base.datetime_from_unix_ms(tx_event.expiry_time.unix_milliseconds),
+                            purchased_at             = base.datetime_from_unix_ms(tx_event.event_ts_ms),
+                            platform_refund_expires_at = base.datetime_from_unix_ms(tx_event.event_ts_ms + platform_google_api.refund_deadline_duration_ms),
                             platform_obfuscated_account_id    = obfuscated_external_account_id,
                             err                               = err,
                         )
@@ -461,7 +462,7 @@ def handle_subscription_notification(tx_payment: base.PaymentProviderTransaction
                         if not err.has():
                             set_purchase_grace_period_duration(tx_payment               = tx_payment,
                                                                tx                       = tx,
-                                                               grace_period_duration_ms = base.DEFAULT_GOOGLE_GRACE_PERIOD_DURATION_MS,
+                                                               grace_period = base.DEFAULT_GOOGLE_GRACE_PERIOD,
                                                                err                      = err)
 
         case SubscriptionNotificationType.IN_GRACE_PERIOD:
@@ -474,14 +475,14 @@ def handle_subscription_notification(tx_payment: base.PaymentProviderTransaction
                 if not err.has():
                     assert plan_details is not None
                     set_purchase_grace_period_duration(tx_payment               = tx_payment,
-                                                       grace_period_duration_ms = plan_details.grace_period.milliseconds,
+                                                       grace_period = base.timedelta_from_ms(plan_details.grace_period.milliseconds),
                                                        tx                       = tx,
                                                        err                      = err)
 
         case SubscriptionNotificationType.RECOVERED | SubscriptionNotificationType.RENEWED:
             if tx_event.subscription_state == SubscriptionsV2State.ACTIVE:
-                expiry        = base.readable_unix_ts_ms(tx_event.expiry_time.unix_milliseconds)
-                unredeemed    = base.readable_unix_ts_ms(tx_event.event_ts_ms)
+                expiry        = base.readable(base.datetime_from_unix_ms(tx_event.expiry_time.unix_milliseconds))
+                unredeemed    = base.readable(base.datetime_from_unix_ms(tx_event.event_ts_ms))
                 payment_label = backend.payment_provider_tx_log_label_safe(tx_payment)
                 log.info(f'{tx_event.notification.name}+{tx_event.subscription_state.name}; (payment={payment_label}, plan={tx_event.pro_plan.name}, unredeemed={unredeemed}, expiry={expiry})')
 
@@ -493,16 +494,16 @@ def handle_subscription_notification(tx_payment: base.PaymentProviderTransaction
                         tx                                = tx,
                         payment_tx                        = tx_payment,
                         plan                              = tx_event.pro_plan,
-                        expiry_unix_ts_ms                 = tx_event.expiry_time.unix_milliseconds,
-                        unredeemed_unix_ts_ms             = tx_event.event_ts_ms,
-                        platform_refund_expiry_unix_ts_ms = tx_event.event_ts_ms + platform_google_api.refund_deadline_duration_ms,
+                        expires_at                 = base.datetime_from_unix_ms(tx_event.expiry_time.unix_milliseconds),
+                        purchased_at             = base.datetime_from_unix_ms(tx_event.event_ts_ms),
+                        platform_refund_expires_at = base.datetime_from_unix_ms(tx_event.event_ts_ms + platform_google_api.refund_deadline_duration_ms),
                         platform_obfuscated_account_id    = obfuscated_external_account_id,
                         err                               = err)
 
                     if not err.has():
                         set_purchase_grace_period_duration(tx_payment               = tx_payment,
                                                            tx                       = tx,
-                                                           grace_period_duration_ms = base.DEFAULT_GOOGLE_GRACE_PERIOD_DURATION_MS,
+                                                           grace_period = base.DEFAULT_GOOGLE_GRACE_PERIOD,
                                                            err                      = err)
 
         case SubscriptionNotificationType.CANCELED:
@@ -526,7 +527,7 @@ def handle_subscription_notification(tx_payment: base.PaymentProviderTransaction
                 log.info(f'{tx_event.notification.name}+{tx_event.subscription_state.name}; (payment={payment_label}, auto_renew=false)')
                 _ = backend.add_google_revocation_tx(tx                   = tx,
                                                      google_payment_token = tx_payment.google_payment_token,
-                                                     revoke_unix_ts_ms    = tx_event.event_ts_ms,
+                                                     revoke_at    = base.datetime_from_unix_ms(tx_event.event_ts_ms),
                                                      err                  = err)
 
         case SubscriptionNotificationType.EXPIRED | SubscriptionNotificationType.ON_HOLD:
@@ -539,7 +540,7 @@ def handle_subscription_notification(tx_payment: base.PaymentProviderTransaction
             if tx_event.subscription_state == SubscriptionsV2State.EXPIRED \
             or tx_event.subscription_state == SubscriptionsV2State.ON_HOLD:
                 payment_label = backend.payment_provider_tx_log_label_safe(tx_payment)
-                log.info(f'{tx_event.notification.name}+{tx_event.subscription_state.name}; (payment={payment_label}, revoke={base.readable_unix_ts_ms(tx_event.event_ts_ms)})')
+                log.info(f'{tx_event.notification.name}+{tx_event.subscription_state.name}; (payment={payment_label}, revoke={base.readable(base.datetime_from_unix_ms(tx_event.event_ts_ms))})')
 
                 # TODO: If this function ever finds rounded(expiry_ts) > rounded(event_ts) the devs need to be notified somehow.
                 """If everything works as intended, this function should always find that `rounded(expiry_ts) == rounded(event_ts)` and 
@@ -552,16 +553,16 @@ def handle_subscription_notification(tx_payment: base.PaymentProviderTransaction
 
                 if not err.has():
                     assert payment is not None
-                    rounded_expiry_ts_ms = backend.round_unix_ts_ms_to_next_day_with_platform_testing_support(payment_provider=tx_payment.provider, unix_ts_ms=payment.expiry_unix_ts_ms)
-                    rounded_event_ts_ms = backend.round_unix_ts_ms_to_next_day_with_platform_testing_support(payment_provider=tx_payment.provider, unix_ts_ms=tx_event.event_ts_ms)
+                    rounded_expiry_at = backend.round_datetime_to_next_day_with_platform_testing_support(payment_provider=tx_payment.provider, at=payment.expires_at)
+                    rounded_event_at  = backend.round_datetime_to_next_day_with_platform_testing_support(payment_provider=tx_payment.provider, at=base.datetime_from_unix_ms(tx_event.event_ts_ms))
 
-                    # NOTE: expiry_unix_ts_ms in the db is not rounded, but the proof's themselves have an
+                    # NOTE: expires_at in the db is not rounded, but the proof's themselves have an
                     # expiry timestamp rounded to the end of the UTC day. So we only actually want to revoke
                     # proofs that aren't going to self-expire by the end of the day.
-                    if rounded_expiry_ts_ms > rounded_event_ts_ms:
+                    if rounded_expiry_at > rounded_event_at:
                         _ = backend.add_google_revocation_tx(tx                   = tx,
                                                              google_payment_token = tx_payment.google_payment_token,
-                                                             revoke_unix_ts_ms    = tx_event.event_ts_ms,
+                                                             revoke_at    = base.datetime_from_unix_ms(tx_event.event_ts_ms),
                                                              err                  = err)
 
         # NOTE: Explicitly unsupported cases

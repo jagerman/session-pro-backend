@@ -60,14 +60,14 @@ from appstoreserverlibrary.models.RevocationReason             import Revocation
 from appstoreserverlibrary.models.AutoRenewStatus              import AutoRenewStatus              as AppleAutoRenewStatus
 from appstoreserverlibrary.models.ConsumptionRequestReason     import ConsumptionRequestReason     as AppleConsumptionRequestReason
 
-def derived_status(payment: backend.PaymentRow, at_unix_ts_ms: int | None = None) -> base.PaymentStatus:
+def derived_status(payment: backend.PaymentRow, at: datetime.datetime | None = None) -> base.PaymentStatus:
     """A payment's status is derived from its timestamps, not stored (see backend.derive_payment_status).
 
     These assertions check the *latched* facts — redeemed / revoked / unredeemed — which do not depend
-    on the observation time (revoked short-circuits; ingest is always before expiry), so by default we
-    observe at the payment's ingest instant. Pass `at_unix_ts_ms` to probe the one time-relative
-    boundary, expiry, explicitly (e.g. `expiry_unix_ts_ms` to assert Expired)."""
-    return backend.derive_payment_status(payment, payment.unredeemed_unix_ts_ms if at_unix_ts_ms is None else at_unix_ts_ms)
+    on the observation time (revoked short-circuits; purchase is always before expiry), so by default we
+    observe at the payment's purchase instant. Pass `at` to probe the one time-relative boundary,
+    expiry, explicitly (e.g. `payment.expires_at` to assert Expired)."""
+    return backend.derive_payment_status(payment, payment.purchased_at if at is None else at)
 
 @dataclasses.dataclass
 class TestingContext:
@@ -90,7 +90,7 @@ class TestingContext:
     def __enter__(self):
         base.PLATFORM_TESTING_ENV = self.platform_testing_env
         if base.PLATFORM_TESTING_ENV:
-            base.DEFAULT_GOOGLE_GRACE_PERIOD_DURATION_MS = platform_google_api.testing_grace_period_duration_ms
+            base.DEFAULT_GOOGLE_GRACE_PERIOD = base.timedelta_from_ms(platform_google_api.testing_grace_period_duration_ms)
 
         # Mint a fresh database on the ephemeral PostgreSQL cluster
         assert self.db_url_factory is not None
@@ -118,7 +118,7 @@ class TestingContext:
                  traceback: traceback.TracebackException | None):
         self.db_engine.close()
         base.PLATFORM_TESTING_ENV                    = False
-        base.DEFAULT_GOOGLE_GRACE_PERIOD_DURATION_MS = base.DEFAULT_APPLE_GRACE_PERIOD_DURATION_MS
+        base.DEFAULT_GOOGLE_GRACE_PERIOD = base.DEFAULT_APPLE_GRACE_PERIOD
         return False
 
     @contextlib.contextmanager
@@ -212,8 +212,8 @@ def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_d
     backend_key:         nacl.signing.SigningKey = nacl.signing.SigningKey.generate()
     master_key:          nacl.signing.SigningKey = nacl.signing.SigningKey.generate()
     rotating_key:        nacl.signing.SigningKey = nacl.signing.SigningKey.generate()
-    unix_ts_ms:          int                     = int(time.time() * 1000)
-    redeemed_unix_ts_ms: int                     = base.round_unix_ts_ms_to_next_day(unix_ts_ms)
+    now:                 datetime.datetime       = datetime.datetime.now(datetime.timezone.utc)
+    redeemed_at:         datetime.datetime       = base.round_datetime_to_next_day(now)
 
     @dataclasses.dataclass
     class Scenario:
@@ -222,22 +222,22 @@ def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_d
         plan:                     base.ProPlan                 = base.ProPlan.Nil
         proof:                    backend.ProSubscriptionProof = dataclasses.field(default_factory=backend.ProSubscriptionProof)
         payment_provider:         base.PaymentProvider         = base.PaymentProvider.Nil
-        expiry_unix_ts_ms:        int                          = 0
-        grace_period_duration_ms: int                          = 0
+        expires_at:        datetime.datetime            = base.EPOCH
+        grace_period:      datetime.timedelta           = datetime.timedelta(0)
 
     scenarios: list[Scenario] = [
         Scenario(google_payment_token     = os.urandom(backend.BLAKE2B_DIGEST_SIZE).hex(),
                  google_order_id          = 'DEV.' + os.urandom(backend.BLAKE2B_DIGEST_SIZE).hex(),
                  plan                     = base.ProPlan.OneMonth,
-                 expiry_unix_ts_ms        = redeemed_unix_ts_ms + ((30 * base.SECONDS_IN_DAY) * 1000),
-                 grace_period_duration_ms = 0,
+                 expires_at        = redeemed_at + datetime.timedelta(days=30),
+                 grace_period = datetime.timedelta(0),
                  payment_provider         = base.PaymentProvider.GooglePlayStore),
 
         Scenario(google_payment_token     = os.urandom(backend.BLAKE2B_DIGEST_SIZE).hex(),
                  google_order_id          = 'DEV.' + os.urandom(backend.BLAKE2B_DIGEST_SIZE).hex(),
                  plan                     = base.ProPlan.TwelveMonth,
-                 expiry_unix_ts_ms        = redeemed_unix_ts_ms + ((31 * base.SECONDS_IN_DAY) * 1000),
-                 grace_period_duration_ms = 0,
+                 expires_at        = redeemed_at + datetime.timedelta(days=31),
+                 grace_period = datetime.timedelta(0),
                  payment_provider         = base.PaymentProvider.GooglePlayStore)
     ]
 
@@ -254,9 +254,9 @@ def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_d
         backend.add_unredeemed_payment(conn                              = db_conn,
                                        payment_tx                        = payment_tx,
                                        plan                              = it.plan,
-                                       unredeemed_unix_ts_ms             = unix_ts_ms,
-                                       expiry_unix_ts_ms                 = it.expiry_unix_ts_ms,
-                                       platform_refund_expiry_unix_ts_ms = 0,
+                                       purchased_at             = now,
+                                       expires_at                 = it.expires_at,
+                                       platform_refund_expires_at = base.EPOCH,
                                        platform_obfuscated_account_id    = backend.google_obfuscated_account_id_from_master_pkey(master_key.verify_key),
                                        err                               = err)
         assert len(err.msg_list) == 0
@@ -265,10 +265,10 @@ def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_d
         assert len(unredeemed_payment_list)                       == 1
         assert derived_status(unredeemed_payment_list[0])                  == base.PaymentStatus.Unredeemed
         assert unredeemed_payment_list[0].payment_provider        == it.payment_provider
-        assert unredeemed_payment_list[0].unredeemed_unix_ts_ms   == unix_ts_ms
-        assert unredeemed_payment_list[0].redeemed_unix_ts_ms     == None
-        assert unredeemed_payment_list[0].expiry_unix_ts_ms       == it.expiry_unix_ts_ms
-        assert unredeemed_payment_list[0].revoked_unix_ts_ms      == None
+        assert unredeemed_payment_list[0].purchased_at   == now
+        assert unredeemed_payment_list[0].redeemed_at     == None
+        assert unredeemed_payment_list[0].expires_at       == it.expires_at
+        assert unredeemed_payment_list[0].revoked_at      == None
         assert unredeemed_payment_list[0].google_payment_token    == it.google_payment_token
         assert unredeemed_payment_list[0].google_order_id         == it.google_order_id
         assert unredeemed_payment_list[0].plan                    == it.plan
@@ -288,8 +288,8 @@ def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_d
         redeemed_payment = backend.verify_and_add_pro_payment(version             = version,
                                                    conn                = db_conn,
                                                    signing_key         = backend_key,
-                                                   unix_ts_ms          = unix_ts_ms,
-                                                   redeemed_unix_ts_ms = redeemed_unix_ts_ms,
+                                                   request_at          = now,
+                                                   redeemed_at = redeemed_at,
                                                    master_pkey         = master_key.verify_key,
                                                    rotating_pkey       = rotating_key.verify_key,
                                                    payment_tx          = add_pro_payment_tx,
@@ -308,8 +308,8 @@ def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_d
         redeemed_payment_2nd = backend.verify_and_add_pro_payment(version             = version,
                                                        conn                = db_conn,
                                                        signing_key         = backend_key,
-                                                       unix_ts_ms          = unix_ts_ms,
-                                                       redeemed_unix_ts_ms = redeemed_unix_ts_ms,
+                                                       request_at          = now,
+                                                       redeemed_at = redeemed_at,
                                                        master_pkey         = master_key.verify_key,
                                                        rotating_pkey       = rotating_key.verify_key,
                                                        payment_tx          = add_pro_payment_tx,
@@ -330,7 +330,7 @@ def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_d
     assert len(user_list)                                  == 1
     assert user_list[0].master_pkey                        == bytes(master_key.verify_key), 'lhs={}, rhs={}'.format(user_list[0].master_pkey.hex(), bytes(master_key.verify_key).hex())
     assert user_list[0].gen_index                          == runtime.gen_index - 1
-    assert user_list[0].expiry_unix_ts_ms                  == scenarios[1].expiry_unix_ts_ms
+    assert user_list[0].expires_at                  == scenarios[1].expires_at
 
     payment_list: list[backend.PaymentRow]                  = backend.get_payments_list(db_conn)
     assert len(payment_list)                               == 2
@@ -338,9 +338,9 @@ def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_d
     assert payment_list[0].plan                            == scenarios[0].plan
     assert payment_list[0].payment_provider                == scenarios[0].payment_provider
     assert payment_list[0].auto_renewing                   == True
-    assert payment_list[0].redeemed_unix_ts_ms             == redeemed_unix_ts_ms
-    assert payment_list[0].expiry_unix_ts_ms               == scenarios[0].expiry_unix_ts_ms
-    assert payment_list[0].revoked_unix_ts_ms              is None
+    assert payment_list[0].redeemed_at             == redeemed_at
+    assert payment_list[0].expires_at               == scenarios[0].expires_at
+    assert payment_list[0].revoked_at              is None
     assert payment_list[0].google_payment_token            == scenarios[0].google_payment_token
     assert payment_list[0].google_order_id                 == scenarios[0].google_order_id
     assert len(payment_list[0].apple.tx_id)                == 0
@@ -351,9 +351,9 @@ def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_d
     assert payment_list[1].plan                            == scenarios[1].plan
     assert payment_list[1].payment_provider                == scenarios[1].payment_provider
     assert payment_list[1].auto_renewing                   == True
-    assert payment_list[1].redeemed_unix_ts_ms             == redeemed_unix_ts_ms
-    assert payment_list[1].expiry_unix_ts_ms               == scenarios[1].expiry_unix_ts_ms
-    assert payment_list[1].revoked_unix_ts_ms              is None
+    assert payment_list[1].redeemed_at             == redeemed_at
+    assert payment_list[1].expires_at               == scenarios[1].expires_at
+    assert payment_list[1].revoked_at              is None
     assert payment_list[1].google_payment_token            == scenarios[1].google_payment_token
     assert payment_list[1].google_order_id                 == scenarios[1].google_order_id
     assert len(payment_list[0].apple.tx_id)                == 0
@@ -363,7 +363,7 @@ def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_d
     revocation_list: list[backend.RevocationRow]            = backend.get_revocations_list(db_conn)
     assert len(revocation_list)                            == 0
 
-    expire_result: backend.ExpireResult                     = backend.expire_payments_revocations_and_users(db_conn, unix_ts_ms=scenarios[0].expiry_unix_ts_ms)
+    expire_result: backend.ExpireResult                     = backend.expire_payments_revocations_and_users(db_conn, now=scenarios[0].expires_at)
     assert expire_result.already_done_by_someone_else      == False
     assert expire_result.success                           == True
     assert expire_result.payments                          == 1
@@ -375,10 +375,10 @@ def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_d
     payment_tx.provider                                     = scenarios[1].payment_provider
     payment_tx.google_payment_token                         = scenarios[1].google_payment_token
     payment_tx.google_order_id                              = scenarios[1].google_order_id
-    new_grace_duration_ms                                   = 10000
+    new_grace_period                                   = datetime.timedelta(milliseconds=10000)
     updated: bool                                           = backend.update_payment_renewal_info(conn                     = db_conn,
                                                                                                   payment_tx               = payment_tx,
-                                                                                                  grace_period_duration_ms = new_grace_duration_ms,
+                                                                                                  grace_period = new_grace_period,
                                                                                                   auto_renewing            = False,
                                                                                                   err                      = err)
     assert not err.has() and updated
@@ -390,10 +390,10 @@ def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_d
     assert payment_list[0].plan         == scenarios[0].plan
     assert payment_list[0].payment_provider                == scenarios[0].payment_provider
     assert payment_list[0].auto_renewing                   == True
-    assert payment_list[0].redeemed_unix_ts_ms             == redeemed_unix_ts_ms
-    assert payment_list[0].expiry_unix_ts_ms               == scenarios[0].expiry_unix_ts_ms
-    assert payment_list[0].grace_period_duration_ms        == scenarios[0].grace_period_duration_ms
-    assert payment_list[0].revoked_unix_ts_ms              is None
+    assert payment_list[0].redeemed_at             == redeemed_at
+    assert payment_list[0].expires_at               == scenarios[0].expires_at
+    assert payment_list[0].grace_period        == scenarios[0].grace_period
+    assert payment_list[0].revoked_at              is None
     assert payment_list[0].google_payment_token            == scenarios[0].google_payment_token
     assert payment_list[0].google_order_id                 == scenarios[0].google_order_id
     assert len(payment_list[0].apple.tx_id)                == 0
@@ -404,10 +404,10 @@ def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_d
     assert payment_list[1].plan                            == scenarios[1].plan
     assert payment_list[1].payment_provider                == scenarios[1].payment_provider
     assert payment_list[1].auto_renewing                   == False
-    assert payment_list[1].redeemed_unix_ts_ms             == redeemed_unix_ts_ms
-    assert payment_list[1].expiry_unix_ts_ms               == scenarios[1].expiry_unix_ts_ms
-    assert payment_list[1].grace_period_duration_ms        == new_grace_duration_ms
-    assert payment_list[1].revoked_unix_ts_ms              is None
+    assert payment_list[1].redeemed_at             == redeemed_at
+    assert payment_list[1].expires_at               == scenarios[1].expires_at
+    assert payment_list[1].grace_period        == new_grace_period
+    assert payment_list[1].revoked_at              is None
     assert payment_list[1].google_payment_token            == scenarios[1].google_payment_token
     assert payment_list[1].google_order_id                 == scenarios[1].google_order_id
     assert len(payment_list[0].apple.tx_id)                == 0
@@ -418,7 +418,7 @@ def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_d
     with db.transaction(db_conn) as tx:
         get: backend.GetUserAndPayments           = backend.get_user_and_payments(tx=tx, master_pkey=master_key.verify_key)
         assert get.user.auto_renewing            == False
-        assert get.user.grace_period_duration_ms == new_grace_duration_ms
+        assert get.user.grace_period == new_grace_period
 
     # NOTE: Verify the DB invariants
     _ = backend.verify_db(db_conn, err)
@@ -437,14 +437,14 @@ def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_d
         Scenario(google_payment_token     = auto_redeem_google_payment_token,
                  google_order_id          = 'DEV.' + os.urandom(backend.BLAKE2B_DIGEST_SIZE).hex(),
                  plan                     = base.ProPlan.OneMonth,
-                 expiry_unix_ts_ms        = redeemed_unix_ts_ms + ((30 * base.SECONDS_IN_DAY) * 1000),
-                 grace_period_duration_ms = 0,
+                 expires_at        = redeemed_at + datetime.timedelta(days=30),
+                 grace_period = datetime.timedelta(0),
                  payment_provider         = base.PaymentProvider.GooglePlayStore),
         Scenario(google_payment_token     = auto_redeem_google_payment_token,
                  google_order_id          = 'DEV.' + os.urandom(backend.BLAKE2B_DIGEST_SIZE).hex(),
                  plan                     = base.ProPlan.TwelveMonth,
-                 expiry_unix_ts_ms        = redeemed_unix_ts_ms + ((31 * base.SECONDS_IN_DAY) * 1000),
-                 grace_period_duration_ms = 0,
+                 expires_at        = redeemed_at + datetime.timedelta(days=31),
+                 grace_period = datetime.timedelta(0),
                  payment_provider         = base.PaymentProvider.GooglePlayStore)
     ]
 
@@ -459,9 +459,9 @@ def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_d
         backend.add_unredeemed_payment(conn                              = db_conn,
                                        payment_tx                        = payment_tx,
                                        plan                              = it.plan,
-                                       unredeemed_unix_ts_ms             = unix_ts_ms,
-                                       expiry_unix_ts_ms                 = it.expiry_unix_ts_ms,
-                                       platform_refund_expiry_unix_ts_ms = 0,
+                                       purchased_at             = now,
+                                       expires_at                 = it.expires_at,
+                                       platform_refund_expires_at = base.EPOCH,
                                        platform_obfuscated_account_id    = backend.google_obfuscated_account_id_from_master_pkey(auto_redeem_user_master_key.verify_key),
                                        err                               = err)
         assert len(err.msg_list) == 0
@@ -487,8 +487,8 @@ def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_d
             redeemed_payment: backend.RedeemPayment = backend.verify_and_add_pro_payment(version             = version,
                                                                               conn                = db_conn,
                                                                               signing_key         = backend_key,
-                                                                              unix_ts_ms          = unix_ts_ms,
-                                                                              redeemed_unix_ts_ms = redeemed_unix_ts_ms,
+                                                                              request_at          = now,
+                                                                              redeemed_at = redeemed_at,
                                                                               master_pkey         = auto_redeem_user_master_key.verify_key,
                                                                               rotating_pkey       = auto_redeem_user_rotating_key.verify_key,
                                                                               payment_tx          = add_pro_payment_tx,
@@ -520,17 +520,17 @@ def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_d
             assert payments_list[2].google_order_id          == auto_redeem_scenarios[0].google_order_id
             assert payments_list[2].google_payment_token     == auto_redeem_google_payment_token
             assert payments_list[2].master_pkey              == bytes(auto_redeem_user_master_key.verify_key)
-            assert payments_list[2].unredeemed_unix_ts_ms    == unix_ts_ms
+            assert payments_list[2].purchased_at    == now
             assert payments_list[2].auto_renewing            == True
-            assert payments_list[2].grace_period_duration_ms == auto_redeem_scenarios[0].grace_period_duration_ms
+            assert payments_list[2].grace_period == auto_redeem_scenarios[0].grace_period
 
             assert derived_status(payments_list[3])                   == base.PaymentStatus.Redeemed
             assert payments_list[3].google_order_id          == auto_redeem_scenarios[1].google_order_id
             assert payments_list[3].google_payment_token     == auto_redeem_google_payment_token
             assert payments_list[3].master_pkey              == bytes(auto_redeem_user_master_key.verify_key)
-            assert payments_list[3].redeemed_unix_ts_ms      == backend.convert_unix_ts_ms_to_redeemed_unix_ts_ms(payments_list[3].unredeemed_unix_ts_ms)
+            assert payments_list[3].redeemed_at      == backend.to_redeemed_at(payments_list[3].purchased_at)
             assert payments_list[3].auto_renewing            == True
-            assert payments_list[3].grace_period_duration_ms == auto_redeem_scenarios[1].grace_period_duration_ms
+            assert payments_list[3].grace_period == auto_redeem_scenarios[1].grace_period
 
 def test_server_add_payment_flow(monkeypatch, pg_database):
     monkeypatch.setattr(
@@ -564,8 +564,9 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
 
         # Register an unredeemed payment (by writing the the token to the DB directly)
         start_unix_ts_ms: int           = int(time.time() * 1000)
-        unix_ts_ms: int                 = start_unix_ts_ms
-        next_day_unix_ts_ms: int        = base.round_unix_ts_ms_to_next_day(unix_ts_ms)
+        unix_ts_ms: int                 = start_unix_ts_ms                          # ms, for the wire bodies
+        request_at                      = base.datetime_from_unix_ms(unix_ts_ms)    # datetime, for hashes + DB seeding
+        next_day_at                     = base.round_datetime_to_next_day(request_at)
         master_key                      = nacl.signing.SigningKey.generate()
         rotating_key                    = nacl.signing.SigningKey.generate()
         payment_tx                      = base.PaymentProviderTransaction()
@@ -575,9 +576,9 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
         backend.add_unredeemed_payment(conn                              = db_conn,
                                        payment_tx                        = payment_tx,
                                        plan                              = base.ProPlan.OneMonth,
-                                       unredeemed_unix_ts_ms             = unix_ts_ms,
-                                       expiry_unix_ts_ms                 = next_day_unix_ts_ms + ((base.SECONDS_IN_DAY * 90) * 1000),
-                                       platform_refund_expiry_unix_ts_ms = 0,
+                                       purchased_at             = request_at,
+                                       expires_at                 = next_day_at + datetime.timedelta(days=90),
+                                       platform_refund_expires_at = base.EPOCH,
                                        platform_obfuscated_account_id    = backend.google_obfuscated_account_id_from_master_pkey(master_key.verify_key),
                                        err                               = err)
         assert len(err.msg_list) == 0, f'{err.msg_list}'
@@ -585,7 +586,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
         if 1: # Grab the pro status before anything has happened
             version:      int   = 0
             count:        int   = 10_000
-            hash_to_sign: bytes = backend.make_get_pro_details_hash(version=version, master_pkey=master_key.verify_key, unix_ts_ms=unix_ts_ms, count=count)
+            hash_to_sign: bytes = backend.make_get_pro_details_hash(version=version, master_pkey=master_key.verify_key, request_at=base.datetime_from_unix_ms(unix_ts_ms), count=count)
             request_body={'version':     version,
                           'master_pkey': bytes(master_key.verify_key).hex(),
                           'master_sig':  bytes(master_key.sign(hash_to_sign).signature).hex(),
@@ -688,7 +689,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
             proof_hash: bytes = backend.build_proof_hash(result_version,
                                                          result_gen_index_hash,
                                                          result_rotating_pkey,
-                                                         result_expiry_unix_ts_ms)
+                                                         base.datetime_from_unix_ms(result_expiry_unix_ts_ms))
             runtime = backend.get_runtime(db_conn)
             _ = backend_key.verify_key.verify(smessage=proof_hash, signature=result_sig)
 
@@ -703,7 +704,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
             hash_to_sign: bytes = backend.make_generate_pro_proof_hash(version=version,
                                                                        master_pkey=master_key.verify_key,
                                                                        rotating_pkey=new_rotating_key.verify_key,
-                                                                       unix_ts_ms=unix_ts_ms)
+                                                                       request_at=base.datetime_from_unix_ms(unix_ts_ms))
 
             request_body = {
                 'version':       version,
@@ -757,14 +758,14 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
             proof_hash = backend.build_proof_hash(result_version,
                                                   result_gen_index_hash,
                                                   result_rotating_pkey,
-                                                  result_expiry_unix_ts_ms)
+                                                  base.datetime_from_unix_ms(result_expiry_unix_ts_ms))
             _ = backend_key.verify_key.verify(smessage=proof_hash, signature=result_sig)
 
             # Check that the expiry time does not exceed 31 days (we clamped to 30 days and if there's
             # overrun of 30 days we round up to 31 days)
-            assert result_expiry_unix_ts_ms % base.SECONDS_IN_DAY == 0
-            assert result_expiry_unix_ts_ms == base.round_unix_ts_ms_to_start_of_day(unix_ts_ms + (base.MILLISECONDS_IN_DAY * 31)) or \
-                   result_expiry_unix_ts_ms == base.round_unix_ts_ms_to_start_of_day(unix_ts_ms + (base.MILLISECONDS_IN_DAY * 30))
+            assert result_expiry_unix_ts_ms % base.MILLISECONDS_IN_DAY == 0
+            assert result_expiry_unix_ts_ms == base.unix_ms_from_datetime(base.round_datetime_to_start_of_day(request_at + datetime.timedelta(days=31))) or \
+                   result_expiry_unix_ts_ms == base.unix_ms_from_datetime(base.round_datetime_to_start_of_day(request_at + datetime.timedelta(days=30)))
 
         new_add_pro_payment_tx = backend.UserPaymentTransaction()
         if 1: # Register another payment on the same user, backend will choose the latest expiring payment
@@ -775,9 +776,9 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
             backend.add_unredeemed_payment(conn                              = db_conn,
                                            payment_tx                        = new_payment_tx,
                                            plan                              = base.ProPlan.OneMonth,
-                                           unredeemed_unix_ts_ms             = unix_ts_ms,
-                                           expiry_unix_ts_ms                 = unix_ts_ms + ((base.SECONDS_IN_DAY * 30) * 1000),
-                                           platform_refund_expiry_unix_ts_ms = 0,
+                                           purchased_at             = request_at,
+                                           expires_at                 = request_at + datetime.timedelta(days=30),
+                                           platform_refund_expires_at = base.EPOCH,
                                            platform_obfuscated_account_id    = backend.google_obfuscated_account_id_from_master_pkey(master_key.verify_key),
                                            err                               = err)
 
@@ -845,7 +846,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
             proof_hash: bytes = backend.build_proof_hash(result_version,
                                                          result_gen_index_hash,
                                                          result_rotating_pkey,
-                                                         result_expiry_unix_ts_ms)
+                                                         base.datetime_from_unix_ms(result_expiry_unix_ts_ms))
             _ = backend_key.verify_key.verify(smessage=proof_hash, signature=result_sig)
 
         curr_revocation_ticket: int = 0
@@ -906,7 +907,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
             with db.transaction(db_conn) as tx:
                 revoked = backend.add_google_revocation_tx(tx                   = tx,
                                                            google_payment_token = new_add_pro_payment_tx.google_payment_token,
-                                                           revoke_unix_ts_ms    = unix_ts_ms,
+                                                           revoke_at    = base.datetime_from_unix_ms(unix_ts_ms),
                                                            err                  = err)
                 assert revoked
                 assert not err.has()
@@ -959,7 +960,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
                     assert 'gen_index_hash'   in it and isinstance(it['gen_index_hash'], str)
                     assert 'effective_unix_ts_ms' in it and isinstance(it['effective_unix_ts_ms'], int)
                     assert it['gen_index_hash']    == post_revoke_gen_index_hash.hex()
-                    assert it['expiry_unix_ts_ms'] == get_user.user.expiry_unix_ts_ms
+                    assert it['expiry_unix_ts_ms'] == base.unix_ms_from_datetime(get_user.user.expires_at)
                     # effective_unix_ts_ms should be creation time + 1 day (86400 seconds)
                     # Since we can't know exact creation time in the test, just verify it's a reasonable value
                     assert it['effective_unix_ts_ms'] > 0
@@ -1011,7 +1012,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
             version:      int   = 0
             unix_ts_ms:   int   = int(time.time() * 1000)
             count:        int   = 10_000
-            hash_to_sign: bytes = backend.make_get_pro_details_hash(version=version, master_pkey=master_key.verify_key, unix_ts_ms=unix_ts_ms, count=count)
+            hash_to_sign: bytes = backend.make_get_pro_details_hash(version=version, master_pkey=master_key.verify_key, request_at=base.datetime_from_unix_ms(unix_ts_ms), count=count)
 
             request_body={'version':     version,
                           'master_pkey': bytes(master_key.verify_key).hex(),
@@ -1052,7 +1053,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
             # Retry the request but use a too old timestamp
             if 1:
                 unix_ts_ms:   int   = int((time.time() * 1000) + (server.DEFAULT_TIMESTAMP_TOLERANCE_MS * 2))
-                hash_to_sign: bytes = backend.make_get_pro_details_hash(version=version, master_pkey=master_key.verify_key, unix_ts_ms=unix_ts_ms, count=count)
+                hash_to_sign: bytes = backend.make_get_pro_details_hash(version=version, master_pkey=master_key.verify_key, request_at=base.datetime_from_unix_ms(unix_ts_ms), count=count)
                 onion_request = onion_req.make_request_v4(our_x25519_pkey=our_x25519_skey.public_key,
                                                           shared_key=shared_key,
                                                           endpoint=server.FLASK_ROUTE_GET_PRO_DETAILS,
@@ -1080,7 +1081,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
             if 1:
                 unix_ts_ms:    int   = int(time.time() * 1000)
                 count:         int   = 10_000
-                hash_to_sign:  bytes = backend.make_get_pro_details_hash(version=version, master_pkey=rotating_key.verify_key, unix_ts_ms=unix_ts_ms, count=count)
+                hash_to_sign:  bytes = backend.make_get_pro_details_hash(version=version, master_pkey=rotating_key.verify_key, request_at=base.datetime_from_unix_ms(unix_ts_ms), count=count)
                 onion_request = onion_req.make_request_v4(our_x25519_pkey=our_x25519_skey.public_key,
                                                           shared_key=shared_key,
                                                           endpoint=server.FLASK_ROUTE_GET_PRO_DETAILS,
@@ -1108,7 +1109,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
             if 1:
                 unix_ts_ms:   int   = int(time.time() * 1000)
                 count:        int   = 0
-                hash_to_sign: bytes = backend.make_get_pro_details_hash(version=version, master_pkey=master_key.verify_key, unix_ts_ms=unix_ts_ms, count=count)
+                hash_to_sign: bytes = backend.make_get_pro_details_hash(version=version, master_pkey=master_key.verify_key, request_at=base.datetime_from_unix_ms(unix_ts_ms), count=count)
                 onion_request       = onion_req.make_request_v4(our_x25519_pkey=our_x25519_skey.public_key,
                                                           shared_key=shared_key,
                                                           endpoint=server.FLASK_ROUTE_GET_PRO_DETAILS,
@@ -1139,12 +1140,12 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
             # NOTE: Verify that there is no grace period set first
             with db.transaction(db_conn) as tx:
                 get_user: backend.GetUserAndPayments = backend.get_user_and_payments(tx, master_key.verify_key)
-                assert get_user.user.grace_period_duration_ms == 0
+                assert get_user.user.grace_period == datetime.timedelta(0)
 
             # NOTE: Grab the latest expiring payment so that we have access to the payment details
             last_payment = backend.PaymentRow()
             for payment_it in backend.get_payments_list(db_conn):
-                if payment_it.expiry_unix_ts_ms > last_payment.expiry_unix_ts_ms:
+                if payment_it.expires_at > last_payment.expires_at:
                     last_payment = payment_it
 
             # NOTE: Add a grace period
@@ -1157,7 +1158,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
             payment_tx.google_order_id            = last_payment.google_order_id
             _ = backend.update_payment_renewal_info(db_conn,
                                                     payment_tx,
-                                                    grace_period_duration_ms=10 * 1000,
+                                                    grace_period=base.timedelta_from_ms(10 * 1000),
                                                     auto_renewing=True,
                                                     err=err)
             assert not err.has()
@@ -1166,8 +1167,8 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
             pro_proof_deadline_unix_ts_ms: int = 0
             with db.transaction(db_conn) as tx:
                 get_user: backend.GetUserAndPayments = backend.get_user_and_payments(tx, master_key.verify_key)
-                assert get_user.user.grace_period_duration_ms > 0
-                pro_proof_deadline_unix_ts_ms = get_user.user.expiry_unix_ts_ms
+                assert get_user.user.grace_period > datetime.timedelta(0)
+                pro_proof_deadline_unix_ts_ms = base.unix_ms_from_datetime(get_user.user.expires_at)
 
             # NOTE: Try to generate a proof on the deadline timestamp (which includes grace), should be permitted
             request_version: int   = 0
@@ -1175,7 +1176,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
             hash_to_sign:    bytes = backend.make_generate_pro_proof_hash(version       = request_version,
                                                                      master_pkey   = master_key.verify_key,
                                                                      rotating_pkey = rotating_key.verify_key,
-                                                                     unix_ts_ms    = unix_ts_ms)
+                                                                     request_at    = base.datetime_from_unix_ms(unix_ts_ms))
 
             runtime = backend.get_runtime(db_conn)
             proof: backend.ProSubscriptionProof = backend.generate_pro_proof(conn           = db_conn,
@@ -1184,17 +1185,17 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
                                                                              gen_index_salt = runtime.gen_index_salt,
                                                                              master_pkey    = master_key.verify_key,
                                                                              rotating_pkey  = rotating_key.verify_key,
-                                                                             unix_ts_ms     = unix_ts_ms,
+                                                                             request_at     = base.datetime_from_unix_ms(unix_ts_ms),
                                                                              master_sig     = bytes(master_key.sign(hash_to_sign).signature),
                                                                              rotating_sig   = bytes(rotating_key.sign(hash_to_sign).signature),
                                                                              err            = err)
-            assert not err.has(), base.readable_unix_ts_ms(pro_proof_deadline_unix_ts_ms)
+            assert not err.has(), base.readable(pro_proof_deadline_unix_ts_ms)
 
             # NOTE: Check that the proof is invalid
             proof_hash = backend.build_proof_hash(proof.version,
                                                   proof.gen_index_hash,
                                                   proof.rotating_pkey,
-                                                  proof.expiry_unix_ts_ms)
+                                                  proof.expires_at)
             _ = backend_key.verify_key.verify(smessage=proof_hash, signature=proof.sig)
 
 
@@ -1203,7 +1204,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
             hash_to_sign: bytes = backend.make_generate_pro_proof_hash(version       = request_version,
                                                                   master_pkey   = master_key.verify_key,
                                                                   rotating_pkey = rotating_key.verify_key,
-                                                                  unix_ts_ms    = unix_ts_ms)
+                                                                  request_at    = base.datetime_from_unix_ms(unix_ts_ms))
 
             runtime = backend.get_runtime(db_conn)
             proof = backend.generate_pro_proof(conn           = db_conn,
@@ -1212,7 +1213,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
                                                gen_index_salt = runtime.gen_index_salt,
                                                master_pkey    = master_key.verify_key,
                                                rotating_pkey  = rotating_key.verify_key,
-                                               unix_ts_ms     = unix_ts_ms,
+                                               request_at     = base.datetime_from_unix_ms(unix_ts_ms),
                                                master_sig     = bytes(master_key.sign(hash_to_sign).signature),
                                                rotating_sig   = bytes(rotating_key.sign(hash_to_sign).signature),
                                                err            = err)
@@ -1220,7 +1221,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
             proof_hash = backend.build_proof_hash(proof.version,
                                                   proof.gen_index_hash,
                                                   proof.rotating_pkey,
-                                                  proof.expiry_unix_ts_ms)
+                                                  proof.expires_at)
 
             failed: bool = False
             try:
@@ -1234,7 +1235,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
             with db.transaction(db_conn) as tx:
                 revoked = backend.add_google_revocation_tx(tx                   = tx,
                                                            google_payment_token = payment_tx.google_payment_token,
-                                                           revoke_unix_ts_ms    = start_unix_ts_ms,
+                                                           revoke_at    = base.datetime_from_unix_ms(start_unix_ts_ms),
                                                            err                  = err)
             assert revoked
             assert not err.has()
@@ -1244,7 +1245,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
             hash_to_sign: bytes = backend.make_generate_pro_proof_hash(version       = generate_pro_proof_hash_version,
                                                                        master_pkey   = master_key.verify_key,
                                                                        rotating_pkey = rotating_key.verify_key,
-                                                                       unix_ts_ms    = start_unix_ts_ms)
+                                                                       request_at    = base.datetime_from_unix_ms(start_unix_ts_ms))
 
             request_body = {
                 'version':       generate_pro_proof_hash_version,
@@ -1291,9 +1292,9 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
             backend.add_unredeemed_payment(conn                              = db_conn,
                                            payment_tx                        = apple_payment_tx,
                                            plan                              = base.ProPlan.OneMonth,
-                                           unredeemed_unix_ts_ms             = unix_ts_ms,
-                                           expiry_unix_ts_ms                 = unix_ts_ms + ((base.SECONDS_IN_DAY * 30) * 1000),
-                                           platform_refund_expiry_unix_ts_ms = 0,
+                                           purchased_at             = base.datetime_from_unix_ms(unix_ts_ms),
+                                           expires_at                 = base.datetime_from_unix_ms(unix_ts_ms) + datetime.timedelta(days=30),
+                                           platform_refund_expires_at = base.EPOCH,
                                            platform_obfuscated_account_id    = '',
                                            err                               = err)
 
@@ -1323,8 +1324,8 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
             set_refund_requested_version = 0
             hash_to_sign: bytes = backend.make_set_payment_refund_requested_hash(version                     = set_refund_requested_version,
                                                                                  master_pkey                 = master_key.verify_key,
-                                                                                 unix_ts_ms                  = start_unix_ts_ms,
-                                                                                 refund_requested_unix_ts_ms = start_unix_ts_ms,
+                                                                                 request_at                  = base.datetime_from_unix_ms(start_unix_ts_ms),
+                                                                                 refund_requested_at = base.datetime_from_unix_ms(start_unix_ts_ms),
                                                                                  payment_tx                  = apple_tx)
 
             request_body = {
@@ -1371,8 +1372,8 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
 
             hash_to_sign: bytes = backend.make_set_payment_refund_requested_hash(version                     = set_refund_requested_version,
                                                                                  master_pkey                 = master_key.verify_key,
-                                                                                 unix_ts_ms                  = start_unix_ts_ms,
-                                                                                 refund_requested_unix_ts_ms = start_unix_ts_ms,
+                                                                                 request_at                  = base.datetime_from_unix_ms(start_unix_ts_ms),
+                                                                                 refund_requested_at = base.datetime_from_unix_ms(start_unix_ts_ms),
                                                                                  payment_tx                  = fake_payment)
 
             request_body = {
@@ -1501,7 +1502,7 @@ def test_apple_grace_period_stores_duration_not_absolute_date(pg_database):
     (gracePeriodExpiresDate - expiresDate), not the absolute gracePeriodExpiresDate.
 
     gracePeriodExpiresDate is an absolute ms-epoch timestamp per the App Store Server API; storing it
-    straight into the duration field `grace_period_duration_ms` made `expiry + grace_period` land ~50
+    straight into the duration field `grace_period` made `expiry + grace_period` land ~50
     years in the future on any grace-period renewal failure. No prior test covered this path (every
     scenario set gracePeriodExpiresDate = None)."""
     err = base.ErrorSink()
@@ -1522,9 +1523,9 @@ def test_apple_grace_period_stores_duration_not_absolute_date(pg_database):
             backend.add_unredeemed_payment(conn                              = conn,
                                            payment_tx                        = payment_tx,
                                            plan                              = base.ProPlan.OneMonth,
-                                           expiry_unix_ts_ms                 = expires_ms,
-                                           unredeemed_unix_ts_ms             = expires_ms - (30 * base.MILLISECONDS_IN_DAY),
-                                           platform_refund_expiry_unix_ts_ms = expires_ms,
+                                           expires_at                 = base.datetime_from_unix_ms(expires_ms),
+                                           purchased_at             = base.datetime_from_unix_ms(expires_ms - (30 * base.MILLISECONDS_IN_DAY)),
+                                           platform_refund_expires_at = base.datetime_from_unix_ms(expires_ms),
                                            platform_obfuscated_account_id    = '',
                                            err                               = err)
             assert not err.has(), err.msg_list
@@ -1549,17 +1550,16 @@ def test_apple_grace_period_stores_duration_not_absolute_date(pg_database):
             tx_info.expiresDate                 = expires_ms
 
             decoded = platform_apple.DecodedNotification(body=body, tx_info=tx_info, renewal_info=renewal_info)
-            handled = platform_apple.handle_notification(decoded_notification=decoded, conn=conn, notification_retry_duration_ms=0, err=err)
+            handled = platform_apple.handle_notification(decoded_notification=decoded, conn=conn, notification_retry_duration=datetime.timedelta(0), err=err)
             assert not err.has(), err.msg_list
             assert handled
 
-            # Then the stored value is the grace DURATION, not the absolute date,
+            # Then the stored value is the grace DURATION (timedelta), not the absolute date,
             payment_list = backend.get_payments_list(conn)
             assert len(payment_list)                        == 1
-            assert payment_list[0].grace_period_duration_ms == grace_len_ms
-            assert payment_list[0].grace_period_duration_ms != renewal_info.gracePeriodExpiresDate  # the old bug
-            # and `expiry + grace` resolves to exactly gracePeriodExpiresDate.
-            assert payment_list[0].expiry_unix_ts_ms + payment_list[0].grace_period_duration_ms == renewal_info.gracePeriodExpiresDate
+            assert payment_list[0].grace_period == base.timedelta_from_ms(grace_len_ms)
+            # and `expiry + grace` resolves to exactly gracePeriodExpiresDate (the absolute instant).
+            assert payment_list[0].expires_at + payment_list[0].grace_period == base.datetime_from_unix_ms(renewal_info.gracePeriodExpiresDate)
 
 def test_platform_apple(pg_database):
     err = base.ErrorSink()
@@ -1678,7 +1678,7 @@ def test_platform_apple(pg_database):
         notification = platform_apple.DecodedNotification(body=body, tx_info=tx_info, renewal_info=renewal_info)
         err = base.ErrorSink()
         with test.connection() as conn:
-            _ = platform_apple.handle_notification(decoded_notification=notification, conn=conn, notification_retry_duration_ms=0, err=err)
+            _ = platform_apple.handle_notification(decoded_notification=notification, conn=conn, notification_retry_duration=datetime.timedelta(0), err=err)
             assert not err.has(), err.msg_list
 
             # NOTE: Subscription renewal should be unredeemed
@@ -1748,7 +1748,7 @@ def test_platform_apple(pg_database):
         assert result_rotating_pkey == rotating_key.verify_key
 
         # NOTE: Check that the server signed our proof w/ their public key
-        proof_hash: bytes = backend.build_proof_hash(result_version, result_gen_index_hash, result_rotating_pkey, result_expiry_unix_ts_ms)
+        proof_hash: bytes = backend.build_proof_hash(result_version, result_gen_index_hash, result_rotating_pkey, base.datetime_from_unix_ms(result_expiry_unix_ts_ms))
         _ = test.backend_key.verify_key.verify(smessage=proof_hash, signature=result_sig)
 
     # The following is a sequence of notifications/events that transpired for the same account under
@@ -1875,7 +1875,7 @@ def test_platform_apple(pg_database):
 
             err = base.ErrorSink()
             with test.connection() as conn:
-                _ = platform_apple.handle_notification(decoded_notification=decoded_notification, conn=conn, notification_retry_duration_ms=0, err=err)
+                _ = platform_apple.handle_notification(decoded_notification=decoded_notification, conn=conn, notification_retry_duration=datetime.timedelta(0), err=err)
                 assert not err.has(), err.msg_list
 
                 # NOTE: Subscription purchase is unredeemed
@@ -1886,12 +1886,12 @@ def test_platform_apple(pg_database):
                 assert unredeemed_list[0].plan                              == base.ProPlan.OneMonth
                 assert unredeemed_list[0].payment_provider                  == base.PaymentProvider.iOSAppStore
                 assert unredeemed_list[0].auto_renewing                     == True
-                assert unredeemed_list[0].unredeemed_unix_ts_ms             == tx_info.purchaseDate
-                assert unredeemed_list[0].redeemed_unix_ts_ms               == None
-                assert unredeemed_list[0].expiry_unix_ts_ms                 == tx_info.expiresDate
-                assert unredeemed_list[0].grace_period_duration_ms          == base.DEFAULT_APPLE_GRACE_PERIOD_DURATION_MS
-                assert unredeemed_list[0].platform_refund_expiry_unix_ts_ms == tx_info.expiresDate
-                assert unredeemed_list[0].revoked_unix_ts_ms                == None
+                assert unredeemed_list[0].purchased_at             == base.datetime_from_unix_ms(tx_info.purchaseDate)
+                assert unredeemed_list[0].redeemed_at               == None
+                assert unredeemed_list[0].expires_at                 == base.datetime_from_unix_ms(tx_info.expiresDate)
+                assert unredeemed_list[0].grace_period          == base.DEFAULT_APPLE_GRACE_PERIOD
+                assert unredeemed_list[0].platform_refund_expires_at == base.datetime_from_unix_ms(tx_info.expiresDate)
+                assert unredeemed_list[0].revoked_at                == None
             assert unredeemed_list[0].apple.original_tx_id              == tx_info.originalTransactionId
             assert unredeemed_list[0].apple.tx_id                       == tx_info.transactionId
             assert unredeemed_list[0].apple.web_line_order_tx_id        == tx_info.webOrderLineItemId
@@ -2008,7 +2008,7 @@ def test_platform_apple(pg_database):
 
             err = base.ErrorSink()
             with test.connection() as conn:
-                _ = platform_apple.handle_notification(decoded_notification=decoded_notification, conn=conn, notification_retry_duration_ms=0, err=err)
+                _ = platform_apple.handle_notification(decoded_notification=decoded_notification, conn=conn, notification_retry_duration=datetime.timedelta(0), err=err)
                 assert not err.has(), err.msg_list
 
                 # NOTE: Check payment is still in the DB and that auto-renewing was turned off
@@ -2019,12 +2019,12 @@ def test_platform_apple(pg_database):
                 assert payment_list[0].plan                              == base.ProPlan.OneMonth
                 assert payment_list[0].payment_provider                  == base.PaymentProvider.iOSAppStore
                 assert payment_list[0].auto_renewing                     == False
-                assert payment_list[0].unredeemed_unix_ts_ms             == tx_info.purchaseDate
-                assert payment_list[0].redeemed_unix_ts_ms               == None
-                assert payment_list[0].expiry_unix_ts_ms                 == tx_info.expiresDate
-                assert payment_list[0].grace_period_duration_ms          == base.DEFAULT_APPLE_GRACE_PERIOD_DURATION_MS
-                assert payment_list[0].platform_refund_expiry_unix_ts_ms == tx_info.expiresDate
-                assert payment_list[0].revoked_unix_ts_ms                == None
+                assert payment_list[0].purchased_at             == base.datetime_from_unix_ms(tx_info.purchaseDate)
+                assert payment_list[0].redeemed_at               == None
+                assert payment_list[0].expires_at                 == base.datetime_from_unix_ms(tx_info.expiresDate)
+                assert payment_list[0].grace_period          == base.DEFAULT_APPLE_GRACE_PERIOD
+                assert payment_list[0].platform_refund_expires_at == base.datetime_from_unix_ms(tx_info.expiresDate)
+                assert payment_list[0].revoked_at                == None
             assert payment_list[0].apple.original_tx_id              == tx_info.originalTransactionId
             assert payment_list[0].apple.tx_id                       == tx_info.transactionId
             assert payment_list[0].apple.web_line_order_tx_id        == tx_info.webOrderLineItemId
@@ -2141,7 +2141,7 @@ def test_platform_apple(pg_database):
 
             err = base.ErrorSink()
             with test.connection() as conn:
-                _ = platform_apple.handle_notification(decoded_notification=decoded_notification, conn=conn, notification_retry_duration_ms=0, err=err)
+                _ = platform_apple.handle_notification(decoded_notification=decoded_notification, conn=conn, notification_retry_duration=datetime.timedelta(0), err=err)
                 assert not err.has(), err.msg_list
 
                 # NOTE: The payment expires as per Apple's notification. We don't have to do anything
@@ -2154,34 +2154,34 @@ def test_platform_apple(pg_database):
                 assert derived_status(payment_list[0])                            == base.PaymentStatus.Unredeemed
                 assert payment_list[0].plan                              == base.ProPlan.OneMonth
                 assert payment_list[0].payment_provider                  == base.PaymentProvider.iOSAppStore
-                assert payment_list[0].unredeemed_unix_ts_ms             == tx_info.purchaseDate
-                assert payment_list[0].redeemed_unix_ts_ms               == None
-                assert payment_list[0].expiry_unix_ts_ms                 == tx_info.expiresDate
-                assert payment_list[0].grace_period_duration_ms          == base.DEFAULT_APPLE_GRACE_PERIOD_DURATION_MS
-                assert payment_list[0].platform_refund_expiry_unix_ts_ms == tx_info.expiresDate
-                assert payment_list[0].revoked_unix_ts_ms                == None
+                assert payment_list[0].purchased_at             == base.datetime_from_unix_ms(tx_info.purchaseDate)
+                assert payment_list[0].redeemed_at               == None
+                assert payment_list[0].expires_at                 == base.datetime_from_unix_ms(tx_info.expiresDate)
+                assert payment_list[0].grace_period          == base.DEFAULT_APPLE_GRACE_PERIOD
+                assert payment_list[0].platform_refund_expires_at == base.datetime_from_unix_ms(tx_info.expiresDate)
+                assert payment_list[0].revoked_at                == None
                 assert payment_list[0].apple.original_tx_id              == tx_info.originalTransactionId
                 assert payment_list[0].apple.tx_id                       == tx_info.transactionId
                 assert payment_list[0].apple.web_line_order_tx_id        == tx_info.webOrderLineItemId
 
             # NOTE: Now expire the payment
             with test.connection() as conn:
-                _ = backend.expire_payments_revocations_and_users(conn=conn, unix_ts_ms=payment_list[0].expiry_unix_ts_ms + 1)
+                _ = backend.expire_payments_revocations_and_users(conn=conn, now=payment_list[0].expires_at + datetime.timedelta(milliseconds=1))
 
                 # NOTE: Now check that the payments were marked expired
                 payment_list = backend.get_payments_list(conn)
 
                 assert len(payment_list)                                 == 1
                 assert payment_list[0].master_pkey                       == None
-                assert derived_status(payment_list[0], payment_list[0].expiry_unix_ts_ms)                            == base.PaymentStatus.Expired
+                assert derived_status(payment_list[0], payment_list[0].expires_at)                            == base.PaymentStatus.Expired
                 assert payment_list[0].plan                              == base.ProPlan.OneMonth
                 assert payment_list[0].payment_provider                  == base.PaymentProvider.iOSAppStore
-                assert payment_list[0].unredeemed_unix_ts_ms             == tx_info.purchaseDate
-                assert payment_list[0].redeemed_unix_ts_ms               == None
-                assert payment_list[0].expiry_unix_ts_ms                 == tx_info.expiresDate
-                assert payment_list[0].grace_period_duration_ms          == base.DEFAULT_APPLE_GRACE_PERIOD_DURATION_MS
-                assert payment_list[0].platform_refund_expiry_unix_ts_ms == tx_info.expiresDate
-                assert payment_list[0].revoked_unix_ts_ms                == None
+                assert payment_list[0].purchased_at             == base.datetime_from_unix_ms(tx_info.purchaseDate)
+                assert payment_list[0].redeemed_at               == None
+                assert payment_list[0].expires_at                 == base.datetime_from_unix_ms(tx_info.expiresDate)
+                assert payment_list[0].grace_period          == base.DEFAULT_APPLE_GRACE_PERIOD
+                assert payment_list[0].platform_refund_expires_at == base.datetime_from_unix_ms(tx_info.expiresDate)
+                assert payment_list[0].revoked_at                == None
                 assert payment_list[0].apple.original_tx_id              == tx_info.originalTransactionId
                 assert payment_list[0].apple.tx_id                       == tx_info.transactionId
                 assert payment_list[0].apple.web_line_order_tx_id        == tx_info.webOrderLineItemId
@@ -2947,7 +2947,7 @@ def test_platform_apple(pg_database):
         if 1:
             unredeemed_payment_list = []
             with test.connection() as conn:
-                _ = platform_apple.handle_notification(decoded_notification=e00_sub_to_3_months_decoded_notification, conn=conn, notification_retry_duration_ms=0, err=err)
+                _ = platform_apple.handle_notification(decoded_notification=e00_sub_to_3_months_decoded_notification, conn=conn, notification_retry_duration=datetime.timedelta(0), err=err)
                 assert not err.has(), err.msg_list
                 unredeemed_payment_list = backend.get_unredeemed_payments_list(conn)
 
@@ -2957,12 +2957,12 @@ def test_platform_apple(pg_database):
             assert unredeemed_payment_list[0].plan                              == base.ProPlan.ThreeMonth
             assert unredeemed_payment_list[0].payment_provider                  == base.PaymentProvider.iOSAppStore
             assert unredeemed_payment_list[0].auto_renewing                     == True
-            assert unredeemed_payment_list[0].unredeemed_unix_ts_ms             == e00_sub_to_3_months_tx_info.purchaseDate
-            assert unredeemed_payment_list[0].redeemed_unix_ts_ms               == None
-            assert unredeemed_payment_list[0].expiry_unix_ts_ms                 == e00_sub_to_3_months_tx_info.expiresDate
-            assert unredeemed_payment_list[0].grace_period_duration_ms          == base.DEFAULT_APPLE_GRACE_PERIOD_DURATION_MS
-            assert unredeemed_payment_list[0].platform_refund_expiry_unix_ts_ms == e00_sub_to_3_months_tx_info.expiresDate
-            assert unredeemed_payment_list[0].revoked_unix_ts_ms                == None
+            assert unredeemed_payment_list[0].purchased_at             == base.datetime_from_unix_ms(e00_sub_to_3_months_tx_info.purchaseDate)
+            assert unredeemed_payment_list[0].redeemed_at               == None
+            assert unredeemed_payment_list[0].expires_at                 == base.datetime_from_unix_ms(e00_sub_to_3_months_tx_info.expiresDate)
+            assert unredeemed_payment_list[0].grace_period          == base.DEFAULT_APPLE_GRACE_PERIOD
+            assert unredeemed_payment_list[0].platform_refund_expires_at == base.datetime_from_unix_ms(e00_sub_to_3_months_tx_info.expiresDate)
+            assert unredeemed_payment_list[0].revoked_at                == None
             assert unredeemed_payment_list[0].apple.original_tx_id              == e00_sub_to_3_months_tx_info.originalTransactionId
             assert unredeemed_payment_list[0].apple.tx_id                       == e00_sub_to_3_months_tx_info.transactionId
             assert unredeemed_payment_list[0].apple.web_line_order_tx_id        == e00_sub_to_3_months_tx_info.webOrderLineItemId
@@ -3000,12 +3000,12 @@ def test_platform_apple(pg_database):
             assert payment_list[0].plan                              == base.ProPlan.ThreeMonth
             assert payment_list[0].payment_provider                  == base.PaymentProvider.iOSAppStore
             assert payment_list[0].auto_renewing                     == True
-            assert payment_list[0].unredeemed_unix_ts_ms             == e00_sub_to_3_months_tx_info.purchaseDate
-            assert payment_list[0].redeemed_unix_ts_ms               != None
-            assert payment_list[0].expiry_unix_ts_ms                 == e00_sub_to_3_months_tx_info.expiresDate
-            assert payment_list[0].grace_period_duration_ms          == base.DEFAULT_APPLE_GRACE_PERIOD_DURATION_MS
-            assert payment_list[0].platform_refund_expiry_unix_ts_ms == e00_sub_to_3_months_tx_info.expiresDate
-            assert payment_list[0].revoked_unix_ts_ms                == None
+            assert payment_list[0].purchased_at             == base.datetime_from_unix_ms(e00_sub_to_3_months_tx_info.purchaseDate)
+            assert payment_list[0].redeemed_at               != None
+            assert payment_list[0].expires_at                 == base.datetime_from_unix_ms(e00_sub_to_3_months_tx_info.expiresDate)
+            assert payment_list[0].grace_period          == base.DEFAULT_APPLE_GRACE_PERIOD
+            assert payment_list[0].platform_refund_expires_at == base.datetime_from_unix_ms(e00_sub_to_3_months_tx_info.expiresDate)
+            assert payment_list[0].revoked_at                == None
             assert payment_list[0].apple.original_tx_id              == e00_sub_to_3_months_tx_info.originalTransactionId
             assert payment_list[0].apple.tx_id                       == e00_sub_to_3_months_tx_info.transactionId
             assert payment_list[0].apple.web_line_order_tx_id        == e00_sub_to_3_months_tx_info.webOrderLineItemId
@@ -3016,7 +3016,7 @@ def test_platform_apple(pg_database):
         # month subscription following it. This means that going to a 1 week subscription is
         # considered an "upgrade".
         with test.connection() as conn:
-            _ = platform_apple.handle_notification(decoded_notification=e01_upgrade_to_1wk_decoded_notification, conn=conn, notification_retry_duration_ms=0, err=err)
+            _ = platform_apple.handle_notification(decoded_notification=e01_upgrade_to_1wk_decoded_notification, conn=conn, notification_retry_duration=datetime.timedelta(0), err=err)
             assert not err.has(), err.msg_list
             payment_list = backend.get_payments_list(conn)
 
@@ -3031,16 +3031,16 @@ def test_platform_apple(pg_database):
             assert payment_list[0].plan                              == base.ProPlan.ThreeMonth
             assert payment_list[0].payment_provider                  == base.PaymentProvider.iOSAppStore
             assert payment_list[0].auto_renewing                     == False
-            assert payment_list[0].unredeemed_unix_ts_ms             == e00_sub_to_3_months_tx_info.purchaseDate
-            assert payment_list[0].redeemed_unix_ts_ms               != None
-            assert payment_list[0].expiry_unix_ts_ms                 == e00_sub_to_3_months_tx_info.expiresDate
-            assert payment_list[0].grace_period_duration_ms          == base.DEFAULT_APPLE_GRACE_PERIOD_DURATION_MS
-            assert payment_list[0].platform_refund_expiry_unix_ts_ms == e00_sub_to_3_months_tx_info.expiresDate
-            assert payment_list[0].revoked_unix_ts_ms                == e01_upgrade_to_1wk_tx_info.purchaseDate
+            assert payment_list[0].purchased_at             == base.datetime_from_unix_ms(e00_sub_to_3_months_tx_info.purchaseDate)
+            assert payment_list[0].redeemed_at               != None
+            assert payment_list[0].expires_at                 == base.datetime_from_unix_ms(e00_sub_to_3_months_tx_info.expiresDate)
+            assert payment_list[0].grace_period          == base.DEFAULT_APPLE_GRACE_PERIOD
+            assert payment_list[0].platform_refund_expires_at == base.datetime_from_unix_ms(e00_sub_to_3_months_tx_info.expiresDate)
+            assert payment_list[0].revoked_at                == base.datetime_from_unix_ms(e01_upgrade_to_1wk_tx_info.purchaseDate)
             assert payment_list[0].apple.original_tx_id              == e00_sub_to_3_months_tx_info.originalTransactionId
             assert payment_list[0].apple.tx_id                       == e00_sub_to_3_months_tx_info.transactionId
             assert payment_list[0].apple.web_line_order_tx_id        == e00_sub_to_3_months_tx_info.webOrderLineItemId
-            assert payment_list[0].revoked_unix_ts_ms                == e01_upgrade_to_1wk_tx_info.purchaseDate
+            assert payment_list[0].revoked_at                == base.datetime_from_unix_ms(e01_upgrade_to_1wk_tx_info.purchaseDate)
 
             # NOTE: The previous payment was revoked, but it won't be in the revocation list because
             # a revocation's start time is rounded to the end of the day. So they won't show up if
@@ -3065,18 +3065,18 @@ def test_platform_apple(pg_database):
             assert payment_list[1].plan                              == base.ProPlan.OneMonth
             assert payment_list[1].payment_provider                  == base.PaymentProvider.iOSAppStore
             assert payment_list[1].auto_renewing                     == True
-            assert payment_list[1].unredeemed_unix_ts_ms             == e01_upgrade_to_1wk_tx_info.purchaseDate
-            assert payment_list[1].redeemed_unix_ts_ms               == backend.convert_unix_ts_ms_to_redeemed_unix_ts_ms(e01_upgrade_to_1wk_tx_info.purchaseDate)
-            assert payment_list[1].expiry_unix_ts_ms                 == e01_upgrade_to_1wk_tx_info.expiresDate
-            assert payment_list[1].grace_period_duration_ms          == base.DEFAULT_APPLE_GRACE_PERIOD_DURATION_MS
-            assert payment_list[1].platform_refund_expiry_unix_ts_ms == e01_upgrade_to_1wk_tx_info.expiresDate
-            assert payment_list[1].revoked_unix_ts_ms                == None
+            assert payment_list[1].purchased_at             == base.datetime_from_unix_ms(e01_upgrade_to_1wk_tx_info.purchaseDate)
+            assert payment_list[1].redeemed_at               == backend.to_redeemed_at(base.datetime_from_unix_ms(e01_upgrade_to_1wk_tx_info.purchaseDate))
+            assert payment_list[1].expires_at                 == base.datetime_from_unix_ms(e01_upgrade_to_1wk_tx_info.expiresDate)
+            assert payment_list[1].grace_period          == base.DEFAULT_APPLE_GRACE_PERIOD
+            assert payment_list[1].platform_refund_expires_at == base.datetime_from_unix_ms(e01_upgrade_to_1wk_tx_info.expiresDate)
+            assert payment_list[1].revoked_at                == None
             assert payment_list[1].apple.original_tx_id              == e01_upgrade_to_1wk_tx_info.originalTransactionId
             assert payment_list[1].apple.tx_id                       == e01_upgrade_to_1wk_tx_info.transactionId
             assert payment_list[1].apple.web_line_order_tx_id        == e01_upgrade_to_1wk_tx_info.webOrderLineItemId
 
         with test.connection() as conn:
-            _ = platform_apple.handle_notification(decoded_notification=e02_disable_auto_renew_decoded_notification, conn=conn, notification_retry_duration_ms=0, err=err)
+            _ = platform_apple.handle_notification(decoded_notification=e02_disable_auto_renew_decoded_notification, conn=conn, notification_retry_duration=datetime.timedelta(0), err=err)
             assert not err.has(), err.msg_list
 
             # NOTE: Check the payment was marked not auto-renewing
@@ -3087,7 +3087,7 @@ def test_platform_apple(pg_database):
         # NOTE: A downgrade should be a no-op as it's queued to execute at the end of the billing
         # cycle, but it does implicitly mean that auto-renewing is turned back on.
         with test.connection() as conn:
-            _ = platform_apple.handle_notification(decoded_notification=e03_queue_downgrade_to_3_months_decoded_notification,  conn=conn, notification_retry_duration_ms=0, err=err)
+            _ = platform_apple.handle_notification(decoded_notification=e03_queue_downgrade_to_3_months_decoded_notification,  conn=conn, notification_retry_duration=datetime.timedelta(0), err=err)
             assert not err.has(), err.msg_list
 
             # NOTE: Check the new payment has remain unchanged
@@ -3106,12 +3106,12 @@ def test_platform_apple(pg_database):
             # So the auto-renewing flag on our side should be set true
             assert payment_list[-1].auto_renewing                     == True
 
-            assert payment_list[-1].unredeemed_unix_ts_ms             == e01_upgrade_to_1wk_tx_info.purchaseDate
-            assert payment_list[-1].redeemed_unix_ts_ms               == backend.convert_unix_ts_ms_to_redeemed_unix_ts_ms(e01_upgrade_to_1wk_tx_info.purchaseDate)
-            assert payment_list[-1].expiry_unix_ts_ms                 == e01_upgrade_to_1wk_tx_info.expiresDate
-            assert payment_list[-1].grace_period_duration_ms          == base.DEFAULT_APPLE_GRACE_PERIOD_DURATION_MS
-            assert payment_list[-1].platform_refund_expiry_unix_ts_ms == e01_upgrade_to_1wk_tx_info.expiresDate
-            assert payment_list[-1].revoked_unix_ts_ms                == None
+            assert payment_list[-1].purchased_at             == base.datetime_from_unix_ms(e01_upgrade_to_1wk_tx_info.purchaseDate)
+            assert payment_list[-1].redeemed_at               == backend.to_redeemed_at(base.datetime_from_unix_ms(e01_upgrade_to_1wk_tx_info.purchaseDate))
+            assert payment_list[-1].expires_at                 == base.datetime_from_unix_ms(e01_upgrade_to_1wk_tx_info.expiresDate)
+            assert payment_list[-1].grace_period          == base.DEFAULT_APPLE_GRACE_PERIOD
+            assert payment_list[-1].platform_refund_expires_at == base.datetime_from_unix_ms(e01_upgrade_to_1wk_tx_info.expiresDate)
+            assert payment_list[-1].revoked_at                == None
             assert payment_list[-1].apple.original_tx_id              == e01_upgrade_to_1wk_tx_info.originalTransactionId
             assert payment_list[-1].apple.tx_id                       == e01_upgrade_to_1wk_tx_info.transactionId
             assert payment_list[-1].apple.web_line_order_tx_id        == e01_upgrade_to_1wk_tx_info.webOrderLineItemId
@@ -3119,7 +3119,7 @@ def test_platform_apple(pg_database):
         # NOTE: Cancelling a downgrade means that the queued downgrade to 3 months is undone. We
         # remain on the 1wk plan
         with test.connection() as conn:
-            _ = platform_apple.handle_notification(decoded_notification=e04_cancel_downgrade_to_3_months_decoded_notification, conn=conn, notification_retry_duration_ms=0, err=err)
+            _ = platform_apple.handle_notification(decoded_notification=e04_cancel_downgrade_to_3_months_decoded_notification, conn=conn, notification_retry_duration=datetime.timedelta(0), err=err)
             assert not err.has(), err.msg_list
 
             # NOTE: Check that the initial 3 month subscription remains refunded (e.g. unchanged)
@@ -3130,12 +3130,12 @@ def test_platform_apple(pg_database):
             assert payment_list[0].plan                              == base.ProPlan.ThreeMonth
             assert payment_list[0].payment_provider                  == base.PaymentProvider.iOSAppStore
             assert payment_list[0].auto_renewing                     == False
-            assert payment_list[0].unredeemed_unix_ts_ms             == e00_sub_to_3_months_tx_info.purchaseDate
-            assert payment_list[0].redeemed_unix_ts_ms               != None
-            assert payment_list[0].expiry_unix_ts_ms                 == e00_sub_to_3_months_tx_info.expiresDate
-            assert payment_list[0].grace_period_duration_ms          == base.DEFAULT_APPLE_GRACE_PERIOD_DURATION_MS
-            assert payment_list[0].platform_refund_expiry_unix_ts_ms == e00_sub_to_3_months_tx_info.expiresDate
-            assert payment_list[0].revoked_unix_ts_ms                == e01_upgrade_to_1wk_tx_info.purchaseDate
+            assert payment_list[0].purchased_at             == base.datetime_from_unix_ms(e00_sub_to_3_months_tx_info.purchaseDate)
+            assert payment_list[0].redeemed_at               != None
+            assert payment_list[0].expires_at                 == base.datetime_from_unix_ms(e00_sub_to_3_months_tx_info.expiresDate)
+            assert payment_list[0].grace_period          == base.DEFAULT_APPLE_GRACE_PERIOD
+            assert payment_list[0].platform_refund_expires_at == base.datetime_from_unix_ms(e00_sub_to_3_months_tx_info.expiresDate)
+            assert payment_list[0].revoked_at                == base.datetime_from_unix_ms(e01_upgrade_to_1wk_tx_info.purchaseDate)
             assert payment_list[0].apple.original_tx_id              == e00_sub_to_3_months_tx_info.originalTransactionId
             assert payment_list[0].apple.tx_id                       == e00_sub_to_3_months_tx_info.transactionId
             assert payment_list[0].apple.web_line_order_tx_id        == e00_sub_to_3_months_tx_info.webOrderLineItemId
@@ -3151,19 +3151,19 @@ def test_platform_apple(pg_database):
             assert payment_list[-1].plan                              == base.ProPlan.OneMonth
             assert payment_list[-1].payment_provider                  == base.PaymentProvider.iOSAppStore
             assert payment_list[-1].auto_renewing                     == True
-            assert payment_list[-1].unredeemed_unix_ts_ms             == e01_upgrade_to_1wk_tx_info.purchaseDate
-            assert payment_list[-1].redeemed_unix_ts_ms               == backend.convert_unix_ts_ms_to_redeemed_unix_ts_ms(e01_upgrade_to_1wk_tx_info.purchaseDate)
-            assert payment_list[-1].expiry_unix_ts_ms                 == e01_upgrade_to_1wk_tx_info.expiresDate
-            assert payment_list[-1].grace_period_duration_ms          == base.DEFAULT_APPLE_GRACE_PERIOD_DURATION_MS
-            assert payment_list[-1].platform_refund_expiry_unix_ts_ms == e01_upgrade_to_1wk_tx_info.expiresDate
-            assert payment_list[-1].revoked_unix_ts_ms                == None
+            assert payment_list[-1].purchased_at             == base.datetime_from_unix_ms(e01_upgrade_to_1wk_tx_info.purchaseDate)
+            assert payment_list[-1].redeemed_at               == backend.to_redeemed_at(base.datetime_from_unix_ms(e01_upgrade_to_1wk_tx_info.purchaseDate))
+            assert payment_list[-1].expires_at                 == base.datetime_from_unix_ms(e01_upgrade_to_1wk_tx_info.expiresDate)
+            assert payment_list[-1].grace_period          == base.DEFAULT_APPLE_GRACE_PERIOD
+            assert payment_list[-1].platform_refund_expires_at == base.datetime_from_unix_ms(e01_upgrade_to_1wk_tx_info.expiresDate)
+            assert payment_list[-1].revoked_at                == None
             assert payment_list[-1].apple.original_tx_id              == e01_upgrade_to_1wk_tx_info.originalTransactionId
             assert payment_list[-1].apple.tx_id                       == e01_upgrade_to_1wk_tx_info.transactionId
             assert payment_list[-1].apple.web_line_order_tx_id        == e01_upgrade_to_1wk_tx_info.webOrderLineItemId
 
         # NOTE: Disable auto renew, flag should be turned false for the 1 week plan payment
         with test.connection() as conn:
-            _ = platform_apple.handle_notification(decoded_notification=e05_disable_auto_renew_decoded_notification, conn=conn, notification_retry_duration_ms=0, err=err)
+            _ = platform_apple.handle_notification(decoded_notification=e05_disable_auto_renew_decoded_notification, conn=conn, notification_retry_duration=datetime.timedelta(0), err=err)
             assert not err.has(), err.msg_list
 
             # NOTE: Check the payment was marked not auto-renewing
@@ -3173,7 +3173,7 @@ def test_platform_apple(pg_database):
 
         # NOTE: Expire the subscription
         with test.connection() as conn:
-            _ = platform_apple.handle_notification(decoded_notification=e06_expire_voluntary_decoded_notification,   conn=conn, notification_retry_duration_ms=0, err=err)
+            _ = platform_apple.handle_notification(decoded_notification=e06_expire_voluntary_decoded_notification,   conn=conn, notification_retry_duration=datetime.timedelta(0), err=err)
             assert not err.has(), err.msg_list
 
             # NOTE: This is a no-op, but in this test we haven't advanced time past the expiry yet
@@ -3187,12 +3187,12 @@ def test_platform_apple(pg_database):
             assert payment_list[-1].plan                              == base.ProPlan.OneMonth
             assert payment_list[-1].payment_provider                  == base.PaymentProvider.iOSAppStore
             assert payment_list[-1].auto_renewing                     == False
-            assert payment_list[-1].unredeemed_unix_ts_ms             == e01_upgrade_to_1wk_tx_info.purchaseDate
-            assert payment_list[-1].redeemed_unix_ts_ms               == backend.convert_unix_ts_ms_to_redeemed_unix_ts_ms(e01_upgrade_to_1wk_tx_info.purchaseDate)
-            assert payment_list[-1].expiry_unix_ts_ms                 == e01_upgrade_to_1wk_tx_info.expiresDate
-            assert payment_list[-1].grace_period_duration_ms          == base.DEFAULT_APPLE_GRACE_PERIOD_DURATION_MS
-            assert payment_list[-1].platform_refund_expiry_unix_ts_ms == e01_upgrade_to_1wk_tx_info.expiresDate
-            assert payment_list[-1].revoked_unix_ts_ms                == None
+            assert payment_list[-1].purchased_at             == base.datetime_from_unix_ms(e01_upgrade_to_1wk_tx_info.purchaseDate)
+            assert payment_list[-1].redeemed_at               == backend.to_redeemed_at(base.datetime_from_unix_ms(e01_upgrade_to_1wk_tx_info.purchaseDate))
+            assert payment_list[-1].expires_at                 == base.datetime_from_unix_ms(e01_upgrade_to_1wk_tx_info.expiresDate)
+            assert payment_list[-1].grace_period          == base.DEFAULT_APPLE_GRACE_PERIOD
+            assert payment_list[-1].platform_refund_expires_at == base.datetime_from_unix_ms(e01_upgrade_to_1wk_tx_info.expiresDate)
+            assert payment_list[-1].revoked_at                == None
             assert payment_list[-1].apple.original_tx_id              == e01_upgrade_to_1wk_tx_info.originalTransactionId
             assert payment_list[-1].apple.tx_id                       == e01_upgrade_to_1wk_tx_info.transactionId
             assert payment_list[-1].apple.web_line_order_tx_id        == e01_upgrade_to_1wk_tx_info.webOrderLineItemId
@@ -3360,7 +3360,7 @@ def test_platform_apple(pg_database):
 
         e00_sub_to_3_months_decoded_notification = platform_apple.DecodedNotification(body=e00_sub_to_3_months_body, tx_info=e00_sub_to_3_months_tx_info, renewal_info=e00_sub_to_3_months_renewal_info)
         with test.connection() as conn:
-            _ = platform_apple.handle_notification(decoded_notification = e00_sub_to_3_months_decoded_notification, conn=conn, notification_retry_duration_ms=0, err=err)
+            _ = platform_apple.handle_notification(decoded_notification = e00_sub_to_3_months_decoded_notification, conn=conn, notification_retry_duration=datetime.timedelta(0), err=err)
             assert not err.has(), err.msg_list
 
         # NOTE: Generated by dump_apple_signed_payloads
@@ -3459,7 +3459,7 @@ def test_platform_apple(pg_database):
 
         e01_consumption_req_decoded_notification = platform_apple.DecodedNotification(body=e01_consumption_req_body, tx_info=e01_consumption_req_tx_info, renewal_info=e01_consumption_req_renewal_info)
         with test.connection() as conn:
-            _ = platform_apple.handle_notification(decoded_notification=e01_consumption_req_decoded_notification, conn=conn, notification_retry_duration_ms=0, err=err)
+            _ = platform_apple.handle_notification(decoded_notification=e01_consumption_req_decoded_notification, conn=conn, notification_retry_duration=datetime.timedelta(0), err=err)
             assert not err.has(), err.msg_list
 
         # NOTE: Generated by dump_apple_signed_payloads
@@ -3558,7 +3558,7 @@ def test_platform_apple(pg_database):
 
         e02_apple_refund_decoded_notification = platform_apple.DecodedNotification(body=e02_apple_refund_body, tx_info=e02_apple_refund_tx_info, renewal_info=e02_apple_refund_renewal_info)
         with test.connection() as conn:
-            _ = platform_apple.handle_notification(decoded_notification=e02_apple_refund_decoded_notification, conn=conn, notification_retry_duration_ms=0, err=err)
+            _ = platform_apple.handle_notification(decoded_notification=e02_apple_refund_decoded_notification, conn=conn, notification_retry_duration=datetime.timedelta(0), err=err)
             assert not err.has(), err.msg_list
 
             # NOTE: For this unit test we only test the ending state because we've already tested the
@@ -3569,7 +3569,7 @@ def test_platform_apple(pg_database):
             assert payments[0].apple.original_tx_id       == e00_sub_to_3_months_tx_info.originalTransactionId
             assert payments[0].apple.tx_id                == e00_sub_to_3_months_tx_info.transactionId
             assert payments[0].apple.web_line_order_tx_id == e00_sub_to_3_months_tx_info.webOrderLineItemId
-            assert payments[0].revoked_unix_ts_ms         == e02_apple_refund_tx_info.revocationDate
+            assert payments[0].revoked_at         == base.datetime_from_unix_ms(e02_apple_refund_tx_info.revocationDate)
 
 def test_google_platform_handle_notification(monkeypatch, pg_database):
     with TestingContext(pg_database) as ctx:
@@ -3619,7 +3619,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
         purchase_token: str
         order_id: str
         event_ms: int
-        expiry_unix_ts_ms: int
+        expires_at: int
 
     def test_notification(scenario: TestScenario, ctx: TestingContext) -> TestTx:
         err_parse = base.ErrorSink()
@@ -3658,7 +3658,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
         expiry_time_unix_ms = current_state.line_items[0].expiry_time.unix_milliseconds
         assert order_id is not None and len(order_id) > 0
         assert purchase_token is not None and len(purchase_token) > 0
-        return TestTx(purchase_token=purchase_token, order_id=order_id, event_ms=event_ms, expiry_unix_ts_ms=expiry_time_unix_ms)
+        return TestTx(purchase_token=purchase_token, order_id=order_id, event_ms=event_ms, expires_at=expiry_time_unix_ms)
 
     """
     Testing Interaction Utility Functions
@@ -3667,7 +3667,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
     def get_pro_details(user_ctx: TestUserCtx, ctx: TestingContext, unix_ts_ms: int) -> base.JSONObject:
         version:      int   = 0
         count:        int   = 10_000
-        hash_to_sign: bytes = backend.make_get_pro_details_hash(version=version, master_pkey=user_ctx.master_key.verify_key, unix_ts_ms=unix_ts_ms, count=count)
+        hash_to_sign: bytes = backend.make_get_pro_details_hash(version=version, master_pkey=user_ctx.master_key.verify_key, request_at=base.datetime_from_unix_ms(unix_ts_ms), count=count)
         request_body={'version':     version,
                       'master_pkey': bytes(user_ctx.master_key.verify_key).hex(),
                       'master_sig':  bytes(user_ctx.master_key.sign(hash_to_sign).signature).hex(),
@@ -3707,12 +3707,13 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
         _ = ctx.flask_client.post(server.FLASK_ROUTE_ADD_PRO_PAYMENT, json=request_body)
         server.time_now = lambda: time.time()
 
-        return base.round_unix_ts_ms_to_next_day(tx.event_ms)
+        return base.unix_ms_from_datetime(base.round_datetime_to_next_day(base.datetime_from_unix_ms(tx.event_ms)))
 
     def backend_expire_payments_at_end_of_day(event_ms: int, assert_success: bool = False):
-        end_of_day_ts_ms = event_ms + backend.round_unix_ts_ms_to_next_day_with_platform_testing_support(payment_provider=base.PaymentProvider.GooglePlayStore, unix_ts_ms=event_ms)
+        boundary_ms      = base.unix_ms_from_datetime(backend.round_datetime_to_next_day_with_platform_testing_support(payment_provider=base.PaymentProvider.GooglePlayStore, at=base.datetime_from_unix_ms(event_ms)))
+        end_of_day_ts_ms = event_ms + boundary_ms
         with ctx.connection() as conn:
-            expire_result = backend.expire_payments_revocations_and_users(conn=conn, unix_ts_ms=end_of_day_ts_ms)
+            expire_result = backend.expire_payments_revocations_and_users(conn=conn, now=base.datetime_from_unix_ms(end_of_day_ts_ms))
         if assert_success:
             assert expire_result.success
 
@@ -3726,7 +3727,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             assert len(backend.get_payments_list(conn)) == 0
             assert len(backend.get_revocations_list(conn)) == 0
 
-    def assert_has_unredeemed_payment(tx: TestTx, plan: base.ProPlan, platform_refund_expiry_unix_ts_ms: int, ctx: TestingContext):
+    def assert_has_unredeemed_payment(tx: TestTx, plan: base.ProPlan, platform_refund_expires_at: int, ctx: TestingContext):
         with ctx.connection() as conn:
             unredeemed_payments = backend.get_unredeemed_payments_list(conn)
             found = False
@@ -3738,17 +3739,17 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
                     assert derived_status(unredeemed_payment)                            == base.PaymentStatus.Unredeemed
                     assert unredeemed_payment.plan                              == plan
                     assert unredeemed_payment.payment_provider                  == base.PaymentProvider.GooglePlayStore
-                    assert unredeemed_payment.redeemed_unix_ts_ms               == None
-                    assert unredeemed_payment.expiry_unix_ts_ms                 == tx.expiry_unix_ts_ms
-                    assert unredeemed_payment.grace_period_duration_ms          == 0
-                    assert unredeemed_payment.platform_refund_expiry_unix_ts_ms == platform_refund_expiry_unix_ts_ms
-                    assert unredeemed_payment.revoked_unix_ts_ms                == None
+                    assert unredeemed_payment.redeemed_at               == None
+                    assert unredeemed_payment.expires_at                 == base.datetime_from_unix_ms(tx.expires_at)
+                    assert unredeemed_payment.grace_period          == datetime.timedelta(0)
+                    assert unredeemed_payment.platform_refund_expires_at == base.datetime_from_unix_ms(platform_refund_expires_at)
+                    assert unredeemed_payment.revoked_at                == None
                     assert unredeemed_payment.apple                             == backend.AppleTransaction()
                     assert unredeemed_payment.google_payment_token              == tx.purchase_token
                     assert unredeemed_payment.google_order_id                   == tx.order_id
             assert found
 
-    def assert_has_payment(tx: TestTx, plan: base.ProPlan, redeemed_ts_ms_rounded: int, platform_refund_expiry_unix_ts_ms: int, user_ctx: TestUserCtx, ctx: TestingContext):
+    def assert_has_payment(tx: TestTx, plan: base.ProPlan, redeemed_ts_ms_rounded: int, platform_refund_expires_at: int, user_ctx: TestUserCtx, ctx: TestingContext):
         with ctx.connection() as conn:
             payments = backend.get_payments_list(conn)
             assert len(payments) == user_ctx.payments
@@ -3758,11 +3759,11 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             assert derived_status(payment)                                                          == base.PaymentStatus.Redeemed
             assert payment.plan                                                            == plan
             assert payment.payment_provider                                                == base.PaymentProvider.GooglePlayStore
-            assert payment.redeemed_unix_ts_ms is not None and payment.redeemed_unix_ts_ms == redeemed_ts_ms_rounded
-            assert payment.expiry_unix_ts_ms                                               == tx.expiry_unix_ts_ms
-            assert payment.grace_period_duration_ms                                        == base.DEFAULT_GOOGLE_GRACE_PERIOD_DURATION_MS
-            assert payment.platform_refund_expiry_unix_ts_ms                               == platform_refund_expiry_unix_ts_ms
-            assert payment.revoked_unix_ts_ms                                              == None
+            assert payment.redeemed_at is not None and payment.redeemed_at == base.datetime_from_unix_ms(redeemed_ts_ms_rounded)
+            assert payment.expires_at                                               == base.datetime_from_unix_ms(tx.expires_at)
+            assert payment.grace_period                                        == base.DEFAULT_GOOGLE_GRACE_PERIOD
+            assert payment.platform_refund_expires_at                               == base.datetime_from_unix_ms(platform_refund_expires_at)
+            assert payment.revoked_at                                              == None
             assert payment.apple                                                           == backend.AppleTransaction()
             assert payment.google_payment_token                                            == tx.purchase_token
             assert payment.google_order_id                                                 == tx.order_id
@@ -3773,7 +3774,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             assert isinstance(user, backend.UserRow)
             assert user.master_pkey == bytes(user_ctx.master_key.verify_key)
             assert user.gen_index == user_ctx.payments - 1 # NOTE: this is wrong, but it wont be a problem until we have tests which revoke then resubscribe, fix this when that happens
-            assert user.expiry_unix_ts_ms == tx.expiry_unix_ts_ms + base.DEFAULT_GOOGLE_GRACE_PERIOD_DURATION_MS
+            assert user.expires_at == base.datetime_from_unix_ms(tx.expires_at) + base.DEFAULT_GOOGLE_GRACE_PERIOD
 
     def assert_pro_details(tx:                                TestTx,
                            pro_status:                        server.UserProStatus,
@@ -3781,7 +3782,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
                            auto_renew:                        bool,
                            grace_duration_ms:                 int,
                            redeemed_ts_ms_rounded:            int,
-                           platform_refund_expiry_unix_ts_ms: int,
+                           platform_refund_expires_at: int,
                            user_ctx:                          TestUserCtx,
                            ctx:                               TestingContext,
                            unix_ts_ms:                        int | None = None,
@@ -3801,10 +3802,10 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             assert revoke_unix_ts_ms != None
             assert res_expiry_unix_ts_ms == revoke_unix_ts_ms
         else:
-            expiry_unix_ts_ms = res_expiry_unix_ts_ms
+            expires_at = res_expiry_unix_ts_ms
             if res_auto_renewing:
-                expiry_unix_ts_ms -= res_grace_period_duration_ms
-            assert expiry_unix_ts_ms == tx.expiry_unix_ts_ms, json.dumps(result, indent=1)
+                expires_at -= res_grace_period_duration_ms
+            assert expires_at == tx.expires_at, json.dumps(result, indent=1)
         assert res_pro_status == pro_status
         assert len(res_items) == user_ctx.payments
         item = res_items[0]
@@ -3819,12 +3820,12 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
         item_revoked_unix_ts_ms                = base.json_dict_require_int(item, "revoked_unix_ts_ms", err)
         item_status                            = base.json_dict_require_str_coerce_to_enum(item, "status", base.PaymentStatus, err)
         assert not err.has()
-        assert item_expiry_unix_ts                    == tx.expiry_unix_ts_ms, res_items
+        assert item_expiry_unix_ts                    == tx.expires_at, res_items
         assert item_order_id                          == tx.order_id
         assert item_payment_token                     == tx.purchase_token
-        assert item_grace_duration_ms                 == grace_duration_ms
+        assert item_grace_duration_ms                 == base.ms_from_timedelta(grace_duration_ms)
         assert item_payment_provider                  == base.PaymentProvider.GooglePlayStore
-        assert item_platform_refund_expiry_unix_ts_ms == platform_refund_expiry_unix_ts_ms
+        assert item_platform_refund_expiry_unix_ts_ms == platform_refund_expires_at
         assert item_redeemed_unix_ts_ms               == redeemed_ts_ms_rounded
         assert item_revoked_unix_ts_ms                == 0 if not revoked else tx.event_ms
         assert item_status                            == payment_status
@@ -3836,7 +3837,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
         tx = test_notification(purchase, ctx)
         platform_refund_expiry_unix_tx_ms = tx.event_ms + base.MILLISECONDS_IN_DAY * 2
         if check_payment_is_unredeemed:
-            assert_has_unredeemed_payment(tx=tx, plan=plan, platform_refund_expiry_unix_ts_ms=platform_refund_expiry_unix_tx_ms, ctx=ctx)
+            assert_has_unredeemed_payment(tx=tx, plan=plan, platform_refund_expires_at=platform_refund_expiry_unix_tx_ms, ctx=ctx)
         return tx, platform_refund_expiry_unix_tx_ms
 
     def test_make_purchase_and_claim_payment(purchase: TestScenario, plan: base.ProPlan, user_ctx: TestUserCtx, ctx: TestingContext):
@@ -3847,9 +3848,9 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             assert len(backend.get_unredeemed_payments_list(conn)) == 0
 
         user_ctx.payments += 1
-        assert_has_payment(tx=tx, plan=plan, redeemed_ts_ms_rounded=redeemed_ts_ms_rounded, platform_refund_expiry_unix_ts_ms=platform_refund_expiry_unix_tx_ms, user_ctx=user_ctx, ctx=ctx)
+        assert_has_payment(tx=tx, plan=plan, redeemed_ts_ms_rounded=redeemed_ts_ms_rounded, platform_refund_expires_at=platform_refund_expiry_unix_tx_ms, user_ctx=user_ctx, ctx=ctx)
         assert_has_user(tx=tx, user_ctx=user_ctx, ctx=ctx)
-        assert_pro_details(tx=tx, pro_status=server.UserProStatus.Active, payment_status=base.PaymentStatus.Redeemed, auto_renew=True, grace_duration_ms=base.DEFAULT_GOOGLE_GRACE_PERIOD_DURATION_MS, redeemed_ts_ms_rounded=redeemed_ts_ms_rounded, platform_refund_expiry_unix_ts_ms=platform_refund_expiry_unix_tx_ms, user_ctx=user_ctx, ctx=ctx)
+        assert_pro_details(tx=tx, pro_status=server.UserProStatus.Active, payment_status=base.PaymentStatus.Redeemed, auto_renew=True, grace_duration_ms=base.DEFAULT_GOOGLE_GRACE_PERIOD, redeemed_ts_ms_rounded=redeemed_ts_ms_rounded, platform_refund_expires_at=platform_refund_expiry_unix_tx_ms, user_ctx=user_ctx, ctx=ctx)
         return tx, platform_refund_expiry_unix_tx_ms, redeemed_ts_ms_rounded
 
     with TestingContext(pg_database, platform_testing_env=True) as ctx:
@@ -3903,9 +3904,9 @@ current_state={'kind': 'androidpublisher#subscriptionPurchaseV2', 'startTime': '
                            pro_status                        = server.UserProStatus.Active,
                            payment_status                    = base.PaymentStatus.Redeemed,
                            auto_renew                        = False,
-                           grace_duration_ms                 = base.DEFAULT_GOOGLE_GRACE_PERIOD_DURATION_MS,
+                           grace_duration_ms                 = base.DEFAULT_GOOGLE_GRACE_PERIOD,
                            redeemed_ts_ms_rounded            = redeemed_ts_ms_rounded,
-                           platform_refund_expiry_unix_ts_ms = platform_refund_expiry_unix_tx_ms,
+                           platform_refund_expires_at = platform_refund_expiry_unix_tx_ms,
                            user_ctx                          = user_ctx, ctx=ctx)
 
         """3. User un-cancels"""
@@ -3914,9 +3915,9 @@ current_state={'kind': 'androidpublisher#subscriptionPurchaseV2', 'startTime': '
                            pro_status                        = server.UserProStatus.Active,
                            payment_status                    = base.PaymentStatus.Redeemed,
                            auto_renew                        = True,
-                           grace_duration_ms                 = base.DEFAULT_GOOGLE_GRACE_PERIOD_DURATION_MS,
+                           grace_duration_ms                 = base.DEFAULT_GOOGLE_GRACE_PERIOD,
                            redeemed_ts_ms_rounded            = redeemed_ts_ms_rounded,
-                           platform_refund_expiry_unix_ts_ms = platform_refund_expiry_unix_tx_ms,
+                           platform_refund_expires_at = platform_refund_expiry_unix_tx_ms,
                            user_ctx                          = user_ctx, ctx = ctx)
 
         """4. User refunds"""
@@ -3925,9 +3926,9 @@ current_state={'kind': 'androidpublisher#subscriptionPurchaseV2', 'startTime': '
                            pro_status                        = server.UserProStatus.Expired,
                            payment_status                    = base.PaymentStatus.Revoked,
                            auto_renew                        = False,
-                           grace_duration_ms                 = base.DEFAULT_GOOGLE_GRACE_PERIOD_DURATION_MS,
+                           grace_duration_ms                 = base.DEFAULT_GOOGLE_GRACE_PERIOD,
                            redeemed_ts_ms_rounded            = redeemed_ts_ms_rounded,
-                           platform_refund_expiry_unix_ts_ms = platform_refund_expiry_unix_tx_ms,
+                           platform_refund_expires_at = platform_refund_expiry_unix_tx_ms,
                            user_ctx                          = user_ctx,
                            ctx                               = ctx,
                            revoke_unix_ts_ms                 = refund_tx.event_ms,
@@ -3993,9 +3994,9 @@ current_state={'kind': 'androidpublisher#subscriptionPurchaseV2', 'startTime': '
                            pro_status                        = server.UserProStatus.Active,
                            payment_status                    = base.PaymentStatus.Redeemed,
                            auto_renew                        = True,
-                           grace_duration_ms                 = test_product_details.grace_period.milliseconds,
+                           grace_duration_ms                 = base.timedelta_from_ms(test_product_details.grace_period.milliseconds),
                            redeemed_ts_ms_rounded            = redeemed_ts_ms_rounded,
-                           platform_refund_expiry_unix_ts_ms = platform_refund_expiry_unix_tx_ms,
+                           platform_refund_expires_at = platform_refund_expiry_unix_tx_ms,
                            user_ctx                          = user_ctx, ctx=ctx)
 
         # Expire payments at the EOD of the resubscribe expiry_ts (note the extend expiry_ts from the grace period tx)
@@ -4006,9 +4007,9 @@ current_state={'kind': 'androidpublisher#subscriptionPurchaseV2', 'startTime': '
                            pro_status                        = server.UserProStatus.Expired,
                            payment_status                    = base.PaymentStatus.Expired,
                            auto_renew                        = True,
-                           grace_duration_ms                 = test_product_details.grace_period.milliseconds,
+                           grace_duration_ms                 = base.timedelta_from_ms(test_product_details.grace_period.milliseconds),
                            redeemed_ts_ms_rounded            = redeemed_ts_ms_rounded,
-                           platform_refund_expiry_unix_ts_ms = platform_refund_expiry_unix_tx_ms,
+                           platform_refund_expires_at = platform_refund_expiry_unix_tx_ms,
                            user_ctx                          = user_ctx,
                            ctx                               = ctx,
                            unix_ts_ms                        = tx_grace.event_ms + test_product_details.grace_period.milliseconds)
@@ -4026,9 +4027,9 @@ current_state={'kind': 'androidpublisher#subscriptionPurchaseV2', 'startTime': '
                            pro_status                        = server.UserProStatus.Active,
                            payment_status                    = base.PaymentStatus.Redeemed,
                            auto_renew                        = False,
-                           grace_duration_ms                 = base.DEFAULT_GOOGLE_GRACE_PERIOD_DURATION_MS,
-                           redeemed_ts_ms_rounded            = backend.convert_unix_ts_ms_to_redeemed_unix_ts_ms(tx_renew.event_ms),
-                           platform_refund_expiry_unix_ts_ms = platform_refund_expiry_unix_tx_ms,
+                           grace_duration_ms                 = base.DEFAULT_GOOGLE_GRACE_PERIOD,
+                           redeemed_ts_ms_rounded            = base.unix_ms_from_datetime(backend.to_redeemed_at(base.datetime_from_unix_ms(tx_renew.event_ms))),
+                           platform_refund_expires_at = platform_refund_expiry_unix_tx_ms,
                            user_ctx                          = user_ctx,
                            ctx                               = ctx,
                            unix_ts_ms                        = tx_cancel.event_ms)
@@ -4040,9 +4041,9 @@ current_state={'kind': 'androidpublisher#subscriptionPurchaseV2', 'startTime': '
                            pro_status                        = server.UserProStatus.Active,
                            payment_status                    = base.PaymentStatus.Redeemed,
                            auto_renew                        = False,
-                           grace_duration_ms                 = base.DEFAULT_GOOGLE_GRACE_PERIOD_DURATION_MS,
-                           redeemed_ts_ms_rounded            = backend.convert_unix_ts_ms_to_redeemed_unix_ts_ms(tx_renew.event_ms),
-                           platform_refund_expiry_unix_ts_ms = platform_refund_expiry_unix_tx_ms,
+                           grace_duration_ms                 = base.DEFAULT_GOOGLE_GRACE_PERIOD,
+                           redeemed_ts_ms_rounded            = base.unix_ms_from_datetime(backend.to_redeemed_at(base.datetime_from_unix_ms(tx_renew.event_ms))),
+                           platform_refund_expires_at = platform_refund_expiry_unix_tx_ms,
                            user_ctx                          = user_ctx,
                            ctx                               = ctx)
 
@@ -4052,9 +4053,9 @@ current_state={'kind': 'androidpublisher#subscriptionPurchaseV2', 'startTime': '
                            pro_status                        = server.UserProStatus.Expired,
                            payment_status                    = base.PaymentStatus.Expired,
                            auto_renew                        = False,
-                           grace_duration_ms                 = base.DEFAULT_GOOGLE_GRACE_PERIOD_DURATION_MS,
-                           redeemed_ts_ms_rounded            = backend.convert_unix_ts_ms_to_redeemed_unix_ts_ms(tx_renew.event_ms),
-                           platform_refund_expiry_unix_ts_ms = platform_refund_expiry_unix_tx_ms,
+                           grace_duration_ms                 = base.DEFAULT_GOOGLE_GRACE_PERIOD,
+                           redeemed_ts_ms_rounded            = base.unix_ms_from_datetime(backend.to_redeemed_at(base.datetime_from_unix_ms(tx_renew.event_ms))),
+                           platform_refund_expires_at = platform_refund_expiry_unix_tx_ms,
                            user_ctx                          = user_ctx,
                            ctx                               = ctx,
                            unix_ts_ms                        = tx_expire.event_ms)
@@ -4174,9 +4175,9 @@ current_state={'kind': 'androidpublisher#subscriptionPurchaseV2', 'startTime': '
                            pro_status                        = server.UserProStatus.Active,
                            payment_status                    = base.PaymentStatus.Redeemed,
                            auto_renew                        = False,
-                           grace_duration_ms                 = base.DEFAULT_GOOGLE_GRACE_PERIOD_DURATION_MS,
-                           redeemed_ts_ms_rounded            = backend.convert_unix_ts_ms_to_redeemed_unix_ts_ms(tx_renew_2.event_ms),
-                           platform_refund_expiry_unix_ts_ms = platform_refund_expiry_unix_tx_ms,
+                           grace_duration_ms                 = base.DEFAULT_GOOGLE_GRACE_PERIOD,
+                           redeemed_ts_ms_rounded            = base.unix_ms_from_datetime(backend.to_redeemed_at(base.datetime_from_unix_ms(tx_renew_2.event_ms))),
+                           platform_refund_expires_at = platform_refund_expiry_unix_tx_ms,
                            user_ctx                          = user_ctx,
                            ctx                               = ctx)
 
@@ -4187,9 +4188,9 @@ current_state={'kind': 'androidpublisher#subscriptionPurchaseV2', 'startTime': '
                           pro_status                        = server.UserProStatus.Active,
                           payment_status                    = base.PaymentStatus.Redeemed,
                           auto_renew                        = False,
-                          grace_duration_ms                 = base.DEFAULT_GOOGLE_GRACE_PERIOD_DURATION_MS,
-                          redeemed_ts_ms_rounded            = backend.convert_unix_ts_ms_to_redeemed_unix_ts_ms(tx_renew_2.event_ms),
-                          platform_refund_expiry_unix_ts_ms = platform_refund_expiry_unix_tx_ms,
+                          grace_duration_ms                 = base.DEFAULT_GOOGLE_GRACE_PERIOD,
+                          redeemed_ts_ms_rounded            = base.unix_ms_from_datetime(backend.to_redeemed_at(base.datetime_from_unix_ms(tx_renew_2.event_ms))),
+                          platform_refund_expires_at = platform_refund_expiry_unix_tx_ms,
                           user_ctx                          = user_ctx,
                           ctx                               = ctx)
 
@@ -4200,9 +4201,9 @@ current_state={'kind': 'androidpublisher#subscriptionPurchaseV2', 'startTime': '
                            pro_status                        = server.UserProStatus.Expired,
                            payment_status                    = base.PaymentStatus.Expired,
                            auto_renew                        = False,
-                           grace_duration_ms                 = base.DEFAULT_GOOGLE_GRACE_PERIOD_DURATION_MS,
-                           redeemed_ts_ms_rounded            = backend.convert_unix_ts_ms_to_redeemed_unix_ts_ms(tx_renew_2.event_ms),
-                           platform_refund_expiry_unix_ts_ms = platform_refund_expiry_unix_tx_ms,
+                           grace_duration_ms                 = base.DEFAULT_GOOGLE_GRACE_PERIOD,
+                           redeemed_ts_ms_rounded            = base.unix_ms_from_datetime(backend.to_redeemed_at(base.datetime_from_unix_ms(tx_renew_2.event_ms))),
+                           platform_refund_expires_at = platform_refund_expiry_unix_tx_ms,
                            user_ctx                          = user_ctx,
                            ctx                               = ctx,
                            unix_ts_ms                        = tx_expire.event_ms)
@@ -4219,9 +4220,9 @@ current_state={'kind': 'androidpublisher#subscriptionPurchaseV2', 'startTime': '
                            pro_status                        = server.UserProStatus.Active,
                            payment_status                    = base.PaymentStatus.Redeemed,
                            auto_renew                        = True,
-                           grace_duration_ms                 = test_product_details.grace_period.milliseconds,
+                           grace_duration_ms                 = base.timedelta_from_ms(test_product_details.grace_period.milliseconds),
                            redeemed_ts_ms_rounded            = redeemed_ts_ms_rounded, # TODO: This is not a good design, should not use real-time timestamps
-                           platform_refund_expiry_unix_ts_ms = platform_refund_expiry_unix_tx_ms,
+                           platform_refund_expires_at = platform_refund_expiry_unix_tx_ms,
                            user_ctx                          = user_ctx,
                            ctx                               = ctx)
 
@@ -4231,9 +4232,9 @@ current_state={'kind': 'androidpublisher#subscriptionPurchaseV2', 'startTime': '
                            pro_status=server.UserProStatus.Expired,
                            payment_status=base.PaymentStatus.Expired,
                            auto_renew=True,
-                           grace_duration_ms=test_product_details.grace_period.milliseconds,
+                           grace_duration_ms=base.timedelta_from_ms(test_product_details.grace_period.milliseconds),
                            redeemed_ts_ms_rounded=redeemed_ts_ms_rounded,
-                           platform_refund_expiry_unix_ts_ms=platform_refund_expiry_unix_tx_ms,
+                           platform_refund_expires_at=platform_refund_expiry_unix_tx_ms,
                            user_ctx=user_ctx,
                            ctx=ctx,
                            unix_ts_ms=tx_grace.event_ms + test_product_details.grace_period.milliseconds)
@@ -4244,9 +4245,9 @@ current_state={'kind': 'androidpublisher#subscriptionPurchaseV2', 'startTime': '
                            pro_status=server.UserProStatus.Expired,
                            payment_status=base.PaymentStatus.Expired,
                            auto_renew=True,
-                           grace_duration_ms=test_product_details.grace_period.milliseconds,
+                           grace_duration_ms=base.timedelta_from_ms(test_product_details.grace_period.milliseconds),
                            redeemed_ts_ms_rounded=redeemed_ts_ms_rounded,
-                           platform_refund_expiry_unix_ts_ms=platform_refund_expiry_unix_tx_ms,
+                           platform_refund_expires_at=platform_refund_expiry_unix_tx_ms,
                            user_ctx=user_ctx,
                            ctx=ctx,
                            unix_ts_ms=tx_grace.event_ms + test_product_details.grace_period.milliseconds)
@@ -4258,9 +4259,9 @@ current_state={'kind': 'androidpublisher#subscriptionPurchaseV2', 'startTime': '
                             pro_status=server.UserProStatus.Expired,
                             payment_status=base.PaymentStatus.Expired,
                             auto_renew=False,
-                            grace_duration_ms=test_product_details.grace_period.milliseconds,
+                            grace_duration_ms=base.timedelta_from_ms(test_product_details.grace_period.milliseconds),
                             redeemed_ts_ms_rounded=redeemed_ts_ms_rounded,
-                            platform_refund_expiry_unix_ts_ms=platform_refund_expiry_unix_tx_ms,
+                            platform_refund_expires_at=platform_refund_expiry_unix_tx_ms,
                             user_ctx=user_ctx,
                             ctx=ctx,
                             unix_ts_ms=tx_grace.event_ms + test_product_details.grace_period.milliseconds)
@@ -4311,16 +4312,16 @@ current_state={'kind': 'androidpublisher#subscriptionPurchaseV2', 'startTime': '
 
         """2. User fails to renew (enter grace period)"""
         tx_grace = test_notification(grace, ctx)
-        assert_pro_details(tx=tx_subscribe, pro_status=server.UserProStatus.Active, payment_status=base.PaymentStatus.Redeemed, auto_renew=True, grace_duration_ms=test_product_details.grace_period.milliseconds, redeemed_ts_ms_rounded=redeemed_ts_ms_rounded, platform_refund_expiry_unix_ts_ms=platform_refund_expiry_unix_tx_ms, user_ctx=user_ctx, ctx=ctx)
+        assert_pro_details(tx=tx_subscribe, pro_status=server.UserProStatus.Active, payment_status=base.PaymentStatus.Redeemed, auto_renew=True, grace_duration_ms=base.timedelta_from_ms(test_product_details.grace_period.milliseconds), redeemed_ts_ms_rounded=redeemed_ts_ms_rounded, platform_refund_expires_at=platform_refund_expiry_unix_tx_ms, user_ctx=user_ctx, ctx=ctx)
         backend_expire_payments_at_end_of_day(event_ms=tx_grace.event_ms, assert_success=True)
         # Now that payments up to the expiry time has been expired, this user's status should be expired
         assert_pro_details(tx=tx_subscribe,
                            pro_status=server.UserProStatus.Expired,
                            payment_status=base.PaymentStatus.Expired,
                            auto_renew=True,
-                           grace_duration_ms=test_product_details.grace_period.milliseconds,
+                           grace_duration_ms=base.timedelta_from_ms(test_product_details.grace_period.milliseconds),
                            redeemed_ts_ms_rounded=redeemed_ts_ms_rounded,
-                           platform_refund_expiry_unix_ts_ms=platform_refund_expiry_unix_tx_ms,
+                           platform_refund_expires_at=platform_refund_expiry_unix_tx_ms,
                            user_ctx=user_ctx,
                            ctx=ctx,
                            unix_ts_ms=tx_grace.event_ms + test_product_details.grace_period.milliseconds)
@@ -4332,9 +4333,9 @@ current_state={'kind': 'androidpublisher#subscriptionPurchaseV2', 'startTime': '
         pro_status=server.UserProStatus.Expired,
         payment_status=base.PaymentStatus.Expired,
         auto_renew=False,
-        grace_duration_ms=test_product_details.grace_period.milliseconds,
+        grace_duration_ms=base.timedelta_from_ms(test_product_details.grace_period.milliseconds),
         redeemed_ts_ms_rounded=redeemed_ts_ms_rounded,
-        platform_refund_expiry_unix_ts_ms=platform_refund_expiry_unix_tx_ms,
+        platform_refund_expires_at=platform_refund_expiry_unix_tx_ms,
         user_ctx=user_ctx, ctx=ctx,
         unix_ts_ms=tx_grace.event_ms + test_product_details.grace_period.milliseconds)
 
@@ -4393,7 +4394,7 @@ current_state={'kind': 'androidpublisher#subscriptionPurchaseV2', 'startTime': '
 
         """2. User fails to renew (enter grace period)"""
         tx_grace = test_notification(grace, ctx)
-        assert_pro_details(tx=tx_subscribe, pro_status=server.UserProStatus.Active, payment_status=base.PaymentStatus.Redeemed, auto_renew=True, grace_duration_ms=test_product_details.grace_period.milliseconds, redeemed_ts_ms_rounded=redeemed_ts_ms_rounded, platform_refund_expiry_unix_ts_ms=platform_refund_expiry_unix_tx_ms, user_ctx=user_ctx, ctx=ctx)
+        assert_pro_details(tx=tx_subscribe, pro_status=server.UserProStatus.Active, payment_status=base.PaymentStatus.Redeemed, auto_renew=True, grace_duration_ms=base.timedelta_from_ms(test_product_details.grace_period.milliseconds), redeemed_ts_ms_rounded=redeemed_ts_ms_rounded, platform_refund_expires_at=platform_refund_expiry_unix_tx_ms, user_ctx=user_ctx, ctx=ctx)
         # Expire payments at the EOD of the resubscribe expiry_ts (not the extend expiry_ts from the grace period tx)
         backend_expire_payments_at_end_of_day(event_ms=tx_grace.event_ms, assert_success=True)
         # Now that payments up to the expiry time has been expired, this user's status should be expired
@@ -4401,9 +4402,9 @@ current_state={'kind': 'androidpublisher#subscriptionPurchaseV2', 'startTime': '
             pro_status=server.UserProStatus.Expired,
             payment_status=base.PaymentStatus.Expired,
             auto_renew=True,
-            grace_duration_ms=test_product_details.grace_period.milliseconds,
+            grace_duration_ms=base.timedelta_from_ms(test_product_details.grace_period.milliseconds),
             redeemed_ts_ms_rounded=redeemed_ts_ms_rounded,
-            platform_refund_expiry_unix_ts_ms=platform_refund_expiry_unix_tx_ms,
+            platform_refund_expires_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
             unix_ts_ms=tx_grace.event_ms + test_product_details.grace_period.milliseconds)
@@ -4414,9 +4415,9 @@ current_state={'kind': 'androidpublisher#subscriptionPurchaseV2', 'startTime': '
             pro_status=server.UserProStatus.Expired,
             payment_status=base.PaymentStatus.Expired,
             auto_renew=True,
-            grace_duration_ms=test_product_details.grace_period.milliseconds,
+            grace_duration_ms=base.timedelta_from_ms(test_product_details.grace_period.milliseconds),
             redeemed_ts_ms_rounded=redeemed_ts_ms_rounded,
-            platform_refund_expiry_unix_ts_ms=platform_refund_expiry_unix_tx_ms,
+            platform_refund_expires_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
             unix_ts_ms=tx_grace.event_ms + test_product_details.grace_period.milliseconds)
@@ -4428,9 +4429,9 @@ current_state={'kind': 'androidpublisher#subscriptionPurchaseV2', 'startTime': '
             pro_status=server.UserProStatus.Expired,
             payment_status=base.PaymentStatus.Expired,
             auto_renew=False,
-            grace_duration_ms=test_product_details.grace_period.milliseconds,
+            grace_duration_ms=base.timedelta_from_ms(test_product_details.grace_period.milliseconds),
             redeemed_ts_ms_rounded=redeemed_ts_ms_rounded,
-            platform_refund_expiry_unix_ts_ms=platform_refund_expiry_unix_tx_ms,
+            platform_refund_expires_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
             unix_ts_ms=tx_grace.event_ms + test_product_details.grace_period.milliseconds)
@@ -4482,16 +4483,16 @@ current_state={'kind': 'androidpublisher#subscriptionPurchaseV2', 'startTime': '
 
         """2. User fails to renew (enter grace period)"""
         tx_grace = test_notification(grace, ctx)
-        assert_pro_details(tx=tx_subscribe, pro_status=server.UserProStatus.Active, payment_status=base.PaymentStatus.Redeemed, auto_renew=True, grace_duration_ms=test_product_details.grace_period.milliseconds, redeemed_ts_ms_rounded=redeemed_ts_ms_rounded, platform_refund_expiry_unix_ts_ms=platform_refund_expiry_unix_tx_ms, user_ctx=user_ctx, ctx=ctx)
+        assert_pro_details(tx=tx_subscribe, pro_status=server.UserProStatus.Active, payment_status=base.PaymentStatus.Redeemed, auto_renew=True, grace_duration_ms=base.timedelta_from_ms(test_product_details.grace_period.milliseconds), redeemed_ts_ms_rounded=redeemed_ts_ms_rounded, platform_refund_expires_at=platform_refund_expiry_unix_tx_ms, user_ctx=user_ctx, ctx=ctx)
         backend_expire_payments_at_end_of_day(event_ms=tx_grace.event_ms, assert_success=True)
         # Now that payments up to the expiry time has been expired, this user's status should be expired
         assert_pro_details(tx=tx_subscribe,
             pro_status=server.UserProStatus.Expired,
             payment_status=base.PaymentStatus.Expired,
             auto_renew=True,
-            grace_duration_ms=test_product_details.grace_period.milliseconds,
+            grace_duration_ms=base.timedelta_from_ms(test_product_details.grace_period.milliseconds),
             redeemed_ts_ms_rounded=redeemed_ts_ms_rounded,
-            platform_refund_expiry_unix_ts_ms=platform_refund_expiry_unix_tx_ms,
+            platform_refund_expires_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
             unix_ts_ms=tx_grace.event_ms + test_product_details.grace_period.milliseconds)
@@ -4502,9 +4503,9 @@ current_state={'kind': 'androidpublisher#subscriptionPurchaseV2', 'startTime': '
             pro_status=server.UserProStatus.Expired,
             payment_status=base.PaymentStatus.Expired,
             auto_renew=True,
-            grace_duration_ms=test_product_details.grace_period.milliseconds,
+            grace_duration_ms=base.timedelta_from_ms(test_product_details.grace_period.milliseconds),
             redeemed_ts_ms_rounded=redeemed_ts_ms_rounded,
-            platform_refund_expiry_unix_ts_ms=platform_refund_expiry_unix_tx_ms,
+            platform_refund_expires_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
             unix_ts_ms=tx_grace.event_ms + test_product_details.grace_period.milliseconds)
@@ -4519,8 +4520,8 @@ current_state={'kind': 'androidpublisher#subscriptionPurchaseV2', 'startTime': '
 
         assert_has_payment(tx                                = tx,
                            plan                              = base.ProPlan.OneMonth,
-                           redeemed_ts_ms_rounded            = backend.convert_unix_ts_ms_to_redeemed_unix_ts_ms(tx.event_ms),
-                           platform_refund_expiry_unix_ts_ms = platform_refund_expiry_unix_tx_ms,
+                           redeemed_ts_ms_rounded            = base.unix_ms_from_datetime(backend.to_redeemed_at(base.datetime_from_unix_ms(tx.event_ms))),
+                           platform_refund_expires_at = platform_refund_expiry_unix_tx_ms,
                            user_ctx                          = user_ctx, ctx=ctx)
 
         assert_has_user(tx       = tx,
@@ -4531,9 +4532,9 @@ current_state={'kind': 'androidpublisher#subscriptionPurchaseV2', 'startTime': '
                           pro_status                        = server.UserProStatus.Active,
                           payment_status                    = base.PaymentStatus.Redeemed,
                           auto_renew                        = True,
-                          grace_duration_ms                 = base.DEFAULT_GOOGLE_GRACE_PERIOD_DURATION_MS,
-                          redeemed_ts_ms_rounded            = backend.convert_unix_ts_ms_to_redeemed_unix_ts_ms(tx.event_ms),
-                          platform_refund_expiry_unix_ts_ms = platform_refund_expiry_unix_tx_ms,
+                          grace_duration_ms                 = base.DEFAULT_GOOGLE_GRACE_PERIOD,
+                          redeemed_ts_ms_rounded            = base.unix_ms_from_datetime(backend.to_redeemed_at(base.datetime_from_unix_ms(tx.event_ms))),
+                          platform_refund_expires_at = platform_refund_expiry_unix_tx_ms,
                           user_ctx                          = user_ctx,
                           ctx                               = ctx)
 
@@ -4601,9 +4602,9 @@ current_state={'kind': 'androidpublisher#subscriptionPurchaseV2', 'startTime': '
                           pro_status                        = server.UserProStatus.Active,
                           payment_status                    = base.PaymentStatus.Redeemed,
                           auto_renew                        = True,
-                          grace_duration_ms                 = base.DEFAULT_GOOGLE_GRACE_PERIOD_DURATION_MS,
-                          redeemed_ts_ms_rounded            = backend.convert_unix_ts_ms_to_redeemed_unix_ts_ms(tx.event_ms),
-                          platform_refund_expiry_unix_ts_ms = platform_refund_expiry_unix_tx_ms,
+                          grace_duration_ms                 = base.DEFAULT_GOOGLE_GRACE_PERIOD,
+                          redeemed_ts_ms_rounded            = base.unix_ms_from_datetime(backend.to_redeemed_at(base.datetime_from_unix_ms(tx.event_ms))),
+                          platform_refund_expires_at = platform_refund_expiry_unix_tx_ms,
                           user_ctx                          = user_ctx,
                           ctx                               = ctx)
 
@@ -4666,7 +4667,7 @@ current_state={'kind': 'androidpublisher#subscriptionPurchaseV2', 'startTime': '
 
         """3. User fails to renew (enter grace period)"""
         tx_grace = test_notification(grace, ctx)
-        assert_pro_details(tx=tx_change_plan, pro_status=server.UserProStatus.Active, payment_status=base.PaymentStatus.Redeemed, auto_renew=True, grace_duration_ms=test_product_details.grace_period.milliseconds, redeemed_ts_ms_rounded=redeemed_ts_ms_rounded, platform_refund_expiry_unix_ts_ms=platform_refund_expiry_unix_tx_ms, user_ctx=user_ctx, ctx=ctx)
+        assert_pro_details(tx=tx_change_plan, pro_status=server.UserProStatus.Active, payment_status=base.PaymentStatus.Redeemed, auto_renew=True, grace_duration_ms=base.timedelta_from_ms(test_product_details.grace_period.milliseconds), redeemed_ts_ms_rounded=redeemed_ts_ms_rounded, platform_refund_expires_at=platform_refund_expiry_unix_tx_ms, user_ctx=user_ctx, ctx=ctx)
         backend_expire_payments_at_end_of_day(event_ms=tx_grace.event_ms, assert_success=True)
 
         # Now that payments up to the expiry time has been expired, this user's status should be expired
@@ -4674,9 +4675,9 @@ current_state={'kind': 'androidpublisher#subscriptionPurchaseV2', 'startTime': '
             pro_status=server.UserProStatus.Expired,
             payment_status=base.PaymentStatus.Expired,
             auto_renew=True,
-            grace_duration_ms=test_product_details.grace_period.milliseconds,
+            grace_duration_ms=base.timedelta_from_ms(test_product_details.grace_period.milliseconds),
             redeemed_ts_ms_rounded=redeemed_ts_ms_rounded,
-            platform_refund_expiry_unix_ts_ms=platform_refund_expiry_unix_tx_ms,
+            platform_refund_expires_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
             unix_ts_ms=tx_grace.event_ms + test_product_details.grace_period.milliseconds)
@@ -4697,9 +4698,9 @@ current_state={'kind': 'androidpublisher#subscriptionPurchaseV2', 'startTime': '
                           pro_status                        = server.UserProStatus.Active,
                           payment_status                    = base.PaymentStatus.Redeemed,
                           auto_renew                        = True,
-                          grace_duration_ms                 = base.DEFAULT_GOOGLE_GRACE_PERIOD_DURATION_MS,
-                          redeemed_ts_ms_rounded            = backend.convert_unix_ts_ms_to_redeemed_unix_ts_ms(tx.event_ms),
-                          platform_refund_expiry_unix_ts_ms = platform_refund_expiry_unix_tx_ms,
+                          grace_duration_ms                 = base.DEFAULT_GOOGLE_GRACE_PERIOD,
+                          redeemed_ts_ms_rounded            = base.unix_ms_from_datetime(backend.to_redeemed_at(base.datetime_from_unix_ms(tx.event_ms))),
+                          platform_refund_expires_at = platform_refund_expiry_unix_tx_ms,
                           user_ctx                          = user_ctx,
                           ctx                               = ctx)
 
@@ -4772,16 +4773,16 @@ current_state={'kind': 'androidpublisher#subscriptionPurchaseV2', 'startTime': '
 
         """2. User fails to renew (enter grace period)"""
         tx_grace = test_notification(grace, ctx)
-        assert_pro_details(tx=tx_change_plan, pro_status=server.UserProStatus.Active, payment_status=base.PaymentStatus.Redeemed, auto_renew=True, grace_duration_ms=test_product_details.grace_period.milliseconds, redeemed_ts_ms_rounded=redeemed_ts_ms_rounded, platform_refund_expiry_unix_ts_ms=platform_refund_expiry_unix_tx_ms, user_ctx=user_ctx, ctx=ctx)
+        assert_pro_details(tx=tx_change_plan, pro_status=server.UserProStatus.Active, payment_status=base.PaymentStatus.Redeemed, auto_renew=True, grace_duration_ms=base.timedelta_from_ms(test_product_details.grace_period.milliseconds), redeemed_ts_ms_rounded=redeemed_ts_ms_rounded, platform_refund_expires_at=platform_refund_expiry_unix_tx_ms, user_ctx=user_ctx, ctx=ctx)
         backend_expire_payments_at_end_of_day(event_ms=tx_grace.event_ms, assert_success=True)
         # Now that payments up to the expiry time has been expired, this user's status should be expired
         assert_pro_details(tx=tx_change_plan,
             pro_status=server.UserProStatus.Expired,
             payment_status=base.PaymentStatus.Expired,
             auto_renew=True,
-            grace_duration_ms=test_product_details.grace_period.milliseconds,
+            grace_duration_ms=base.timedelta_from_ms(test_product_details.grace_period.milliseconds),
             redeemed_ts_ms_rounded=redeemed_ts_ms_rounded,
-            platform_refund_expiry_unix_ts_ms=platform_refund_expiry_unix_tx_ms,
+            platform_refund_expires_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
             unix_ts_ms=tx_grace.event_ms + test_product_details.grace_period.milliseconds)
@@ -4792,9 +4793,9 @@ current_state={'kind': 'androidpublisher#subscriptionPurchaseV2', 'startTime': '
         pro_status=server.UserProStatus.Expired,
         payment_status=base.PaymentStatus.Expired,
         auto_renew=True,
-        grace_duration_ms=test_product_details.grace_period.milliseconds,
+        grace_duration_ms=base.timedelta_from_ms(test_product_details.grace_period.milliseconds),
         redeemed_ts_ms_rounded=redeemed_ts_ms_rounded,
-        platform_refund_expiry_unix_ts_ms=platform_refund_expiry_unix_tx_ms,
+        platform_refund_expires_at=platform_refund_expiry_unix_tx_ms,
         user_ctx=user_ctx,
         ctx=ctx,
         unix_ts_ms=tx_grace.event_ms + test_product_details.grace_period.milliseconds)
@@ -4815,9 +4816,9 @@ current_state={'kind': 'androidpublisher#subscriptionPurchaseV2', 'startTime': '
                           pro_status                        = server.UserProStatus.Active,
                           payment_status                    = base.PaymentStatus.Redeemed,
                           auto_renew                        = True,
-                          grace_duration_ms                 = base.DEFAULT_GOOGLE_GRACE_PERIOD_DURATION_MS,
-                          redeemed_ts_ms_rounded            = backend.convert_unix_ts_ms_to_redeemed_unix_ts_ms(tx.event_ms),
-                          platform_refund_expiry_unix_ts_ms = platform_refund_expiry_unix_tx_ms,
+                          grace_duration_ms                 = base.DEFAULT_GOOGLE_GRACE_PERIOD,
+                          redeemed_ts_ms_rounded            = base.unix_ms_from_datetime(backend.to_redeemed_at(base.datetime_from_unix_ms(tx.event_ms))),
+                          platform_refund_expires_at = platform_refund_expiry_unix_tx_ms,
                           user_ctx                          = user_ctx,
                           ctx                               = ctx)
 
@@ -4908,9 +4909,9 @@ current_state={'kind': 'androidpublisher#subscriptionPurchaseV2', 'startTime': '
                           pro_status                        = server.UserProStatus.Active,
                           payment_status                    = base.PaymentStatus.Redeemed,
                           auto_renew                        = True,
-                          grace_duration_ms                 = base.DEFAULT_GOOGLE_GRACE_PERIOD_DURATION_MS,
-                          redeemed_ts_ms_rounded            = backend.convert_unix_ts_ms_to_redeemed_unix_ts_ms(tx.event_ms),
-                          platform_refund_expiry_unix_ts_ms = platform_refund_expiry_unix_tx_ms,
+                          grace_duration_ms                 = base.DEFAULT_GOOGLE_GRACE_PERIOD,
+                          redeemed_ts_ms_rounded            = base.unix_ms_from_datetime(backend.to_redeemed_at(base.datetime_from_unix_ms(tx.event_ms))),
+                          platform_refund_expires_at = platform_refund_expiry_unix_tx_ms,
                           user_ctx                          = user_ctx,
                           ctx                               = ctx)
 
@@ -4990,9 +4991,9 @@ current_state={'kind': 'androidpublisher#subscriptionPurchaseV2', 'startTime': '
             pro_status=server.UserProStatus.Expired,
             payment_status=base.PaymentStatus.Revoked,
             auto_renew=False,
-            grace_duration_ms=base.DEFAULT_GOOGLE_GRACE_PERIOD_DURATION_MS,
+            grace_duration_ms=base.DEFAULT_GOOGLE_GRACE_PERIOD,
             redeemed_ts_ms_rounded=redeemed_ts_ms_rounded,
-            platform_refund_expiry_unix_ts_ms=platform_refund_expiry_unix_tx_ms,
+            platform_refund_expires_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
             unix_ts_ms=tx_refund_a.event_ms + 1, # +1 to increment us over the threshold to be expired

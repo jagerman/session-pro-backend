@@ -7,6 +7,7 @@ flushing historical notifications received, generating reports e.t.c
 import argparse
 import configparser
 import dataclasses
+import datetime
 import os
 import pathlib
 import sys
@@ -501,7 +502,7 @@ def cmd_user_error_set(args: argparse.Namespace, dry_run: bool) -> int:
                         if backend.has_user_error(conn=conn, payment_provider=payment_provider, payment_id=payment_id):
                             label += ' (skipped - already exists)'
                         else:
-                            backend.add_user_error(conn=conn, error=error, unix_ts_ms=int(time.time() * 1000))
+                            backend.add_user_error(conn=conn, error=error, at=base.datetime_from_unix_ms(int(time.time() * 1000)))
                             count += 1
                             label += ' (added)'
                     else:
@@ -665,8 +666,8 @@ def cmd_google_notification_list(args: argparse.Namespace) -> int:
 
                     print(f"Found {len(items)} unhandled google notifications:")
                     for index, item in enumerate(items):
-                        message_id, payload, expiry_unix_ts_ms = item
-                        expiry_str = base.readable_unix_ts_ms(expiry_unix_ts_ms)
+                        message_id, payload, expires_at = item
+                        expiry_str = base.readable(expires_at)
                         print(f"  {index:02d} message_id={message_id}, expiry={expiry_str}")
 
                     return 0
@@ -697,7 +698,7 @@ def cmd_revoke_list(args: argparse.Namespace) -> int:
 
                     eligible_count = 0
                     list_label = ''
-                    now_ms = int(time.time() * 1000)
+                    now = datetime.datetime.now(datetime.timezone.utc)
 
                     for row in user_and_payments.payments_it:
                         payment: backend.PaymentRow = backend.payment_row_from_dict(row)
@@ -716,11 +717,11 @@ def cmd_revoke_list(args: argparse.Namespace) -> int:
                             case base.PaymentProvider.iOSAppStore:     payment_id = f'{payment.apple.original_tx_id}'
                             case base.PaymentProvider.Rangeproof:      payment_id = f'{payment.rangeproof_order_id}'
 
-                        if now_ms >= payment.expiry_unix_ts_ms:
+                        if now >= payment.expires_at:
                             continue
 
-                        status_label = backend.derive_payment_status(payment, now_ms).name
-                        list_label += f'\n    {eligible_count:02d} RevokeID={payment.payment_provider.name}-{payment_id}; Status={status_label}; Plan={plan_label}; Unredeemed={base.readable_unix_ts_ms(payment.unredeemed_unix_ts_ms)}; Expiry={base.readable_unix_ts_ms(payment.expiry_unix_ts_ms)};'
+                        status_label = backend.derive_payment_status(payment, now).name
+                        list_label += f'\n    {eligible_count:02d} RevokeID={payment.payment_provider.name}-{payment_id}; Status={status_label}; Plan={plan_label}; Unredeemed={base.readable(payment.purchased_at)}; Expiry={base.readable(payment.expires_at)};'
                         eligible_count += 1
 
                     print(f"User {args.master_pkey} has {eligible_count} revocable payments{list_label}")
@@ -751,7 +752,7 @@ def cmd_revoke_delete(args: argparse.Namespace, dry_run: bool) -> int:
         with db.open_database(config.db_url) as engine:
             with db.connection(engine) as conn:
                 with db.transaction(conn) as tx:
-                    set_result = backend.set_revocation_tx(tx=tx, master_pkey=master_pkey, creation_unix_ts_ms=int(time.time() * 1000), expiry_unix_ts_ms=0, delete_item=True)
+                    set_result = backend.set_revocation_tx(tx=tx, master_pkey=master_pkey, created_at=datetime.datetime.now(datetime.timezone.utc), expires_at=base.EPOCH, delete_item=True)
                     print(f"Deleted revocation for {args.master_pkey} ({set_result.value.lower()})")
                     return 0
 
@@ -774,17 +775,17 @@ def cmd_revoke_timestamp(args: argparse.Namespace, dry_run: bool) -> int:
         return 1
 
     if dry_run:
-        print(f"(DRY RUN) Would set revocation timestamp for {args.master_pkey} to {base.readable_unix_ts_ms(args.unix_ts_s * 1000)}")
+        print(f"(DRY RUN) Would set revocation timestamp for {args.master_pkey} to {base.readable(base.datetime_from_unix_ms(args.unix_ts_s * 1000))}")
         return 0
 
     try:
         with db.open_database(config.db_url) as engine:
             with db.connection(engine) as conn:
                 with db.transaction(conn) as tx:
-                    expiry_unix_ts_ms   = args.expiry_unix_ts_s * 1000
-                    creation_unix_ts_ms = args.creation_unix_ts_s * 1000
-                    set_result          = backend.set_revocation_tx(tx=tx, master_pkey=master_pkey, creation_unix_ts_ms=creation_unix_ts_ms, expiry_unix_ts_ms=expiry_unix_ts_ms, delete_item=False)
-                    print(f"Set revocation for {args.master_pkey} to {base.readable_unix_ts_ms(creation_unix_ts_ms)} to {base.readable_unix_ts_ms(expiry_unix_ts_ms)} ({set_result.value.lower()})")
+                    expires_at   = base.datetime_from_unix_ms(args.expiry_unix_ts_s * 1000)
+                    created_at = base.datetime_from_unix_ms(args.creation_unix_ts_s * 1000)
+                    set_result          = backend.set_revocation_tx(tx=tx, master_pkey=master_pkey, created_at=created_at, expires_at=expires_at, delete_item=False)
+                    print(f"Set revocation for {args.master_pkey} to {base.readable(created_at)} to {base.readable(expires_at)} ({set_result.value.lower()})")
                     return 0
 
     except Exception as e:
@@ -1022,7 +1023,7 @@ def cmd_server_set_payment_refund_requested(args: argparse.Namespace) -> int:
         print(f"ERROR: Unsupported payment provider: {args.provider}", file=sys.stderr)
         return 1
 
-    hash_bytes: bytes = backend.make_set_payment_refund_requested_hash(args.version, master_skey.verify_key, now_unix_ts_ms, refund_unix_ts_ms, payment_tx)
+    hash_bytes: bytes = backend.make_set_payment_refund_requested_hash(args.version, master_skey.verify_key, base.datetime_from_unix_ms(now_unix_ts_ms), base.datetime_from_unix_ms(refund_unix_ts_ms), payment_tx)
 
     # Build request
     request_body = {
@@ -1111,7 +1112,7 @@ def cmd_server_get_pro_details(args: argparse.Namespace) -> int:
     hash_bytes = backend.make_get_pro_details_hash(
         version=args.version,
         master_pkey=master_skey.verify_key,
-        unix_ts_ms=unix_ts_ms,
+        request_at=base.datetime_from_unix_ms(unix_ts_ms),
         count=args.count
     )
 
@@ -1175,7 +1176,7 @@ def cmd_server_generate_pro_proof(args: argparse.Namespace) -> int:
         version=args.version,
         master_pkey=master_skey.verify_key,
         rotating_pkey=rotating_skey.verify_key,
-        unix_ts_ms=unix_ts_ms
+        request_at=base.datetime_from_unix_ms(unix_ts_ms)
     )
 
     # Build request
@@ -1272,9 +1273,10 @@ def cmd_voucher(args: argparse.Namespace) -> int:
         with db.open_database(config.db_url) as engine:
             with db.connection(engine) as conn:
                 with db.transaction(conn) as tx:
-                    unix_ts_ms            = int(time.time() * 1000)
-                    expiry_unix_ts_ms     = unix_ts_ms + duration_ms
-                    unredeemed_unix_ts_ms = unix_ts_ms
+                    unix_ts_ms   = int(time.time() * 1000)
+                    request_at   = base.datetime_from_unix_ms(unix_ts_ms)
+                    expires_at   = base.datetime_from_unix_ms(unix_ts_ms + duration_ms)
+                    purchased_at = request_at
 
                     # Step 1: Add unredeemed payment
                     print('\nStep 1: Creating unredeemed Rangeproof payment...')
@@ -1283,9 +1285,9 @@ def cmd_voucher(args: argparse.Namespace) -> int:
                         tx                                = tx,
                         payment_tx                        = payment_tx,
                         plan                              = plan,
-                        expiry_unix_ts_ms                 = expiry_unix_ts_ms,
-                        unredeemed_unix_ts_ms             = unredeemed_unix_ts_ms,
-                        platform_refund_expiry_unix_ts_ms = 0,
+                        expires_at                 = expires_at,
+                        purchased_at             = purchased_at,
+                        platform_refund_expires_at = base.EPOCH,
                         platform_obfuscated_account_id    = b'',
                         err                               = err
                     )
@@ -1317,8 +1319,8 @@ def cmd_voucher(args: argparse.Namespace) -> int:
                         tx                  = tx,
                         version             = 0,
                         signing_key         = backend_key,
-                        unix_ts_ms          = unix_ts_ms,
-                        redeemed_unix_ts_ms = backend.convert_unix_ts_ms_to_redeemed_unix_ts_ms(unix_ts_ms),
+                        request_at          = request_at,
+                        redeemed_at         = backend.to_redeemed_at(request_at),
                         master_pkey         = master_pkey,
                         rotating_pkey       = rotating_pkey,
                         payment_tx          = backend.UserPaymentTransaction(
@@ -1339,7 +1341,7 @@ def cmd_voucher(args: argparse.Namespace) -> int:
 
                     print("Success: Payment redeemed and pro proof generated")
                     print(f'\nProof Details:')
-                    print(f'  Expiry: {base.readable_unix_ts_ms(redeem_result.proof.expiry_unix_ts_ms)}')
+                    print(f'  Expiry: {base.readable(redeem_result.proof.expires_at)}')
                     print(f'  Gen Index Hash: {redeem_result.proof.gen_index_hash.hex()}')
 
                     return 0

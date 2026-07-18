@@ -93,7 +93,7 @@ def backend_maintenance_thread_entry_point(db_url: str):
     global stop_maintenance_thread
     while not stop_maintenance_thread:
         start_unix_ts_s:    float = time.time()
-        next_day_unix_ts_s: float = base.round_unix_ts_ms_to_next_day(int(start_unix_ts_s * 1000)) / 1000.0
+        next_day_unix_ts_s: float = base.round_datetime_to_next_day(base.datetime_from_unix_ms(int(start_unix_ts_s * 1000))).timestamp()
         sleep_time_s:       float = next_day_unix_ts_s - start_unix_ts_s
 
         next_day_date:      datetime.datetime = datetime.datetime.fromtimestamp(next_day_unix_ts_s)
@@ -116,7 +116,7 @@ def backend_maintenance_thread_entry_point(db_url: str):
                 with db.open_database(db_url) as engine:
                     with db.connection(engine) as conn:
                         expire_result = backend.expire_payments_revocations_and_users(conn=conn,
-                                                                                      unix_ts_ms=int(next_day_unix_ts_s * 1000))
+                                                                                      now=base.datetime_from_unix_ms(int(next_day_unix_ts_s * 1000)))
 
                 yesterday_str: str = datetime.datetime.fromtimestamp(next_day_unix_ts_s - base.SECONDS_IN_DAY).strftime('%Y-%m-%d')
                 today_str: str     = datetime.datetime.fromtimestamp(next_day_unix_ts_s).strftime('%m-%d')
@@ -480,7 +480,7 @@ def entry_point() -> flask.Flask:
         # (10 threads by default) to process messages.
         if parsed_args.with_platform_google:
             if base.PLATFORM_TESTING_ENV:
-                base.DEFAULT_GOOGLE_GRACE_PERIOD_DURATION_MS = platform_google_api.testing_grace_period_duration_ms
+                base.DEFAULT_GOOGLE_GRACE_PERIOD = base.timedelta_from_ms(platform_google_api.testing_grace_period_duration_ms)
             global google_thread_context
             google_thread_context = platform_google.init(cloud_project_id                  = parsed_args.google_cloud_project_id,
                                                           package_name                      = parsed_args.google_package_name,

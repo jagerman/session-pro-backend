@@ -559,6 +559,7 @@ API
 
 import collections.abc
 import contextlib
+import datetime
 import dataclasses
 import enum
 import flask
@@ -757,9 +758,11 @@ def add_pro_payment():
                 dev_add_pro_payment_args.plan = plan
 
         if duration_key in get.json:
-            dev_add_pro_payment_args.duration_ms = base.json_dict_require_int(d=get.json, key=duration_key, err=err)
-            if dev_add_pro_payment_args.duration_ms <= 0 or dev_add_pro_payment_args.duration_ms > (base.SECONDS_IN_YEAR * 1000):
-                err.msg_list.append(f'{duration_key} must be > 0 and <= year ind duration, received: {dev_add_pro_payment_args.duration_ms/1000}s')
+            duration_ms = base.json_dict_require_int(d=get.json, key=duration_key, err=err)   # wire is ms (5a)
+            if duration_ms <= 0 or duration_ms > (base.SECONDS_IN_YEAR * 1000):
+                err.msg_list.append(f'{duration_key} must be > 0 and <= year ind duration, received: {duration_ms/1000}s')
+            else:
+                dev_add_pro_payment_args.duration = base.timedelta_from_ms(duration_ms)
 
         dev_add_pro_payment_args.auto_renewing = base.json_dict_optional_bool(d=get.json,
                                                                               key='dev_auto_renewing',
@@ -773,13 +776,13 @@ def add_pro_payment():
     redeemed_payment         = backend.RedeemPayment()
     with get_db(flask.current_app) as engine:
         with db.connection(engine) as conn:
-            unix_ts_ms          = int(time_now() * 1000)
-            redeemed_unix_ts_ms = backend.convert_unix_ts_ms_to_redeemed_unix_ts_ms(unix_ts_ms)
+            request_at          = base.datetime_from_unix_ms(int(time_now() * 1000))
+            redeemed_at         = backend.to_redeemed_at(request_at)
             redeemed_payment    = backend.verify_and_add_pro_payment(conn                = conn,
                                                                      version             = version,
                                                                      signing_key         = flask.current_app.config[FLASK_CONFIG_BACKEND_SKEY_KEY],
-                                                                     unix_ts_ms          = unix_ts_ms,
-                                                                     redeemed_unix_ts_ms = redeemed_unix_ts_ms,
+                                                                     request_at          = request_at,
+                                                                     redeemed_at         = redeemed_at,
                                                                      master_pkey         = nacl.signing.VerifyKey(master_pkey_bytes),
                                                                      rotating_pkey       = nacl.signing.VerifyKey(rotating_pkey_bytes),
                                                                      payment_tx          = user_payment,
@@ -840,6 +843,8 @@ def generate_pro_proof() -> flask.Response:
     if len(err.msg_list):
         return make_error_response(status=RESPONSE_PARSE_ERROR, errors=err.msg_list)
 
+    request_at = base.datetime_from_unix_ms(unix_ts_ms)   # wire ms → datetime for the backend (5a)
+
     # Request proof from the backend
     with get_db(flask.current_app) as engine:
         with db.connection(engine) as conn:
@@ -850,7 +855,7 @@ def generate_pro_proof() -> flask.Response:
                                                  gen_index_salt = runtime.gen_index_salt,
                                                  master_pkey    = nacl.signing.VerifyKey(master_pkey_bytes),
                                                  rotating_pkey  = nacl.signing.VerifyKey(rotating_pkey_bytes),
-                                                 unix_ts_ms     = unix_ts_ms,
+                                                 request_at     = request_at,
                                                  master_sig     = master_sig_bytes,
                                                  rotating_sig   = rotating_sig_bytes,
                                                  err            = err)
@@ -893,19 +898,18 @@ def get_pro_revocations():
                 if ticket < revocation_ticket:
                     runtime = backend.get_runtime_tx(tx)
                     for row in backend.get_pro_revocations_iterator_tx(tx):
-                        gen_index:            int   = row[0]
-                        creation_unix_ts_ms:  int   = row[1]
-                        expiry_unix_ts_ms:    int   = row[2]
-                        gen_index_hash:       bytes = backend.make_gen_index_hash(gen_index=gen_index, gen_index_salt=runtime.gen_index_salt)
+                        gen_index, created_at, expires_at = row
+                        gen_index_hash: bytes = backend.make_gen_index_hash(gen_index=gen_index, gen_index_salt=runtime.gen_index_salt)
                         assert gen_index < runtime.gen_index, f"lhs={gen_index}, rhs={runtime.gen_index}"
                         assert len(runtime.gen_index_salt) == hashlib.blake2b.SALT_SIZE
 
-                        expiry_unix_ts_ms         = base.round_unix_ts_ms_to_next_day(expiry_unix_ts_ms)
-                        effective_unix_ts_ms: int = min(creation_unix_ts_ms + (RETRY_IN_S * 1000), expiry_unix_ts_ms)
+                        expires_at   = base.round_datetime_to_next_day(expires_at)
+                        effective_at = min(created_at + datetime.timedelta(seconds=RETRY_IN_S), expires_at)
                         revocation_items.append({
-                            'expiry_unix_ts_ms':    expiry_unix_ts_ms,
+                            # Wire keys/units unchanged in 5a (byte-identical); 5b → `_ts` + seconds.
+                            'expiry_unix_ts_ms':    base.unix_ms_from_datetime(expires_at),
                             'gen_index_hash':       gen_index_hash.hex(),
-                            'effective_unix_ts_ms': effective_unix_ts_ms,
+                            'effective_unix_ts_ms': base.unix_ms_from_datetime(effective_at),
                         })
             if len(err.msg_list):
                 return make_error_response(status=RESPONSE_GENERIC_ERROR, errors=err.msg_list)
@@ -956,8 +960,9 @@ def get_pro_details():
         return make_error_response(status=RESPONSE_PARSE_ERROR, errors=err.msg_list)
 
     # Validate the signature
+    request_at            = base.datetime_from_unix_ms(unix_ts_ms)   # wire ms → datetime (5a)
     master_pkey_nacl      = nacl.signing.VerifyKey(master_pkey_bytes)
-    hash_to_verify: bytes = backend.make_get_pro_details_hash(version=version, master_pkey=master_pkey_nacl, unix_ts_ms=unix_ts_ms, count=count)
+    hash_to_verify: bytes = backend.make_get_pro_details_hash(version=version, master_pkey=master_pkey_nacl, request_at=request_at, count=count)
     try:
         _ = master_pkey_nacl.verify(smessage=hash_to_verify, signature=master_sig_bytes)
     except Exception as e:
@@ -981,11 +986,12 @@ def get_pro_details():
             with db.transaction(conn) as tx:
                 error_report                         = int(backend.has_user_error_from_master_pkey_tx(tx, master_pkey_nacl))
                 get_user: backend.GetUserAndPayments = backend.get_user_and_payments(tx=tx, master_pkey=master_pkey_nacl)
-                grace_period_duration_ms             = get_user.user.grace_period_duration_ms
-                expiry_unix_ts_ms                    = get_user.user.expiry_unix_ts_ms
                 auto_renewing                        = get_user.user.auto_renewing
                 payments_total                       = get_user.payments_count
-                refund_requested_unix_ts_ms          = get_user.user.refund_requested_unix_ts_ms
+                # Egress: convert the user's datetimes/timedelta to the (unchanged in 5a) ms wire values.
+                grace_period_duration_ms             = base.ms_from_timedelta(get_user.user.grace_period)
+                expiry_unix_ts_ms                    = base.unix_ms_from_datetime(get_user.user.expires_at)
+                refund_requested_unix_ts_ms          = base.unix_ms_from_datetime(get_user.user.refund_requested_at) if get_user.user.refund_requested_at else 0
 
                 # NOTE: Collect payment history. Each item's status is derived against the *request*
                 # timestamp `unix_ts_ms` (client's signed clock, anti-replay-bounded to ≈now) — the same
@@ -1002,61 +1008,41 @@ def get_pro_details():
                         # NOTE: We do not return unredeemed payments. Their token/tx IDs are
                         # confidential until the user registers them from their own receipt. (payments_it
                         # filters by user_id, which only redeemed payments have, so this is defensive.)
-                        if payment.redeemed_unix_ts_ms is None:
+                        if payment.redeemed_at is None:
                             continue
 
+                        # Common fields: internal datetime/timedelta → the (unchanged in 5a) ms wire
+                        # values; JSON keys stay `_unix_ts_ms`. (The three near-identical branches are a
+                        # Phase-5 dedup target — folds with Q10.)
+                        item: dict[str, str | int | bool] = {
+                            'status':                            backend.derive_payment_status(payment, request_at).value,
+                            'plan':                              payment.plan.value,
+                            'payment_provider':                  payment.payment_provider.value,
+                            'auto_renewing':                     payment.auto_renewing,
+                            'unredeemed_unix_ts_ms':             base.unix_ms_from_datetime(payment.purchased_at),
+                            'redeemed_unix_ts_ms':               base.unix_ms_from_datetime(payment.redeemed_at) if payment.redeemed_at else 0,
+                            'expiry_unix_ts_ms':                 base.unix_ms_from_datetime(payment.expires_at),
+                            'grace_period_duration_ms':          base.ms_from_timedelta(payment.grace_period) if payment.grace_period is not None else 0,
+                            'platform_refund_expiry_unix_ts_ms': base.unix_ms_from_datetime(payment.platform_refund_expires_at),
+                            'revoked_unix_ts_ms':                base.unix_ms_from_datetime(payment.revoked_at) if payment.revoked_at else 0,
+                            'refund_requested_unix_ts_ms':       base.unix_ms_from_datetime(payment.refund_requested_at) if payment.refund_requested_at else 0,
+                        }
                         if payment.payment_provider == base.PaymentProvider.GooglePlayStore:
-                            items.append({
-                                'status':                               backend.derive_payment_status(payment, unix_ts_ms).value,
-                                'plan':                                 payment.plan.value,
-                                'payment_provider':                     payment.payment_provider.value,
-                                'auto_renewing':                        payment.auto_renewing,
-                                'unredeemed_unix_ts_ms':                payment.unredeemed_unix_ts_ms,
-                                'redeemed_unix_ts_ms':                  payment.redeemed_unix_ts_ms if payment.redeemed_unix_ts_ms else 0,
-                                'expiry_unix_ts_ms':                    payment.expiry_unix_ts_ms,
-                                'grace_period_duration_ms':             payment.grace_period_duration_ms,
-                                'platform_refund_expiry_unix_ts_ms':    payment.platform_refund_expiry_unix_ts_ms,
-                                'revoked_unix_ts_ms':                   payment.revoked_unix_ts_ms if payment.revoked_unix_ts_ms else 0,
-                                'google_payment_token':                 payment.google_payment_token,
-                                'google_order_id':                      payment.google_order_id,
-                                'refund_requested_unix_ts_ms':          payment.refund_requested_unix_ts_ms,
-                            })
+                            item['google_payment_token'] = payment.google_payment_token
+                            item['google_order_id']      = payment.google_order_id
+                            items.append(item)
                         elif payment.payment_provider == base.PaymentProvider.iOSAppStore:
-                            items.append({
-                                'status':                               backend.derive_payment_status(payment, unix_ts_ms).value,
-                                'plan':                                 payment.plan.value,
-                                'payment_provider':                     payment.payment_provider.value,
-                                'auto_renewing':                        payment.auto_renewing,
-                                'unredeemed_unix_ts_ms':                payment.unredeemed_unix_ts_ms,
-                                'redeemed_unix_ts_ms':                  payment.redeemed_unix_ts_ms if payment.redeemed_unix_ts_ms else 0,
-                                'expiry_unix_ts_ms':                    payment.expiry_unix_ts_ms,
-                                'grace_period_duration_ms':             payment.grace_period_duration_ms,
-                                'platform_refund_expiry_unix_ts_ms':    payment.platform_refund_expiry_unix_ts_ms,
-                                'revoked_unix_ts_ms':                   payment.revoked_unix_ts_ms if payment.revoked_unix_ts_ms else 0,
-                                'apple_original_tx_id':                 payment.apple.original_tx_id,
-                                'apple_tx_id':                          payment.apple.tx_id,
-                                'apple_web_line_order_id':              payment.apple.web_line_order_tx_id,
-                                'refund_requested_unix_ts_ms':          payment.refund_requested_unix_ts_ms,
-                            })
+                            item['apple_original_tx_id']    = payment.apple.original_tx_id
+                            item['apple_tx_id']             = payment.apple.tx_id
+                            item['apple_web_line_order_id'] = payment.apple.web_line_order_tx_id
+                            items.append(item)
                         elif payment.payment_provider == base.PaymentProvider.Rangeproof:
-                            items.append({
-                                'status':                               backend.derive_payment_status(payment, unix_ts_ms).value,
-                                'plan':                                 payment.plan.value,
-                                'payment_provider':                     payment.payment_provider.value,
-                                'auto_renewing':                        payment.auto_renewing,
-                                'unredeemed_unix_ts_ms':                payment.unredeemed_unix_ts_ms,
-                                'redeemed_unix_ts_ms':                  payment.redeemed_unix_ts_ms if payment.redeemed_unix_ts_ms else 0,
-                                'expiry_unix_ts_ms':                    payment.expiry_unix_ts_ms,
-                                'grace_period_duration_ms':             payment.grace_period_duration_ms,
-                                'platform_refund_expiry_unix_ts_ms':    payment.platform_refund_expiry_unix_ts_ms,
-                                'revoked_unix_ts_ms':                   payment.revoked_unix_ts_ms if payment.revoked_unix_ts_ms else 0,
-                                'rangeproof_order_id':                  payment.rangeproof_order_id,
-                                'refund_requested_unix_ts_ms':          payment.refund_requested_unix_ts_ms,
-                            })
+                            item['rangeproof_order_id'] = payment.rangeproof_order_id
+                            items.append(item)
 
                 # NOTE: Determine pro status of user
                 if get_user.payments_count > 0:
-                    if unix_ts_ms <= get_user.user.expiry_unix_ts_ms:
+                    if request_at <= get_user.user.expires_at:
                         user_pro_status = UserProStatus.Active
                     else:
                         user_pro_status = UserProStatus.Expired
@@ -1079,7 +1065,7 @@ def get_pro_details():
             result = make_success_response(dict_result)
             if 1:
                 flask.current_app.logger.setLevel(logging.DEBUG)
-                flask.current_app.logger.debug(f"Request (their_clock={base.readable_unix_ts_ms(unix_ts_ms)}, master_pkey={master_pkey}) => ({json.dumps(dict_result)})")
+                flask.current_app.logger.debug(f"Request (their_clock={base.readable(request_at)}, master_pkey={master_pkey}) => ({json.dumps(dict_result)})")
             return result
 
 @flask_blueprint.route(FLASK_ROUTE_SET_PAYMENT_REFUND_REQUESTED, methods=['POST'])
@@ -1137,13 +1123,17 @@ def set_payment_refund_requested():
     if len(err.msg_list):
         return make_error_response(status=RESPONSE_PARSE_ERROR, errors=err.msg_list)
 
+    # wire ms → datetime (5a): request_at is the anti-replay nonce; refund_requested_at is the value to store.
+    request_at          = base.datetime_from_unix_ms(unix_ts_ms)
+    refund_requested_at = base.datetime_from_unix_ms(refund_requested_unix_ts_ms)
+
     # Validate the signature
     master_pkey_nacl      = nacl.signing.VerifyKey(master_pkey_bytes)
-    hash_to_verify: bytes = backend.make_set_payment_refund_requested_hash(version                     = version,
-                                                                           master_pkey                 = master_pkey_nacl,
-                                                                           unix_ts_ms                  = unix_ts_ms,
-                                                                           refund_requested_unix_ts_ms = refund_requested_unix_ts_ms,
-                                                                           payment_tx                  = user_payment)
+    hash_to_verify: bytes = backend.make_set_payment_refund_requested_hash(version             = version,
+                                                                           master_pkey         = master_pkey_nacl,
+                                                                           request_at          = request_at,
+                                                                           refund_requested_at = refund_requested_at,
+                                                                           payment_tx          = user_payment)
     try:
         _ = master_pkey_nacl.verify(smessage=hash_to_verify, signature=master_sig_bytes)
     except Exception:
@@ -1153,9 +1143,11 @@ def set_payment_refund_requested():
     updated: bool = False
     with get_db(flask.current_app) as engine:
         with db.connection(engine) as conn:
-            updated = backend.set_refund_requested_unix_ts_ms(conn       = conn,
-                                                              payment_tx = user_payment,
-                                                              unix_ts_ms = refund_requested_unix_ts_ms)
+            # Wire `0` means "clear the refund request" → NULL internally (the hash above still used the
+            # literal wire value the client signed).
+            updated = backend.set_refund_requested(conn                = conn,
+                                                   payment_tx          = user_payment,
+                                                   refund_requested_at = refund_requested_at if refund_requested_unix_ts_ms else None)
 
             result = make_success_response(dict_result={'version': 0, 'updated': updated})
             return result

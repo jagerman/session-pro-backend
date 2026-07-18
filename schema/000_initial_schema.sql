@@ -5,15 +5,17 @@
 -- The user identity anchor. master_pkey (the account's Ed25519 public key) lives ONLY here; everything
 -- else references a user by the surrogate `id`.
 CREATE TABLE IF NOT EXISTS users (
-    id                           BIGINT  GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    master_pkey                  BYTEA   NOT NULL UNIQUE CHECK (octet_length(master_pkey) = 32),
-    gen_index                    INTEGER NOT NULL,
-    expiry_unix_ts_ms            BIGINT  NOT NULL,
-    grace_period_duration_ms     BIGINT  NOT NULL,
-    auto_renewing                BOOLEAN NOT NULL DEFAULT FALSE,
-    refund_requested_unix_ts_ms  BIGINT  NOT NULL DEFAULT 0,
-    google_obfuscated_account_id BYTEA           NULL CHECK (octet_length(google_obfuscated_account_id) = 32),
-    apple_app_account_token      TEXT    NOT NULL DEFAULT ''
+    id                           BIGINT      GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    master_pkey                  BYTEA       NOT NULL UNIQUE CHECK (octet_length(master_pkey) = 32),
+    gen_index                    INTEGER     NOT NULL,
+    expires_at                   TIMESTAMPTZ NOT NULL,
+    grace_period                 INTERVAL    NOT NULL,
+    auto_renewing                BOOLEAN     NOT NULL DEFAULT FALSE,
+    -- NULL = no refund requested (was a BIGINT DEFAULT 0 sentinel — 0 is a valid instant).
+    refund_requested_at          TIMESTAMPTZ,
+    google_obfuscated_account_id BYTEA       CHECK (octet_length(google_obfuscated_account_id) = 32),
+    -- NULL = not an Apple account (was a TEXT DEFAULT '' sentinel).
+    apple_app_account_token      TEXT
 );
 
 -- Enumerated value sets. The code string is the canonical value used in Python, on the wire, and in the
@@ -40,16 +42,18 @@ CREATE TABLE IF NOT EXISTS payments (
     -- No `status` column: it is derived from the timestamps below (redeemed/revoked/expiry) — see
     -- backend.derive_payment_status. redeemed_unix_ts_ms IS NULL = unredeemed; revoked_unix_ts_ms
     -- IS NOT NULL = revoked; now >= expiry_unix_ts_ms = expired.
-    plan                              TEXT    NOT     NULL REFERENCES pro_plans(code),
-    payment_provider                  TEXT    NOT     NULL REFERENCES payment_providers(code),
-    auto_renewing                     BOOLEAN NOT     NULL DEFAULT FALSE,
-    unredeemed_unix_ts_ms             BIGINT  NOT     NULL,
+    plan                              TEXT        NOT     NULL REFERENCES pro_plans(code),
+    payment_provider                  TEXT        NOT     NULL REFERENCES payment_providers(code),
+    auto_renewing                     BOOLEAN     NOT     NULL DEFAULT FALSE,
+    -- When this payment (billing cycle) was purchased at the provider (Apple purchaseDate / Google
+    -- event ts). NOT when we witnessed it.
+    purchased_at                      TIMESTAMPTZ NOT     NULL,
 
-    redeemed_unix_ts_ms               BIGINT,
-    expiry_unix_ts_ms                 BIGINT  NOT     NULL,
-    grace_period_duration_ms          BIGINT,
-    platform_refund_expiry_unix_ts_ms BIGINT  NOT     NULL,
-    revoked_unix_ts_ms                BIGINT,
+    redeemed_at                       TIMESTAMPTZ,                    -- NULL until redeemed
+    expires_at                        TIMESTAMPTZ NOT     NULL,
+    grace_period                      INTERVAL,
+    platform_refund_expires_at        TIMESTAMPTZ NOT     NULL,
+    revoked_at                        TIMESTAMPTZ,                    -- NOT NULL once revoked
 
     apple_original_tx_id              TEXT,
     apple_tx_id                       TEXT,
@@ -58,15 +62,17 @@ CREATE TABLE IF NOT EXISTS payments (
     google_order_id                   TEXT,
     rangeproof_order_id               TEXT,
 
-    refund_requested_unix_ts_ms       BIGINT  NOT     NULL DEFAULT 0,
-    google_obfuscated_account_id      BYTEA           NULL CHECK (octet_length(google_obfuscated_account_id) = 32),
-    apple_app_account_token           TEXT    NOT     NULL DEFAULT ''
+    -- NULL = no refund requested (was a BIGINT DEFAULT 0 sentinel — 0 is a valid instant).
+    refund_requested_at               TIMESTAMPTZ,
+    google_obfuscated_account_id      BYTEA       CHECK (octet_length(google_obfuscated_account_id) = 32),
+    -- NULL = not an Apple payment (was a TEXT DEFAULT '' sentinel).
+    apple_app_account_token           TEXT
 );
 
 CREATE TABLE IF NOT EXISTS revocations (
-    gen_index            INTEGER PRIMARY KEY NOT NULL,
-    creation_unix_ts_ms  BIGINT NOT NULL,  -- When the revocation was created (used to calculate effective time)
-    expiry_unix_ts_ms    BIGINT NOT NULL
+    gen_index            INTEGER     PRIMARY KEY NOT NULL,
+    created_at           TIMESTAMPTZ NOT NULL,  -- When the revocation was created (used to calculate effective time)
+    expires_at           TIMESTAMPTZ NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS runtime (
@@ -79,20 +85,20 @@ CREATE TABLE IF NOT EXISTS runtime (
 
 CREATE TABLE IF NOT EXISTS apple_notification_uuid_history (
     uuid              TEXT PRIMARY KEY,
-    expiry_unix_ts_ms BIGINT NOT NULL
+    expires_at        TIMESTAMPTZ NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS google_notification_history (
     message_id        BIGINT NOT NULL,
     handled           BOOLEAN NOT NULL DEFAULT FALSE,
     payload           TEXT,
-    expiry_unix_ts_ms BIGINT NOT NULL
+    expires_at        TIMESTAMPTZ NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS user_errors (
     payment_id         TEXT NOT NULL,
     payment_provider   TEXT NOT NULL REFERENCES payment_providers(code),
-    unix_ts_ms         BIGINT NOT NULL,
+    at                 TIMESTAMPTZ NOT NULL,
     UNIQUE(payment_id, payment_provider)
 );
 

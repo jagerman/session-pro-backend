@@ -30,6 +30,24 @@ SECONDS_IN_MONTH:      int     = SECONDS_IN_DAY * 30
 MILLISECONDS_IN_YEAR:  int     = MILLISECONDS_IN_DAY * 365
 SECONDS_IN_YEAR:       int     = SECONDS_IN_DAY * 365
 
+# Every instant in this codebase is a tz-aware UTC `datetime` and every duration a `timedelta`. The
+# millisecond wire/proof epoch unit lives ONLY in the four converters below — item 5b flips these to
+# integer seconds (the wire spec's unit) and nothing else changes.
+EPOCH: datetime.datetime = datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
+
+def datetime_from_unix_ms(unix_ms: int) -> datetime.datetime:
+    return EPOCH + datetime.timedelta(milliseconds=unix_ms)
+
+def unix_ms_from_datetime(value: datetime.datetime) -> int:
+    # Exact integer milliseconds via integer division — never float `.timestamp()` truncation.
+    return (value - EPOCH) // datetime.timedelta(milliseconds=1)
+
+def timedelta_from_ms(ms: int) -> datetime.timedelta:
+    return datetime.timedelta(milliseconds=ms)
+
+def ms_from_timedelta(value: datetime.timedelta) -> int:
+    return value // datetime.timedelta(milliseconds=1)
+
 # NOTE: Default grace period we add to the subscription payments because in real world situations
 # no payment processor/billing cycle is going to bill exactly on the dot due to real-world
 # extenuating circumstances. In those cases we provide a small but reasonable grace period of 1
@@ -47,10 +65,10 @@ SECONDS_IN_YEAR:       int     = SECONDS_IN_DAY * 365
 # which the billing for the end of the subscription cycle is executed can vary and similarly, users
 # may encounter that they lose Pro because the billing was late. The 1 hour grace period looks to
 # minimise that.
-DEFAULT_APPLE_GRACE_PERIOD_DURATION_MS:  int = 60 * 60 * 1 * 1000
+DEFAULT_APPLE_GRACE_PERIOD:  datetime.timedelta = datetime.timedelta(hours=1)
 
 # NOTE: Always the same as Apple, unless we're in a testing environment where this gets changed
-DEFAULT_GOOGLE_GRACE_PERIOD_DURATION_MS: int = DEFAULT_APPLE_GRACE_PERIOD_DURATION_MS
+DEFAULT_GOOGLE_GRACE_PERIOD: datetime.timedelta = DEFAULT_APPLE_GRACE_PERIOD
 
 # NOTE: Global variables
 DB_URL                         = ''
@@ -261,10 +279,9 @@ def hex_to_bytes(hex: str, label: str, hex_len: int, err: ErrorSink) -> bytes:
             err.msg_list.append(f'{label} was not valid hex: {e}')
     return result
 
-def readable_unix_ts_ms(unix_ts_ms: int) -> str:
-    date_str = datetime.datetime.fromtimestamp(unix_ts_ms/1000.0).strftime('%y-%m-%d %H:%M:%S.%f')[:-3]
-    result   = f'{unix_ts_ms} ({date_str})'
-    return result
+def readable(value: datetime.datetime) -> str:
+    # Compact UTC timestamp for logs, millisecond precision (no strftime %f-slice hack).
+    return value.astimezone(datetime.timezone.utc).isoformat(sep=' ', timespec='milliseconds')
 
 def print_unicode_table(rows: list[list[str]]) -> None:
     # Calculate maximum width for each column
@@ -361,17 +378,10 @@ def print_db_to_stdout_tx(conn: psycopg.Connection) -> None:
                                 content.append(str(text))
                         except Exception:
                             content.append(str(value))
-                    elif col.endswith('unix_ts_ms'):
-                        content.append(readable_unix_ts_ms(int(value)))
-                    elif col.endswith('_s'):
-                        seconds = int(value)
-                        days    = seconds / SECONDS_IN_DAY
-                        content.append(f'{seconds} ({days:.2f} days)')
-                    elif table_name == 'payments' and col == 'status':
-                        value_enum = PaymentStatus(value)
-                        content.append(f'{value_enum.name} ({value_enum.value})')
-                    # payment_provider / plan are now FK ids into the lookup tables — print the raw id
-                    # (this is a debug dump; join the lookup tables by hand if you need the code).
+                    elif isinstance(value, datetime.datetime):
+                        content.append(readable(value))
+                    elif isinstance(value, datetime.timedelta):
+                        content.append(str(value))
                     elif table_name == 'payments' and col == 'auto_renewing':
                         content.append('Yes' if value else 'No' + f' ({value})')
                     else:
@@ -387,13 +397,14 @@ def print_db_to_stdout(conn: psycopg.Connection) -> None:
     with db.transaction(conn):
         print_db_to_stdout_tx(conn)
 
-def round_unix_ts_ms_to_next_day(unix_ts_ms: int) -> int:
-    result: int = (unix_ts_ms + (MILLISECONDS_IN_DAY - 1)) // MILLISECONDS_IN_DAY * MILLISECONDS_IN_DAY
-    return result
+def round_datetime_to_start_of_day(value: datetime.datetime) -> datetime.datetime:
+    return value.astimezone(datetime.timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
 
-def round_unix_ts_ms_to_start_of_day(unix_ts_ms: int) -> int:
-    result: int = unix_ts_ms // MILLISECONDS_IN_DAY * MILLISECONDS_IN_DAY
-    return result
+def round_datetime_to_next_day(value: datetime.datetime) -> datetime.datetime:
+    # Ceil to the next UTC midnight; a value already exactly at midnight stays put (matches the old
+    # `(ms + DAY-1)//DAY*DAY` ceil semantics).
+    start = round_datetime_to_start_of_day(value)
+    return start if start == value else start + datetime.timedelta(days=1)
 
 def format_bytes(size: int):
     units = [
