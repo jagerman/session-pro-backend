@@ -90,7 +90,7 @@ COMMAND FORMATS DETAILED:
       --tx-id <id>              Apple: transaction ID
 
     Optional:
-      --refund-requested-unix-ts-ms <ms>  Unix timestamp ms for refund (default: now + 1s)
+      --refund-requested-ts <s>           Unix timestamp (seconds) for refund (default: now + 1s)
       --version <int>                     Request version (default: 0)
 
     Examples:
@@ -1002,13 +1002,13 @@ def cmd_server_set_payment_refund_requested(args: argparse.Namespace) -> int:
             return 1
         payment_tx = {'provider': provider_enum, 'apple_tx_id': args.tx_id}
 
-    # Set refund timestamp
-    if args.refund_requested_unix_ts_ms:
-        refund_unix_ts_ms = args.refund_requested_unix_ts_ms
+    # Set refund timestamp (wire is integer seconds — wire spec §3.3)
+    if args.refund_requested_ts:
+        refund_ts = args.refund_requested_ts
     else:
-        refund_unix_ts_ms = int((time.time() + 1) * 1000)
+        refund_ts = int(time.time() + 1)
 
-    now_unix_ts_ms = int(time.time() * 1000)
+    now_ts = int(time.time())
 
     # Compute hash
     payment_tx = backend.UserPaymentTransaction()
@@ -1023,15 +1023,15 @@ def cmd_server_set_payment_refund_requested(args: argparse.Namespace) -> int:
         print(f"ERROR: Unsupported payment provider: {args.provider}", file=sys.stderr)
         return 1
 
-    hash_bytes: bytes = backend.make_set_payment_refund_requested_hash(args.version, master_skey.verify_key, base.datetime_from_unix_ms(now_unix_ts_ms), base.datetime_from_unix_ms(refund_unix_ts_ms), payment_tx)
+    hash_bytes: bytes = backend.make_set_payment_refund_requested_hash(args.version, master_skey.verify_key, base.datetime_from_unix_seconds(now_ts), base.datetime_from_unix_seconds(refund_ts), payment_tx)
 
     # Build request
     request_body = {
         'version': args.version,
         'master_pkey': bytes(master_skey.verify_key).hex(),
         'master_sig': bytes(master_skey.sign(hash_bytes).signature).hex(),
-        'unix_ts_ms': now_unix_ts_ms,
-        'refund_requested_unix_ts_ms': refund_unix_ts_ms,
+        'ts': now_ts,
+        'refund_requested_ts': refund_ts,
         'payment_tx': payment_tx
     }
 
@@ -1106,13 +1106,13 @@ def cmd_server_get_pro_details(args: argparse.Namespace) -> int:
         print(f"ERROR: Failed to parse master key: {e}", file=sys.stderr)
         return 1
 
-    unix_ts_ms = int(time.time() * 1000)
+    ts = int(time.time())
 
     # Compute hash
     hash_bytes = backend.make_get_pro_details_hash(
         version=args.version,
         master_pkey=master_skey.verify_key,
-        request_at=base.datetime_from_unix_ms(unix_ts_ms),
+        request_at=base.datetime_from_unix_seconds(ts),
         count=args.count
     )
 
@@ -1121,7 +1121,7 @@ def cmd_server_get_pro_details(args: argparse.Namespace) -> int:
         'version': args.version,
         'master_pkey': bytes(master_skey.verify_key).hex(),
         'master_sig': bytes(master_skey.sign(hash_bytes).signature).hex(),
-        'unix_ts_ms': unix_ts_ms,
+        'ts': ts,
         'count': args.count
     }
 
@@ -1169,14 +1169,14 @@ def cmd_server_generate_pro_proof(args: argparse.Namespace) -> int:
         print(f"ERROR: Failed to parse rotating key: {e}", file=sys.stderr)
         return 1
 
-    unix_ts_ms = int(time.time() * 1000)
+    ts = int(time.time())
 
     # Compute hash
     hash_bytes = backend.make_generate_pro_proof_hash(
         version=args.version,
         master_pkey=master_skey.verify_key,
         rotating_pkey=rotating_skey.verify_key,
-        request_at=base.datetime_from_unix_ms(unix_ts_ms)
+        request_at=base.datetime_from_unix_seconds(ts)
     )
 
     # Build request
@@ -1186,7 +1186,7 @@ def cmd_server_generate_pro_proof(args: argparse.Namespace) -> int:
         'rotating_pkey': bytes(rotating_skey.verify_key).hex(),
         'master_sig': bytes(master_skey.sign(hash_bytes).signature).hex(),
         'rotating_sig': bytes(rotating_skey.sign(hash_bytes).signature).hex(),
-        'unix_ts_ms': unix_ts_ms
+        'ts': ts
     }
 
     print(f'\nGenerate Pro Proof')
@@ -1392,7 +1392,7 @@ def main() -> int:
     _                       = server_set_refund.add_argument('--payment-token',                                                           help='Google: payment token')
     _                       = server_set_refund.add_argument('--order-id',                                                                help='Google: order ID')
     _                       = server_set_refund.add_argument('--tx-id',                                                                   help='Apple: transaction ID')
-    _                       = server_set_refund.add_argument('--refund-requested-unix-ts-ms', type=int,                                   help='Unix timestamp ms for refund (default: now + 1s)')
+    _                       = server_set_refund.add_argument('--refund-requested-ts',         type=int,                                   help='Unix timestamp (seconds) for refund (default: now + 1s)')
     _                       = server_set_refund.add_argument('--version',                     type=int,      default=0,                   help='Request version (default: 0)')
 
     # get-pro-revocations endpoint

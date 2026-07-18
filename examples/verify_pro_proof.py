@@ -9,13 +9,13 @@ hardcoded Ed25519 keypair (secret = [0xcd * 32]):
    "version": 0,
    "master_pkey": "162c30675ecc72ad17ef57e749a54284812cc178b1d2f31cfb3260f1f7594dc5",
    "rotating_pkey": "ecd0e9c371b5e1d9e116ba4d29b057e458c8b4bca40b5b3fea1cd5d5e89ae7b7",
-   "unix_ts_ms": 1762407212143,
+   "ts": 1762407212,
    "master_sig": "85462a36939e034e5ff4832943aab60056000a65f461cfdd058b5392068a88335c4db0507c37cf3fc7f73169cfba99d2f61a44999241078cb65bcf43d43e630d",
    "rotating_sig": "52de8c99bbfb7be78ad907848664e5efc746bedfaa074d8a28885fde51cad459be1c787b8626d7eaa52436b48d254ab038a2730c106b0e7e05177ea08da56d03"
   }
   Response: {
    "result": {
-    "expiry_unix_ts_ms": 1762473660000,
+    "expiry_ts": 1762473660,
     "gen_index_hash": "b330d8a3679ba0016169907bed1f49fa7d5ed8e1a73042197dd2949fecc7d174",
     "rotating_pkey": "ecd0e9c371b5e1d9e116ba4d29b057e458c8b4bca40b5b3fea1cd5d5e89ae7b7",
     "sig": "4537d985f6ec0134ed80537affd04be10f44a0f658cf26c6a3f48da43f5056a51b1ae48d2287bbed72e72c92ea87253357d466c7319c7d3514b081f9f1337d0e",
@@ -30,25 +30,29 @@ The produced Session Pro Proof should be verifiable by invoking this utility as 
           --version 0 \
           --gen-index-hash b330d8a3679ba0016169907bed1f49fa7d5ed8e1a73042197dd2949fecc7d174 \
           --rotating-pubkey ecd0e9c371b5e1d9e116ba4d29b057e458c8b4bca40b5b3fea1cd5d5e89ae7b7 \
-          --expiry-ts-ms 1762473660000 \
+          --expiry-ts 1762473660 \
           --signature 4537d985f6ec0134ed80537affd04be10f44a0f658cf26c6a3f48da43f5056a51b1ae48d2287bbed72e72c92ea87253357d466c7319c7d3514b081f9f1337d0e \
           --verify-pubkey fc947730f49eb01427a66e050733294d9e520e545c7a27125a780634e0860a27
 
-Which produces the output:
+Which produces output of the form:
 
-  Hash: 1fafd76b50fd486fef1694c98a1f14317de2329f5a1a653a8d46f53418151db5
+  Hash: <64 hex>
   Signature valid: True
+
+(The gen-index-hash / signature / hash hex above are illustrative values from one dev run; a fresh
+run produces its own. What matters is the method: personalisation "ProProof________", little-endian
+field widths, and an integer-seconds 8-byte expiry.)
 """
 from nacl.signing import VerifyKey
 from nacl.exceptions import BadSignatureError
 import hashlib
 import argparse
 
-parser = argparse.ArgumentParser(description='Verify the given signature signed the Session Pro Proof elements (gen-index-hash, rotating-pkey, expiry-ts-ms)')
+parser = argparse.ArgumentParser(description='Verify the given signature signed the Session Pro Proof elements (gen-index-hash, rotating-pkey, expiry-ts)')
 _ = parser.add_argument('--version',        type=int, required=True, help='Proof version')
 _ = parser.add_argument('--gen-index-hash', type=str, required=True, help='32-byte gen index hash (in hex)')
 _ = parser.add_argument('--rotating-pkey',  type=str, required=True, help='32-byte Ed25519 rotating public key (in hex)')
-_ = parser.add_argument('--expiry-ts-ms',   type=int, required=True, help='Expiry timestamp (ms)')
+_ = parser.add_argument('--expiry-ts',      type=int, required=True, help='Expiry timestamp (UNIX seconds)')
 _ = parser.add_argument('--signature',      type=str,                help='64-byte Ed25519 signature (in hex) that the Pro Backend produced by signing the proof to verify')
 _ = parser.add_argument('--verify-pkey',    type=str,                help='32-byte Ed25519 public key (in hex) that the Pro Backend signed the proof with')
 args = parser.parse_args()
@@ -56,7 +60,7 @@ args = parser.parse_args()
 # Compute hash of the proof
 hash_result: bytes = b''
 if 1:
-    personalization = b"SeshProBackend__"
+    personalization = b"ProProof________"
     h = hashlib.blake2b(person=personalization, digest_size=32)
     h.update(args.version.to_bytes(byteorder='little', length=1))
 
@@ -66,7 +70,7 @@ if 1:
 
     h.update(bytes.fromhex(gen_hash))
     h.update(bytes.fromhex(rotating_pkey))
-    h.update(args.expiry_ts_ms.to_bytes(byteorder='little', length=8))
+    h.update(args.expiry_ts.to_bytes(byteorder='little', length=8))
     hash_result = h.digest()
     print(f"Hash: {hash_result.hex()}")
 

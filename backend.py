@@ -116,12 +116,12 @@ class ProSubscriptionProof:
 
     def to_dict(self) -> dict[str, str | int]:
         result = {
-            "version":           self.version,
-            "gen_index_hash":    self.gen_index_hash.hex(),
-            "rotating_pkey":     bytes(self.rotating_pkey).hex(),
-            # Wire key/unit unchanged in 5a (byte-identical); 5b renames to `expiry_ts` in seconds.
-            "expiry_unix_ts_ms": base.unix_ms_from_datetime(self.expires_at),
-            "sig":               self.sig.hex(),
+            "version":        self.version,
+            "gen_index_hash": self.gen_index_hash.hex(),
+            "rotating_pkey":  bytes(self.rotating_pkey).hex(),
+            # Proof expiry is day-aligned, so integer seconds is exact (wire spec §2).
+            "expiry_ts":      base.unix_seconds_from_datetime(self.expires_at),
+            "sig":            self.sig.hex(),
         }
         return result
 
@@ -388,9 +388,9 @@ def make_set_payment_refund_requested_hash(version: int, master_pkey: nacl.signi
     hasher: hashlib.blake2b = make_blake2b_hasher(personalisation=SET_PAYMENT_REFUND_REQUESTED_HASH_PERSONALISATION)
     hasher.update(version.to_bytes(length=1, byteorder='little'))
     hasher.update(bytes(master_pkey))
-    # Wire/crypto unchanged in 5a: still 8-byte LE milliseconds (5b switches to seconds).
-    hasher.update(base.unix_ms_from_datetime(request_at).to_bytes(length=8, byteorder='little'))
-    hasher.update(base.unix_ms_from_datetime(refund_requested_at).to_bytes(length=8, byteorder='little'))
+    # Signed timestamps are integer seconds, 8-byte LE (wire spec §1/§3.3).
+    hasher.update(base.unix_seconds_from_datetime(request_at).to_bytes(length=8, byteorder='little'))
+    hasher.update(base.unix_seconds_from_datetime(refund_requested_at).to_bytes(length=8, byteorder='little'))
     hasher.update(payment_tx.provider.value.encode('utf-8'))  # provider_code, UTF-8, undelimited (spec §3.3, Delta #10)
     match payment_tx.provider:
         case base.PaymentProvider.Rangeproof:
@@ -409,7 +409,7 @@ def make_get_pro_details_hash(version: int, master_pkey: nacl.signing.VerifyKey,
     hasher: hashlib.blake2b = make_blake2b_hasher(personalisation=GET_PRO_DETAILS_HASH_PERSONALISATION)
     hasher.update(version.to_bytes(length=1, byteorder='little'))
     hasher.update(bytes(master_pkey))
-    hasher.update(base.unix_ms_from_datetime(request_at).to_bytes(length=8, byteorder='little'))
+    hasher.update(base.unix_seconds_from_datetime(request_at).to_bytes(length=8, byteorder='little'))
     hasher.update(count.to_bytes(length=4, byteorder='little'))
     result: bytes = hasher.digest()
     return result
@@ -1628,7 +1628,7 @@ def make_generate_pro_proof_hash(version:       int,
     hasher.update(version.to_bytes(length=1, byteorder='little'))
     hasher.update(bytes(master_pkey))
     hasher.update(bytes(rotating_pkey))
-    hasher.update(base.unix_ms_from_datetime(request_at).to_bytes(length=8, byteorder='little'))
+    hasher.update(base.unix_seconds_from_datetime(request_at).to_bytes(length=8, byteorder='little'))
     result: bytes = hasher.digest()
     return result
 
@@ -1641,7 +1641,7 @@ def build_proof_hash(version:        int,
     hasher.update(version.to_bytes(length=1, byteorder='little'))
     hasher.update(gen_index_hash)
     hasher.update(bytes(rotating_pkey))
-    hasher.update(base.unix_ms_from_datetime(expires_at).to_bytes(length=8, byteorder='little'))
+    hasher.update(base.unix_seconds_from_datetime(expires_at).to_bytes(length=8, byteorder='little'))
     result: bytes = hasher.digest()
     return result
 

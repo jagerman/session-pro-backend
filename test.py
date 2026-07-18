@@ -586,11 +586,11 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
         if 1: # Grab the pro status before anything has happened
             version:      int   = 0
             count:        int   = 10_000
-            hash_to_sign: bytes = backend.make_get_pro_details_hash(version=version, master_pkey=master_key.verify_key, request_at=base.datetime_from_unix_ms(unix_ts_ms), count=count)
+            hash_to_sign: bytes = backend.make_get_pro_details_hash(version=version, master_pkey=master_key.verify_key, request_at=base.datetime_from_unix_seconds(unix_ts_ms // 1000), count=count)
             request_body={'version':     version,
                           'master_pkey': bytes(master_key.verify_key).hex(),
                           'master_sig':  bytes(master_key.sign(hash_to_sign).signature).hex(),
-                          'unix_ts_ms':  unix_ts_ms,
+                          'ts': unix_ts_ms // 1000,
                           'count':       count}
 
             onion_request = onion_req.make_request_v4(our_x25519_pkey=our_x25519_skey.public_key,
@@ -672,7 +672,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
             result_version:            int = base.json_dict_require_int(d=result_json, key='version',          err=err)
             result_gen_index_hash_hex: str = base.json_dict_require_str(d=result_json, key='gen_index_hash',   err=err)
             result_rotating_pkey_hex:  str = base.json_dict_require_str(d=result_json, key='rotating_pkey',    err=err)
-            result_expiry_unix_ts_ms:  int = base.json_dict_require_int(d=result_json, key='expiry_unix_ts_ms', err=err)
+            result_expiry_ts:  int = base.json_dict_require_int(d=result_json, key='expiry_ts', err=err)
             result_sig_hex:            str = base.json_dict_require_str(d=result_json, key='sig',              err=err)
             assert len(err.msg_list) == 0, '{err.msg_list}'
 
@@ -689,7 +689,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
             proof_hash: bytes = backend.build_proof_hash(result_version,
                                                          result_gen_index_hash,
                                                          result_rotating_pkey,
-                                                         base.datetime_from_unix_ms(result_expiry_unix_ts_ms))
+                                                         base.datetime_from_unix_seconds(result_expiry_ts))
             runtime = backend.get_runtime(db_conn)
             _ = backend_key.verify_key.verify(smessage=proof_hash, signature=result_sig)
 
@@ -704,13 +704,13 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
             hash_to_sign: bytes = backend.make_generate_pro_proof_hash(version=version,
                                                                        master_pkey=master_key.verify_key,
                                                                        rotating_pkey=new_rotating_key.verify_key,
-                                                                       request_at=base.datetime_from_unix_ms(unix_ts_ms))
+                                                                       request_at=base.datetime_from_unix_seconds(unix_ts_ms // 1000))
 
             request_body = {
                 'version':       version,
                 'master_pkey':   bytes(master_key.verify_key).hex(),
                 'rotating_pkey': bytes(new_rotating_key.verify_key).hex(),
-                'unix_ts_ms':    unix_ts_ms,
+                'ts': unix_ts_ms // 1000,
                 'master_sig':    bytes(master_key.sign(hash_to_sign).signature).hex(),
                 'rotating_sig':  bytes(new_rotating_key.sign(hash_to_sign).signature).hex(),
             }
@@ -741,7 +741,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
             result_version:            int = base.json_dict_require_int(d=result_json, key='version',          err=err)
             result_gen_index_hash_hex: str = base.json_dict_require_str(d=result_json, key='gen_index_hash',   err=err)
             result_rotating_pkey_hex:  str = base.json_dict_require_str(d=result_json, key='rotating_pkey',    err=err)
-            result_expiry_unix_ts_ms:  int = base.json_dict_require_int(d=result_json, key='expiry_unix_ts_ms', err=err)
+            result_expiry_ts:  int = base.json_dict_require_int(d=result_json, key='expiry_ts', err=err)
             result_sig_hex:            str = base.json_dict_require_str(d=result_json, key='sig',              err=err)
             assert len(err.msg_list) == 0, '{err.msg_list}'
 
@@ -758,14 +758,14 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
             proof_hash = backend.build_proof_hash(result_version,
                                                   result_gen_index_hash,
                                                   result_rotating_pkey,
-                                                  base.datetime_from_unix_ms(result_expiry_unix_ts_ms))
+                                                  base.datetime_from_unix_seconds(result_expiry_ts))
             _ = backend_key.verify_key.verify(smessage=proof_hash, signature=result_sig)
 
             # Check that the expiry time does not exceed 31 days (we clamped to 30 days and if there's
             # overrun of 30 days we round up to 31 days)
-            assert result_expiry_unix_ts_ms % base.MILLISECONDS_IN_DAY == 0
-            assert result_expiry_unix_ts_ms == base.unix_ms_from_datetime(base.round_datetime_to_start_of_day(request_at + datetime.timedelta(days=31))) or \
-                   result_expiry_unix_ts_ms == base.unix_ms_from_datetime(base.round_datetime_to_start_of_day(request_at + datetime.timedelta(days=30)))
+            assert result_expiry_ts % base.SECONDS_IN_DAY == 0
+            assert result_expiry_ts == base.unix_seconds_from_datetime(base.round_datetime_to_start_of_day(request_at + datetime.timedelta(days=31))) or \
+                   result_expiry_ts == base.unix_seconds_from_datetime(base.round_datetime_to_start_of_day(request_at + datetime.timedelta(days=30)))
 
         new_add_pro_payment_tx = backend.UserPaymentTransaction()
         if 1: # Register another payment on the same user, backend will choose the latest expiring payment
@@ -829,7 +829,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
             result_version:            int = base.json_dict_require_int(d=result_json, key='version',          err=err)
             result_gen_index_hash_hex: str = base.json_dict_require_str(d=result_json, key='gen_index_hash',   err=err)
             result_rotating_pkey_hex:  str = base.json_dict_require_str(d=result_json, key='rotating_pkey',    err=err)
-            result_expiry_unix_ts_ms:  int = base.json_dict_require_int(d=result_json, key='expiry_unix_ts_ms', err=err)
+            result_expiry_ts:  int = base.json_dict_require_int(d=result_json, key='expiry_ts', err=err)
             result_sig_hex:            str = base.json_dict_require_str(d=result_json, key='sig',              err=err)
             assert len(err.msg_list) == 0, '{err.msg_list}'
 
@@ -846,7 +846,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
             proof_hash: bytes = backend.build_proof_hash(result_version,
                                                          result_gen_index_hash,
                                                          result_rotating_pkey,
-                                                         base.datetime_from_unix_ms(result_expiry_unix_ts_ms))
+                                                         base.datetime_from_unix_seconds(result_expiry_ts))
             _ = backend_key.verify_key.verify(smessage=proof_hash, signature=result_sig)
 
         curr_revocation_ticket: int = 0
@@ -879,11 +879,11 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
             result_version: int = base.json_dict_require_int(d=result_json, key='version', err=err)
             result_items        = base.json_dict_require_array(d=result_json, key='items', err=err)
             result_ticket:  int = base.json_dict_require_int(d=result_json, key='ticket',  err=err)
-            result_retry_in_s: int = base.json_dict_require_int(d=result_json, key='retry_in_s', err=err)
+            result_retry_in: int = base.json_dict_require_int(d=result_json, key='retry_in', err=err)
             assert len(err.msg_list) == 0, '{err.msg_list}'
             assert result_version == 0
             assert result_ticket  == 0
-            assert result_retry_in_s == base.SECONDS_IN_DAY
+            assert result_retry_in == base.SECONDS_IN_DAY
             curr_revocation_ticket = result_ticket
 
             # Check that the server returned an empty revocation list, we no longer revoke the old
@@ -940,11 +940,11 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
                 result_version: int = base.json_dict_require_int(d=result_json, key='version', err=err)
                 result_items        = base.json_dict_require_array(d=result_json, key='items', err=err)
                 result_ticket:  int = base.json_dict_require_int(d=result_json, key='ticket',  err=err)
-                result_retry_in_s: int = base.json_dict_require_int(d=result_json, key='retry_in_s', err=err)
+                result_retry_in: int = base.json_dict_require_int(d=result_json, key='retry_in', err=err)
                 assert len(err.msg_list) == 0, '{err.msg_list}'
                 assert result_version == 0
                 assert result_ticket  == 1
-                assert result_retry_in_s == base.SECONDS_IN_DAY
+                assert result_retry_in == base.SECONDS_IN_DAY
                 curr_revocation_ticket = result_ticket
                 assert len(result_items) == 1
 
@@ -956,14 +956,14 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
 
                 for it in result_items:
                     it: dict[str, int | str]
-                    assert 'expiry_unix_ts_ms' in it and isinstance(it['expiry_unix_ts_ms'], int)
+                    assert 'expiry_ts' in it and isinstance(it['expiry_ts'], int)
                     assert 'gen_index_hash'   in it and isinstance(it['gen_index_hash'], str)
-                    assert 'effective_unix_ts_ms' in it and isinstance(it['effective_unix_ts_ms'], int)
-                    assert it['gen_index_hash']    == post_revoke_gen_index_hash.hex()
-                    assert it['expiry_unix_ts_ms'] == base.unix_ms_from_datetime(get_user.user.expires_at)
-                    # effective_unix_ts_ms should be creation time + 1 day (86400 seconds)
+                    assert 'effective_ts' in it and isinstance(it['effective_ts'], int)
+                    assert it['gen_index_hash'] == post_revoke_gen_index_hash.hex()
+                    assert it['expiry_ts']      == base.unix_seconds_from_datetime(get_user.user.expires_at)
+                    # effective_ts should be creation time + 1 day (86400 seconds)
                     # Since we can't know exact creation time in the test, just verify it's a reasonable value
-                    assert it['effective_unix_ts_ms'] > 0
+                    assert it['effective_ts'] > 0
 
             assert not err.has()
 
@@ -996,11 +996,11 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
             result_version: int = base.json_dict_require_int(d=result_json, key='version', err=err)
             result_items        = base.json_dict_require_array(d=result_json, key='items', err=err)
             result_ticket:  int = base.json_dict_require_int(d=result_json, key='ticket',  err=err)
-            result_retry_in_s: int = base.json_dict_require_int(d=result_json, key='retry_in_s', err=err)
+            result_retry_in: int = base.json_dict_require_int(d=result_json, key='retry_in', err=err)
             assert len(err.msg_list) == 0, '{err.msg_list}'
             assert result_version == 0, f'Response was: {json.dumps(response_json, indent=2)}'
             assert result_ticket  == 1, f'Response was: {json.dumps(response_json, indent=2)}'
-            assert result_retry_in_s == base.SECONDS_IN_DAY
+            assert result_retry_in == base.SECONDS_IN_DAY
 
             # List should be empty because we passed in the newest revocation
             # ticket. There are no changes to the revocation list so the backend
@@ -1012,12 +1012,12 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
             version:      int   = 0
             unix_ts_ms:   int   = int(time.time() * 1000)
             count:        int   = 10_000
-            hash_to_sign: bytes = backend.make_get_pro_details_hash(version=version, master_pkey=master_key.verify_key, request_at=base.datetime_from_unix_ms(unix_ts_ms), count=count)
+            hash_to_sign: bytes = backend.make_get_pro_details_hash(version=version, master_pkey=master_key.verify_key, request_at=base.datetime_from_unix_seconds(unix_ts_ms // 1000), count=count)
 
             request_body={'version':     version,
                           'master_pkey': bytes(master_key.verify_key).hex(),
                           'master_sig':  bytes(master_key.sign(hash_to_sign).signature).hex(),
-                          'unix_ts_ms':  unix_ts_ms,
+                          'ts': unix_ts_ms // 1000,
                           'count':       count}
 
             onion_request = onion_req.make_request_v4(our_x25519_pkey=our_x25519_skey.public_key,
@@ -1052,15 +1052,15 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
 
             # Retry the request but use a too old timestamp
             if 1:
-                unix_ts_ms:   int   = int((time.time() * 1000) + (server.DEFAULT_TIMESTAMP_TOLERANCE_MS * 2))
-                hash_to_sign: bytes = backend.make_get_pro_details_hash(version=version, master_pkey=master_key.verify_key, request_at=base.datetime_from_unix_ms(unix_ts_ms), count=count)
+                unix_ts_ms:   int   = int((time.time() + server.DEFAULT_TIMESTAMP_TOLERANCE.total_seconds() * 2) * 1000)
+                hash_to_sign: bytes = backend.make_get_pro_details_hash(version=version, master_pkey=master_key.verify_key, request_at=base.datetime_from_unix_seconds(unix_ts_ms // 1000), count=count)
                 onion_request = onion_req.make_request_v4(our_x25519_pkey=our_x25519_skey.public_key,
                                                           shared_key=shared_key,
                                                           endpoint=server.FLASK_ROUTE_GET_PRO_DETAILS,
                                                           request_body={'version':     version,
                                                                         'master_pkey': bytes(master_key.verify_key).hex(),
                                                                         'master_sig':  bytes(master_key.sign(hash_to_sign).signature).hex(),
-                                                                        'unix_ts_ms':  unix_ts_ms,
+                                                                        'ts': unix_ts_ms // 1000,
                                                                         'count':       count})
 
                 # POST and get response
@@ -1081,14 +1081,14 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
             if 1:
                 unix_ts_ms:    int   = int(time.time() * 1000)
                 count:         int   = 10_000
-                hash_to_sign:  bytes = backend.make_get_pro_details_hash(version=version, master_pkey=rotating_key.verify_key, request_at=base.datetime_from_unix_ms(unix_ts_ms), count=count)
+                hash_to_sign:  bytes = backend.make_get_pro_details_hash(version=version, master_pkey=rotating_key.verify_key, request_at=base.datetime_from_unix_seconds(unix_ts_ms // 1000), count=count)
                 onion_request = onion_req.make_request_v4(our_x25519_pkey=our_x25519_skey.public_key,
                                                           shared_key=shared_key,
                                                           endpoint=server.FLASK_ROUTE_GET_PRO_DETAILS,
                                                           request_body={'version':     version,
                                                                         'master_pkey': bytes(master_key.verify_key).hex(),
                                                                         'master_sig':  bytes(master_key.sign(hash_to_sign).signature).hex(),
-                                                                        'unix_ts_ms':  unix_ts_ms,
+                                                                        'ts': unix_ts_ms // 1000,
                                                                         'count':       count})
 
                 # POST and get response
@@ -1109,14 +1109,14 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
             if 1:
                 unix_ts_ms:   int   = int(time.time() * 1000)
                 count:        int   = 0
-                hash_to_sign: bytes = backend.make_get_pro_details_hash(version=version, master_pkey=master_key.verify_key, request_at=base.datetime_from_unix_ms(unix_ts_ms), count=count)
+                hash_to_sign: bytes = backend.make_get_pro_details_hash(version=version, master_pkey=master_key.verify_key, request_at=base.datetime_from_unix_seconds(unix_ts_ms // 1000), count=count)
                 onion_request       = onion_req.make_request_v4(our_x25519_pkey=our_x25519_skey.public_key,
                                                           shared_key=shared_key,
                                                           endpoint=server.FLASK_ROUTE_GET_PRO_DETAILS,
                                                           request_body={'version':     version,
                                                                         'master_pkey': bytes(master_key.verify_key).hex(),
                                                                         'master_sig':  bytes(master_key.sign(hash_to_sign).signature).hex(),
-                                                                        'unix_ts_ms':  unix_ts_ms,
+                                                                        'ts': unix_ts_ms // 1000,
                                                                         'count':       count})
 
                 # POST and get response
@@ -1245,13 +1245,13 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
             hash_to_sign: bytes = backend.make_generate_pro_proof_hash(version       = generate_pro_proof_hash_version,
                                                                        master_pkey   = master_key.verify_key,
                                                                        rotating_pkey = rotating_key.verify_key,
-                                                                       request_at    = base.datetime_from_unix_ms(start_unix_ts_ms))
+                                                                       request_at    = base.datetime_from_unix_seconds(start_unix_ts_ms // 1000))
 
             request_body = {
                 'version':       generate_pro_proof_hash_version,
                 'master_pkey':   bytes(master_key.verify_key).hex(),
                 'rotating_pkey': bytes(rotating_key.verify_key).hex(),
-                'unix_ts_ms':    start_unix_ts_ms,
+                'ts': start_unix_ts_ms // 1000,
                 'master_sig':    bytes(master_key.sign(hash_to_sign).signature).hex(),
                 'rotating_sig':  bytes(rotating_key.sign(hash_to_sign).signature).hex(),
             }
@@ -1324,16 +1324,16 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
             set_refund_requested_version = 0
             hash_to_sign: bytes = backend.make_set_payment_refund_requested_hash(version                     = set_refund_requested_version,
                                                                                  master_pkey                 = master_key.verify_key,
-                                                                                 request_at                  = base.datetime_from_unix_ms(start_unix_ts_ms),
-                                                                                 refund_requested_at = base.datetime_from_unix_ms(start_unix_ts_ms),
+                                                                                 request_at                  = base.datetime_from_unix_seconds(start_unix_ts_ms // 1000),
+                                                                                 refund_requested_at = base.datetime_from_unix_seconds(start_unix_ts_ms // 1000),
                                                                                  payment_tx                  = apple_tx)
 
             request_body = {
                 'version':                     set_refund_requested_version,
                 'master_pkey':                 bytes(master_key.verify_key).hex(),
                 'master_sig':                  bytes(master_key.sign(hash_to_sign).signature).hex(),
-                'unix_ts_ms':                  start_unix_ts_ms,
-                'refund_requested_unix_ts_ms': start_unix_ts_ms,
+                'ts': start_unix_ts_ms // 1000,
+                'refund_requested_ts': start_unix_ts_ms // 1000,
                 'payment_tx': {
                     'provider':                   base.PaymentProvider.iOSAppStore.value,
                     'apple_original_tx_id':       throwaway_id,
@@ -1372,8 +1372,8 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
 
             hash_to_sign: bytes = backend.make_set_payment_refund_requested_hash(version                     = set_refund_requested_version,
                                                                                  master_pkey                 = master_key.verify_key,
-                                                                                 request_at                  = base.datetime_from_unix_ms(start_unix_ts_ms),
-                                                                                 refund_requested_at = base.datetime_from_unix_ms(start_unix_ts_ms),
+                                                                                 request_at                  = base.datetime_from_unix_seconds(start_unix_ts_ms // 1000),
+                                                                                 refund_requested_at = base.datetime_from_unix_seconds(start_unix_ts_ms // 1000),
                                                                                  payment_tx                  = fake_payment)
 
             request_body = {
@@ -1385,8 +1385,8 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
                     'google_payment_token': fake_payment.google_payment_token,
                     'google_order_id':      fake_payment.google_order_id,
                 },
-                'unix_ts_ms':                  start_unix_ts_ms,
-                'refund_requested_unix_ts_ms': start_unix_ts_ms,
+                'ts': start_unix_ts_ms // 1000,
+                'refund_requested_ts': start_unix_ts_ms // 1000,
             }
 
             onion_request = onion_req.make_request_v4(our_x25519_pkey = our_x25519_skey.public_key,
@@ -1734,7 +1734,7 @@ def test_platform_apple(pg_database):
         result_version:            int = base.json_dict_require_int(d=result_json, key='version',          err=err)
         result_gen_index_hash_hex: str = base.json_dict_require_str(d=result_json, key='gen_index_hash',   err=err)
         result_rotating_pkey_hex:  str = base.json_dict_require_str(d=result_json, key='rotating_pkey',    err=err)
-        result_expiry_unix_ts_ms:  int = base.json_dict_require_int(d=result_json, key='expiry_unix_ts_ms', err=err)
+        result_expiry_ts:  int = base.json_dict_require_int(d=result_json, key='expiry_ts', err=err)
         result_sig_hex:            str = base.json_dict_require_str(d=result_json, key='sig',              err=err)
         assert len(err.msg_list) == 0, '{err.msg_list}'
 
@@ -1748,7 +1748,7 @@ def test_platform_apple(pg_database):
         assert result_rotating_pkey == rotating_key.verify_key
 
         # NOTE: Check that the server signed our proof w/ their public key
-        proof_hash: bytes = backend.build_proof_hash(result_version, result_gen_index_hash, result_rotating_pkey, base.datetime_from_unix_ms(result_expiry_unix_ts_ms))
+        proof_hash: bytes = backend.build_proof_hash(result_version, result_gen_index_hash, result_rotating_pkey, base.datetime_from_unix_seconds(result_expiry_ts))
         _ = test.backend_key.verify_key.verify(smessage=proof_hash, signature=result_sig)
 
     # The following is a sequence of notifications/events that transpired for the same account under
@@ -3667,11 +3667,12 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
     def get_pro_details(user_ctx: TestUserCtx, ctx: TestingContext, unix_ts_ms: int) -> base.JSONObject:
         version:      int   = 0
         count:        int   = 10_000
-        hash_to_sign: bytes = backend.make_get_pro_details_hash(version=version, master_pkey=user_ctx.master_key.verify_key, request_at=base.datetime_from_unix_ms(unix_ts_ms), count=count)
+        ts: int             = unix_ts_ms // 1000   # wire nonce is integer seconds (wire spec §3.4)
+        hash_to_sign: bytes = backend.make_get_pro_details_hash(version=version, master_pkey=user_ctx.master_key.verify_key, request_at=base.datetime_from_unix_seconds(ts), count=count)
         request_body={'version':     version,
                       'master_pkey': bytes(user_ctx.master_key.verify_key).hex(),
                       'master_sig':  bytes(user_ctx.master_key.sign(hash_to_sign).signature).hex(),
-                      'unix_ts_ms':  unix_ts_ms,
+                      'ts':          ts,
                       'count':       count}
         server.time_now = lambda: unix_ts_ms / 1000.0
         response: werkzeug.test.TestResponse = ctx.flask_client.post(server.FLASK_ROUTE_GET_PRO_DETAILS, json=request_body)
@@ -3787,48 +3788,52 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
                            ctx:                               TestingContext,
                            unix_ts_ms:                        int | None = None,
                            revoke_unix_ts_ms:                 int | None = None):
-        status                       = get_pro_details(user_ctx=user_ctx, ctx=ctx, unix_ts_ms=unix_ts_ms if unix_ts_ms else tx.event_ms)
-        err                          = base.ErrorSink()
-        result                       = base.json_dict_require_obj(status, "result", err)
-        res_auto_renewing            = base.json_dict_require_bool(result, "auto_renewing", err)
-        res_expiry_unix_ts_ms        = base.json_dict_require_int(result, "expiry_unix_ts_ms", err)
-        res_grace_period_duration_ms = base.json_dict_require_int(result, "grace_period_duration_ms", err)
-        res_pro_status               = base.json_dict_require_int_coerce_to_enum(result, "status", server.UserProStatus, err)
-        res_items                    = base.json_dict_require_array(result, "items", err)
+        # The wire is integer seconds (upstream provider instants — here `revoked_ts` — are floats);
+        # the harness/provider fixtures below are ms. `to_s` mirrors the server's floor-to-seconds so
+        # a ms fixture compares against the emitted integer-seconds value.
+        to_s = lambda ms: base.unix_seconds_from_datetime(base.datetime_from_unix_ms(ms))
+        status                    = get_pro_details(user_ctx=user_ctx, ctx=ctx, unix_ts_ms=unix_ts_ms if unix_ts_ms else tx.event_ms)
+        err                       = base.ErrorSink()
+        result                    = base.json_dict_require_obj(status, "result", err)
+        res_auto_renewing         = base.json_dict_require_bool(result, "auto_renewing", err)
+        res_expiry_ts             = base.json_dict_require_int(result, "expiry_ts", err)
+        res_grace_period_duration = base.json_dict_require_int(result, "grace_period_duration", err)
+        res_pro_status            = base.json_dict_require_int_coerce_to_enum(result, "status", server.UserProStatus, err)
+        res_items                 = base.json_dict_require_array(result, "items", err)
         assert not err.has(), status
         assert res_auto_renewing == auto_renew, json.dumps(result, indent=1)
         revoked = payment_status == base.PaymentStatus.Revoked
         if revoked:
             assert revoke_unix_ts_ms != None
-            assert res_expiry_unix_ts_ms == revoke_unix_ts_ms
+            assert res_expiry_ts == to_s(revoke_unix_ts_ms)
         else:
-            expires_at = res_expiry_unix_ts_ms
+            expires_at = res_expiry_ts
             if res_auto_renewing:
-                expires_at -= res_grace_period_duration_ms
-            assert expires_at == tx.expires_at, json.dumps(result, indent=1)
+                expires_at -= res_grace_period_duration
+            assert expires_at == to_s(tx.expires_at), json.dumps(result, indent=1)
         assert res_pro_status == pro_status
         assert len(res_items) == user_ctx.payments
         item = res_items[0]
         assert isinstance(item, dict)
-        item_expiry_unix_ts                    = base.json_dict_require_int(item, "expiry_unix_ts_ms", err)
-        item_order_id                          = base.json_dict_require_str(item, "google_order_id", err)
-        item_payment_token                     = base.json_dict_require_str(item, "google_payment_token", err)
-        item_grace_duration_ms                 = base.json_dict_require_int(item, "grace_period_duration_ms", err)
-        item_payment_provider                  = base.json_dict_require_str_coerce_to_enum(item, "payment_provider", base.PaymentProvider, err)
-        item_platform_refund_expiry_unix_ts_ms = base.json_dict_require_int(item, "platform_refund_expiry_unix_ts_ms", err)
-        item_redeemed_unix_ts_ms               = base.json_dict_require_int(item, "redeemed_unix_ts_ms", err)
-        item_revoked_unix_ts_ms                = base.json_dict_require_int(item, "revoked_unix_ts_ms", err)
-        item_status                            = base.json_dict_require_str_coerce_to_enum(item, "status", base.PaymentStatus, err)
+        item_expiry_ts                 = base.json_dict_require_int(item, "expiry_ts", err)
+        item_order_id                  = base.json_dict_require_str(item, "google_order_id", err)
+        item_payment_token             = base.json_dict_require_str(item, "google_payment_token", err)
+        item_grace_duration            = base.json_dict_require_int(item, "grace_period_duration", err)
+        item_payment_provider          = base.json_dict_require_str_coerce_to_enum(item, "payment_provider", base.PaymentProvider, err)
+        item_platform_refund_expiry_ts = base.json_dict_require_int(item, "platform_refund_expiry_ts", err)
+        item_redeemed_ts               = base.json_dict_require_int(item, "redeemed_ts", err)
+        item_revoked_ts                = base.json_dict_require_float(item, "revoked_ts", err)
+        item_status                    = base.json_dict_require_str_coerce_to_enum(item, "status", base.PaymentStatus, err)
         assert not err.has()
-        assert item_expiry_unix_ts                    == tx.expires_at, res_items
-        assert item_order_id                          == tx.order_id
-        assert item_payment_token                     == tx.purchase_token
-        assert item_grace_duration_ms                 == base.ms_from_timedelta(grace_duration_ms)
-        assert item_payment_provider                  == base.PaymentProvider.GooglePlayStore
-        assert item_platform_refund_expiry_unix_ts_ms == platform_refund_expires_at
-        assert item_redeemed_unix_ts_ms               == redeemed_ts_ms_rounded
-        assert item_revoked_unix_ts_ms                == 0 if not revoked else tx.event_ms
-        assert item_status                            == payment_status
+        assert item_expiry_ts                 == to_s(tx.expires_at), res_items
+        assert item_order_id                  == tx.order_id
+        assert item_payment_token             == tx.purchase_token
+        assert item_grace_duration            == base.seconds_from_timedelta(grace_duration_ms)
+        assert item_payment_provider          == base.PaymentProvider.GooglePlayStore
+        assert item_platform_refund_expiry_ts == to_s(platform_refund_expires_at)
+        assert item_redeemed_ts               == to_s(redeemed_ts_ms_rounded)
+        assert item_revoked_ts                == 0.0 if not revoked else base.unix_seconds_float_from_datetime(base.datetime_from_unix_ms(tx.event_ms))
+        assert item_status                    == payment_status
 
     """
     Testing Common Action Functions
@@ -3932,7 +3937,9 @@ current_state={'kind': 'androidpublisher#subscriptionPurchaseV2', 'startTime': '
                            user_ctx                          = user_ctx,
                            ctx                               = ctx,
                            revoke_unix_ts_ms                 = refund_tx.event_ms,
-                           unix_ts_ms                        = refund_tx.event_ms + 1)
+                           # +1s (not +1ms): the wire nonce is integer seconds, so a sub-second margin
+                           # past expiry floors away — "just past expiry" is one whole second.
+                           unix_ts_ms                        = refund_tx.event_ms + 1000)
 
     with TestingContext(pg_database, platform_testing_env=True) as ctx:
         """
@@ -4996,7 +5003,7 @@ current_state={'kind': 'androidpublisher#subscriptionPurchaseV2', 'startTime': '
             platform_refund_expires_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
-            unix_ts_ms=tx_refund_a.event_ms + 1, # +1 to increment us over the threshold to be expired
+            unix_ts_ms=tx_refund_a.event_ms + 1000, # +1s (wire nonce is integer seconds) to cross the expiry threshold
             revoke_unix_ts_ms=tx_refund_a.event_ms)
 
     with TestingContext(pg_database, platform_testing_env=True) as ctx:

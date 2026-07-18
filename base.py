@@ -30,9 +30,16 @@ SECONDS_IN_MONTH:      int     = SECONDS_IN_DAY * 30
 MILLISECONDS_IN_YEAR:  int     = MILLISECONDS_IN_DAY * 365
 SECONDS_IN_YEAR:       int     = SECONDS_IN_DAY * 365
 
-# Every instant in this codebase is a tz-aware UTC `datetime` and every duration a `timedelta`. The
-# millisecond wire/proof epoch unit lives ONLY in the four converters below — item 5b flips these to
-# integer seconds (the wire spec's unit) and nothing else changes.
+# Every instant in this codebase is a tz-aware UTC `datetime` and every duration a `timedelta`. Integer
+# epochs live ONLY in the converters below, at two kinds of boundary with distinct units:
+#   - MILLISECONDS: the payment providers (Apple/Google App Store APIs) and the `runtime` shim genuinely
+#     speak ms, so their ingest/egress uses the `*_ms` pair.
+#   - SECONDS: our own wire + proof format is seconds (the wire spec's unit, item 5b), so every
+#     client-facing boundary and every signed hash uses the `*_seconds` pair. Wire seconds are integer
+#     everywhere except two upstream provider event instants (`purchased_ts`, `revoked_ts`) that keep
+#     the provider's sub-second precision as a float via `unix_seconds_float_from_datetime` — see the
+#     wire spec §1. Nothing hashed is ever a float.
+# The two never mix: a value crossing the provider boundary is ms, a value crossing our wire is seconds.
 EPOCH: datetime.datetime = datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
 
 def datetime_from_unix_ms(unix_ms: int) -> datetime.datetime:
@@ -47,6 +54,26 @@ def timedelta_from_ms(ms: int) -> datetime.timedelta:
 
 def ms_from_timedelta(value: datetime.timedelta) -> int:
     return value // datetime.timedelta(milliseconds=1)
+
+def datetime_from_unix_seconds(unix_s: int) -> datetime.datetime:
+    return EPOCH + datetime.timedelta(seconds=unix_s)
+
+def unix_seconds_from_datetime(value: datetime.datetime) -> int:
+    # Exact integer seconds via integer division — never float `.timestamp()` truncation. Sub-second
+    # precision (a provider ms value) is floored: our wire is second-resolution by spec.
+    return (value - EPOCH) // datetime.timedelta(seconds=1)
+
+def timedelta_from_seconds(s: int) -> datetime.timedelta:
+    return datetime.timedelta(seconds=s)
+
+def seconds_from_timedelta(value: datetime.timedelta) -> int:
+    return value // datetime.timedelta(seconds=1)
+
+def unix_seconds_float_from_datetime(value: datetime.datetime) -> float:
+    # Fractional UNIX seconds (true division) — preserves the sub-second precision of an upstream
+    # provider instant on the wire. ONLY for the enumerated float display fields (wire spec §1); never
+    # for a hashed value, which must be integer seconds via `unix_seconds_from_datetime`.
+    return (value - EPOCH) / datetime.timedelta(seconds=1)
 
 # NOTE: Default grace period we add to the subscription payments because in real world situations
 # no payment processor/billing cycle is going to bill exactly on the dot due to real-world
@@ -552,6 +579,19 @@ def json_dict_require_int(d: JSONObject, key: str, err: ErrorSink) -> int:
             result = typing.cast(int, d[key])
         else:
             err.msg_list.append(f'Key "{key}" value was not an integer: "{safe_get_dict_value_type(d, key)}"')
+    else:
+        err.msg_list.append(f'Required key "{key}" is missing from JSON: {safe_dump_dict_keys_or_data(d)}')
+    return result
+
+def json_dict_require_float(d: JSONObject, key: str, err: ErrorSink) -> float:
+    # Accepts a JSON number (int or float) and returns it as a float. Used for the wire's fractional
+    # -second fields (`purchased_ts`, `revoked_ts`) which may serialise as either `X` or `X.0`.
+    result = 0.0
+    if key in d:
+        if isinstance(d[key], (int, float)) and not isinstance(d[key], bool):
+            result = float(typing.cast(float, d[key]))
+        else:
+            err.msg_list.append(f'Key "{key}" value was not a number: "{safe_get_dict_value_type(d, key)}"')
     else:
         err.msg_list.append(f'Required key "{key}" is missing from JSON: {safe_dump_dict_keys_or_data(d)}')
     return result

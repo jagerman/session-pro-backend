@@ -71,7 +71,7 @@ API
       result: Result object with the pro proof, only set if status was success otherwise there will
               be an error array as aforementioned.
         version:           1 byte version value from the request
-        expiry_unix_ts_ms: 8 byte UNIX time-stamp of when the proof will expire
+        expiry_ts: 8 byte UNIX time-stamp of when the proof will expire
         gen_index_hash:    32 byte hash of the internal generation index that has been allocated to
                            the user. This hash is the unique identifier for all Session Pro Proofs
                            generated for a given payment.
@@ -111,7 +111,7 @@ API
       Response
       {
        "result": {
-        "expiry_unix_ts_ms": 1762407280000,
+        "expiry_ts": 1762407280,
         "gen_index_hash": "2caeefdd95a0ce0dfbdbdeca987e7cdd7cb40fb40de55282931740c56ca40245",
         "rotating_pkey": "ecd0e9c371b5e1d9e116ba4d29b057e458c8b4bca40b5b3fea1cd5d5e89ae7b7",
         "sig": "51d2ea19a4e26ea4181214ce8f72ea1f8c9b3b53a911399a3a63713272211aec481c40d6ab65f91f71ef093bbda608f037aafba73482a304db6fe30f1806130b",
@@ -130,7 +130,7 @@ API
       The embedded `master_sig` and `rotating_sig` signature must sign over a 32 byte hash of the
       request components (in little endian):
 
-        hash = blake2b32(person='ProGenerateProof', version || master_pkey || rotating_pkey || unix_ts_ms)
+        hash = blake2b32(person='ProGenerateProof', version || master_pkey || rotating_pkey || ts)
 
       Once the response has been received, the caller should store the proof offline and embed it
       into their messages on the Session Protocol, signing the message with their rotating secret
@@ -141,14 +141,14 @@ API
       signature in the response signs over a 32 byte hash of the following response components (in
       little endian):
 
-        hash = blake2b32(person='ProProof________', version || gen_index_hash || rotating_pkey || expiry_unix_ts_ms)
+        hash = blake2b32(person='ProProof________', version || gen_index_hash || rotating_pkey || expiry_ts)
 
     Request
       version:       1 byte, current version of the request which should be 0
       master_pkey:   32 byte Ed25519 master Session Pro public key derived deterministically from
                      the Session Account seed in hex to get pro status for
       rotating_pkey: 32 byte Ed25519 public key to pair to the pro proof in hex
-      unix_ts_ms:    8 byte current UNIX timestamp
+      ts:    8 byte current UNIX timestamp
       master_sig:    64 byte signature over the hash of the contents of the request proving that the
                      user knows the secret component to the `master_pkey` and hence the caller is
                      authorised to pair a new `rotating_pkey` to the payment associated with the
@@ -161,7 +161,7 @@ API
                  RESPONSE_GENERIC_ERROR
       result:
         version:           1 byte version value from the request
-        expiry_unix_ts_ms: 8 byte UNIX timestamp of when the proof will expire
+        expiry_ts: 8 byte UNIX timestamp of when the proof will expire
         gen_index_hash:    32 byte hash of the internal generation index that has been allocated to
                            the user.
         rotating_pkey:     32 byte Ed25519 public key authorised to use the proof
@@ -175,7 +175,7 @@ API
         "version": 0,
         "master_pkey": "2a87bf679678fe7ccad36ae081de58ee327f1a6706d1f2b2ecda52219b7ee8bf",
         "rotating_pkey": "67917f7507c58880c50e249afecb2fe4a236d422c7e05b04d4fbf46e30c965d5",
-        "unix_ts_ms": 1755648412000,
+        "ts": 1755648412,
         "master_sig": "76e02d201fad147a318aa798196bf9880bf4425f529e24bb25af34a4181365ef7591ae066b31aded05e3b67370892f381910fcaf3c2ffb5be13cca389a572108",
         "rotating_sig": "74ffec4d91caf777d439f2f34a1c7375ff746ae798181bf357050f7848fd8b7f100a933b61e15f13cacdbd6028b37bc1f2a4d8888b2b04a6e5d7e51b38dd360e"
       }
@@ -183,7 +183,7 @@ API
       Response
       {
         "result": {
-          "expiry_unix_ts_ms": 1758412800000,
+          "expiry_ts": 1758412800,
           "gen_index_hash": "084563482babfdf1acda66fcef7c70ad835e148ab98f26371ce9e4abef6104d7",
           "rotating_pkey": "67917f7507c58880c50e249afecb2fe4a236d422c7e05b04d4fbf46e30c965d5",
           "sig": "a1ea79c2a274afc0a61e5946976297b42e1dcfdbde29f007c8fe43d2e616fc7e5db5865d05212e392a6395fabe1ed69f976fb19c25f4640df5b89a5870739e0e",
@@ -238,12 +238,12 @@ API
                  be empty as there are no changes to the revocation list.
          items:   Array of revocations, can be empty if there are no revocations or the request ticket
                   is the latest ticket managed by the backend.
-          expiry_unix_ts_ms:    8 byte UNIX timestamp indicating when the Session Pro Proof identified
+          expiry_ts:    8 byte UNIX timestamp indicating when the Session Pro Proof identified
                                 by its `gen_index_hash` should be rejected until.
           gen_index_hash:       32 byte hash of the Session Pro proof that has been revoked.
-          effective_unix_ts_ms: 8 byte UNIX timestamp indicating when the revocation becomes effective
+          effective_ts: 8 byte UNIX timestamp indicating when the revocation becomes effective
                                 (i.e., clients should start rejecting proofs at this time).
-        retry_in_s: 4 byte integer of the recommended time in seconds that the client should wait to
+        retry_in: 4 byte integer of the recommended time in seconds that the client should wait to
                     send the request for the pro-revocation list again to avoid being throttled.
 
     Examples
@@ -255,13 +255,13 @@ API
         "result": {
           "items": [
             {
-              "expiry_unix_ts_ms": 1758412800000,
+              "expiry_ts": 1758412800,
               "gen_index_hash": "3ab824a62d2b6004449d44962383294a5e6e833d6ed491930fbba726a2569c68",
-              "effective_unix_ts_ms": 1758326400000
+              "effective_ts": 1758326400
             }
           ],
           "ticket": 1,
-          "retry_in_s": 86400,
+          "retry_in": 86400,
           "version": 0
         },
         "status": 0
@@ -280,7 +280,7 @@ API
       The embedded `master_sig` signature must sign over the 32 byte hash of the requests contents
       (in little endian):
 
-        hash = blake2b32(person='ProGetProDetReq_', version || master_pkey || unix_ts_ms || count)
+        hash = blake2b32(person='ProGetProDetReq_', version || master_pkey || ts || count)
 
       TODO: In future we plan to prune payment history after some legally required threshold such as
       a year.
@@ -296,7 +296,7 @@ API
       master_sig:  64 byte signature over the hash of the contents of the request proving that the
                    user knows the secret component to the `master_pkey` and hence the caller is
                    authorised to get pro status for this key.
-      unix_ts_ms:  8 byte UNIX timestamp of the current time.
+      ts:  8 byte UNIX timestamp of the current time.
       count:       4 byte integer indicating up to how many payments can be populated in the `items`
                    array. `items` is capped to the actual number of payments available for
                    `master_pkey`.
@@ -319,7 +319,7 @@ API
                                   entitlement to Session Pro features.
         auto_renewing:     1 byte boolean indicating if the latest pro subscription (if active)
                            is set to auto-renew at the marked expiry time.
-        expiry_unix_ts_ms: 8 byte UNIX timestamp indicating the latest timestamp to which a user is
+        expiry_ts: 8 byte UNIX timestamp indicating the latest timestamp to which a user is
                            allowed to request a Session Pro Proof from the backend. This timestamp
                            is inclusive of the grace period a user may be allocated if they have an
                            auto- renewing subscription. This expiry value is roughly calculated as
@@ -331,19 +331,19 @@ API
                            then defers the responsibility of choosing the best/most relevant active
                            payment associated with an account to the server which is the
                            authoritative source of truth.
-        refund_requested_unix_ts_ms: 8 byte UNIX timestamp indicating if the user has requested a
+        refund_requested_ts: 8 byte UNIX timestamp indicating if the user has requested a
                                      refund for their latest subscription that would be otherwise be
                                      expiring at the payment associated with the
-                                     'expiring_unix_ts_ms'. This value is set to 0 if no refund has
+                                     'expiry_ts'. This value is set to 0 if no refund has
                                      been initiated.
-        grace_period_duration_ms:  8 byte duration integer indicating the grace period duration
+        grace_period_duration:  8 byte duration integer indicating the grace period duration
                                    indicating the amount of time the payment platform will attempt
                                    to auto-renew the subscription after it has expired. Clients can
                                    continue to request a proof for users during the grace period
                                    that expires at the end of the period. The grace period is
                                    included into the expiry timestamp thus the timestamp at which
                                    auto-renewing of a subscription starts can be calculated by
-                                   `expiry_unix_ts_ms - grace_duration_ms` and that `auto_renewing`
+                                   `expiry_ts - grace_period_duration` and that `auto_renewing`
                                    is true. Note: on some platforms, the grace period is not known
                                    until the user enters the grace period (such as Google) and as
                                    such this value may be set at different value whilst
@@ -390,19 +390,19 @@ API
                                     enabled to repeat this payment. It additionally indicates that
                                     the user is to be granted the grace period marked on the
                                     payment.
-          unredeemed_unix_ts_ms:    8 byte UNIX timestamp indicating when the payment was executed.
-          redeemed_unix_ts_ms:      8 byte UNIX timestamp indicating when the payment was
+          purchased_ts:    8 byte UNIX timestamp indicating when the payment was executed.
+          redeemed_ts:      8 byte UNIX timestamp indicating when the payment was
                                     registered. This timestamp is rounded up to the next day
                                     boundary from the actual registration date.
-          expiry_unix_ts_ms:        8 byte UNIX timestamp indicating when the entitlement of Session
+          expiry_ts:        8 byte UNIX timestamp indicating when the entitlement of Session
                                     Pro is due to expire. Note this is _not_ inclusive of grace
                                     unlike the expiry timestamp in the top-level result object.
-          grace_period_duration_ms: 8 byte duration integer indicating how long the subscription's
+          grace_period_duration: 8 byte duration integer indicating how long the subscription's
                                     grace period is. Set to 0 if auto-renewing is disabled.
-          platform_refund_expiry_unix_ts_ms: 8 byte unix timestamp indicating when the payment will
+          platform_refund_expiry_ts: 8 byte unix timestamp indicating when the payment will
                                              no longer be eligible for a refund via its purchase
                                              platform.
-          revoked_unix_ts_ms:                8 byte UNIX timestamp indicating when the payment was
+          revoked_ts:                8 byte UNIX timestamp indicating when the payment was
                                              revoked. 0 if it never revoked.
           google_payment_token:        When payment provider is Google Play Store, a string which is
                                        set to the platform-specific purchase token for the
@@ -420,7 +420,7 @@ API
                                        for the subscription.
           rangeproof_order_id:         When payment provider is Rangeproof, a string which is set to
                                        the platform-specific order ID for the subscription.
-          refund_requested_unix_ts_ms: 8 byte UNIX timestamp indicating if the user has requested a
+          refund_requested_ts: 8 byte UNIX timestamp indicating if the user has requested a
                                        refund for this payment. This value is set to 0 if no refund
                                        has been initiated. Setting the refund request value for
                                        a payment is optional and platforms must call the set refund
@@ -432,7 +432,7 @@ API
         "version": 0,
         "master_pkey": "8ddc57b457fca85d2184813ea18a048f64a35ab0e693d4a0a3e4f8ee87ff3360",
         "master_sig": "37495dfab72772ebf4e4bf213b0a1c46e8e044ef3e4360ff8ef04ee8a7daf2178a716447de6f938d0e7865be31735fb2db2d1213dc35c02dfe253aac77fb2a0d",
-        "unix_ts_ms": 1755653705,
+        "ts": 1755653705,
         "count":      10000,
       }
 
@@ -445,21 +445,21 @@ API
               "plan": 1,
               "payment_provider": 1,
               "auto_renewing": 1,
-              "unredeemed_unix_ts_ms": 1759190400000,
-              "redeemed_unix_ts_ms": 1759190400000,
-              "expiry_unix_ts_ms": 1761718134941,
-              "grace_period_duration_ms": 0,
-              "platform_refund_expiry_unix_ts_ms": 1761718134941,
-              "revoked_unix_ts_ms": 0,
+              "purchased_ts": 1759190412.532,
+              "redeemed_ts": 1759190400,
+              "expiry_ts": 1761718134,
+              "grace_period_duration": 0,
+              "platform_refund_expiry_ts": 1761718134,
+              "revoked_ts": 0.0,
               "google_payment_token": "ad8b67960eb91e8e2c0a4e8f191ea77b5ad593508b52ecc36c69c059cab39397fbf1e96142fa7fbcc7391cc3369ad110e3f9cbfccef284a925dcd470a4670aec",
               "google_order_id": "993f7d1bbcf4dfda482a8bce4f2b62acfc8c2d3d06b6512dfc981738ddf85562490b016f27b07a17c080c0765ada43f2e4c0618196f667e1174d1b3d67752b86",
-              "refund_requested_unix_ts_ms": 0,
+              "refund_requested_ts": 0,
             }
           ],
           "auto_renewing": 1,
-          "expiry_unix_ts_ms": 1761782400000,
-          "grace_period_duration_ms": 60000,
-          "refund_requested_unix_ts_ms": 0,
+          "expiry_ts": 1761782400,
+          "grace_period_duration": 60,
+          "refund_requested_ts": 0,
           "payments_total": 1,
           "status": 1,
           "error_report": 0,
@@ -498,8 +498,8 @@ API
       The embedded `master_sig` signature must sign over the 32 byte hash of the requests contents
       (in little endian):
 
-        google_hash = blake2b32(person='ProSetRefundReq_', version || master_pkey || unix_ts_ms || refund_requested_unix_ts_ms || payment_tx.provider || payment_tx.google_payment_token || payment_tx.google_order_id)
-        apple_hash  = blake2b32(person='ProSetRefundReq_', version || master_pkey || unix_ts_ms || refund_requested_unix_ts_ms || payment_tx.provider || payment_tx.apple_tx_id)
+        google_hash = blake2b32(person='ProSetRefundReq_', version || master_pkey || ts || refund_requested_ts || payment_tx.provider || payment_tx.google_payment_token || payment_tx.google_order_id)
+        apple_hash  = blake2b32(person='ProSetRefundReq_', version || master_pkey || ts || refund_requested_ts || payment_tx.provider || payment_tx.apple_tx_id)
 
     Request
       version:                     1 byte, current version of the request which should be 0
@@ -510,8 +510,8 @@ API
                                    proving that the user knows the secret component to the
                                    `master_pkey` and hence the caller is authorised to set the
                                    refund request status of the payment.
-      unix_ts_ms:                  8 byte UNIX timestamp of the current time.
-      refund_requested_unix_ts_ms: 8 byte UNIX timestamp of the timestamp to set as the timestamp
+      ts:                  8 byte UNIX timestamp of the current time.
+      refund_requested_ts: 8 byte UNIX timestamp of the timestamp to set as the timestamp
                                    that a refund request was initiated at
       payment_tx:                  Object containing fields about the purchase from the payment
                                    provider to set the refund request on.
@@ -538,8 +538,8 @@ API
         "version": 0,
         "master_pkey": "8ddc57b457fca85d2184813ea18a048f64a35ab0e693d4a0a3e4f8ee87ff3360",
         "master_sig": "37495dfab72772ebf4e4bf213b0a1c46e8e044ef3e4360ff8ef04ee8a7daf2178a716447de6f938d0e7865be31735fb2db2d1213dc35c02dfe253aac77fb2a0d",
-        "unix_ts_ms": 1755653705,
-        "refund_requested_unix_ts_ms": 1755653705,
+        "ts": 1755653705,
+        "refund_requested_ts": 1755653705,
         "payment_tx": {
           "provider": 1,
           "google_payment_token": "b228c0144d1368541410693c82bbceb1",
@@ -615,7 +615,7 @@ FLASK_ROUTE_SET_PAYMENT_REFUND_REQUESTED            = '/set_payment_refund_reque
 # default to assuming it is.
 #
 # All platforms are designed to interact with the backend using onion requests.
-DEFAULT_TIMESTAMP_TOLERANCE_MS                      = 70 * 1000
+DEFAULT_TIMESTAMP_TOLERANCE                         = datetime.timedelta(seconds=70)
 SET_PAYMENT_REFUND_REQUESTED_HASH_PERSONALISATION   = b'ProSetRefundReq_'
 GET_PRO_PAYMENTS_DETAIL_HASH_PERSONALISATION        = b'ProGetProDetReq_'
 assert len(SET_PAYMENT_REFUND_REQUESTED_HASH_PERSONALISATION) == hashlib.blake2b.PERSON_SIZE
@@ -815,7 +815,7 @@ def generate_pro_proof() -> flask.Response:
     version:       int = base.json_dict_require_int(d=get.json, key='version',       err=err)
     master_pkey:   str = base.json_dict_require_str(d=get.json, key='master_pkey',   err=err)
     rotating_pkey: str = base.json_dict_require_str(d=get.json, key='rotating_pkey', err=err)
-    unix_ts_ms:    int = base.json_dict_require_int(d=get.json, key='unix_ts_ms',    err=err)
+    ts:            int = base.json_dict_require_int(d=get.json, key='ts',            err=err)
     master_sig:    str = base.json_dict_require_str(d=get.json, key='master_sig',    err=err)
     rotating_sig:  str = base.json_dict_require_str(d=get.json, key='rotating_sig',  err=err)
     if len(err.msg_list):
@@ -829,21 +829,19 @@ def generate_pro_proof() -> flask.Response:
     master_sig_bytes    = base.hex_to_bytes(hex=master_sig,    label='Master key signature',   hex_len=nacl.bindings.crypto_sign_BYTES * 2,          err=err)
     rotating_sig_bytes  = base.hex_to_bytes(hex=rotating_sig,  label='Rotating key signature', hex_len=nacl.bindings.crypto_sign_BYTES * 2,          err=err)
 
-    # Validate the timestamp is within 5 minutes of the current time (mitigate replay attacks)
-    now:                  int = int(time_now() * 1000)
-    max_unix_ts_ms:       int = now + DEFAULT_TIMESTAMP_TOLERANCE_MS
-    min_unix_ts_ms:       int = now - DEFAULT_TIMESTAMP_TOLERANCE_MS
+    # Validate the timestamp is within tolerance of the current time (mitigate replay attacks). The
+    # wire nonce is integer seconds (wire spec §3); the comparison is datetime-native.
+    request_at = base.datetime_from_unix_seconds(ts)
+    now        = base.datetime_from_unix_ms(int(time_now() * 1000))
 
-    if unix_ts_ms < min_unix_ts_ms:
-        err.msg_list.append(f'Nonce timestamp is too far in the past: {unix_ts_ms} (min {min_unix_ts_ms})')
+    if request_at < now - DEFAULT_TIMESTAMP_TOLERANCE:
+        err.msg_list.append(f'Nonce timestamp is too far in the past: {base.readable(request_at)} (now {base.readable(now)})')
 
-    if unix_ts_ms > max_unix_ts_ms:
-        err.msg_list.append(f'Nonce timestamp is too far in the future: {unix_ts_ms} (max {max_unix_ts_ms})')
+    if request_at > now + DEFAULT_TIMESTAMP_TOLERANCE:
+        err.msg_list.append(f'Nonce timestamp is too far in the future: {base.readable(request_at)} (now {base.readable(now)})')
 
     if len(err.msg_list):
         return make_error_response(status=RESPONSE_PARSE_ERROR, errors=err.msg_list)
-
-    request_at = base.datetime_from_unix_ms(unix_ts_ms)   # wire ms → datetime for the backend (5a)
 
     # Request proof from the backend
     with get_db(flask.current_app) as engine:
@@ -887,7 +885,7 @@ def get_pro_revocations():
     if len(err.msg_list):
         return make_error_response(status=RESPONSE_PARSE_ERROR, errors=err.msg_list)
 
-    RETRY_IN_S = base.SECONDS_IN_DAY
+    RETRY_IN = base.SECONDS_IN_DAY
     revocation_items:  list[dict[str, str | int]] = []
     revocation_ticket: int                        = 0
     with get_db(flask.current_app) as engine:
@@ -904,21 +902,21 @@ def get_pro_revocations():
                         assert len(runtime.gen_index_salt) == hashlib.blake2b.SALT_SIZE
 
                         expires_at   = base.round_datetime_to_next_day(expires_at)
-                        effective_at = min(created_at + datetime.timedelta(seconds=RETRY_IN_S), expires_at)
+                        effective_at = min(created_at + datetime.timedelta(seconds=RETRY_IN), expires_at)
                         revocation_items.append({
-                            # Wire keys/units unchanged in 5a (byte-identical); 5b → `_ts` + seconds.
-                            'expiry_unix_ts_ms':    base.unix_ms_from_datetime(expires_at),
-                            'gen_index_hash':       gen_index_hash.hex(),
-                            'effective_unix_ts_ms': base.unix_ms_from_datetime(effective_at),
+                            # Integer seconds: these are day-aligned/computed instants (wire spec §1/§4).
+                            'expiry_ts':      base.unix_seconds_from_datetime(expires_at),
+                            'gen_index_hash': gen_index_hash.hex(),
+                            'effective_ts':   base.unix_seconds_from_datetime(effective_at),
                         })
             if len(err.msg_list):
                 return make_error_response(status=RESPONSE_GENERIC_ERROR, errors=err.msg_list)
 
             result = make_success_response(dict_result={
-                'version':    version,
-                'ticket':     revocation_ticket,
-                'items':      revocation_items,
-                'retry_in_s': RETRY_IN_S,
+                'version':  version,
+                'ticket':   revocation_ticket,
+                'items':    revocation_items,
+                'retry_in': RETRY_IN,
             })
             return result
 
@@ -934,7 +932,7 @@ def get_pro_details():
     version:     int  = base.json_dict_require_int(d=get.json,  key='version',     err=err)
     master_pkey: str  = base.json_dict_require_str(d=get.json,  key='master_pkey', err=err)
     master_sig:  str  = base.json_dict_require_str(d=get.json,  key='master_sig',  err=err)
-    unix_ts_ms:  int  = base.json_dict_require_int(d=get.json,  key='unix_ts_ms',  err=err)
+    ts:          int  = base.json_dict_require_int(d=get.json,  key='ts',          err=err)
     count:       int  = base.json_dict_require_int(d=get.json, key='count',       err=err)
     if len(err.msg_list):
         return make_error_response(status=RESPONSE_PARSE_ERROR, errors=err.msg_list)
@@ -952,15 +950,15 @@ def get_pro_details():
     # TODO: We _could_ track the last GET_ALL_PAYMENTS_MAX_TIMESTAMP_DELTA_S seconds worth of
     # requests to completely reject replay attacks if we cared enough but onion requests probably
     # suffice to mask the ability to replay a query.
-    timestamp_delta: float = (time_now() * 1000) - float(unix_ts_ms)
-    if abs(timestamp_delta) >= DEFAULT_TIMESTAMP_TOLERANCE_MS:
-        err.msg_list.append(f'Timestamp is too old to permit retrieval of payments, delta was {timestamp_delta}ms')
+    request_at             = base.datetime_from_unix_seconds(ts)   # wire nonce is integer seconds (§3.4)
+    now                    = base.datetime_from_unix_ms(int(time_now() * 1000))
+    if abs(now - request_at) >= DEFAULT_TIMESTAMP_TOLERANCE:
+        err.msg_list.append(f'Timestamp is too old to permit retrieval of payments, delta was {abs(now - request_at)}')
 
     if len(err.msg_list):
         return make_error_response(status=RESPONSE_PARSE_ERROR, errors=err.msg_list)
 
     # Validate the signature
-    request_at            = base.datetime_from_unix_ms(unix_ts_ms)   # wire ms → datetime (5a)
     master_pkey_nacl      = nacl.signing.VerifyKey(master_pkey_bytes)
     hash_to_verify: bytes = backend.make_get_pro_details_hash(version=version, master_pkey=master_pkey_nacl, request_at=request_at, count=count)
     try:
@@ -969,13 +967,13 @@ def get_pro_details():
         err.msg_list.append('Signature failed to be verified')
         return make_error_response(status=RESPONSE_PARSE_ERROR, errors=err.msg_list)
 
-    items:           list[dict[str, str | int | bool]] = []
-    user_pro_status: UserProStatus                     = UserProStatus.NeverBeenPro
-    auto_renewing                                      = False
-    expiry_unix_ts_ms                                  = 0
-    grace_period_duration_ms                           = 0
-    payments_total                                     = 0
-    refund_requested_unix_ts_ms                        = 0
+    items:           list[dict[str, str | int | float | bool]] = []
+    user_pro_status: UserProStatus                           = UserProStatus.NeverBeenPro
+    auto_renewing                                            = False
+    expiry_ts                                                = 0
+    grace_period_duration                                    = 0
+    payments_total                                           = 0
+    refund_requested_ts                                      = 0
 
     # NOTE: Eventually we might migrate this to be a fully-featured enum to provide some more
     # descriptive messaging
@@ -988,13 +986,14 @@ def get_pro_details():
                 get_user: backend.GetUserAndPayments = backend.get_user_and_payments(tx=tx, master_pkey=master_pkey_nacl)
                 auto_renewing                        = get_user.user.auto_renewing
                 payments_total                       = get_user.payments_count
-                # Egress: convert the user's datetimes/timedelta to the (unchanged in 5a) ms wire values.
-                grace_period_duration_ms             = base.ms_from_timedelta(get_user.user.grace_period)
-                expiry_unix_ts_ms                    = base.unix_ms_from_datetime(get_user.user.expires_at)
-                refund_requested_unix_ts_ms          = base.unix_ms_from_datetime(get_user.user.refund_requested_at) if get_user.user.refund_requested_at else 0
+                # Egress: convert the user's datetimes/timedelta to integer-seconds wire values. These
+                # are all backend-computed/day-aligned, so integer seconds is exact (wire spec §1).
+                grace_period_duration                = base.seconds_from_timedelta(get_user.user.grace_period)
+                expiry_ts                            = base.unix_seconds_from_datetime(get_user.user.expires_at)
+                refund_requested_ts                  = base.unix_seconds_from_datetime(get_user.user.refund_requested_at) if get_user.user.refund_requested_at else 0
 
                 # NOTE: Collect payment history. Each item's status is derived against the *request*
-                # timestamp `unix_ts_ms` (client's signed clock, anti-replay-bounded to ≈now) — the same
+                # timestamp `ts` (client's signed clock, anti-replay-bounded to ≈now) — the same
                 # clock the user-level active/expired decision below uses. Deliberately NOT a second
                 # `time.time()` read: two clocks in one response could disagree by the request's
                 # in-flight time and report user-level "Active" alongside an "expired" item.
@@ -1011,21 +1010,22 @@ def get_pro_details():
                         if payment.redeemed_at is None:
                             continue
 
-                        # Common fields: internal datetime/timedelta → the (unchanged in 5a) ms wire
-                        # values; JSON keys stay `_unix_ts_ms`. (The three near-identical branches are a
-                        # Phase-5 dedup target — folds with Q10.)
-                        item: dict[str, str | int | bool] = {
-                            'status':                            backend.derive_payment_status(payment, request_at).value,
-                            'plan':                              payment.plan.value,
-                            'payment_provider':                  payment.payment_provider.value,
-                            'auto_renewing':                     payment.auto_renewing,
-                            'unredeemed_unix_ts_ms':             base.unix_ms_from_datetime(payment.purchased_at),
-                            'redeemed_unix_ts_ms':               base.unix_ms_from_datetime(payment.redeemed_at) if payment.redeemed_at else 0,
-                            'expiry_unix_ts_ms':                 base.unix_ms_from_datetime(payment.expires_at),
-                            'grace_period_duration_ms':          base.ms_from_timedelta(payment.grace_period) if payment.grace_period is not None else 0,
-                            'platform_refund_expiry_unix_ts_ms': base.unix_ms_from_datetime(payment.platform_refund_expires_at),
-                            'revoked_unix_ts_ms':                base.unix_ms_from_datetime(payment.revoked_at) if payment.revoked_at else 0,
-                            'refund_requested_unix_ts_ms':       base.unix_ms_from_datetime(payment.refund_requested_at) if payment.refund_requested_at else 0,
+                        # Wire seconds (wire spec §1/§5): integer everywhere the backend computes or
+                        # rounds the value; the two upstream provider event instants — `purchased_ts`
+                        # and `revoked_ts` — are floats carrying the provider's sub-second precision.
+                        # (The three near-identical branches are a Phase-5 dedup target — folds with Q10.)
+                        item: dict[str, str | int | float | bool] = {
+                            'status':                     backend.derive_payment_status(payment, request_at).value,
+                            'plan':                       payment.plan.value,
+                            'payment_provider':           payment.payment_provider.value,
+                            'auto_renewing':              payment.auto_renewing,
+                            'purchased_ts':               base.unix_seconds_float_from_datetime(payment.purchased_at),
+                            'redeemed_ts':                base.unix_seconds_from_datetime(payment.redeemed_at) if payment.redeemed_at else 0,
+                            'expiry_ts':                  base.unix_seconds_from_datetime(payment.expires_at),
+                            'grace_period_duration':      base.seconds_from_timedelta(payment.grace_period) if payment.grace_period is not None else 0,
+                            'platform_refund_expiry_ts':  base.unix_seconds_from_datetime(payment.platform_refund_expires_at),
+                            'revoked_ts':                 base.unix_seconds_float_from_datetime(payment.revoked_at) if payment.revoked_at else 0.0,
+                            'refund_requested_ts':        base.unix_seconds_from_datetime(payment.refund_requested_at) if payment.refund_requested_at else 0,
                         }
                         if payment.payment_provider == base.PaymentProvider.GooglePlayStore:
                             item['google_payment_token'] = payment.google_payment_token
@@ -1051,15 +1051,15 @@ def get_pro_details():
                         user_pro_status = UserProStatus.Expired
 
             dict_result = {
-                'version':                     0,
-                'status':                      int(user_pro_status.value),
-                'auto_renewing':               auto_renewing,
-                'expiry_unix_ts_ms':           expiry_unix_ts_ms,
-                'refund_requested_unix_ts_ms': refund_requested_unix_ts_ms,
-                'grace_period_duration_ms':    grace_period_duration_ms if auto_renewing else 0,
-                'payments_total':              payments_total,
-                'error_report':                error_report,
-                'items':                       items
+                'version':               0,
+                'status':                int(user_pro_status.value),
+                'auto_renewing':         auto_renewing,
+                'expiry_ts':             expiry_ts,
+                'refund_requested_ts':   refund_requested_ts,
+                'grace_period_duration': grace_period_duration if auto_renewing else 0,
+                'payments_total':        payments_total,
+                'error_report':          error_report,
+                'items':                 items
             }
 
             result = make_success_response(dict_result)
@@ -1080,10 +1080,10 @@ def set_payment_refund_requested():
     version:                     int                       = base.json_dict_require_int(d=get.json,   key='version',                     err=err)
     master_pkey:                 str                       = base.json_dict_require_str(d=get.json,   key='master_pkey',                 err=err)
     master_sig:                  str                       = base.json_dict_require_str(d=get.json,   key='master_sig',                  err=err)
-    payment_tx:                  dict[str, base.JSONValue] = base.json_dict_require_obj(d=get.json,   key='payment_tx',                  err=err)
-    unix_ts_ms:                  int                       = base.json_dict_require_int(d=get.json,   key='unix_ts_ms',                  err=err)
-    refund_requested_unix_ts_ms: int                       = base.json_dict_require_int(d=get.json,   key='refund_requested_unix_ts_ms', err=err)
-    payment_provider:            str                       = base.json_dict_require_str(d=payment_tx, key='provider',                    err=err)
+    payment_tx:          dict[str, base.JSONValue] = base.json_dict_require_obj(d=get.json,   key='payment_tx',          err=err)
+    ts:                  int                       = base.json_dict_require_int(d=get.json,   key='ts',                  err=err)
+    refund_requested_ts: int                       = base.json_dict_require_int(d=get.json,   key='refund_requested_ts', err=err)
+    payment_provider:    str                       = base.json_dict_require_str(d=payment_tx, key='provider',            err=err)
     if len(err.msg_list):
         return make_error_response(status=RESPONSE_PARSE_ERROR, errors=err.msg_list)
 
@@ -1115,17 +1115,15 @@ def set_payment_refund_requested():
         err.msg_list.append(f'Bad payment provider given')
         return make_error_response(status=RESPONSE_PARSE_ERROR, errors=err.msg_list)
 
-    # Validate timestamp
-    timestamp_delta: float = (time_now() * 1000) - float(unix_ts_ms)
-    if abs(timestamp_delta) >= DEFAULT_TIMESTAMP_TOLERANCE_MS:
-        err.msg_list.append(f'Timestamp is too old to permit refund request update, delta was {timestamp_delta}ms')
+    # Validate timestamp. The wire nonce is integer seconds (wire spec §3.3); compare as datetimes.
+    request_at          = base.datetime_from_unix_seconds(ts)
+    refund_requested_at = base.datetime_from_unix_seconds(refund_requested_ts)
+    now                 = base.datetime_from_unix_ms(int(time_now() * 1000))
+    if abs(now - request_at) >= DEFAULT_TIMESTAMP_TOLERANCE:
+        err.msg_list.append(f'Timestamp is too old to permit refund request update, delta was {abs(now - request_at)}')
 
     if len(err.msg_list):
         return make_error_response(status=RESPONSE_PARSE_ERROR, errors=err.msg_list)
-
-    # wire ms → datetime (5a): request_at is the anti-replay nonce; refund_requested_at is the value to store.
-    request_at          = base.datetime_from_unix_ms(unix_ts_ms)
-    refund_requested_at = base.datetime_from_unix_ms(refund_requested_unix_ts_ms)
 
     # Validate the signature
     master_pkey_nacl      = nacl.signing.VerifyKey(master_pkey_bytes)
@@ -1147,7 +1145,7 @@ def set_payment_refund_requested():
             # literal wire value the client signed).
             updated = backend.set_refund_requested(conn                = conn,
                                                    payment_tx          = user_payment,
-                                                   refund_requested_at = refund_requested_at if refund_requested_unix_ts_ms else None)
+                                                   refund_requested_at = refund_requested_at if refund_requested_ts else None)
 
             result = make_success_response(dict_result={'version': 0, 'updated': updated})
             return result
