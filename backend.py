@@ -597,23 +597,22 @@ def get_revocations_list(conn: psycopg.Connection) -> list[RevocationRow]:
             result.append(RevocationRow(gen_index=gen_index, created_at=created_at, expires_at=expires_at))
     return result
 
-def is_gen_index_revoked_tx(tx: db.SQLTransaction, gen_index: int) -> bool:
-    row = db.query_one(tx.conn, "SELECT 1 FROM revocations WHERE gen_index = %s", gen_index)
-    return row is not None
+def is_gen_index_revoked_tx(tx: db.SQLTransaction, gen_index: int, now: datetime.datetime) -> bool:
+    # `expires_at > now` guard: an expired revocation is moot (the proof it revokes has itself expired),
+    # so it must NOT count as revoked. Guarding here also makes the answer independent of whether the
+    # cleanup sweep has run — a lapsed revocation is invisible the instant it expires, pruned or not.
+    row = db.query_one(tx.conn, "SELECT EXISTS (SELECT 1 FROM revocations WHERE gen_index = %s AND expires_at > %s)", gen_index, now)
+    return bool(row[0]) if row else False
 
-def is_gen_index_revoked(conn: psycopg.Connection, gen_index: int) -> bool:
+def is_gen_index_revoked(conn: psycopg.Connection, gen_index: int, now: datetime.datetime) -> bool:
     result: bool = False
     with db.transaction(conn) as tx:
-        result = is_gen_index_revoked_tx(tx, gen_index)
+        result = is_gen_index_revoked_tx(tx, gen_index, now)
     return result
 
 def get_revocation_ticket(conn: psycopg.Connection) -> int:
     row = db.query_one(conn, "SELECT revocation_ticket FROM runtime")
     return row[0] if row else 0
-
-def get_pro_revocations_iterator_tx(tx: db.SQLTransaction) -> collections.abc.Iterator[tuple[int, int, int]]:
-    for row in db.query(tx.conn, "SELECT gen_index, created_at, expires_at FROM revocations"):
-        yield (row[0], row[1], row[2])
 
 def get_runtime_tx(tx: db.SQLTransaction) -> RuntimeRow:
     row = db.query_one(tx.conn, ("SELECT gen_index,"
@@ -2080,7 +2079,7 @@ def generate_pro_proof(conn: psycopg.Connection,
 
     if get_user.user.master_pkey == bytes(master_pkey):
         # Check that the gen index hash is not revoked
-        if is_gen_index_revoked(conn, get_user.user.gen_index):
+        if is_gen_index_revoked(conn, get_user.user.gen_index, request_at):
             err.msg_list.append(f'User {bytes(master_pkey).hex()} payment has been revoked')
         else:
             proof_expires_at = _build_proof_clamped_expiry_time(request_at=request_at, proposed_expires_at=get_user.user.expires_at)

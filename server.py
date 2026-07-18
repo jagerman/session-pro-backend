@@ -820,6 +820,7 @@ def get_pro_revocations():
         return make_error_response(status=RESPONSE_PARSE_ERROR, errors=err.msg_list)
 
     RETRY_IN = base.SECONDS_IN_DAY
+    now                = base.datetime_from_unix_ms(int(time_now() * 1000))
     revocation_items:  list[dict[str, str | int]] = []
     revocation_ticket: int                        = 0
     with get_db(flask.current_app) as engine:
@@ -829,7 +830,9 @@ def get_pro_revocations():
                 revocation_ticket = runtime_row[0] if runtime_row else 0
                 if ticket < revocation_ticket:
                     runtime = backend.get_runtime_tx(tx)
-                    for row in backend.get_pro_revocations_iterator_tx(tx):
+                    # Only revocations still in effect (`expires_at > now`): an expired entry is moot and
+                    # its presence would otherwise depend on whether the cleanup sweep has run.
+                    for row in db.query(tx.conn, "SELECT gen_index, created_at, expires_at FROM revocations WHERE expires_at > %s", now):
                         gen_index, created_at, expires_at = row
                         gen_index_hash: bytes = backend.make_gen_index_hash(gen_index=gen_index, gen_index_salt=runtime.gen_index_salt)
                         assert gen_index < runtime.gen_index, f"lhs={gen_index}, rhs={runtime.gen_index}"
@@ -969,7 +972,7 @@ def get_pro_details():
                     else:
                         user_pro_status = UserProStatus.Expired
 
-                    if backend.is_gen_index_revoked_tx(tx, get_user.user.gen_index):
+                    if backend.is_gen_index_revoked_tx(tx, get_user.user.gen_index, request_at):
                         user_pro_status = UserProStatus.Expired
 
             dict_result = {

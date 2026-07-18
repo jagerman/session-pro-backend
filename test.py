@@ -187,6 +187,33 @@ def test_migrations_reject_duplicate_basename(tmp_path, monkeypatch):
     with pytest.raises(RuntimeError):
         _ = migrations._migration_files()
 
+def test_expired_revocation_is_not_reported(pg_database):
+    # A revocation must stop counting the instant it passes expires_at — independent of whether the
+    # cleanup sweep has pruned it. A lapsed revocation is moot (the proof it revokes has itself
+    # expired); treating it as still-revoked would make expires_at a "not before" floor, not an expiry,
+    # and would make live results depend on cleanup timing.
+    err  = base.ErrorSink()
+    pool = backend.bootstrap_db(database_url=pg_database(), err=err)
+    assert not err.msg_list, err.msg_list
+    assert pool
+
+    created = base.datetime_from_unix_seconds(1_700_000_000)
+    expires = created + datetime.timedelta(days=30)
+    before  = expires - datetime.timedelta(seconds=1)
+    after   = expires + datetime.timedelta(seconds=1)
+    with db.connection(pool) as conn:
+        # Insert a revocation directly (no prune has run — the row is still present after `expires`).
+        with db.transaction(conn) as tx:
+            _ = db.query(tx.conn,
+                         'INSERT INTO revocations (gen_index, created_at, expires_at) VALUES (%(g)s, %(c)s, %(e)s)',
+                         g=7, c=created, e=expires)
+
+        # Revoked before expiry, NOT revoked after — despite the row still existing (unpruned). The
+        # client-served list in get_pro_revocations applies the identical `expires_at > now` guard.
+        assert backend.is_gen_index_revoked(conn, 7, before) is True
+        assert backend.is_gen_index_revoked(conn, 7, after)  is False
+    pool.close()
+
 def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_database):
     monkeypatch.setattr(
         "platform_google_api.subscription_v1_acknowledge",
