@@ -627,6 +627,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
             add_pro_payment_tx.provider             = payment_tx.provider
             add_pro_payment_tx.google_payment_token = payment_tx.google_payment_token
             add_pro_payment_tx.google_order_id      = payment_tx.google_order_id
+            add_pro_payment_tx.payment_id           = backend.payment_id_from_user_tx(add_pro_payment_tx)
 
             payment_hash_to_sign: bytes = backend.make_add_pro_payment_hash(
                                                                             master_pkey=master_key.verify_key,
@@ -642,9 +643,8 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
                                                           'master_sig':           bytes(master_key.sign(payment_hash_to_sign).signature).hex(),
                                                           'rotating_sig':         bytes(rotating_key.sign(payment_hash_to_sign).signature).hex(),
                                                           'payment_tx': {
-                                                              'provider':             add_pro_payment_tx.provider.value,
-                                                              'google_payment_token': add_pro_payment_tx.google_payment_token,
-                                                              'google_order_id':      add_pro_payment_tx.google_order_id,
+                                                              'provider':   add_pro_payment_tx.provider.value,
+                                                              'payment_id': add_pro_payment_tx.payment_id,
                                                           }
                                                       })
 
@@ -778,6 +778,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
             new_add_pro_payment_tx.provider             = new_payment_tx.provider
             new_add_pro_payment_tx.google_payment_token = new_payment_tx.google_payment_token
             new_add_pro_payment_tx.google_order_id      = new_payment_tx.google_order_id
+            new_add_pro_payment_tx.payment_id           = backend.payment_id_from_user_tx(new_add_pro_payment_tx)
             payment_hash_to_sign: bytes = backend.make_add_pro_payment_hash(
                                                                             master_pkey   = master_key.verify_key,
                                                                             rotating_pkey = rotating_key.verify_key,
@@ -789,9 +790,8 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
                 'master_sig':           bytes(master_key.sign(payment_hash_to_sign).signature).hex(),
                 'rotating_sig':         bytes(rotating_key.sign(payment_hash_to_sign).signature).hex(),
                 'payment_tx': {
-                    'provider':             new_add_pro_payment_tx.provider.value,
-                    'google_payment_token': new_add_pro_payment_tx.google_payment_token,
-                    'google_order_id':      new_add_pro_payment_tx.google_order_id,
+                    'provider':   new_add_pro_payment_tx.provider.value,
+                    'payment_id': new_add_pro_payment_tx.payment_id,
                 }
             }
 
@@ -1267,6 +1267,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
             apple_tx             = backend.UserPaymentTransaction()
             apple_tx.provider    = base.PaymentProvider.iOSAppStore
             apple_tx.apple_tx_id = throwaway_id
+            apple_tx.payment_id  = backend.payment_id_from_user_tx(apple_tx)
             backend.add_unredeemed_payment(conn                              = db_conn,
                                            payment_tx                        = apple_payment_tx,
                                            plan                              = base.ProPlan.OneMonth,
@@ -1291,8 +1292,8 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
                                             'master_sig':           bytes(master_key.sign(payment_hash_to_sign).signature).hex(),
                                             'rotating_sig':         bytes(rotating_key.sign(payment_hash_to_sign).signature).hex(),
                                             'payment_tx': {
-                                                'provider':    base.PaymentProvider.iOSAppStore.value,
-                                                'apple_tx_id': throwaway_id,
+                                                'provider':   base.PaymentProvider.iOSAppStore.value,
+                                                'payment_id': apple_tx.payment_id,
                                             }
                                           })
             response: werkzeug.test.TestResponse = flask_client.post(onion_req.ROUTE_OXEN_V4_LSRPC, data=onion_request)
@@ -1311,10 +1312,8 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
                 'ts': start_unix_ts_ms // 1000,
                 'refund_requested_ts': start_unix_ts_ms // 1000,
                 'payment_tx': {
-                    'provider':                   base.PaymentProvider.iOSAppStore.value,
-                    'apple_original_tx_id':       throwaway_id,
-                    'apple_tx_id':                throwaway_id,
-                    'apple_web_line_order_tx_id': throwaway_id,
+                    'provider':   base.PaymentProvider.iOSAppStore.value,
+                    'payment_id': apple_tx.payment_id,
                 },
             }
 
@@ -1344,6 +1343,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
             fake_payment.provider             = base.PaymentProvider.GooglePlayStore
             fake_payment.google_payment_token = 'non-existent-payment-token-to-trigger-fail-response'
             fake_payment.google_order_id      = 'non-existent-order-id-to-trigger-fail-response'
+            fake_payment.payment_id           = backend.payment_id_from_user_tx(fake_payment)
 
             hash_to_sign: bytes = backend.make_set_payment_refund_requested_hash(
                                                                                  master_pkey                 = master_key.verify_key,
@@ -1355,9 +1355,8 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
                 'master_pkey': bytes(master_key.verify_key).hex(),
                 'master_sig':  bytes(master_key.sign(hash_to_sign).signature).hex(),
                 'payment_tx': {
-                    'provider':             fake_payment.provider.value,
-                    'google_payment_token': fake_payment.google_payment_token,
-                    'google_order_id':      fake_payment.google_order_id,
+                    'provider':   fake_payment.provider.value,
+                    'payment_id': fake_payment.payment_id,
                 },
                 'ts': start_unix_ts_ms // 1000,
                 'refund_requested_ts': start_unix_ts_ms // 1000,
@@ -1673,6 +1672,7 @@ def test_platform_apple(pg_database):
         add_pro_payment_tx             = backend.UserPaymentTransaction()
         add_pro_payment_tx.provider    = base.PaymentProvider.iOSAppStore
         add_pro_payment_tx.apple_tx_id = unredeemed_list[0].apple.tx_id
+        add_pro_payment_tx.payment_id  = backend.payment_id_from_user_tx(add_pro_payment_tx)
         payment_hash_to_sign: bytes    = backend.make_add_pro_payment_hash(
                                                                            master_pkey   = master_key.verify_key,
                                                                            rotating_pkey = rotating_key.verify_key,
@@ -1685,8 +1685,8 @@ def test_platform_apple(pg_database):
             'master_sig':    bytes(master_key.sign(payment_hash_to_sign).signature).hex(),
             'rotating_sig':  bytes(rotating_key.sign(payment_hash_to_sign).signature).hex(),
             'payment_tx': {
-                'provider':    add_pro_payment_tx.provider.value,
-                'apple_tx_id': add_pro_payment_tx.apple_tx_id,
+                'provider':   add_pro_payment_tx.provider.value,
+                'payment_id': add_pro_payment_tx.payment_id,
             }
         })
 
@@ -2944,6 +2944,7 @@ def test_platform_apple(pg_database):
             add_pro_payment_tx             = backend.UserPaymentTransaction()
             add_pro_payment_tx.provider    = base.PaymentProvider.iOSAppStore
             add_pro_payment_tx.apple_tx_id = unredeemed_payment_list[0].apple.tx_id
+            add_pro_payment_tx.payment_id  = backend.payment_id_from_user_tx(add_pro_payment_tx)
             payment_hash_to_sign: bytes = backend.make_add_pro_payment_hash(
                                                                             master_pkey=master_key.verify_key,
                                                                             rotating_pkey=rotating_key.verify_key,
@@ -2956,8 +2957,8 @@ def test_platform_apple(pg_database):
                 'master_sig':    bytes(master_key.sign(payment_hash_to_sign).signature).hex(),
                 'rotating_sig':  bytes(rotating_key.sign(payment_hash_to_sign).signature).hex(),
                 'payment_tx': {
-                    'provider':    add_pro_payment_tx.provider.value,
-                    'apple_tx_id': add_pro_payment_tx.apple_tx_id,
+                    'provider':   add_pro_payment_tx.provider.value,
+                    'payment_id': add_pro_payment_tx.payment_id,
                 }
             })
 
@@ -3658,6 +3659,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
         add_pro_payment_tx.provider             = base.PaymentProvider.GooglePlayStore
         add_pro_payment_tx.google_payment_token = tx.purchase_token
         add_pro_payment_tx.google_order_id      = tx.order_id
+        add_pro_payment_tx.payment_id           = backend.payment_id_from_user_tx(add_pro_payment_tx)
         payment_hash_to_sign: bytes = backend.make_add_pro_payment_hash(
                                                                         master_pkey   = user_ctx.master_key.verify_key,
                                                                         rotating_pkey = user_ctx.rotating_key.verify_key,
@@ -3668,9 +3670,8 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
               'master_sig'    : bytes(user_ctx.master_key.sign(payment_hash_to_sign).signature).hex(),
               'rotating_sig'  : bytes(user_ctx.rotating_key.sign(payment_hash_to_sign).signature).hex(),
               'payment_tx': {
-                  'provider':             add_pro_payment_tx.provider.value,
-                  'google_payment_token': add_pro_payment_tx.google_payment_token,
-                  'google_order_id':      add_pro_payment_tx.google_order_id,
+                  'provider':   add_pro_payment_tx.provider.value,
+                  'payment_id': add_pro_payment_tx.payment_id,
               }
             }
 
@@ -3786,8 +3787,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
         item = res_items[0]
         assert isinstance(item, dict)
         item_expiry_ts                 = base.json_dict_require_int(item, "expiry_ts", err)
-        item_order_id                  = base.json_dict_require_str(item, "google_order_id", err)
-        item_payment_token             = base.json_dict_require_str(item, "google_payment_token", err)
+        item_payment_id                = base.json_dict_require_str(item, "payment_id", err)
         item_grace_duration            = base.json_dict_require_int(item, "grace_period_duration", err)
         item_payment_provider          = base.json_dict_require_str_coerce_to_enum(item, "payment_provider", base.PaymentProvider, err)
         item_platform_refund_expiry_ts = base.json_dict_require_int(item, "platform_refund_expiry_ts", err)
@@ -3796,8 +3796,8 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
         item_status                    = base.json_dict_require_str_coerce_to_enum(item, "status", base.PaymentStatus, err)
         assert not err.has()
         assert item_expiry_ts                 == to_s(tx.expires_at), res_items
-        assert item_order_id                  == tx.order_id
-        assert item_payment_token             == tx.purchase_token
+        # Google `payment_id` is the opaque `token|order_id` composite (§3.5).
+        assert item_payment_id                == f'{tx.purchase_token}|{tx.order_id}'
         assert item_grace_duration            == base.seconds_from_timedelta(grace_duration_ms)
         assert item_payment_provider          == base.PaymentProvider.GooglePlayStore
         assert item_platform_refund_expiry_ts == to_s(platform_refund_expires_at)

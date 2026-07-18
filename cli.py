@@ -907,6 +907,9 @@ def cmd_server_add_pro_payment(args: argparse.Namespace) -> int:
         print(f"ERROR: Unsupported payment provider: {args.provider}", file=sys.stderr)
         return 1
 
+    # Fold the provider's identifier(s) into the single opaque `payment_id` (§3.5) — hashed verbatim.
+    payment_tx_obj.payment_id = backend.payment_id_from_user_tx(payment_tx_obj)
+
     # Compute hash using backend function
     hash_bytes = backend.make_add_pro_payment_hash(
         master_pkey   = master_skey.verify_key,
@@ -921,20 +924,10 @@ def cmd_server_add_pro_payment(args: argparse.Namespace) -> int:
         'master_sig':    bytes(master_skey.sign(hash_bytes).signature).hex(),
         'rotating_sig':  bytes(rotating_skey.sign(hash_bytes).signature).hex(),
         'payment_tx':  {
-            'provider': payment_tx_obj.provider.value,
+            'provider':   payment_tx_obj.provider.value,
+            'payment_id': payment_tx_obj.payment_id,
         }
     }
-
-    if payment_tx_obj.provider == base.PaymentProvider.GooglePlayStore:
-        request_body['payment_tx']['google_payment_token']  = payment_tx_obj.google_payment_token
-        request_body['payment_tx']['google_order_id']       = payment_tx_obj.google_order_id
-    elif payment_tx_obj.provider == base.PaymentProvider.iOSAppStore:
-        request_body['payment_tx']['apple_tx_id']           = payment_tx_obj.apple_tx_id
-    elif payment_tx_obj.provider == base.PaymentProvider.Rangeproof:
-        request_body['payment_tx']['rangeproof_order_id']   = payment_tx_obj.rangeproof_order_id
-    else:
-        print(f"ERROR: Unsupported payment provider: {args.provider}", file=sys.stderr)
-        return 1
 
     # Add dev arguments
     plan_map = {'1M': 'OneMonth', '3M': 'ThreeMonth', '12M': 'TwelveMonth'}
@@ -981,19 +974,27 @@ def cmd_server_set_payment_refund_requested(args: argparse.Namespace) -> int:
         print(f"ERROR: Failed to parse master key: {e}", file=sys.stderr)
         return 1
 
-    # Determine provider enum and payment details
+    # Determine provider and payment details
+    payment_tx = backend.UserPaymentTransaction()
     if args.provider == 'google':
-        provider_enum = 1
         if not args.payment_token or not args.order_id:
             print("ERROR: --payment-token and --order-id are required for Google", file=sys.stderr)
             return 1
-        payment_tx = {'provider': provider_enum, 'google_payment_token': args.payment_token, 'google_order_id': args.order_id}
-    else:  # apple
-        provider_enum = 2
+        payment_tx.provider             = base.PaymentProvider.GooglePlayStore
+        payment_tx.google_payment_token = args.payment_token
+        payment_tx.google_order_id      = args.order_id
+    elif args.provider == 'apple':
         if not args.tx_id:
             print("ERROR: --tx-id is required for Apple", file=sys.stderr)
             return 1
-        payment_tx = {'provider': provider_enum, 'apple_tx_id': args.tx_id}
+        payment_tx.provider    = base.PaymentProvider.iOSAppStore
+        payment_tx.apple_tx_id = args.tx_id
+    else:
+        print(f"ERROR: Unsupported payment provider: {args.provider}", file=sys.stderr)
+        return 1
+
+    # Fold the provider's identifier(s) into the single opaque `payment_id` (§3.5) — hashed verbatim.
+    payment_tx.payment_id = backend.payment_id_from_user_tx(payment_tx)
 
     # Set refund timestamp (wire is integer seconds — wire spec §3.3)
     if args.refund_requested_ts:
@@ -1003,19 +1004,6 @@ def cmd_server_set_payment_refund_requested(args: argparse.Namespace) -> int:
 
     now_ts = int(time.time())
 
-    # Compute hash
-    payment_tx = backend.UserPaymentTransaction()
-    if args.provider == 'google':
-        payment_tx.provider             = base.PaymentProvider.GooglePlayStore
-        payment_tx.google_payment_token = args.payment_token
-        payment_tx.google_order_id      = args.order_id
-    elif args.provider == 'apple':
-        payment_tx.provider    = base.PaymentProvider.iOSAppStore
-        payment_tx.apple_tx_id = args.tx_id
-    else:
-        print(f"ERROR: Unsupported payment provider: {args.provider}", file=sys.stderr)
-        return 1
-
     hash_bytes: bytes = backend.make_set_payment_refund_requested_hash(master_skey.verify_key, base.datetime_from_unix_seconds(now_ts), base.datetime_from_unix_seconds(refund_ts), payment_tx)
 
     # Build request
@@ -1024,7 +1012,10 @@ def cmd_server_set_payment_refund_requested(args: argparse.Namespace) -> int:
         'master_sig': bytes(master_skey.sign(hash_bytes).signature).hex(),
         'ts': now_ts,
         'refund_requested_ts': refund_ts,
-        'payment_tx': payment_tx
+        'payment_tx': {
+            'provider':   payment_tx.provider.value,
+            'payment_id': payment_tx.payment_id,
+        }
     }
 
     print(f'\nSet payment refund requested via {"Google" if args.provider == "google" else "Apple"}')

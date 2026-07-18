@@ -34,8 +34,7 @@ API
       The embedded `master_sig` and `rotating_sig` signature must sign over a 32 byte hash of the
       request components (in little endian) for example:
 
-        google_hash = blake2b32(person='ProAddPayment___', master_pkey || rotating_pkey || payment_tx.provider || payment_tx.google_payment_token || payment_tx.google_order_id)
-        apple_hash  = blake2b32(person='ProAddPayment___', master_pkey || rotating_pkey || payment_tx.provider || payment_tx.apple_tx_id)
+        hash = blake2b32(person='ProAddPayment___', master_pkey || rotating_pkey || provider_code || payment_id)
 
       This request will fail if the Session Pro backend has not witnessed the equivalent payment
       independently from the storefront that the payment originally came from.
@@ -48,18 +47,11 @@ API
       master_pkey:   32 byte Ed25519 master Session Pro public key derived deterministically from
                      the Session Account seed in hex to get pro status for
       rotating_pkey: 32 byte Ed25519 public key to pair to the pro proof in hex
-      payment_tx:    Object containing fields about the purchase from the payment provider to
-                     register for a Session Pro subscription.
-        provider:             1 byte integer representing the platform that the payment to be
-                              registered is coming from with the following mapping:
-                                1 => Google Play Store
-                                2 => Apple iOS App Store
-        apple_tx_id:          When provider is set to Apple iOS App Store, set this field to the
-                              transaction ID string.
-        google_payment_token: When provider is set to the Google Play Store, set this field to the
-                              purchase token string.
-        google_order_id:      When provider is set to the Google Play Store, set this field to the
-                              order id string.
+      payment_tx:    Object identifying the purchase to register for a Session Pro subscription.
+        provider:   String provider code: "google_play", "app_store" or "rangeproof".
+        payment_id: Opaque string identifying the payment (§3.5). One value per provider; the backend
+                    owns its encoding and splits it for lookup. Google is "<payment_token>|<order_id>",
+                    App Store is the transaction id. The client passes it through as opaque bytes.
       master_sig:    64 byte signature over the hash of the contents of the request proving that the
                      user knows the secret component to the `master_pkey` and hence the caller is
                      authorised to pair a new `rotating_pkey` to this payment
@@ -99,9 +91,8 @@ API
        "master_sig": "63204c239ab4a8b2ec06b591b7a845bab13c5189389a5af216d5f97d48c71b9ed4378bb576da029774775d727c54bd48372f6bd7e565f90d6138b94e803caf06",
        "rotating_sig": "49fa7e5ea564a1e5428acadfa68d602fbc35aac6ac4fcc9022f54cb2819242fad49f375cf11606aeab9d532583480d215dfb18fcac8671899a4e645d32b00803",
        "payment_tx": {
-        "provider": 1,
-        "google_payment_token": "b228c0144d1368541410693c82bbceb1",
-        "google_order_id": "a7ac920177ee9b1fc524c80d377de1ec"
+        "provider": "google_play",
+        "payment_id": "b228c0144d1368541410693c82bbceb1|a7ac920177ee9b1fc524c80d377de1ec"
        }
       }
 
@@ -393,22 +384,9 @@ API
                                              platform.
           revoked_ts:                8 byte UNIX timestamp indicating when the payment was
                                              revoked. 0 if it never revoked.
-          google_payment_token:        When payment provider is Google Play Store, a string which is
-                                       set to the platform-specific purchase token for the
-                                       subscription.
-          google_order_id:             When payment provider is Google Play Store, a string which is
-                                       set to the platform-specific order ID for the subscription.
-          apple_original_tx_id:        When payment provider is Apple iOS App Store, a string which
-                                       is set to the platform-specific original transaction ID for
-                                       the subscription.
-          apple_tx_id:                 When payment provider is Apple iOS App Store, a string which
-                                       is set to the platform-specific transaction ID for the
-                                       subscription.
-          apple_web_line_order_id:     When payment provider is Apple iOS App Store, a string which
-                                       is set to the platform-specific transaction web line order ID
-                                       for the subscription.
-          rangeproof_order_id:         When payment provider is Rangeproof, a string which is set to
-                                       the platform-specific order ID for the subscription.
+          payment_id:                  Opaque string identifying the payment (§3.5) — the provider's
+                                       identifier(s) folded into one value (Google is
+                                       "<payment_token>|<order_id>", App Store is the transaction id).
           refund_requested_ts: 8 byte UNIX timestamp indicating if the user has requested a
                                        refund for this payment. This value is set to 0 if no refund
                                        has been initiated. Setting the refund request value for
@@ -439,8 +417,7 @@ API
               "grace_period_duration": 0,
               "platform_refund_expiry_ts": 1761718134,
               "revoked_ts": 0.0,
-              "google_payment_token": "ad8b67960eb91e8e2c0a4e8f191ea77b5ad593508b52ecc36c69c059cab39397fbf1e96142fa7fbcc7391cc3369ad110e3f9cbfccef284a925dcd470a4670aec",
-              "google_order_id": "993f7d1bbcf4dfda482a8bce4f2b62acfc8c2d3d06b6512dfc981738ddf85562490b016f27b07a17c080c0765ada43f2e4c0618196f667e1174d1b3d67752b86",
+              "payment_id": "ad8b67960eb91e8e2c0a4e8f191ea77b5ad593508b52ecc36c69c059cab39397fbf1e96142fa7fbcc7391cc3369ad110e3f9cbfccef284a925dcd470a4670aec|993f7d1bbcf4dfda482a8bce4f2b62acfc8c2d3d06b6512dfc981738ddf85562490b016f27b07a17c080c0765ada43f2e4c0618196f667e1174d1b3d67752b86",
               "refund_requested_ts": 0,
             }
           ],
@@ -485,8 +462,7 @@ API
       The embedded `master_sig` signature must sign over the 32 byte hash of the requests contents
       (in little endian):
 
-        google_hash = blake2b32(person='ProSetRefundReq_', master_pkey || ts || refund_requested_ts || payment_tx.provider || payment_tx.google_payment_token || payment_tx.google_order_id)
-        apple_hash  = blake2b32(person='ProSetRefundReq_', master_pkey || ts || refund_requested_ts || payment_tx.provider || payment_tx.apple_tx_id)
+        hash = blake2b32(person='ProSetRefundReq_', master_pkey || ts || refund_requested_ts || provider_code || payment_id)
 
     Request
       master_pkey:                 32 byte Ed25519 master Session Pro public key derived
@@ -499,18 +475,10 @@ API
       ts:                  8 byte UNIX timestamp of the current time.
       refund_requested_ts: 8 byte UNIX timestamp of the timestamp to set as the timestamp
                                    that a refund request was initiated at
-      payment_tx:                  Object containing fields about the purchase from the payment
-                                   provider to set the refund request on.
-        provider:                  1 byte integer representing the platform that the payment to be
-                                   registered is coming from with the following mapping:
-                                     1 => Google Play Store
-                                     2 => Apple iOS App Store
-        apple_tx_id:               When provider is set to Apple iOS App Store, set this field to
-                                   the transaction ID string.
-        google_payment_token:      When provider is set to the Google Play Store, set this field to
-                                   the purchase token string.
-        google_order_id:           When provider is set to the Google Play Store, set this field to
-                                   the order id string.
+      payment_tx:                  Object identifying the purchase to set the refund request on.
+        provider:                  String provider code (currently only "app_store" is accepted here).
+        payment_id:                Opaque string identifying the payment (§3.5); App Store is the
+                                   transaction id. The backend owns the encoding.
     Response
       status:    Response status, either RESPONSE_SUCCESS, RESPONSE_PARSE_ERROR or
                  RESPONSE_GENERIC_ERROR
@@ -525,9 +493,8 @@ API
         "ts": 1755653705,
         "refund_requested_ts": 1755653705,
         "payment_tx": {
-          "provider": 1,
-          "google_payment_token": "b228c0144d1368541410693c82bbceb1",
-          "google_order_id": "a7ac920177ee9b1fc524c80d377de1ec"
+          "provider": "app_store",
+          "payment_id": "2000000123456789"
         }
       }
 
@@ -694,23 +661,18 @@ def add_pro_payment():
     if len(err.msg_list):
         return make_error_response(status=RESPONSE_PARSE_ERROR, errors=err.msg_list)
 
-    user_payment          = backend.UserPaymentTransaction()
-    user_payment.provider = base.PaymentProvider(payment_provider)
-    if user_payment.provider == base.PaymentProvider.GooglePlayStore:
-        user_payment.google_payment_token = base.json_dict_require_str(d=payment_tx, key='google_payment_token', err=err)
-        user_payment.google_order_id      = base.json_dict_require_str(d=payment_tx, key='google_order_id', err=err)
-    elif user_payment.provider == base.PaymentProvider.iOSAppStore:
-        user_payment.apple_tx_id = base.json_dict_require_str(d=payment_tx, key='apple_tx_id', err=err)
-    elif user_payment.provider == base.PaymentProvider.Rangeproof:
+    user_payment            = backend.UserPaymentTransaction()
+    user_payment.provider   = base.PaymentProvider(payment_provider)
+    # One opaque `payment_id` (§3.5): hashed verbatim, then split into the backend's typed fields for
+    # DB lookup. The wire/hash never sees the provider-specific sub-fields.
+    user_payment.payment_id = base.json_dict_require_str(d=payment_tx, key='payment_id', err=err)
+    if user_payment.provider == base.PaymentProvider.Rangeproof:
         # TODO: For now we do not support a user claiming a payment granted by Rangeproof via the
         # server. These grants are written directly to the DB. Clients don't have a way of manually
         # claiming a granted payment so this route is completely disabled.
-        # user_payment.rangeproof_order_id = base.json_dict_require_str(d=payment_tx, key='rangeproof_order_id', err=err)
         err.msg_list.append(f'Bad payment provider given')
         return make_error_response(status=RESPONSE_PARSE_ERROR, errors=err.msg_list)
-    else:
-        err.msg_list.append(f'Bad payment provider given')
-        return make_error_response(status=RESPONSE_PARSE_ERROR, errors=err.msg_list)
+    backend.apply_payment_id_to_tx(user_payment)
 
     # Parse other components
     master_pkey_bytes   = base.hex_to_bytes(hex=master_pkey,   label='Master public key',      hex_len=nacl.bindings.crypto_sign_PUBLICKEYBYTES * 2, err=err)
@@ -995,18 +957,10 @@ def get_pro_details():
                             'revoked_ts':                 base.unix_seconds_float_from_datetime(payment.revoked_at) if payment.revoked_at else 0.0,
                             'refund_requested_ts':        base.unix_seconds_from_datetime(payment.refund_requested_at) if payment.refund_requested_at else 0,
                         }
-                        if payment.payment_provider == base.PaymentProvider.GooglePlayStore:
-                            item['google_payment_token'] = payment.google_payment_token
-                            item['google_order_id']      = payment.google_order_id
-                            items.append(item)
-                        elif payment.payment_provider == base.PaymentProvider.iOSAppStore:
-                            item['apple_original_tx_id']    = payment.apple.original_tx_id
-                            item['apple_tx_id']             = payment.apple.tx_id
-                            item['apple_web_line_order_id'] = payment.apple.web_line_order_tx_id
-                            items.append(item)
-                        elif payment.payment_provider == base.PaymentProvider.Rangeproof:
-                            item['rangeproof_order_id'] = payment.rangeproof_order_id
-                            items.append(item)
+                        # One opaque `payment_id` (§3.5, Q10) instead of the provider-specific fields —
+                        # the backend's typed columns folded back into a single wire value.
+                        item['payment_id'] = backend.payment_id_from_payment_row(payment)
+                        items.append(item)
 
                 # NOTE: Determine pro status of user
                 if get_user.payments_count > 0:
@@ -1062,20 +1016,14 @@ def set_payment_refund_requested():
         return make_error_response(status=RESPONSE_PARSE_ERROR, errors=err.msg_list)
 
     user_payment          = backend.UserPaymentTransaction()
-    user_payment.provider = base.PaymentProvider(payment_provider)
-    if user_payment.provider == base.PaymentProvider.GooglePlayStore:
-        # TODO: Google does not support notifying the backend because refunds are executed
-        # out-of-band such as Google's web-portal whereas on Apple this is done in-app which means
-        # we get notified. We don't have a mechanism of figuring out if the process has started on
-        # google so for this route, we complete disable it.
-
-        # user_payment.google_payment_token = base.json_dict_require_str(d=payment_tx, key='google_payment_token', err=err)
-        # user_payment.google_order_id      = base.json_dict_require_str(d=payment_tx, key='google_order_id', err=err)
-        err.msg_list.append(f'Bad payment provider given')
-        return make_error_response(status=RESPONSE_PARSE_ERROR, errors=err.msg_list)
-    elif user_payment.provider == base.PaymentProvider.iOSAppStore:
-        user_payment.apple_tx_id = base.json_dict_require_str(d=payment_tx, key='apple_tx_id', err=err)
+    user_payment.provider   = base.PaymentProvider(payment_provider)
+    # One opaque `payment_id` (§3.5), hashed verbatim then split into the typed fields for DB lookup.
+    user_payment.payment_id = base.json_dict_require_str(d=payment_tx, key='payment_id', err=err)
+    if user_payment.provider == base.PaymentProvider.iOSAppStore:
+        backend.apply_payment_id_to_tx(user_payment)
     else:
+        # TODO: Google refunds are executed out-of-band (their web portal) with no in-app notification,
+        # so unlike Apple we can't tell the request is legitimate — this route is disabled for non-Apple.
         err.msg_list.append(f'Bad payment provider given')
         return make_error_response(status=RESPONSE_PARSE_ERROR, errors=err.msg_list)
 

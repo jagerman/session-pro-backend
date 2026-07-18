@@ -189,6 +189,53 @@ class UserPaymentTransaction:
     rangeproof_order_id:  str                  = ''
     google_payment_token: str                  = ''
     google_order_id:      str                  = ''
+    # The opaque wire `payment_id` (§3.5), hashed verbatim. On ingress it is the exact bytes the client
+    # sent (then split into the typed fields above for DB lookup); when the backend builds a request it
+    # is derived from the typed fields. Kept as its own field so the signed hash is byte-identical to
+    # what the client signed, never a lossy re-join of the split fields.
+    payment_id:           str                  = ''
+
+# Google folds its two identifiers into one opaque `payment_id` as `token | order_id`, split once on the
+# first delimiter. The token is base64url and the order id is `GPA.####-…`, so neither contains `|`.
+GOOGLE_PAYMENT_ID_DELIMITER = '|'
+
+def encode_payment_id(provider:             base.PaymentProvider,
+                      *,
+                      google_payment_token: str = '',
+                      google_order_id:      str = '',
+                      apple_tx_id:          str = '',
+                      rangeproof_order_id:  str = '') -> str:
+    # Encode a payment's provider-specific identifier(s) into the single opaque wire `payment_id`
+    # (§3.5). The backend owns this encoding; the client treats the result as opaque bytes.
+    match provider:
+        case base.PaymentProvider.GooglePlayStore:
+            return f'{google_payment_token}{GOOGLE_PAYMENT_ID_DELIMITER}{google_order_id}'
+        case base.PaymentProvider.iOSAppStore:
+            return apple_tx_id
+        case base.PaymentProvider.Rangeproof:
+            return rangeproof_order_id
+        case _:
+            return ''
+
+def payment_id_from_user_tx(tx: UserPaymentTransaction) -> str:
+    return encode_payment_id(tx.provider,
+                             google_payment_token = tx.google_payment_token,
+                             google_order_id      = tx.google_order_id,
+                             apple_tx_id          = tx.apple_tx_id,
+                             rangeproof_order_id  = tx.rangeproof_order_id)
+
+def apply_payment_id_to_tx(tx: UserPaymentTransaction) -> None:
+    # Split the opaque wire `payment_id` back into the backend's typed fields for DB lookup (§3.5).
+    # A new provider only needs a new case here; the wire/hash never learn a payment has sub-fields.
+    match tx.provider:
+        case base.PaymentProvider.GooglePlayStore:
+            tx.google_payment_token, _, tx.google_order_id = tx.payment_id.partition(GOOGLE_PAYMENT_ID_DELIMITER)
+        case base.PaymentProvider.iOSAppStore:
+            tx.apple_tx_id = tx.payment_id
+        case base.PaymentProvider.Rangeproof:
+            tx.rangeproof_order_id = tx.payment_id
+        case _:
+            pass
 
 @dataclasses.dataclass
 class AppleTransaction:
@@ -217,6 +264,14 @@ class PaymentRow:
     rangeproof_order_id:         str                       = ''
     google_obfuscated_account_id: bytes | None             = None
     apple_app_account_token:     str | None                = None
+
+def payment_id_from_payment_row(row: PaymentRow) -> str:
+    # Egress: fold a stored payment's typed columns back into the opaque wire `payment_id` (§3.5).
+    return encode_payment_id(row.payment_provider,
+                             google_payment_token = row.google_payment_token,
+                             google_order_id      = row.google_order_id,
+                             apple_tx_id          = row.apple.tx_id,
+                             rangeproof_order_id  = row.rangeproof_order_id)
 
 @dataclasses.dataclass
 class UserRow:
@@ -377,16 +432,10 @@ def make_add_pro_payment_hash(master_pkey:   nacl.signing.VerifyKey,
     hasher.update(bytes(master_pkey))
     hasher.update(bytes(rotating_pkey))
 
-    hasher.update(payment_tx.provider.value.encode('utf-8'))  # provider_code, UTF-8, undelimited (spec §3.2, Delta #10)
-    if payment_tx.provider == base.PaymentProvider.GooglePlayStore:
-        hasher.update(payment_tx.google_payment_token.encode('utf-8'))
-        hasher.update(payment_tx.google_order_id.encode('utf-8'))
-    elif payment_tx.provider == base.PaymentProvider.iOSAppStore:
-        hasher.update(payment_tx.apple_tx_id.encode('utf-8'))
-    elif payment_tx.provider == base.PaymentProvider.Rangeproof:
-        hasher.update(payment_tx.rangeproof_order_id.encode('utf-8'))
-    else:
-        pass
+    # Tail is `provider_code ‖ payment_id`, both UTF-8, undelimited (spec §3.2/§3.5, Q10). payment_id is
+    # the opaque value verbatim — one value, so the hash never learns a payment has sub-fields.
+    hasher.update(payment_tx.provider.value.encode('utf-8'))
+    hasher.update(payment_tx.payment_id.encode('utf-8'))
 
     result: bytes = hasher.digest()
     return result
@@ -398,17 +447,9 @@ def make_set_payment_refund_requested_hash(master_pkey: nacl.signing.VerifyKey, 
     # Signed timestamps are integer seconds, 8-byte LE (wire spec §1/§3.3).
     hasher.update(base.unix_seconds_from_datetime(request_at).to_bytes(length=8, byteorder='little'))
     hasher.update(base.unix_seconds_from_datetime(refund_requested_at).to_bytes(length=8, byteorder='little'))
-    hasher.update(payment_tx.provider.value.encode('utf-8'))  # provider_code, UTF-8, undelimited (spec §3.3, Delta #10)
-    match payment_tx.provider:
-        case base.PaymentProvider.Rangeproof:
-            pass
-        case base.PaymentProvider.Nil:
-            pass
-        case base.PaymentProvider.GooglePlayStore:
-            hasher.update(payment_tx.google_payment_token.encode())
-            hasher.update(payment_tx.google_order_id.encode())
-        case base.PaymentProvider.iOSAppStore:
-            hasher.update(payment_tx.apple_tx_id.encode())
+    # Tail is `provider_code ‖ payment_id`, both UTF-8, undelimited (spec §3.3/§3.5, Q10).
+    hasher.update(payment_tx.provider.value.encode('utf-8'))
+    hasher.update(payment_tx.payment_id.encode('utf-8'))
     result: bytes = hasher.digest()
     return result
 
