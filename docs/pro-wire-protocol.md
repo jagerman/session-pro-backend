@@ -60,10 +60,18 @@
     not `"12m"`). **Display/accounting only** (never computed with); recurrence is the separate
     `auto_renewing` field, *not* part of this code. Client maps/parses it for display; backend groups by it.
   - A `nil`/unset value is never valid on the wire — every stored row has a real code.
-- **No `version` field or version byte, anywhere** (Delta #11). Neither the signed digests (§2/§3) nor
-  any request/response body carries a version. Messages are domain-separated by their **personalisation**
-  (in the hash) and the **endpoint** (on the wire); a new message shape earns a **new endpoint**, not a
-  `"version"` discriminator in a shared body.
+- **No version byte in any digest; no `version` field on requests/responses** (Delta #11). Requests are
+  domain-separated by their **personalisation** (in the hash) and their **endpoint**; a new *request*
+  shape earns a **new endpoint**, so requests carry no version at all. The **proof** is the exception: it
+  is free-floating and offline-verified (no endpoint), so it keeps a **plaintext `version` field** — but
+  that field is a verification *input*, not a signed byte. The verifier reads it and maps the proof
+  **data → (personalisation, digest)**: `version` selects the personalisation for that version (v0 →
+  `ProProof_v0_____`; the map is arbitrary per-version, so a future version may pick any personalisation),
+  which is what binds the version into the signature. You can't learn a version
+  *through* a signature you haven't verified — you must already know it to reconstruct the digest — so the
+  version rides in the clear as data and a version byte inside the digest would be redundant. The
+  version→personalisation map is per-version and arbitrary — a future version may choose any
+  personalisation; a verifier refuses versions it doesn't know, so nothing old breaks.
 
 ## 2. The Pro proof (signed by the backend)
 
@@ -72,18 +80,30 @@ verified offline**; it carries **no user identity**.
 
 **Wire (JSON):**
 ```
-{ "revocation_tag": "<64 hex>",   // opaque 32-byte value; see §2.1
+{ "version": 0,                   // plaintext; selects the personalisation (see below). NOT hashed.
+  "revocation_tag": "<64 hex>",   // opaque 32-byte value; see §2.1
   "rotating_pkey":  "<64 hex>",   // Ed25519 public key the proof entitles
   "expiry_ts": <int>,             // seconds; entitlement valid until this instant
   "sig": "<128 hex>" }            // Ed25519 over the digest below
 ```
-There is **no `version` field** (§1, Delta #11): a new proof shape gets a new personalisation, not a
-body version marker.
+`version` is a **plaintext data element**, deliberately **not** a byte in the digest (§1, Delta #11).
+Verification is a mapping from the transmitted **data → (personalisation, digest)**: the verifier reads
+`version`, looks up the personalisation + field layout for that version (v0 → `ProProof_v0_____`),
+reconstructs the digest, and checks `sig`. So the version is a verification **input**, known before
+verification — never something discovered *through* a signature (you must already know it to reconstruct
+the digest at all). It needs no signing: tampering with it just makes the verifier use the wrong
+personalisation and the signature fails. A verifier that doesn't recognise a `version` **refuses to
+interpret the proof** — it *cannot* verify a format it doesn't know. The version→personalisation map is
+arbitrary and per-version: a future version may pick **any** personalisation (or reshape the proof
+entirely), and no existing verifier breaks because it never attempts an unknown version. (A version byte
+*inside* the digest would be pure redundancy — "extra bits for nothing" — since the version is already
+the plaintext input that picks the personalisation.)
 
-**Signed digest** — `sig = Ed25519(backend_key, H)` where
+**Signed digest** — `sig = Ed25519(backend_key, H)`; the verifier picks `person` from the plaintext
+`version` (`0` → `ProProof_v0_____`), then:
 ```
 H = BLAKE2b-256(
-      person = "ProProof________",              # 16 bytes
+      person = "ProProof_v0_____",               # 16 bytes; the "_v0" is the version, chosen from the data
       revocation_tag                             # 32 bytes, raw
    ‖  rotating_pkey                              # 32 bytes, raw
    ‖  expiry_ts.to_bytes(8,  'little'))          # seconds
@@ -235,14 +255,20 @@ a `_ts` marker, durations `…_duration`. Audit every response key against both 
     `code`). `status`/`plan` are wire-only (unsigned responses) → easy. **`provider` is also in the
     add-payment / set-refund signed hashes** (was a 1-byte int, now the UTF-8 `provider_code`), so that's
     a **both-sides-flip**. `plan` is `"1m"/"3m"/"1y"` (period code, not a lookup of tiers-with-attributes).
-11. **Drop `version` entirely — from every signed digest AND the JSON wire** (Q11) — *both-sides-flip*.
-    The leading `version(1)` byte is removed from all five signed digests (§2 proof + §3.1–3.4 requests),
-    and the `version` field is removed from every request body, every response, and the proof object.
-    Rationale: a signed digest is already domain-separated by its **personalisation** and the **endpoint**
-    it is sent to, and the version was always `0` with no party negotiating it — so it bought no
-    forward-compat, only dead weight in every digest and body. If a request's meaning ever needs to change,
-    the lever is a **new endpoint** (or a new personalisation), not a body version marker. Backend +
-    libsession remove it in lockstep.
+11. **Drop the in-digest version byte everywhere; version requests via the endpoint, the proof via a
+    plaintext field that selects its personalisation** (Q11 + Q12) — *both-sides-flip*. The leading
+    `version(1)` byte is removed from all five signed digests. Rationale: you can never learn a version
+    *through* a signature you have not yet verified, while verifying requires you to already know it — so
+    an in-hash byte discovers nothing. For **requests** the version goes entirely (field + any marker): a
+    new request shape earns a **new endpoint**, whose personalisation is the discriminator. For the
+    **proof** — a free-floating, offline-verified credential with no endpoint — the version stays as a
+    **plaintext `version` field** (a verification input): the verifier reads it and maps the proof
+    **data → (personalisation, digest)**, looking up the personalisation for that version (v0 →
+    `ProProof_v0_____`; the map is per-version and arbitrary — a future version may pick any
+    personalisation, and a verifier just refuses versions it doesn't know). The personalisation — not a
+    byte — is what binds the version into the signature; tampering with the plaintext field just makes
+    verification fail. Backend + libsession flip
+    in lockstep (proof personalisation `ProProof________` → `ProProof_v0_____`).
 
 ## Open (coordination)
 - **Spec home:** this file, in the backend repo (`docs/pro-wire-protocol.md`), is proposed as the

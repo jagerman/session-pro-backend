@@ -23,7 +23,7 @@ ZERO_BYTES32               = bytes(32)
 BLAKE2B_DIGEST_SIZE        = 32
 log                        = logging.Logger("BACKEND")
 GENERATE_PROOF_HASH_PERSONALISATION               = b'ProGenerateProof'
-BUILD_PROOF_HASH_PERSONALISATION                  = b'ProProof________'
+BUILD_PROOF_HASH_PERSONALISATION                  = b'ProProof_v0_____'  # version lives IN the personalisation (Q12), not a byte/field
 ADD_PRO_PAYMENT_HASH_PERSONALISATION              = b'ProAddPayment___'
 SET_PAYMENT_REFUND_REQUESTED_HASH_PERSONALISATION = b'ProSetRefundReq_'
 GET_PRO_DETAILS_HASH_PERSONALISATION              = b'ProGetProDetReq_'
@@ -108,15 +108,23 @@ class ExpireResult:
 
 @dataclasses.dataclass
 class ProSubscriptionProof:
+    version:        int                    = 0
     gen_index_hash: bytes                  = b''
     rotating_pkey:  nacl.signing.VerifyKey = nacl.signing.VerifyKey(ZERO_BYTES32)
     expires_at:     datetime.datetime      = base.EPOCH
     sig:            bytes                  = b''
 
     def to_dict(self) -> dict[str, str | int]:
-        # No `version` field (Q11 / wire spec Delta #11): a new proof shape would get a new
-        # personalisation, not a body version marker.
+        # `version` is a PLAINTEXT field, deliberately NOT in the signed digest (Q12). It is the
+        # external indicator a verifier reads to pick the personalisation + layout it must use to
+        # reconstruct and check the digest; v0's personalisation is BUILD_PROOF_HASH_PERSONALISATION
+        # (`ProProof_v0_____`). The version→personalisation map is per-version and arbitrary — a future
+        # version may choose any personalisation (or reshape the proof entirely); a verifier simply
+        # refuses a version it doesn't understand, so nothing old breaks. The version is thus a
+        # verification *input*, never discovered through the signature; tampering with it just makes the
+        # verifier pick the wrong personalisation → signature fails.
         result = {
+            "version":        self.version,
             "gen_index_hash": self.gen_index_hash.hex(),
             "rotating_pkey":  bytes(self.rotating_pkey).hex(),
             # Proof expiry is day-aligned, so integer seconds is exact (wire spec §2).

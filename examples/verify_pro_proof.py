@@ -37,7 +37,7 @@ Which produces output of the form:
   Signature valid: True
 
 (The gen-index-hash / signature / hash hex above are illustrative values from one dev run; a fresh
-run produces its own. What matters is the method: personalisation "ProProof________", little-endian
+run produces its own. What matters is the method: personalisation "ProProof_v0_____", little-endian
 field widths, and an integer-seconds 8-byte expiry.)
 """
 from nacl.signing import VerifyKey
@@ -56,9 +56,11 @@ args = parser.parse_args()
 # Compute hash of the proof
 hash_result: bytes = b''
 if 1:
-    personalization = b"ProProof________"
+    personalization = b"ProProof_v0_____"
     h = hashlib.blake2b(person=personalization, digest_size=32)
-    # No version byte (Q11): the personalisation domain-separates the digest.
+    # No version byte/field: the proof version is embedded in the personalisation (Q12) — it is a
+    # verification *input* (you must know it to reconstruct the digest), so it cannot be a value you
+    # discover from the signed content.
 
     # Strip 0x prefix if present and convert from hex
     gen_hash      = args.gen_index_hash[2:] if args.gen_index_hash.startswith('0x') else args.gen_index_hash
