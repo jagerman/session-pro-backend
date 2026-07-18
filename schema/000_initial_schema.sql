@@ -69,11 +69,23 @@ CREATE TABLE IF NOT EXISTS payments (
     apple_app_account_token           TEXT
 );
 
+-- Indexes (item 13): partial where the column is NULL for rows it doesn't apply to (one provider's ids
+-- per payment; user_id NULL until redeemed) — the `= <value>` lookups never target NULL. google_order_id
+-- and apple_web_line_order_tx_id are only ever secondary AND-filters, so they need no index of their own.
+CREATE INDEX IF NOT EXISTS payments_user_id_idx              ON payments (user_id)              WHERE user_id              IS NOT NULL;  -- owner lookups + PAYMENTS_FROM join
+CREATE INDEX IF NOT EXISTS payments_google_payment_token_idx ON payments (google_payment_token) WHERE google_payment_token IS NOT NULL;  -- provider tx-id lookup
+CREATE INDEX IF NOT EXISTS payments_apple_original_tx_id_idx ON payments (apple_original_tx_id)  WHERE apple_original_tx_id  IS NOT NULL;  -- provider tx-id lookup
+CREATE INDEX IF NOT EXISTS payments_apple_tx_id_idx          ON payments (apple_tx_id)           WHERE apple_tx_id          IS NOT NULL;  -- provider tx-id lookup
+CREATE INDEX IF NOT EXISTS payments_rangeproof_order_id_idx  ON payments (rangeproof_order_id)   WHERE rangeproof_order_id  IS NOT NULL;  -- provider tx-id lookup
+CREATE INDEX IF NOT EXISTS payments_expires_at_idx           ON payments (expires_at);                                                    -- daily expiry sweep
+
 CREATE TABLE IF NOT EXISTS revocations (
     gen_index            INTEGER     PRIMARY KEY NOT NULL,
     created_at           TIMESTAMPTZ NOT NULL,  -- When the revocation was created (used to calculate effective time)
     expires_at           TIMESTAMPTZ NOT NULL
 );
+-- The daily sweep prunes revocations by expiry (item 13).
+CREATE INDEX IF NOT EXISTS revocations_expires_at_idx ON revocations (expires_at);
 
 CREATE TABLE IF NOT EXISTS runtime (
     gen_index                                INTEGER NOT NULL DEFAULT 0,
