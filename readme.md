@@ -42,6 +42,11 @@ layer and replies a response, if any.
 
 - `test.py`: Holds the unit tests implemented via pytest.
 
+- `docs/`: Design and operational docs. **`docs/limitations.md` — payment-provider limitations and the
+  store-config invariants they depend on; READ IT before enabling any new Google Play Console / App Store
+  Connect feature (one-time products, prepaid plans, subscription pause, promotional offers, etc.).** Also
+  the authoritative wire/proof spec, `docs/pro-wire-protocol.md`.
+
 ## Getting Started
 
 ```
