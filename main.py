@@ -40,7 +40,6 @@ def entry_point() -> flask.Flask:
     err = base.ErrorSink()
     parsed_args: config.ParsedArgs = config.parse_args(err)
     base.UNSAFE_LOGGING       = parsed_args.unsafe_logging
-    base.DEV_BACKEND_MODE     = parsed_args.dev
     base.DB_URL               = parsed_args.db_url
     base.PLATFORM_TESTING_ENV = parsed_args.platform_testing_env
     base.PROVIDER_DRY_RUN     = parsed_args.provider_dry_run
@@ -100,13 +99,6 @@ def entry_point() -> flask.Flask:
             sys.exit(1)
 
         startup_log = '\n'
-        if parsed_args.dev:
-            startup_log += "######################################\n"
-            startup_log += "###                                ###\n"
-            startup_log += "###        Dev Mode Enabled        ###\n"
-            startup_log += "###                                ###\n"
-            startup_log += "######################################\n"
-
         startup_log += f'Session Pro Backend\n{info_string}\n'
         startup_log += f'  Features:\n'
         if len(parsed_args.ini_path) > 0:
@@ -120,6 +112,8 @@ def entry_point() -> flask.Flask:
             startup_log += f'    Unsafe logging enabled (this must NOT be used in production)\n'
         if parsed_args.platform_testing_env:
             startup_log += f'    Platform testing environment enabled (special behaviour for rounding timestamps to EOD)\n'
+        if parsed_args.provider_dry_run:
+            startup_log += f'    provider_dry_run ENABLED: all payment-provider egress is stubbed (this must NOT be used in production)\n'
         if parsed_args.with_platform_apple:
             label = 'Sandbox' if parsed_args.apple_sandbox_env else 'Production'
             startup_log += f'    Platform: {label} Apple iOS App Store notification handling enabled\n'
@@ -128,13 +122,6 @@ def entry_point() -> flask.Flask:
         for it in parsed_args.session_webhooks:
             if it.enabled:
                 startup_log += f'    Webhook Logger: Enabled (display name: {it.name})\n'
-
-        if parsed_args.dev:
-            startup_log += "######################################\n"
-            startup_log += "###                                ###\n"
-            startup_log += "###        Dev Mode Enabled        ###\n"
-            startup_log += "###                                ###\n"
-            startup_log += "######################################\n"
 
         log.info(startup_log)
         for it in webhook_loggers:

@@ -102,8 +102,6 @@ DEFAULT_GOOGLE_GRACE_PERIOD: datetime.timedelta = DEFAULT_APPLE_GRACE_PERIOD
 
 # NOTE: Global variables
 DB_URL                         = ''
-DEV_BACKEND_MODE               = False
-DEV_BACKEND_DETERMINISTIC_SKEY = bytes([0xCD] * 32)
 UNSAFE_LOGGING                 = False
 PLATFORM_TESTING_ENV           = False
 # When set, every payment provider treats all of its OUTBOUND interactions as already-succeeded and

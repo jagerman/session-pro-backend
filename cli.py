@@ -24,13 +24,12 @@ import db
 # Epilog definitions
 BRIEF_EPILOG = """
 QUICK START EXAMPLES:
-  server              add-pro-payment              --url <url> --provider <google|apple|...> [--dev-plan <1M|3M|12M>] [--dev-duration-ms ...] [--dev-auto-renewing]
   server              set-payment-refund-requested --url <url> --provider <google|apple> --payment-token <token> --order-id <id>
   server              get-pro-revocations          --url <url> [--ticket <int>]
   server              get-pro-details              --url <url> --master-skey <hex> [--count <n>]
   server              generate-pro-proof           --url <url> --master-skey <hex> --rotating-skey <hex>
 
-  voucher                                           --master-pkey <hex> --plan <1M|3M|12M> [--rotating-pkey <hex>] [--dev-duration-ms <ms>] (requires --config)
+  voucher                                           --master-pkey <hex> --plan <1M|3M|12M> [--rotating-pkey <hex>] [--duration <s>] (requires --config)
 
   user-error          set                          <provider>:<payment-id>=<true|false>[,...]                                               (requires --config)
   user-error          delete                       <provider>:<payment-id>[,...]                                                            (requires --config)
@@ -51,28 +50,6 @@ QUICK START EXAMPLES:
 
 DETAILED_EPILOG = """
 COMMAND FORMATS DETAILED:
-  server add-pro-payment --url <url> --provider <google|apple|...> [options]
-    Add a development payment to a Session Pro backend server (requires backend to be running in dev mode).
-    Mirrors the /add_pro_payment endpoint.
-
-    Required:
-      --url <url>               Server URL (e.g., http://localhost:8000)
-      --provider                Payment provider (one of the following: google, apple, rangeproof)
-
-    Optional:
-      --master-skey <hex>       64-char hex master secret key (generates new if omitted)
-      --rotating-skey <hex>     64-char hex rotating secret key (generates new if omitted)
-      --dev-plan <1M|3M|12M>    Subscription plan (1M/3M/12M)
-      --dev-duration-ms <ms>    Override duration in milliseconds
-      --dev-auto-renewing       Set auto-renewing to true (default: false)
-
-    The command generates DEV.-prefixed order/tx IDs and sends them to the server.
-    Generated keys are always printed to stdout for reproducibility.
-
-    Examples:
-      python cli.py server add-pro-payment --url http://localhost:8000 --provider google --dev-plan 1M
-      python cli.py server add-pro-payment --url http://localhost:8000 --provider apple --dev-plan 3M --master-skey abcdef...
-
   server set-payment-refund-requested --url <url> --provider <google|apple> --master-skey <hex> [options]
     Mark a development payment as refund requested. Mirrors the /set_payment_refund_requested endpoint.
 
@@ -193,7 +170,7 @@ COMMAND FORMATS DETAILED:
       python cli.py --config config.ini user-error delete "1:abc123token"
       python cli.py --config config.ini user-error delete "1:token1,1:token2,2:apple1"
 
-  voucher --config <ini> --master-pkey <hex> --plan <1M|3M|12M> [--rotating-pkey <hex>] [--dev-duration-ms <ms>] (requires --config)
+  voucher --config <ini> --master-pkey <hex> --plan <1M|3M|12M> [--rotating-pkey <hex>] [--duration <s>] (requires --config)
     Create a Rangeproof voucher payment and auto-redeem it. This is an admin command for granting
     promotional or complimentary Session Pro subscriptions directly in the database.
 
@@ -204,12 +181,12 @@ COMMAND FORMATS DETAILED:
 
     Optional:
       --rotating-pkey <hex>   64-char hex rotating public key (generates new if omitted)
-      --dev-duration-ms <ms>  Override duration in milliseconds
+      --duration <s>          Override duration in seconds
 
     Examples:
       python cli.py voucher --config config.ini --master-pkey abcdef... --plan 1M
       python cli.py voucher --config config.ini --master-pkey abcdef... --plan 3M --rotating-pkey fedcba...
-      python cli.py voucher --config config.ini --master-pkey abcdef... --plan 12M --dev-duration-ms 5000
+      python cli.py voucher --config config.ini --master-pkey abcdef... --plan 12M --duration 5
 
   google-notification handle "<message_id>[,...]" (requires --config)
     A ',' delimited string of message IDs to instruct the DB to mark the specified rows as handled
@@ -430,7 +407,6 @@ def require_config(args: argparse.Namespace) -> CLIConfig:
                 result.db_url           = base_section.get('db_url', '')
                 result.backend_key_path = base_section.get('backend_key_path', '')
                 result.log_path         = base_section.get('log_path', '')
-                base.DEV_BACKEND_MODE   = base_section.getboolean('dev', fallback=False)
 
                 # Allow environment variable override
                 result.db_url           = os.getenv('SESH_PRO_BACKEND_DB_URL', result.db_url)
@@ -854,110 +830,6 @@ def cmd_db_print(args: argparse.Namespace) -> int:
         return 1
 
 
-def cmd_server_add_pro_payment(args: argparse.Namespace) -> int:
-    import json
-    import os
-    import urllib.request
-    import urllib.error
-
-    # Parse or generate master key
-    if args.master_skey:
-        try:
-            master_skey = nacl.signing.SigningKey(bytes.fromhex(args.master_skey))
-        except Exception as e:
-            print(f"ERROR: Failed to parse master key: {e}", file=sys.stderr)
-            return 1
-    else:
-        master_skey = nacl.signing.SigningKey.generate()
-        print(f'Generated Master SKey: {bytes(master_skey).hex()}')
-        print(f'Generated Master PKey: {bytes(master_skey.verify_key).hex()}')
-
-    # Parse or generate rotating key
-    if args.rotating_skey:
-        try:
-            rotating_skey = nacl.signing.SigningKey(bytes.fromhex(args.rotating_skey))
-        except Exception as e:
-            print(f"ERROR: Failed to parse rotating key: {e}", file=sys.stderr)
-            return 1
-    else:
-        rotating_skey = nacl.signing.SigningKey.generate()
-        print(f'Generated Rotating SKey: {bytes(rotating_skey).hex()}')
-        print(f'Generated Rotating PKey: {bytes(rotating_skey.verify_key).hex()}')
-
-    # Determine provider enum and build payment_tx
-    if args.provider == 'google':
-        payment_tx_obj = backend.UserPaymentTransaction(
-            provider             = base.PaymentProvider.GooglePlayStore,
-            google_payment_token = os.urandom(8).hex(),
-            google_order_id      = 'DEV.' + os.urandom(8).hex()
-        )
-    elif args.provider == 'apple':
-        payment_tx_obj = backend.UserPaymentTransaction(
-            provider    = base.PaymentProvider.iOSAppStore,
-            apple_tx_id = 'DEV.' + os.urandom(8).hex()
-        )
-    elif args.provider == 'rangeproof':
-        payment_tx_obj = backend.UserPaymentTransaction(
-            provider            = base.PaymentProvider.Rangeproof,
-            rangeproof_order_id = 'DEV.' + os.urandom(8).hex()
-        )
-    else:
-        print(f"ERROR: Unsupported payment provider: {args.provider}", file=sys.stderr)
-        return 1
-
-    # Fold the provider's identifier(s) into the single opaque `payment_id` (§3.5) — hashed verbatim.
-    payment_tx_obj.payment_id = backend.payment_id_from_user_tx(payment_tx_obj)
-
-    # Compute hash using backend function
-    hash_bytes = backend.make_add_pro_payment_hash(
-        master_pkey   = master_skey.verify_key,
-        rotating_pkey = rotating_skey.verify_key,
-        payment_tx    = payment_tx_obj
-    )
-
-    # Build request
-    request_body = {
-        'master_pkey':   bytes(master_skey.verify_key).hex(),
-        'rotating_pkey': bytes(rotating_skey.verify_key).hex(),
-        'master_sig':    bytes(master_skey.sign(hash_bytes).signature).hex(),
-        'rotating_sig':  bytes(rotating_skey.sign(hash_bytes).signature).hex(),
-        'payment_tx':  {
-            'provider':   payment_tx_obj.provider.value,
-            'payment_id': payment_tx_obj.payment_id,
-        }
-    }
-
-    # Add dev arguments
-    plan_map = {'1M': 'OneMonth', '3M': 'ThreeMonth', '12M': 'TwelveMonth'}
-    if args.dev_plan:
-        request_body['dev_plan'] = plan_map[args.dev_plan]
-    if args.dev_duration_ms is not None:
-        request_body['dev_duration_ms'] = args.dev_duration_ms
-    if args.dev_auto_renewing:
-        request_body['dev_auto_renewing'] = True
-
-    print(f'\nAdd Pro Payment via {"Google" if args.provider == "google" else "Apple"}')
-    print(f'Request:\n{json.dumps(request_body, indent=1)}')
-
-    # Send request
-    try:
-        request = urllib.request.Request(
-            f'{args.url}/add_pro_payment',
-            data=json.dumps(request_body).encode('utf-8'),
-            headers={"Content-Type": "application/json"},
-            method="POST"
-        )
-        with urllib.request.urlopen(request) as response:
-            response_data = json.loads(response.read().decode('utf-8'))
-            print(f"Response: {json.dumps(response_data, indent=1)}")
-            return 0
-    except urllib.error.HTTPError as e:
-        print(f"ERROR: Server returned {e.code}: {e.read().decode('utf-8')}", file=sys.stderr)
-        return 1
-    except Exception as e:
-        print(f"ERROR: Failed to connect to {args.url}: {e}", file=sys.stderr)
-        return 1
-
 
 def cmd_server_set_payment_refund_requested(args: argparse.Namespace) -> int:
     import json
@@ -1229,8 +1101,8 @@ def cmd_voucher(args: argparse.Namespace) -> int:
     plan     = plan_map[args.plan]
 
     # Calculate plan duration in milliseconds
-    if args.dev_duration_ms:
-        duration_ms = args.dev_duration_ms
+    if args.duration:
+        duration_ms = args.duration * 1000
     else:
         if plan == base.ProPlan.OneMonth:
             duration_ms = 30 * base.SECONDS_IN_DAY * 1000
@@ -1344,16 +1216,6 @@ def main() -> int:
     server_parser           = subparsers.add_parser('server', help='Server endpoint operations (no --config required)')
     server_subparsers       = server_parser.add_subparsers(dest='server_command', help='Server endpoint subcommands')
 
-    # add-pro-payment endpoint
-    server_add_pro_payment  = server_subparsers.add_parser('add-pro-payment',                                                                      help='Add a pro payment. Mirrors /add_pro_payment')
-    _                       = server_add_pro_payment.add_argument('--url',               required=True,                                            help='Server URL (e.g., http://localhost:8000)')
-    _                       = server_add_pro_payment.add_argument('--provider',          required=True, choices=['google', 'apple', 'rangeproof'], help='Payment provider')
-    _                       = server_add_pro_payment.add_argument('--master-skey',                                                                 help='64-char hex master secret key (generates new if omitted)')
-    _                       = server_add_pro_payment.add_argument('--rotating-skey',                                                               help='64-char hex rotating secret key (generates new if omitted)')
-    _                       = server_add_pro_payment.add_argument('--dev-plan',                         choices=['1M', '3M', '12M'],               help='Subscription plan (1M/3M/12M)')
-    _                       = server_add_pro_payment.add_argument('--dev-duration-ms',   type=int,                                                 help='Override duration in milliseconds')
-    _                       = server_add_pro_payment.add_argument('--dev-auto-renewing', action='store_true',                                      help='Set auto-renewing to true (default: false)')
-
     # set-payment-refund-requested endpoint
     server_set_refund       = server_subparsers.add_parser('set-payment-refund-requested',                                                help='Mark payment as refund requested. Mirrors /set_payment_refund_requested')
     _                       = server_set_refund.add_argument('--url',                         required=True,                              help='Server URL')
@@ -1386,7 +1248,7 @@ def main() -> int:
     _                       = voucher_parser.add_argument('--master-pkey',     required=True,                              help='64-char hex master public key of the recipient')
     _                       = voucher_parser.add_argument('--plan',            required=True, choices=['1M', '3M', '12M'], help='Subscription plan (1M/3M/12M)')
     _                       = voucher_parser.add_argument('--rotating-pkey',                                               help='64-char hex rotating public key (generates new if omitted)')
-    _                       = voucher_parser.add_argument('--dev-duration-ms', type=int,                                   help='Override duration in milliseconds')
+    _                       = voucher_parser.add_argument('--duration',        type=int,                                   help='Override duration in seconds')
 
     # User error commands
     user_error_parser       = subparsers.add_parser('user-error',                         help='Manage user errors')
@@ -1449,9 +1311,7 @@ def main() -> int:
     dry_run = args.dry_run
 
     if args.command == 'server':
-        if args.server_command == 'add-pro-payment':
-            return cmd_server_add_pro_payment(args)
-        elif args.server_command == 'set-payment-refund-requested':
+        if args.server_command == 'set-payment-refund-requested':
             return cmd_server_set_payment_refund_requested(args)
         elif args.server_command == 'get-pro-revocations':
             return cmd_server_get_pro_revocations(args)

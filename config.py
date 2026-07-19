@@ -27,7 +27,6 @@ class ParsedArgs:
     db_url:                                    str                             = ''
     backend_key_path:                          str                             = ''
     log_path:                                  str                             = ''
-    dev:                                       bool                            = False
     unsafe_logging:                            bool                            = False
 
     with_platform_apple:                       bool                            = False
@@ -72,7 +71,6 @@ def parse_args(err: base.ErrorSink) -> ParsedArgs:
         result.db_url                              = base_section.get(option='db_url',                      fallback='')
         result.backend_key_path                    = base_section.get(option='backend_key_path',            fallback='')
         result.log_path                            = base_section.get(option='log_path',                    fallback='')
-        result.dev                                 = base_section.getboolean(option='dev',                  fallback=False)
         result.unsafe_logging                      = base_section.getboolean(option='unsafe_logging',       fallback=False)
 
         result.with_platform_apple                 = base_section.getboolean(option='with_platform_apple',  fallback=False)
@@ -137,7 +135,6 @@ def parse_args(err: base.ErrorSink) -> ParsedArgs:
     result.db_url                         = os.getenv('SESH_PRO_BACKEND_DB_URL',                             result.db_url)
     result.backend_key_path               = os.getenv('SESH_PRO_BACKEND_KEY_PATH',                           result.backend_key_path)
     result.log_path                       = os.getenv('SESH_PRO_BACKEND_LOG_PATH',                           result.log_path)
-    result.dev                            = base.os_get_boolean_env('SESH_PRO_BACKEND_DEV',                  result.dev)
     result.with_platform_apple            = base.os_get_boolean_env('SESH_PRO_BACKEND_WITH_PLATFORM_APPLE',  result.with_platform_apple)
     result.with_platform_google           = base.os_get_boolean_env('SESH_PRO_BACKEND_WITH_PLATFORM_GOOGLE', result.with_platform_google)
     result.with_platform_google           = base.os_get_boolean_env('SESH_PRO_BACKEND_PLATFORM_TESTING_ENV', result.with_platform_google)

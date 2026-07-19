@@ -58,7 +58,6 @@ def run() -> None:
     err                       = base.ErrorSink()
     parsed                    = config.parse_args(err)
     base.UNSAFE_LOGGING       = parsed.unsafe_logging
-    base.DEV_BACKEND_MODE     = parsed.dev
     base.DB_URL               = parsed.db_url
     base.PLATFORM_TESTING_ENV = parsed.platform_testing_env
     base.PROVIDER_DRY_RUN     = parsed.provider_dry_run
