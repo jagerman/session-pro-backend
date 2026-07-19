@@ -121,16 +121,14 @@ def backend_maintenance_thread_entry_point(db_url: str):
                 yesterday_str: str = datetime.datetime.fromtimestamp(next_day_unix_ts_s - base.SECONDS_IN_DAY).strftime('%Y-%m-%d')
                 today_str: str     = datetime.datetime.fromtimestamp(next_day_unix_ts_s).strftime('%m-%d')
                 if expire_result.success:
-                    if not expire_result.already_done_by_someone_else:
-                        log_line: str = ('Daily pruning for {} completed on {}. Expired payments/revocations/users/apple notifs={}/{}/{}/{}'.format(yesterday_str,
-                                                                                                                                                    today_str,
-                                                                                                                                                    expire_result.payments,
-                                                                                                                                                    expire_result.revocations,
-                                                                                                                                                    expire_result.users,
-                                                                                                                                                    expire_result.apple_notification_uuid_history))
-                        log.info(log_line)
-                        for it in webhook_loggers:
-                            it.emit_text(log_line)
+                    log_line: str = ('Daily pruning for {} completed on {}. Pruned revocations/users/apple notifs={}/{}/{}'.format(yesterday_str,
+                                                                                                                                    today_str,
+                                                                                                                                    expire_result.revocations,
+                                                                                                                                    expire_result.users,
+                                                                                                                                    expire_result.apple_notification_uuid_history))
+                    log.info(log_line)
+                    for it in webhook_loggers:
+                        it.emit_text(log_line)
                 else:
                     log.error(f'Daily pruning for {yesterday_str} failed due to an unknown DB error')
 

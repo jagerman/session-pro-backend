@@ -14,6 +14,6 @@ def apply_001_seed_runtime(conn):
     if row and row[0]:
         return
     _ = db.query(conn, '''
-        INSERT INTO runtime (gen_index, gen_index_salt, last_expire_unix_ts_ms, apple_notification_checkpoint_unix_ts_ms, revocation_ticket)
-        VALUES (0, %s, 0, 0, 0)
+        INSERT INTO runtime (gen_index, gen_index_salt, apple_notification_checkpoint_unix_ts_ms, revocation_ticket)
+        VALUES (0, %s, 0, 0)
     ''', os.urandom(hashlib.blake2b.SALT_SIZE))

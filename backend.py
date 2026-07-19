@@ -98,9 +98,7 @@ class GoogleNotificationMessageIDInDB:
 
 @dataclasses.dataclass
 class ExpireResult:
-    already_done_by_someone_else:    bool = False
     success:                         bool = False
-    payments:                        int  = 0
     revocations:                     int  = 0
     users:                           int  = 0
     apple_notification_uuid_history: int  = 0
@@ -335,7 +333,6 @@ class RuntimeRow:
     '''
     gen_index:                                int                     = 0
     gen_index_salt:                           bytes                   = b''
-    last_expire_unix_ts_ms:                   int                     = 0
     apple_notification_checkpoint_unix_ts_ms: int                     = 0
     revocation_ticket:                        int                     = 0
 
@@ -617,12 +614,11 @@ def get_revocation_ticket(conn: psycopg.Connection) -> int:
 def get_runtime_tx(tx: db.SQLTransaction) -> RuntimeRow:
     row = db.query_one(tx.conn, ("SELECT gen_index,"
                                  "gen_index_salt,"
-                                 "last_expire_unix_ts_ms,"
                                  "apple_notification_checkpoint_unix_ts_ms,"
                                  "revocation_ticket FROM runtime"))
     result: RuntimeRow = RuntimeRow()
     if row:
-        (result.gen_index, result.gen_index_salt, result.last_expire_unix_ts_ms,
+        (result.gen_index, result.gen_index_salt,
          result.apple_notification_checkpoint_unix_ts_ms, result.revocation_ticket) = row
     return result
 
@@ -2009,31 +2005,6 @@ def revoke_master_pkey_proofs_and_allocate_new_gen_id_tx(tx: db.SQLTransaction, 
     result = _allocate_new_gen_id_if_master_pkey_has_payments(tx, master_pkey)
     return result
 
-def expiring_master_pkeys_tx(tx: db.SQLTransaction, now: datetime.datetime, last_expire_at: datetime.datetime) -> set[nacl.signing.VerifyKey]:
-    log.info(f'Expire by ts (ts={base.readable(now)})')
-
-    # `status` is no longer stored: a payment's expiry is derived from expires_at (see
-    # derive_payment_status), so "expiring" mutates no rows. We only enumerate the payments that
-    # crossed their expiry within this run's window (last_expire, now] and are not revoked, so the
-    # caller can report how many users just lost an entitlement. Windowing on the *previous*
-    # last_expire keeps each payment counted exactly once across successive runs (the row itself is
-    # untouched, so without the window every run would re-count every already-expired payment).
-    result_set = db.query(tx.conn, ('''
-        SELECT (SELECT master_pkey FROM users WHERE users.id = payments.user_id)
-        FROM   payments
-        WHERE  %(now)s >= expires_at
-          AND  expires_at > %(last_expire)s
-          AND  revoked_at IS NULL
-    '''), now         = now,
-          last_expire = last_expire_at)
-
-    result: set[nacl.signing.VerifyKey] = set()
-    for row in result_set:
-        if row[0]:
-            master_pkey = nacl.signing.VerifyKey(bytes(row[0]))
-            result.add(master_pkey)
-    return result
-
 def round_datetime_to_next_day_with_platform_testing_support(payment_provider: base.PaymentProvider, at: datetime.datetime) -> datetime.datetime:
     """Round `at` up to the next day boundary. In some platforms' testing environments a "day" is
     compressed (Google: 10 seconds); only that case differs from the normal UTC-day rounding."""
@@ -2098,43 +2069,22 @@ def generate_pro_proof(conn: psycopg.Connection,
     return result
 
 def expire_payments_revocations_and_users(conn: psycopg.Connection, now: datetime.datetime) -> ExpireResult:
+    # Pure idempotent housekeeping: prune rows whose expiry has passed (and orphaned users). Nothing
+    # here affects live results — payment expiry is derived on read, and every consuming query
+    # self-guards on expiry (e.g. is_gen_index_revoked) — so this can run on any schedule, any number
+    # of times, in any process, and only ever frees storage. Hence no `last_expire` checkpoint /
+    # windowing / cross-process "only one wins" guard: a redundant run simply deletes nothing.
     result = ExpireResult()
     with db.transaction(conn) as tx:
-        # Retrieve the last expiry time that was executed. runtime.last_expire_unix_ts_ms stays
-        # int-ms for now (item 3 owns the runtime→globals conversion), so shim int↔datetime here.
-        runtime_result                     = db.query_one(tx.conn, '''SELECT last_expire_unix_ts_ms FROM runtime''')
-        assert runtime_result
-
-        last_expire_at:               datetime.datetime = base.datetime_from_unix_ms(runtime_result[0])
-        already_done_by_someone_else: bool              = last_expire_at >= now
-        log.info(f'Expire payments/revocs/users (pid={os.getpid()}, ts={base.readable(now)}, last_expire={base.readable(last_expire_at)}, already_done_by_someone_else={already_done_by_someone_else})')
-        if not already_done_by_someone_else:
-            # Update the timestamp that we executed DB expiry (shim back to int-ms).
-            _ = db.query(tx.conn, '''UPDATE runtime SET last_expire_unix_ts_ms = %s''', base.unix_ms_from_datetime(now))
-
-            # Count payments that newly crossed their (derived) expiry this run. Pass the *previous*
-            # last_expire (read above, before the UPDATE) so the window is (last_expire, now].
-            master_pkeys: set[nacl.signing.VerifyKey] = expiring_master_pkeys_tx(tx=tx, now=now, last_expire_at=last_expire_at)
-            result.payments                           = len(master_pkeys)
-
-            # Delete expired revocations
-            rev_result                                = db.query(tx.conn, '''DELETE FROM revocations WHERE %s >= expires_at''', now)
-            result.revocations                        = rev_result.rowcount
-
-            # Delete expired users
-            users_result                              = db.query(tx.conn, '''DELETE FROM users WHERE id NOT IN (SELECT user_id FROM payments WHERE user_id IS NOT NULL)''')
-            result.users                              = users_result.rowcount
-
-            # Delete expired apple notification UUIDs
-            apple_result                              = db.query(tx.conn, '''DELETE FROM apple_notification_uuid_history WHERE %s >= expires_at''', now)
-            result.apple_notification_uuid_history    = apple_result.rowcount
-
-            # Delete expired google notifications (but only if they have been handled)
-            google_result                      = db.query(tx.conn, '''DELETE FROM google_notification_history WHERE %s >= expires_at AND handled = TRUE''', now)
-            result.google_notification_history = google_result.rowcount
-
-        result.already_done_by_someone_else = already_done_by_someone_else
-        result.success                      = True
+        rev_result    = db.query(tx.conn, '''DELETE FROM revocations WHERE %s >= expires_at''', now)
+        users_result  = db.query(tx.conn, '''DELETE FROM users WHERE id NOT IN (SELECT user_id FROM payments WHERE user_id IS NOT NULL)''')
+        apple_result  = db.query(tx.conn, '''DELETE FROM apple_notification_uuid_history WHERE %s >= expires_at''', now)
+        google_result = db.query(tx.conn, '''DELETE FROM google_notification_history WHERE %s >= expires_at AND handled = TRUE''', now)
+        result.revocations                     = rev_result.rowcount
+        result.users                           = users_result.rowcount
+        result.apple_notification_uuid_history = apple_result.rowcount
+        result.google_notification_history     = google_result.rowcount
+        result.success                         = True
     return result
 
 def add_user_error_tx(tx: db.SQLTransaction, error: UserError, at: datetime.datetime):

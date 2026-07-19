@@ -391,9 +391,7 @@ def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_d
     assert len(revocation_list)                            == 0
 
     expire_result: backend.ExpireResult                     = backend.expire_payments_revocations_and_users(db_conn, now=scenarios[0].expires_at)
-    assert expire_result.already_done_by_someone_else      == False
     assert expire_result.success                           == True
-    assert expire_result.payments                          == 1
     assert expire_result.revocations                       == 0
     assert expire_result.users                             == 0
 
