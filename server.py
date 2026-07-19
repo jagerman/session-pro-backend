@@ -533,10 +533,13 @@ class GetJSONFromFlaskRequest:
     json:    dict[str, base.JSONValue] = dataclasses.field(default_factory=dict)
     err_msg: str                       = ''
 
-class UserProStatus(enum.IntEnum):
-    NeverBeenPro = 0
-    Active       = 1
-    Expired      = 2
+class UserProStatus(enum.StrEnum):
+    # Overall Pro status of the account, emitted as the top-level `status` code in the get-details
+    # response. A string code (not an integer) so an unknown future value passes through opaquely and
+    # old clients degrade gracefully instead of hard-failing the whole parse — see the wire spec §1.
+    Never        = 'never'
+    Active       = 'active'
+    Expired      = 'expired'
 
 # Keys stored in the flask app config dictionary that can be retrieved within
 # a request to get the path to the SQLite DB to load and use for that request.
@@ -901,7 +904,7 @@ def get_pro_details():
         return make_error_response(status=RESPONSE_PARSE_ERROR, errors=err.msg_list)
 
     items:           list[dict[str, str | int | float | bool]] = []
-    user_pro_status: UserProStatus                           = UserProStatus.NeverBeenPro
+    user_pro_status: UserProStatus                           = UserProStatus.Never
     auto_renewing                                            = False
     expiry_ts                                                = 0
     grace_period_duration                                    = 0
@@ -976,7 +979,7 @@ def get_pro_details():
                         user_pro_status = UserProStatus.Expired
 
             dict_result = {
-                'status':                int(user_pro_status.value),
+                'status':                user_pro_status.value,
                 'auto_renewing':         auto_renewing,
                 'expiry_ts':             expiry_ts,
                 'refund_requested_ts':   refund_requested_ts,

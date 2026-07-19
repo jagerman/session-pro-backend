@@ -641,9 +641,9 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
 
             # Extract the fields
             result_items                               = base.json_dict_require_array(d=result_json, key='items',  err=err)
-            result_status:  int                        = base.json_dict_require_int(d=result_json, key='status',  err=err)
+            result_status:  str                        = base.json_dict_require_str(d=result_json, key='status',  err=err)
             assert len(err.msg_list) == 0,                                       '{err.msg_list}'
-            assert result_status     == server.UserProStatus.NeverBeenPro.value, f'Response was: {json.dumps(response_json, indent=2)}'
+            assert result_status     == server.UserProStatus.Never.value, f'Response was: {json.dumps(response_json, indent=2)}'
             assert len(result_items) == 0,                                       f'Response was: {json.dumps(response_json, indent=2)}'
 
         if 1: # Simulate client request to register a payment
@@ -1053,7 +1053,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
 
             # Extract the fields
             result_items = base.json_dict_require_array(d=result_json, key='items',  err=err)
-            result_status:  int                        = base.json_dict_require_int(d=result_json, key='status',  err=err)
+            result_status:  str                        = base.json_dict_require_str(d=result_json, key='status',  err=err)
             assert len(err.msg_list) == 0,                                 '{err.msg_list}'
             assert result_status     == server.UserProStatus.Active.value, f'Response was: {json.dumps(response_json, indent=2)}'
             assert len(result_items) == 2,                                 f'Response was: {json.dumps(response_json, indent=2)}'
@@ -3794,7 +3794,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
         res_auto_renewing         = base.json_dict_require_bool(result, "auto_renewing", err)
         res_expiry_ts             = base.json_dict_require_int(result, "expiry_ts", err)
         res_grace_period_duration = base.json_dict_require_int(result, "grace_period_duration", err)
-        res_pro_status            = base.json_dict_require_int_coerce_to_enum(result, "status", server.UserProStatus, err)
+        res_pro_status            = base.json_dict_require_str_coerce_to_enum(result, "status", server.UserProStatus, err)
         res_items                 = base.json_dict_require_array(result, "items", err)
         assert not err.has(), status
         assert res_auto_renewing == auto_renew, json.dumps(result, indent=1)

@@ -52,9 +52,12 @@
   the DB keeps a surrogate int `id`, but the wire *and the signed hashes* use the `code`, so no magic
   number ever crosses the wire and new values are additive `INSERT`s):
   - `payment_provider`: `"google_play"`, `"app_store"`, `"rangeproof"`
-  - `status`: `"unredeemed"`, `"redeemed"`, `"expired"`, `"revoked"` — **`"revoked"`** is the terminal
-    revoked state (refund/chargeback/protocol kill); distinct from the separate `refund_requested_ts`
-    field (refund-*requested* ≠ *revoked*). There is no `"refunded"` status.
+  - `status`: TWO distinct fields share this name at different nesting levels. Each get-details **item**
+    carries a *payment* `status`: `"unredeemed"`, `"redeemed"`, `"expired"`, `"revoked"` — **`"revoked"`**
+    is the terminal revoked state (refund/chargeback/protocol kill); distinct from the separate
+    `refund_requested_ts` field (refund-*requested* ≠ *revoked*). There is no `"refunded"` status. The
+    **top-level** get-details `status` is the account's overall *Pro* status: `"never"` (never been Pro),
+    `"active"`, `"expired"`.
   - `plan`: a compact **billing-period code** — `"1m"`, `"3m"`, `"1y"` (`N` + unit `d`/`w`/`m`/`y`),
     free-form for non-period plans (`"lifetime"`). Canonical per period (a 12-month product is `"1y"`,
     not `"12m"`). **Display/accounting only** (never computed with); recurrence is the separate
