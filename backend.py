@@ -338,10 +338,6 @@ class AllocatedGenID:
     gen_index:      int                       = 0
     gen_index_salt: bytes                     = b''
 
-def assert_backend_is_in_dev_mode(signing_key: nacl.signing.SigningKey):
-    assert bytes(signing_key) == base.DEV_BACKEND_DETERMINISTIC_SKEY, \
-            "Sanity check failed, developer mode was enabled but the loaded signing key is not the development key. This is a special guard to prevent the user from activating developer mode in the wrong environment"
-
 def load_backend_signing_key(path: str) -> nacl.signing.SigningKey:
     '''Load the backend Ed25519 signing key from disk.
 
@@ -399,9 +395,8 @@ def user_payment_tx_to_safe_string(tx: UserPaymentTransaction) -> str:
     )
 
 def to_redeemed_at(at: datetime.datetime) -> datetime.datetime:
-    # Dev mode keeps the exact instant (fast-expiring test proofs); otherwise round up to the next
-    # UTC-day boundary.
-    return at if base.DEV_BACKEND_MODE else base.round_datetime_to_next_day(at)
+    # Round up to the next UTC-day boundary (masks the exact instant the payment was redeemed).
+    return base.round_datetime_to_next_day(at)
 
 def make_blake2b_hasher(personalisation: bytes, salt: bytes | None = None) -> hashlib.blake2b:
     final_salt      = salt  if salt else b''
@@ -1058,19 +1053,13 @@ def redeem_payment_tx(tx:                  db.SQLTransaction,
                 assert signing_key, "Rotating public key and signing key have to be given in tandem, either both set or both set to nil"
                 proposed_proof_expires_at: int = base.round_datetime_to_next_day(allocated.expires_at)
 
-                # NOTE: In dev mode we don't round up to the next day as we want these proofs to
-                # expire quickly for testing.
-                if base.DEV_BACKEND_MODE:
-                    proposed_proof_expires_at = allocated.expires_at
-
                 result.proof = build_proof(gen_index         = allocated.gen_index,
                                            rotating_pkey     = rotating_pkey,
                                            expires_at = _build_proof_clamped_expiry_time(request_at=request_at, proposed_expires_at=proposed_proof_expires_at),
                                            signing_key       = signing_key,
                                            gen_index_salt    = allocated.gen_index_salt)
 
-                if not base.DEV_BACKEND_MODE:
-                    assert result.proof.expires_at == base.round_datetime_to_start_of_day(result.proof.expires_at), f"Proof expiry must land on a UTC day boundary, was {base.readable(result.proof.expires_at)}"
+                assert result.proof.expires_at == base.round_datetime_to_start_of_day(result.proof.expires_at), f"Proof expiry must land on a UTC day boundary, was {base.readable(result.proof.expires_at)}"
         else:
             err.msg_list.append(f'Failed to update DB after new payment was redeemed for {base.maybe_obfuscate_bytes(master_pkey)}')
 
@@ -1767,9 +1756,8 @@ def add_pro_payment_tx(tx:                  db.SQLTransaction,
     # specifying this argument, so clients should not be specifying this time,
     # ever, it should be generated and rounded up by the server hence the
     # assert.
-    if not base.DEV_BACKEND_MODE:
-        assert redeemed_at == base.round_datetime_to_start_of_day(redeemed_at), \
-                "The passed in creation (and or activated) timestamp must lie on a day boundary: {}".format(base.readable(redeemed_at))
+    assert redeemed_at == base.round_datetime_to_start_of_day(redeemed_at), \
+            "The passed in creation (and or activated) timestamp must lie on a day boundary: {}".format(base.readable(redeemed_at))
 
     # All verified. Redeem the payment
     result: RedeemPayment = redeem_payment_tx(tx                  = tx,

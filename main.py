@@ -72,21 +72,18 @@ def entry_point() -> flask.Flask:
             platform_google.log.addHandler(webhook_logger)
             platform_apple.log.addHandler(webhook_logger)
 
-    # NOTE: Load the backend Ed25519 signing key. Dev mode uses a deterministic key; otherwise it is
-    # loaded from disk and NEVER stored in the DB. The app does not (and its user should not be able
-    # to) write this file — deployment creates it — so a missing/unreadable key is a hard startup
-    # error rather than a silent regeneration that would invalidate every proof already issued.
-    if parsed_args.dev:
-        backend_key: nacl.signing.SigningKey = nacl.signing.SigningKey(base.DEV_BACKEND_DETERMINISTIC_SKEY)
-    else:
-        if not parsed_args.backend_key_path:
-            log.error('No backend signing key configured: set [base] backend_key_path (or SESH_PRO_BACKEND_KEY_PATH)')
-            sys.exit(1)
-        try:
-            backend_key = backend.load_backend_signing_key(parsed_args.backend_key_path)
-        except Exception as e:
-            log.error(f'Failed to load backend signing key from "{parsed_args.backend_key_path}": {e}')
-            sys.exit(1)
+    # NOTE: Load the backend Ed25519 signing key from disk. It is NEVER stored in the DB. The app does
+    # not (and its user should not be able to) write this file — deployment creates it — so a
+    # missing/unreadable key is a hard startup error rather than a silent regeneration that would
+    # invalidate every proof already issued. Tests/dev supply an ephemeral key via the same path.
+    if not parsed_args.backend_key_path:
+        log.error('No backend signing key configured: set [base] backend_key_path (or SESH_PRO_BACKEND_KEY_PATH)')
+        sys.exit(1)
+    try:
+        backend_key: nacl.signing.SigningKey = backend.load_backend_signing_key(parsed_args.backend_key_path)
+    except Exception as e:
+        log.error(f'Failed to load backend signing key from "{parsed_args.backend_key_path}": {e}')
+        sys.exit(1)
 
     # NOTE: Open the DB (create tables if necessary)
     engine: psycopg_pool.ConnectionPool | None = backend.bootstrap_db(database_url=parsed_args.db_url, err=err)
@@ -96,10 +93,6 @@ def entry_point() -> flask.Flask:
     assert engine
 
     with db.connection(engine) as conn:
-        # NOTE: Sanity check dev mode
-        if base.DEV_BACKEND_MODE:
-            backend.assert_backend_is_in_dev_mode(backend_key)
-
         # NOTE: Dump some startup diagnostics
         info_string: str = backend.db_info_string(conn=conn, db_url=parsed_args.db_url, backend_pkey=backend_key.verify_key, err=err)
         if len(err.msg_list) > 0:

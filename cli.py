@@ -819,9 +819,7 @@ def cmd_db_info(args: argparse.Namespace) -> int:
     # Best-effort load of the backend public key so `db info` can show it. The key lives on disk
     # now (not in the DB) and may simply be unavailable wherever the CLI is run.
     backend_pkey: nacl.signing.VerifyKey | None = None
-    if base.DEV_BACKEND_MODE:
-        backend_pkey = nacl.signing.SigningKey(base.DEV_BACKEND_DETERMINISTIC_SKEY).verify_key
-    elif config.backend_key_path:
+    if config.backend_key_path:
         try:
             backend_pkey = backend.load_backend_signing_key(config.backend_key_path).verify_key
         except Exception:
@@ -1276,11 +1274,8 @@ def cmd_voucher(args: argparse.Namespace) -> int:
 
                     print("Success: Unredeemed payment created")
 
-                    # Load the backend signing key (from disk in production, or the deterministic dev
-                    # key in dev mode). It is no longer stored in the DB.
-                    if base.DEV_BACKEND_MODE:
-                        backend_key = nacl.signing.SigningKey(base.DEV_BACKEND_DETERMINISTIC_SKEY)
-                    elif not config.backend_key_path:
+                    # Load the backend signing key from disk. It is not stored in the DB.
+                    if not config.backend_key_path:
                         print("ERROR: No backend signing key configured ([base] backend_key_path)", file=sys.stderr)
                         return 1
                     else:
