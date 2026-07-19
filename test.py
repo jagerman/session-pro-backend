@@ -248,6 +248,68 @@ def test_expired_revocation_is_not_reported(pg_database):
         assert backend.is_gen_index_revoked(conn, 7, after)  is False
     pool.close()
 
+def test_provider_dry_run_redeems_google_without_egress(monkeypatch, pg_database):
+    # With provider_dry_run on, a Google payment redeems to a signed proof with NO call to Google: the
+    # in-function stubs (synthetic already-acknowledged fetch + no-op acknowledge) stand in for the
+    # egress. Deliberately NOT monkeypatching platform_google_api here — exercising the real stubs is
+    # the point. (Contrast test_backend_same_user_stacks_... which monkeypatches those calls instead.)
+    monkeypatch.setattr(base, 'PROVIDER_DRY_RUN', True)
+
+    err                                            = base.ErrorSink()
+    db_engine: psycopg_pool.ConnectionPool | None  = backend.bootstrap_db(database_url=pg_database(), err=err)
+    assert len(err.msg_list) == 0, f'{err.msg_list}'
+    assert db_engine
+
+    backend_key  = nacl.signing.SigningKey.generate()
+    master_key   = nacl.signing.SigningKey.generate()
+    rotating_key = nacl.signing.SigningKey.generate()
+    now          = datetime.datetime.now(datetime.timezone.utc)
+    redeemed_at  = base.round_datetime_to_next_day(now)
+
+    db_conn = db_engine.getconn()
+    try:
+        # Seed a witnessed-unredeemed Google payment (as if a purchase notification had been received).
+        seed_tx                      = base.PaymentProviderTransaction()
+        seed_tx.provider             = base.PaymentProvider.GooglePlayStore
+        seed_tx.google_payment_token = os.urandom(backend.BLAKE2B_DIGEST_SIZE).hex()
+        seed_tx.google_order_id      = os.urandom(backend.BLAKE2B_DIGEST_SIZE).hex()
+        backend.add_unredeemed_payment(conn                           = db_conn,
+                                       payment_tx                     = seed_tx,
+                                       plan                           = base.ProPlan.OneMonth,
+                                       purchased_at                   = now,
+                                       expires_at                     = redeemed_at + datetime.timedelta(days=30),
+                                       platform_refund_expires_at     = base.EPOCH,
+                                       platform_obfuscated_account_id = backend.google_obfuscated_account_id_from_master_pkey(master_key.verify_key),
+                                       err                            = err)
+        assert len(err.msg_list) == 0, f'{err.msg_list}'
+
+        # Client redeems it with a real add_pro_payment (no dev_* fields, no DEV. id, no monkeypatch).
+        user_tx                      = backend.UserPaymentTransaction()
+        user_tx.provider             = base.PaymentProvider.GooglePlayStore
+        user_tx.google_payment_token = seed_tx.google_payment_token
+        user_tx.google_order_id      = seed_tx.google_order_id
+        add_payment_hash = backend.make_add_pro_payment_hash(master_pkey   = master_key.verify_key,
+                                                             rotating_pkey = rotating_key.verify_key,
+                                                             payment_tx    = user_tx)
+        redeemed = backend.verify_and_add_pro_payment(conn         = db_conn,
+                                                      signing_key   = backend_key,
+                                                      request_at    = now,
+                                                      redeemed_at   = redeemed_at,
+                                                      master_pkey   = master_key.verify_key,
+                                                      rotating_pkey = rotating_key.verify_key,
+                                                      payment_tx    = user_tx,
+                                                      master_sig    = master_key.sign(add_payment_hash).signature,
+                                                      rotating_sig  = rotating_key.sign(add_payment_hash).signature,
+                                                      err           = err)
+
+        assert len(err.msg_list) == 0, f'{err.msg_list}'
+        assert redeemed.status == backend.RedeemPaymentStatus.Success
+        assert redeemed.proof is not None
+        assert len(backend.get_unredeemed_payments_list(db_conn)) == 0
+    finally:
+        db_engine.putconn(db_conn)
+        db_engine.close()
+
 def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_database):
     monkeypatch.setattr(
         "platform_google_api.subscription_v1_acknowledge",

@@ -56,17 +56,10 @@ db_url                       = sqlite:///backend.db
 # logging to a file completely)
 log_path                     = <path/to/log>
 
-# Start the server in developer mode, this is most likely only interesting if
-# you are developing locally. If the DB hasn't been bootstrapped yet, this
-# causes the backend to generate a deterministic secret Ed25519 key with 32 bytes of 0xCD
-# and hence creates the following key pairs:
-#
-#   Secret: 0xcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd
-#   Public: 0xfc947730f49eb01427a66e050733294d9e520e545c7a27125a780634e0860a27
-#
-# If the DB already exists this won't have any effect as it will not overwrite
-# the existing DB.
-dev                          = false
+# Stub ALL payment-provider egress (Apple/Google): outbound mutations become no-ops and gating reads
+# return synthetic success. This lets you exercise the payment flow locally/in integration tests with
+# no provider credentials and no calls off-box. For testing ONLY — never enable on a real instance.
+provider_dry_run             = false
 
 # Enable pulling subscription purchases from the iOS App Store. The [apple] section must be
 # configured if this is set
@@ -148,7 +141,7 @@ SESH_PRO_BACKEND_INI_PATH=<path/to/ini/file.ini>
 # For the following options, see the .INI section for more information
 SESH_PRO_BACKEND_DB_URL                  = <...>
 SESH_PRO_BACKEND_LOG_PATH                = <...>
-SESH_PRO_BACKEND_DEV                     = [0|1]
+SESH_PRO_BACKEND_PROVIDER_DRY_RUN        = [0|1]
 SESH_PRO_BACKEND_WITH_PLATFORM_APPLE     = [0|1]
 SESH_PRO_BACKEND_WITH_PLATFORM_GOOGLE    = [0|1]
 ```
