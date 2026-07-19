@@ -35,8 +35,8 @@ SECONDS_IN_YEAR:       int     = SECONDS_IN_DAY * 365
 
 # Every instant in this codebase is a tz-aware UTC `datetime` and every duration a `timedelta`. Integer
 # epochs live ONLY in the converters below, at two kinds of boundary with distinct units:
-#   - MILLISECONDS: the payment providers (Apple/Google App Store APIs) and the `runtime` shim genuinely
-#     speak ms, so their ingest/egress uses the `*_ms` pair.
+#   - MILLISECONDS: the payment providers (Apple/Google App Store APIs) genuinely speak ms, so their
+#     ingest/egress uses the `*_ms` pair.
 #   - SECONDS: our own wire + proof format is seconds (the wire spec's unit, item 5b), so every
 #     client-facing boundary and every signed hash uses the `*_seconds` pair. Wire seconds are integer
 #     everywhere except two upstream provider event instants (`purchased_ts`, `revoked_ts`) that keep

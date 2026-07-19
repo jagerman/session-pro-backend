@@ -87,11 +87,18 @@ CREATE TABLE IF NOT EXISTS revocations (
 -- The daily sweep prunes revocations by expiry (item 13).
 CREATE INDEX IF NOT EXISTS revocations_expires_at_idx ON revocations (expires_at);
 
-CREATE TABLE IF NOT EXISTS runtime (
-    gen_index                                INTEGER NOT NULL DEFAULT 0,
-    gen_index_salt                           BYTEA   NOT NULL CHECK   (octet_length(gen_index_salt) = 16),
-    apple_notification_checkpoint_unix_ts_ms BIGINT  NOT NULL DEFAULT 0,
-    revocation_ticket                        INTEGER NOT NULL DEFAULT 0
+-- App-global singletons as a key/value store with real column types. One row per global (the key is
+-- the PK, so the "exactly one of each" property is structural — no unconstrained-singleton table).
+-- Exactly one typed value slot is populated per row; add a new type by adding a column (e.g. text_val,
+-- bool_val) + extending the CHECK, no DDL-to-widen-a-row. Seeded in 001_seed_globals.py. Current keys:
+--   gen_index (int_val), gen_index_salt (bytes_val), revocation_ticket (int_val),
+--   apple_notification_checkpoint_at (ts_val).
+CREATE TABLE IF NOT EXISTS globals (
+    key       TEXT PRIMARY KEY,
+    int_val   BIGINT,
+    bytes_val BYTEA,
+    ts_val    TIMESTAMPTZ,
+    CHECK (num_nonnulls(int_val, bytes_val, ts_val) = 1)
 );
 
 CREATE TABLE IF NOT EXISTS apple_notification_uuid_history (
@@ -113,11 +120,11 @@ CREATE TABLE IF NOT EXISTS user_errors (
     UNIQUE(payment_id, payment_provider)
 );
 
--- Trigger: bump runtime.revocation_ticket whenever the revocations set changes (client cache-gen stamp).
+-- Trigger: bump the revocation_ticket global whenever the revocations set changes (client cache-gen stamp).
 CREATE OR REPLACE FUNCTION increment_revocation_ticket()
 RETURNS TRIGGER AS '
 BEGIN
-    UPDATE runtime SET revocation_ticket = revocation_ticket + 1;
+    UPDATE globals SET int_val = int_val + 1 WHERE key = ''revocation_ticket'';
     RETURN NEW;
 END;
 ' LANGUAGE plpgsql;

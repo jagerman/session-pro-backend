@@ -158,8 +158,8 @@ def test_dry_run_backup_rotation():
     assert len(result.to_keep) == 8 and len(result.to_delete) == 3
 
 def test_migrations_bootstrap_and_idempotency(pg_database):
-    # bootstrap_db runs the schema/ migrations; every migration file should be recorded, the runtime
-    # row seeded exactly once, and a second pass must be a clean no-op (nothing re-run or duplicated).
+    # bootstrap_db runs the schema/ migrations; every migration file should be recorded, the globals
+    # rows seeded exactly once, and a second pass must be a clean no-op (nothing re-run or duplicated).
     schema_dir = pathlib.Path(migrations.__file__).parent / 'schema'
     expected   = {p.name for p in schema_dir.iterdir() if re.match(r'^\d+_.*\.(sql|py)$', p.name)}
     assert expected, 'expected some migration files to exist'
@@ -172,12 +172,12 @@ def test_migrations_bootstrap_and_idempotency(pg_database):
     with db.connection(pool) as conn:
         applied = {row[0] for row in db.query(conn, 'SELECT name FROM migrations_applied')}
         assert applied == expected
-        assert db.query_one(conn, 'SELECT COUNT(*) FROM runtime')[0] == 1
+        assert db.query_one(conn, 'SELECT COUNT(*) FROM globals')[0] == 4
 
-        # Idempotent: re-running applies nothing new and does not duplicate the runtime seed.
+        # Idempotent: re-running applies nothing new and does not duplicate the globals seed.
         migrations.apply_migrations(conn)
         assert {row[0] for row in db.query(conn, 'SELECT name FROM migrations_applied')} == expected
-        assert db.query_one(conn, 'SELECT COUNT(*) FROM runtime')[0] == 1
+        assert db.query_one(conn, 'SELECT COUNT(*) FROM globals')[0] == 4
     pool.close()
 
 def test_migrations_reject_duplicate_basename(tmp_path, monkeypatch):
@@ -444,13 +444,13 @@ def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_d
         assert len(redeemed_payment_2nd.proof.gen_index_hash) == 0
         err.msg_list.clear()
 
-    runtime: backend.RuntimeRow                             = backend.get_runtime(db_conn)
-    assert runtime.gen_index                               == 2
+    gen_index: int                                          = backend.get_global_int(db_conn, 'gen_index')
+    assert gen_index                                       == 2
 
     user_list: list[backend.UserRow]                        = backend.get_users_list(db_conn)
     assert len(user_list)                                  == 1
     assert user_list[0].master_pkey                        == bytes(master_key.verify_key), 'lhs={}, rhs={}'.format(user_list[0].master_pkey.hex(), bytes(master_key.verify_key).hex())
-    assert user_list[0].gen_index                          == runtime.gen_index - 1
+    assert user_list[0].gen_index                          == gen_index - 1
     assert user_list[0].expires_at                  == scenarios[1].expires_at
 
     payment_list: list[backend.PaymentRow]                  = backend.get_payments_list(db_conn)
@@ -671,7 +671,6 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
         # one for this test and hand it to the server; use it directly to verify signatures below.
         backend_key:  nacl.signing.SigningKey = nacl.signing.SigningKey.generate()
         db_conn: psycopg.Connection = db_engine.getconn()
-        runtime                               = backend.get_runtime(db_conn)
         flask_app:    flask.Flask             = server.init(testing_mode=True, database_url=db_url, backend_key=backend_key)
         flask_client: werkzeug.Client         = flask_app.test_client()
 
@@ -804,7 +803,6 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
             proof_hash: bytes = backend.build_proof_hash(result_gen_index_hash,
                                                          result_rotating_pkey,
                                                          base.datetime_from_unix_seconds(result_expiry_ts))
-            runtime = backend.get_runtime(db_conn)
             _ = backend_key.verify_key.verify(smessage=proof_hash, signature=result_sig)
 
             with db.transaction(db_conn) as tx:
@@ -1007,7 +1005,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
                 assert get_user.user.gen_index == 1
                 gen_index = get_user.user.gen_index
 
-            post_revoke_gen_index_hash: bytes = backend.make_gen_index_hash(gen_index, runtime.gen_index_salt)
+            post_revoke_gen_index_hash: bytes = backend.make_gen_index_hash(gen_index, backend.get_global_bytes(db_conn, 'gen_index_salt'))
 
             # We will now manually revoke the user and check the revocation list again
             with db.transaction(db_conn) as tx:
@@ -1284,10 +1282,9 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
                                                                      rotating_pkey = rotating_key.verify_key,
                                                                      request_at    = base.datetime_from_unix_ms(unix_ts_ms))
 
-            runtime = backend.get_runtime(db_conn)
             proof: backend.ProSubscriptionProof = backend.generate_pro_proof(conn           = db_conn,
                                                                              signing_key    = backend_key,
-                                                                             gen_index_salt = runtime.gen_index_salt,
+                                                                             gen_index_salt = backend.get_global_bytes(db_conn, 'gen_index_salt'),
                                                                              master_pkey    = master_key.verify_key,
                                                                              rotating_pkey  = rotating_key.verify_key,
                                                                              request_at     = base.datetime_from_unix_ms(unix_ts_ms),
@@ -1310,10 +1307,9 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
                                                                   rotating_pkey = rotating_key.verify_key,
                                                                   request_at    = base.datetime_from_unix_ms(unix_ts_ms))
 
-            runtime = backend.get_runtime(db_conn)
             proof = backend.generate_pro_proof(conn           = db_conn,
                                                signing_key    = backend_key,
-                                               gen_index_salt = runtime.gen_index_salt,
+                                               gen_index_salt = backend.get_global_bytes(db_conn, 'gen_index_salt'),
                                                master_pkey    = master_key.verify_key,
                                                rotating_pkey  = rotating_key.verify_key,
                                                request_at     = base.datetime_from_unix_ms(unix_ts_ms),

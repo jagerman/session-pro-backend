@@ -300,40 +300,6 @@ class RevocationItem:
     expires_at:     datetime.datetime = base.EPOCH
 
 @dataclasses.dataclass
-class RuntimeRow:
-    '''The runtime table stores some metadata used for book-keeping and operations of the DB tables
-
-    gen_index - Generation index, an index that is allocated to a user everytime a payment is added
-    or removed from that user. It's monotonically increasing and shared across all users and their
-    allocated index is what gets signed when Session Pro subscription proofs are generated for
-    a particular user.
-
-    Multiple proofs can be generated for a given index until a new payment is added or revoked for
-    that user. A generation index can hence be revoked, thereby revoking all the proofs attributable
-    to the associated user that were previously signed with the generation index to be revoked.
-
-    gen_index_salt - The generation index gets signed after it has been hashed with this particular
-    salt. This prevents leakage of metadata from the generation index which starts from 0 and counts
-    upwards. The raw generation index leaks the timeframe relative to the lifetime of the protocol
-    that a Session Pro subscription unredeemedd.
-
-    The salt gets bootstrapped on creation of the DB and is stored to persist across sessions.
-
-    revocation_ticket - A monotonically increasing index that gets incremented everytime the
-    revocation table has a row added or deleted (i.e. a new ticket is allocated when the table
-    changes). This ticket's purpose is to be handed out to clients when they request the revocation
-    list. The client can then use this ticket to short-circuit the retrieval of the revocation list
-    by comparing the current revocation list ticket with their cached ticket.
-
-    If the tickets are the same, clients can conclude that there are no revocation entries to sync
-    from the database.
-    '''
-    gen_index:                                int                     = 0
-    gen_index_salt:                           bytes                   = b''
-    apple_notification_checkpoint_unix_ts_ms: int                     = 0
-    revocation_ticket:                        int                     = 0
-
-@dataclasses.dataclass
 class AllocatedGenID:
     found:          bool                      = False
     expires_at:     datetime.datetime | None  = None
@@ -599,26 +565,31 @@ def is_gen_index_revoked(conn: psycopg.Connection, gen_index: int, now: datetime
         result = is_gen_index_revoked_tx(tx, gen_index, now)
     return result
 
+# Typed accessors for the `globals` key/value store (one row per app-global; see schema/000). Each
+# global's type is known at the call site, so we read/write the matching value slot directly.
+def get_global_int(conn: psycopg.Connection, key: str) -> int:
+    row = db.query_one(conn, "SELECT int_val FROM globals WHERE key = %s", key)
+    assert row is not None, f'missing int global "{key}"'
+    return row[0]
+
+def set_global_int(conn: psycopg.Connection, key: str, value: int) -> None:
+    db.query(conn, "UPDATE globals SET int_val = %s WHERE key = %s", value, key)
+
+def get_global_bytes(conn: psycopg.Connection, key: str) -> bytes:
+    row = db.query_one(conn, "SELECT bytes_val FROM globals WHERE key = %s", key)
+    assert row is not None, f'missing bytes global "{key}"'
+    return bytes(row[0])
+
+def get_global_datetime(conn: psycopg.Connection, key: str) -> datetime.datetime:
+    row = db.query_one(conn, "SELECT ts_val FROM globals WHERE key = %s", key)
+    assert row is not None, f'missing timestamp global "{key}"'
+    return row[0]
+
+def set_global_datetime(conn: psycopg.Connection, key: str, value: datetime.datetime) -> None:
+    db.query(conn, "UPDATE globals SET ts_val = %s WHERE key = %s", value, key)
+
 def get_revocation_ticket(conn: psycopg.Connection) -> int:
-    row = db.query_one(conn, "SELECT revocation_ticket FROM runtime")
-    return row[0] if row else 0
-
-def get_runtime_tx(tx: db.SQLTransaction) -> RuntimeRow:
-    row = db.query_one(tx.conn, ("SELECT gen_index,"
-                                 "gen_index_salt,"
-                                 "apple_notification_checkpoint_unix_ts_ms,"
-                                 "revocation_ticket FROM runtime"))
-    result: RuntimeRow = RuntimeRow()
-    if row:
-        (result.gen_index, result.gen_index_salt,
-         result.apple_notification_checkpoint_unix_ts_ms, result.revocation_ticket) = row
-    return result
-
-def get_runtime(conn: psycopg.Connection) -> RuntimeRow:
-    result: RuntimeRow = RuntimeRow()
-    with db.transaction(conn) as tx:
-        result = get_runtime_tx(tx)
-    return result
+    return get_global_int(conn, 'revocation_ticket')
 
 def db_info_string(conn: psycopg.Connection, db_url: str, err: base.ErrorSink, backend_pkey: nacl.signing.VerifyKey | None = None) -> str:
     unredeemed_payments             = 0
@@ -667,14 +638,13 @@ def db_info_string(conn: psycopg.Connection, db_url: str, err: base.ErrorSink, b
         if size_row:
             db_size = size_row[0]
 
-        with db.transaction(conn) as tx:
-            runtime: RuntimeRow = get_runtime_tx(tx)
+        gen_index = get_global_int(conn, 'gen_index')
 
         lines: list[str] = []
         lines.append('  DB:                               {} ({})'.format(db_url, base.format_bytes(db_size)))
         lines.append('  Users/Revocs/Payments/Unredeemed: {}/{}/{}/{}'.format(users, revocations, payments, unredeemed_payments))
         lines.append('  U.Errors/Google/Apple Notifs.:    {}/{}/{}'.format(user_errors, google_notification_history, apple_notification_uuid_history))
-        lines.append('  Gen Index:                        {}'.format(runtime.gen_index))
+        lines.append('  Gen Index:                        {}'.format(gen_index))
         backend_key_str = bytes(backend_pkey).hex() if backend_pkey is not None else 'n/a (loaded from disk at runtime)'
         lines.append('  Backend Key:                      {}'.format(backend_key_str))
         result = '\n'.join(lines)
@@ -1606,16 +1576,16 @@ def _allocate_new_gen_id_if_master_pkey_has_payments(tx: db.SQLTransaction, mast
     lookup: LookupUserExpiry = _lookup_user_expiry_tx(tx, master_pkey)
     result.expires_at         = lookup.expiry_from_redeemed
     if lookup.expiry_from_redeemed is not None:
-        # NOTE: Master pkey has a payment we can use. Allocate a new generation ID in the runtime table
+        # NOTE: Master pkey has a payment we can use. Allocate a new generation ID (bump the counter global)
         result.found = True
-        runtime_result = db.query(tx.conn, '''
-            UPDATE    runtime
-            SET       gen_index = gen_index + 1
-            RETURNING gen_index - 1, gen_index_salt
+        gen_result = db.query(tx.conn, '''
+            UPDATE    globals
+            SET       int_val = int_val + 1
+            WHERE     key = 'gen_index'
+            RETURNING int_val - 1
         ''')
-        runtime_row           = typing.cast(tuple[int, bytes], runtime_result.fetchone())
-        result.gen_index      = runtime_row[0]
-        result.gen_index_salt = runtime_row[1]
+        result.gen_index      = typing.cast(tuple[int], gen_result.fetchone())[0]
+        result.gen_index_salt = get_global_bytes(tx.conn, 'gen_index_salt')
 
         # NOTE: Also update the user table with this payment we found that is currently the "best"
         # payment (e.g. the latest and most up to date payment and hence has the best expiry time)
@@ -2188,11 +2158,8 @@ def apple_notification_uuid_is_in_db_tx(tx: db.SQLTransaction, uuid: str) -> boo
     result = row is not None
     return result
 
-def apple_set_notification_checkpoint_unix_ts_ms(tx: db.SQLTransaction, checkpoint_unix_ts_ms: int):
-    _ = db.query(tx.conn, ('''
-        UPDATE runtime
-        SET    apple_notification_checkpoint_unix_ts_ms = %s
-    '''), checkpoint_unix_ts_ms)
+def apple_set_notification_checkpoint_at(tx: db.SQLTransaction, checkpoint_at: datetime.datetime):
+    set_global_datetime(tx.conn, 'apple_notification_checkpoint_at', checkpoint_at)
 
 def google_add_notification_id_tx(tx: db.SQLTransaction, message_id: int, expires_at: datetime.datetime, payload: str):
     maybe_payload: str | None = None

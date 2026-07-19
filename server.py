@@ -769,10 +769,9 @@ def generate_pro_proof() -> flask.Response:
     # Request proof from the backend
     with get_db(flask.current_app) as engine:
         with db.connection(engine) as conn:
-            runtime = backend.get_runtime(conn)
             proof   = backend.generate_pro_proof(conn           = conn,
                                                  signing_key    = flask.current_app.config[FLASK_CONFIG_BACKEND_SKEY_KEY],
-                                                 gen_index_salt = runtime.gen_index_salt,
+                                                 gen_index_salt = backend.get_global_bytes(conn, 'gen_index_salt'),
                                                  master_pkey    = nacl.signing.VerifyKey(master_pkey_bytes),
                                                  rotating_pkey  = nacl.signing.VerifyKey(rotating_pkey_bytes),
                                                  request_at     = request_at,
@@ -815,17 +814,17 @@ def get_pro_revocations():
     with get_db(flask.current_app) as engine:
         with db.connection(engine) as conn:
             with db.transaction(conn) as tx:
-                runtime_row = db.query_one(tx.conn, "SELECT revocation_ticket FROM runtime")
-                revocation_ticket = runtime_row[0] if runtime_row else 0
+                revocation_ticket = backend.get_revocation_ticket(tx.conn)
                 if ticket < revocation_ticket:
-                    runtime = backend.get_runtime_tx(tx)
+                    gen_index_salt: bytes = backend.get_global_bytes(tx.conn, 'gen_index_salt')
+                    max_gen_index:  int   = backend.get_global_int(tx.conn, 'gen_index')
                     # Only revocations still in effect (`expires_at > now`): an expired entry is moot and
                     # its presence would otherwise depend on whether the cleanup sweep has run.
                     for row in db.query(tx.conn, "SELECT gen_index, created_at, expires_at FROM revocations WHERE expires_at > %s", now):
                         gen_index, created_at, expires_at = row
-                        gen_index_hash: bytes = backend.make_gen_index_hash(gen_index=gen_index, gen_index_salt=runtime.gen_index_salt)
-                        assert gen_index < runtime.gen_index, f"lhs={gen_index}, rhs={runtime.gen_index}"
-                        assert len(runtime.gen_index_salt) == hashlib.blake2b.SALT_SIZE
+                        gen_index_hash: bytes = backend.make_gen_index_hash(gen_index=gen_index, gen_index_salt=gen_index_salt)
+                        assert gen_index < max_gen_index, f"lhs={gen_index}, rhs={max_gen_index}"
+                        assert len(gen_index_salt) == hashlib.blake2b.SALT_SIZE
 
                         expires_at   = base.round_datetime_to_next_day(expires_at)
                         effective_at = min(created_at + datetime.timedelta(seconds=RETRY_IN), expires_at)

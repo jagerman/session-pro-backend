@@ -1006,23 +1006,26 @@ def catchup_on_missed_notifications(core: Core, sql_conn: psycopg.Connection, en
         # NOTE: Do a catch-up check only if it's been 30mins since the last checkup. UWSGI spawns
         # multiple processes that call the main entry-point so this naturally dedupes all those
         # processes racing to try and execute this
-        runtime:               backend.RuntimeRow = backend.get_runtime_tx(tx)
-        ms_since_last_catchup: int                = end_unix_ts_ms - runtime.apple_notification_checkpoint_unix_ts_ms
-        ms_between_catchup:    int                = (60 * 30) * 1000 # 30 minutes
-        do_catchup:            bool               = ms_since_last_catchup >= ms_between_catchup
+        # The checkpoint is stored as a timestamptz global; Apple's history API speaks ms, so convert at
+        # this boundary (an epoch checkpoint means "never checkpointed").
+        checkpoint_at:         datetime.datetime = backend.get_global_datetime(tx.conn, 'apple_notification_checkpoint_at')
+        checkpoint_ms:         int               = base.unix_ms_from_datetime(checkpoint_at)
+        ms_since_last_catchup: int               = end_unix_ts_ms - checkpoint_ms
+        ms_between_catchup:    int               = (60 * 30) * 1000 # 30 minutes
+        do_catchup:            bool              = ms_since_last_catchup >= ms_between_catchup
 
         if do_catchup:
             # NOTE: Setup request
             min_start_date:      int = end_unix_ts_ms - (core.max_history_lookup_in_days * base.MILLISECONDS_IN_DAY)
             history_req              = AppleNotificationHistoryRequest()
             history_req.onlyFailures = True
-            history_req.startDate    = max(min_start_date, runtime.apple_notification_checkpoint_unix_ts_ms)
+            history_req.startDate    = max(min_start_date, checkpoint_ms)
             history_req.endDate      = end_unix_ts_ms
             log.info(f'Checking for missed notifications from {base.readable(base.datetime_from_unix_ms(history_req.startDate))} => {base.readable(base.datetime_from_unix_ms(history_req.endDate))}')
 
-            if runtime.apple_notification_checkpoint_unix_ts_ms != 0 and runtime.apple_notification_checkpoint_unix_ts_ms < min_start_date:
+            if checkpoint_at != base.EPOCH and checkpoint_ms < min_start_date:
                 log.warning(f'Apple only allows retrieving 180 days worth of notifications (i.e. {base.readable(base.datetime_from_unix_ms(min_start_date))}). ' +
-                             'Last notification checkpoint was at {base.readable(base.datetime_from_unix_ms(runtime.apple_notification_checkpoint_unix_ts_ms))} which is older than the history that can be recalled')
+                            f'Last notification checkpoint was at {base.readable(checkpoint_at)} which is older than the history that can be recalled')
 
             # NOTE: Iterate the paginated API
             failed             = False
@@ -1056,7 +1059,7 @@ def catchup_on_missed_notifications(core: Core, sql_conn: psycopg.Connection, en
                 assert tx.cancel == True
                 log.error(f'Processed {handled_notifs}/{total_notifs} missed notifications but encountered errors, rolling back:\n' + '\n  '.join(err.msg_list))
             else:
-                backend.apple_set_notification_checkpoint_unix_ts_ms(tx, history_req.endDate)
+                backend.apple_set_notification_checkpoint_at(tx, base.datetime_from_unix_ms(history_req.endDate))
                 log.info(f'Processed {handled_notifs}/{total_notifs} missed notifications, checkpointed from {base.readable(base.datetime_from_unix_ms(history_req.startDate))} => {base.readable(base.datetime_from_unix_ms(history_req.endDate))}')
         else:
             mins_between_catchup    = (ms_between_catchup / 1000) / 60
