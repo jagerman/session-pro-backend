@@ -23,6 +23,9 @@ import db
 import psycopg
 
 # NOTE: Constants
+# Backend software version, reported by the /status health endpoint. Bump on release; there is no other
+# version marker in the system (the wire/proof formats are versioned separately — see the wire spec).
+BACKEND_VERSION:       str     = '0.1.0'
 SECONDS_IN_DAY:        int     = 60 * 60 * 24
 MILLISECONDS_IN_DAY:   int     = 60 * 60 * 24 * 1000
 MILLISECONDS_IN_MONTH: int     = MILLISECONDS_IN_DAY * 30

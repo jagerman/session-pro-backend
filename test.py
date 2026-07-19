@@ -187,6 +187,40 @@ def test_migrations_reject_duplicate_basename(tmp_path, monkeypatch):
     with pytest.raises(RuntimeError):
         _ = migrations._migration_files()
 
+def test_status_endpoint(pg_database):
+    # /status is reachable BOTH directly (a plain GET, for monitors) and over the v4 onion transport,
+    # and reports the backend version + server time + signing pubkey (so a caller can fetch the key to
+    # verify proofs instead of hard-coding it). No auth, no request body, no DB access.
+    with TestingContext(db_url_factory=pg_database) as ctx:
+        expected_pubkey = bytes(ctx.backend_key.verify_key).hex()
+
+        def check(result: dict):
+            assert result['version'] == base.BACKEND_VERSION, result
+            assert result['signing_pubkey'] == expected_pubkey, result
+            assert isinstance(result['timestamp'], int), result
+
+        # (a) Direct GET
+        response = ctx.flask_client.get(server.FLASK_ROUTE_STATUS)
+        assert response.status_code == 200
+        body = response.get_json()
+        assert body['status'] == server.RESPONSE_SUCCESS, body
+        check(body['result'])
+
+        # (b) Through the v4 onion transport (make_request_v4 sends POST; /status accepts GET+POST)
+        server_x25519_skey = ctx.backend_key.to_curve25519_private_key()
+        our_x25519_skey    = nacl.public.PrivateKey.generate()
+        shared_key         = onion_req.make_shared_key(our_x25519_skey=our_x25519_skey, server_x25519_pkey=server_x25519_skey.public_key)
+        onion_request      = onion_req.make_request_v4(our_x25519_pkey=our_x25519_skey.public_key,
+                                                       shared_key=shared_key,
+                                                       endpoint=server.FLASK_ROUTE_STATUS,
+                                                       request_body={})
+        response       = ctx.flask_client.post(onion_req.ROUTE_OXEN_V4_LSRPC, data=onion_request)
+        onion_response = onion_req.make_response_v4(shared_key=shared_key, encrypted_response=response.data)
+        assert onion_response.success
+        body = json.loads(onion_response.body)
+        assert body['status'] == server.RESPONSE_SUCCESS, body
+        check(body['result'])
+
 def test_expired_revocation_is_not_reported(pg_database):
     # A revocation must stop counting the instant it passes expires_at — independent of whether the
     # cleanup sweep has pruned it. A lapsed revocation is moot (the proof it revokes has itself

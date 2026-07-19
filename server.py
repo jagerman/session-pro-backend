@@ -556,6 +556,7 @@ FLASK_ROUTE_GENERATE_PRO_PROOF                      = '/generate_pro_proof'
 FLASK_ROUTE_GET_PRO_REVOCATIONS                     = '/get_pro_revocations'
 FLASK_ROUTE_GET_PRO_DETAILS                         = '/get_pro_details'
 FLASK_ROUTE_SET_PAYMENT_REFUND_REQUESTED            = '/set_payment_refund_requested'
+FLASK_ROUTE_STATUS                                  = '/status'
 
 # How many seconds can the timestamp in requests can differ from the Pro Backend's clock. This
 # currently matches the storage server's store tolerance for onion-request forwarded messages as
@@ -638,6 +639,19 @@ def init(testing_mode: bool, database_url: str, backend_key: nacl.signing.Signin
     result.register_blueprint(flask_blueprint)
     result.register_blueprint(onion_req.flask_blueprint_v4)
     return result
+
+@flask_blueprint.route(FLASK_ROUTE_STATUS, methods=['GET', 'POST'])
+def status():
+    # Health/readiness probe. Unauthenticated, no DB access, no request body — reachable both directly
+    # (a plain GET, for monitors) and over the v4 onion transport (GET or POST). Returns the backend
+    # version, the current server time, and the Ed25519 signing public key so a caller can fetch the key
+    # to verify issued proofs against instead of hard-coding it.
+    backend_key: nacl.signing.SigningKey = flask.current_app.config[FLASK_CONFIG_BACKEND_SKEY_KEY]
+    return make_success_response(dict_result={
+        'version':        base.BACKEND_VERSION,
+        'timestamp':      int(time_now()),  # integer UNIX seconds (wire spec §1)
+        'signing_pubkey': bytes(backend_key.verify_key).hex(),
+    })
 
 @flask_blueprint.route(FLASK_ROUTE_ADD_PRO_PAYMENT, methods=['POST'])
 def add_pro_payment():
