@@ -109,6 +109,30 @@ def init(cloud_project_id:                  str,
     result.thread = threading.Thread(target=thread_entry_point, args=(result, app_credentials_path, cloud_project_id, cloud_subscription_name))
     return result
 
+def start_subscriber(cloud_project_id:        str,
+                     package_name:            str,
+                     cloud_subscription_name: str,
+                     subscription_product_id: str,
+                     app_credentials_path:    str | None) -> ThreadContext:
+    '''Initialise + start the Google Pub/Sub notification subscriber. Runs a background pull loop. All
+    Google/gRPC state is constructed here, so the caller (the maintenance mule) invokes this post-fork.'''
+    context = init(cloud_project_id        = cloud_project_id,
+                   package_name            = package_name,
+                   cloud_subscription_name = cloud_subscription_name,
+                   subscription_product_id = subscription_product_id,
+                   app_credentials_path    = app_credentials_path)
+    assert context.thread
+    context.thread.start()
+    return context
+
+def stop_subscriber(context: ThreadContext) -> None:
+    '''Signal the subscriber pull loop to stop and wait briefly for it to drain (idempotent; safe to
+    call on shutdown even if never started).'''
+    context.kill_thread = True
+    context.sleep_event.set()
+    if context.thread and context.thread.is_alive():
+        context.thread.join(timeout=10)
+
 def handle_parsed_notification(tx: db.SQLTransaction, parse: ParsedNotification, err: base.ErrorSink) -> bool:
     result = False
     match parse.payload_type:
