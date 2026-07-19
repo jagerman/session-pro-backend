@@ -106,6 +106,12 @@ DEV_BACKEND_MODE               = False
 DEV_BACKEND_DETERMINISTIC_SKEY = bytes([0xCD] * 32)
 UNSAFE_LOGGING                 = False
 PLATFORM_TESTING_ENV           = False
+# When set, every payment provider treats all of its OUTBOUND interactions as already-succeeded and
+# performs no external side-effect: mutations (e.g. Google acknowledge) become no-ops and gating reads
+# return a synthetic success. Each provider module owns what dry-run means for it (see platform_*.py).
+# It does NOT fabricate payments — a real witnessed payment must still exist — so it is not a "grant
+# arbitrary Pro" backdoor; worst-case misuse breaks real subscriptions, it does not mint entitlements.
+PROVIDER_DRY_RUN               = False
 
 # NOTE: Restricted type-set, JSON obviously supports much more than this, but
 # our use-case only needs a small subset of it as of current so KISS.

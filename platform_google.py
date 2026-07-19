@@ -116,6 +116,13 @@ def start_subscriber(cloud_project_id:        str,
                      app_credentials_path:    str | None) -> ThreadContext:
     '''Initialise + start the Google Pub/Sub notification subscriber. Runs a background pull loop. All
     Google/gRPC state is constructed here, so the caller (the maintenance mule) invokes this post-fork.'''
+    if base.PROVIDER_DRY_RUN:
+        # Dry-run: consuming real Pub/Sub notifications is outbound provider I/O, so don't start the loop
+        # (this also keeps the notification-path fetch/monetization egress from ever firing). Return an
+        # inert context so the caller's stop_subscriber()/atexit teardown is still safe to call.
+        log.info('Google subscriber not started (provider_dry_run)')
+        return ThreadContext(kill_thread=True)
+
     context = init(cloud_project_id        = cloud_project_id,
                    package_name            = package_name,
                    cloud_subscription_name = cloud_subscription_name,

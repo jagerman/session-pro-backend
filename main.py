@@ -43,6 +43,7 @@ def entry_point() -> flask.Flask:
     base.DEV_BACKEND_MODE     = parsed_args.dev
     base.DB_URL               = parsed_args.db_url
     base.PLATFORM_TESTING_ENV = parsed_args.platform_testing_env
+    base.PROVIDER_DRY_RUN     = parsed_args.provider_dry_run
     if err.has():
         log.error(f'Failed to startup, invalid configuration options:\n  ' + '\n  '.join(err.msg_list))
         sys.exit(1)

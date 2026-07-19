@@ -346,6 +346,13 @@ def fetch_subscription_v2_details(package_name: str, purchase_token: str, err: E
     """
     Call the purchases.subscriptionsv2.get endpoint. https://developers.google.com/android-publisher/api-ref/rest/v3/purchases.subscriptionsv2/get
     """
+    if base.PROVIDER_DRY_RUN:
+        # Dry-run: no call to Google. This is a gating read (its acknowledgement_state decides whether we
+        # acknowledge); return a synthetic active+acknowledged purchase so the caller treats it as good to
+        # go and skips the acknowledge entirely.
+        return SubscriptionV2Data(subscription_state    = SubscriptionsV2State.ACTIVE,
+                                  acknowledgement_state = SubscriptionsV2AcknowledgementState.ACKNOWLEDGED)
+
     service = get_publisher_service()
     response = service.purchases().subscriptionsv2().get(  # pyright: ignore[reportUnknownMemberType, reportAttributeAccessIssue, reportUnknownVariableType]
         packageName=package_name,
@@ -359,6 +366,10 @@ def subscription_v1_acknowledge(purchase_token: str, err: ErrorSink):
     """
     Call the purchases.subscriptionsv1.acknowledge endpoint. https://developers.google.com/android-publisher/api-ref/rest/v3/purchases.subscriptions/acknowledge
     """
+    if base.PROVIDER_DRY_RUN:
+        # Dry-run: acknowledging is an outbound mutation → no-op (leave err untouched = success).
+        return
+
     service = get_publisher_service()
     response = service.purchases().subscriptions().acknowledge( # pyright: ignore[reportUnknownMemberType, reportAttributeAccessIssue, reportUnknownVariableType]
         packageName=package_name,
@@ -372,8 +383,13 @@ def subscription_v1_acknowledge(purchase_token: str, err: ErrorSink):
 
 def fetch_monetizationv3_subscriptions_for_product_id(package_name: str, product_id: str, err: ErrorSink) -> Monetizationv3SubscriptionData | None:
     """
-    Call the Google monetizationv3.subscriptions.get endpoint: https://developers.google.com/android-publisher/api-ref/rest/v3/monetization.subscriptions/get 
+    Call the Google monetizationv3.subscriptions.get endpoint: https://developers.google.com/android-publisher/api-ref/rest/v3/monetization.subscriptions/get
     """
+    if base.PROVIDER_DRY_RUN:
+        # Dry-run: no call to Google. This is only reached via the notification subscriber, which does not
+        # start under dry-run (see platform_google.start_subscriber), so this is belt-and-suspenders.
+        return Monetizationv3SubscriptionData(base_plans=[])
+
     service = get_publisher_service()
     result = None
     response = service.monetization().subscriptions().get( # pyright: ignore[reportUnknownMemberType, reportAttributeAccessIssue, reportUnknownVariableType]

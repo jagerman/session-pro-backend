@@ -34,6 +34,7 @@ class ParsedArgs:
     with_platform_google:                      bool                            = False
 
     platform_testing_env:                      bool                            = False
+    provider_dry_run:                          bool                            = False
 
     session_webhooks:                          list[SessionWebhook]            = dataclasses.field(default_factory=list)
 
@@ -78,6 +79,7 @@ def parse_args(err: base.ErrorSink) -> ParsedArgs:
         result.with_platform_google                = base_section.getboolean(option='with_platform_google', fallback=False)
 
         result.platform_testing_env                = base_section.getboolean(option='platform_testing_env', fallback=False)
+        result.provider_dry_run                    = base_section.getboolean(option='provider_dry_run',     fallback=False)
 
         webhook_index = 0
         while True:
@@ -139,6 +141,7 @@ def parse_args(err: base.ErrorSink) -> ParsedArgs:
     result.with_platform_apple            = base.os_get_boolean_env('SESH_PRO_BACKEND_WITH_PLATFORM_APPLE',  result.with_platform_apple)
     result.with_platform_google           = base.os_get_boolean_env('SESH_PRO_BACKEND_WITH_PLATFORM_GOOGLE', result.with_platform_google)
     result.with_platform_google           = base.os_get_boolean_env('SESH_PRO_BACKEND_PLATFORM_TESTING_ENV', result.with_platform_google)
+    result.provider_dry_run               = base.os_get_boolean_env('SESH_PRO_BACKEND_PROVIDER_DRY_RUN',      result.provider_dry_run)
 
     if result.with_platform_apple:
         if len(result.apple_key_id) == 0:

@@ -979,6 +979,9 @@ def notifications_apple_app_connect_sandbox() -> flask.Response:
     return flask.Response(status=200)
 
 def trigger_test_notification(client: AppleAppStoreServerAPIClient, verifier: AppleSignedDataVerifier):
+    if base.PROVIDER_DRY_RUN:
+        # Dry-run: asking Apple to send a test notification is outbound provider I/O → no-op.
+        return
     try:
         response_test_notif: AppleSendTestNotificationResponse = client.request_test_notification()
         log.debug('Send test notif: ', response_test_notif)
@@ -995,6 +998,9 @@ def trigger_test_notification(client: AppleAppStoreServerAPIClient, verifier: Ap
         log.error(f'Failed to decode test notification: {e}')
 
 def catchup_on_missed_notifications(core: Core, sql_conn: psycopg.Connection, end_unix_ts_ms: int):
+    if base.PROVIDER_DRY_RUN:
+        # Dry-run: the catch-up pulls notification history from Apple (outbound gating read) → skip it.
+        return
     # NOTE: Lock the DB and catch on up missed notifications
     with db.transaction(sql_conn) as tx:
         # NOTE: Do a catch-up check only if it's been 30mins since the last checkup. UWSGI spawns
