@@ -53,12 +53,6 @@ PAYMENTS_FROM = "payments p LEFT JOIN users u ON u.id = p.user_id"
 # So there's no id indirection: the enum's `.value` IS the stored value, and reads map it straight back
 # via base.PaymentProvider(...)/base.ProPlan(...).
 
-@dataclasses.dataclass
-class DevAddProPaymentArgs:
-    plan:          base.ProPlan       = base.ProPlan.OneMonth
-    duration:      datetime.timedelta = datetime.timedelta(days=1)
-    auto_renewing: bool               = False
-
 class SetRevocationResult(enum.StrEnum):
     UserDoesNotExist = 'User does not exist'
     Skipped          = 'Skipped'
@@ -1766,8 +1760,7 @@ def add_pro_payment_tx(tx:                  db.SQLTransaction,
                        master_pkey:         nacl.signing.VerifyKey,
                        rotating_pkey:       nacl.signing.VerifyKey,
                        payment_tx:          UserPaymentTransaction,
-                       err:                 base.ErrorSink,
-                       THIS_WAS_A_DEBUG_PAYMENT_THAT_THE_DB_MADE_A_FAKE_UNCLAIMED_PAYMENT_TO_REDEEM_DO_NOT_USE_IN_PRODUCTION: bool) -> RedeemPayment:
+                       err:                 base.ErrorSink) -> RedeemPayment:
 
     # Note being able to pass in the creation unix timestamp is mainly for
     # testing purposes to allow time-travel. User space should never be
@@ -1807,22 +1800,23 @@ def add_pro_payment_tx(tx:                  db.SQLTransaction,
         # Yes generating proofs for Google then blocks on the subscription acknowledge, that is
         # unfortunate but intentional, if Google can't be contacted, we can't approve and so the payment
         # cannot be claimed and should be re-attempted.
-        if THIS_WAS_A_DEBUG_PAYMENT_THAT_THE_DB_MADE_A_FAKE_UNCLAIMED_PAYMENT_TO_REDEEM_DO_NOT_USE_IN_PRODUCTION == False:
-            sub_data: platform_google_types.SubscriptionV2Data | None = platform_google_api.fetch_subscription_v2_details(package_name=platform_google_api.package_name,
-                                                                                                                          purchase_token=payment_tx.google_payment_token,
-                                                                                                                          err=err)
-            if not sub_data:
+        # (Under provider_dry_run these Google calls are stubbed inside platform_google_api — a synthetic
+        # already-acknowledged fetch and a no-op acknowledge — so this block runs unconditionally.)
+        sub_data: platform_google_types.SubscriptionV2Data | None = platform_google_api.fetch_subscription_v2_details(package_name=platform_google_api.package_name,
+                                                                                                                      purchase_token=payment_tx.google_payment_token,
+                                                                                                                      err=err)
+        if not sub_data:
+            tx.cancel = True
+            return result
+
+        payment_tx_label = _add_pro_payment_user_tx_log_label_safe(payment_tx)
+        log.info(f'Google ack. payment check (master={base.maybe_obfuscate_bytes(master_pkey)}, payment={payment_tx_label}, acked={sub_data.acknowledgement_state})')
+
+        if sub_data.acknowledgement_state != platform_google_types.SubscriptionsV2AcknowledgementState.ACKNOWLEDGED:
+            platform_google_api.subscription_v1_acknowledge(purchase_token=payment_tx.google_payment_token, err=err)
+            if len(err.msg_list) > 0:
                 tx.cancel = True
                 return result
-
-            payment_tx_label = _add_pro_payment_user_tx_log_label_safe(payment_tx)
-            log.info(f'Google ack. payment check (dev={base.DEV_BACKEND_MODE}, master={base.maybe_obfuscate_bytes(master_pkey)}, payment={payment_tx_label}, acked={sub_data.acknowledgement_state})')
-
-            if sub_data.acknowledgement_state != platform_google_types.SubscriptionsV2AcknowledgementState.ACKNOWLEDGED:
-                platform_google_api.subscription_v1_acknowledge(purchase_token=payment_tx.google_payment_token, err=err)
-                if len(err.msg_list) > 0:
-                    tx.cancel = True
-                    return result
     return result
 
 
@@ -1833,8 +1827,7 @@ def add_pro_payment(conn:                psycopg.Connection,
                     master_pkey:         nacl.signing.VerifyKey,
                     rotating_pkey:       nacl.signing.VerifyKey,
                     payment_tx:          UserPaymentTransaction,
-                    err:                 base.ErrorSink,
-                    THIS_WAS_A_DEBUG_PAYMENT_THAT_THE_DB_MADE_A_FAKE_UNCLAIMED_PAYMENT_TO_REDEEM_DO_NOT_USE_IN_PRODUCTION: bool) -> RedeemPayment:
+                    err:                 base.ErrorSink) -> RedeemPayment:
     result = RedeemPayment()
     with db.transaction(conn) as tx:
         result = add_pro_payment_tx(tx,
@@ -1844,8 +1837,7 @@ def add_pro_payment(conn:                psycopg.Connection,
                                      master_pkey,
                                      rotating_pkey,
                                      payment_tx,
-                                     err,
-                                     THIS_WAS_A_DEBUG_PAYMENT_THAT_THE_DB_MADE_A_FAKE_UNCLAIMED_PAYMENT_TO_REDEEM_DO_NOT_USE_IN_PRODUCTION)
+                                     err)
     return result
 
 def verify_and_add_pro_payment(conn:                psycopg.Connection,
@@ -1857,8 +1849,7 @@ def verify_and_add_pro_payment(conn:                psycopg.Connection,
                                payment_tx:          UserPaymentTransaction,
                                master_sig:          bytes,
                                rotating_sig:        bytes,
-                               err:                 base.ErrorSink,
-                               dev_args:            DevAddProPaymentArgs) -> RedeemPayment:
+                               err:                 base.ErrorSink) -> RedeemPayment:
     """
     request_at: The timestamp typically accurate to the current time, used as a frame-of-reference
     to clamp the duration of the proof returned to the user to at most 1 month, also used to mask
@@ -1870,91 +1861,10 @@ def verify_and_add_pro_payment(conn:                psycopg.Connection,
     """
 
     payment_tx_label = _add_pro_payment_user_tx_log_label_safe(payment_tx)
-    log.info(f'Add payment (dev={base.DEV_BACKEND_MODE}, redeemed={base.readable(redeemed_at)}, master={base.maybe_obfuscate_bytes(master_pkey)}, payment={payment_tx_label})')
+    log.info(f'Add payment (redeemed={base.readable(redeemed_at)}, master={base.maybe_obfuscate_bytes(master_pkey)}, payment={payment_tx_label})')
 
     result        = RedeemPayment()
     result.status = RedeemPaymentStatus.Error
-
-    # In developer mode, the server is intended to be launched locally and we
-    # typically run libsession tests against it (to get accurate request and
-    # response payloads) from the server. In these tests we try and register
-    # a payment, but the design of the pro backend is that it pulls payment
-    # tokens from the 3rd party storefronts.
-    #
-    # It must have pulled the token first before permitting the payment token to
-    # be registered. Here we skipping the pulling step by implicitly registering
-    # the token into our unredeemed queue, then process the payment from the
-    # unredeemed queue immediately.
-    #
-    # There is a sanity check to _only_ allow this in developer mode. In
-    # any other context having this turn on would be a critical failure and
-    # would allow someone to register arbitrary Session Pro subscriptions
-    # without a valid payment.
-    THIS_WAS_A_DEBUG_PAYMENT_THAT_THE_DB_MADE_A_FAKE_UNCLAIMED_PAYMENT_TO_REDEEM_DO_NOT_USE_IN_PRODUCTION: bool = False
-    if base.DEV_BACKEND_MODE and (payment_tx.google_order_id.startswith('DEV.') or payment_tx.apple_tx_id.startswith('DEV.') or payment_tx.rangeproof_order_id.startswith('DEV.')):
-        assert_backend_is_in_dev_mode(signing_key)
-
-        # Convert the user payment transaction into the backend native representation. Note that
-        # this is testing code for the unit tests so for example for Apple we just provide stub data
-        # for transaction data.
-        #
-        # For the order id, we duplicate the unredeemed token to mock that
-        internal_payment_tx          = base.PaymentProviderTransaction()
-        internal_payment_tx.provider = payment_tx.provider
-
-        if internal_payment_tx.provider == base.PaymentProvider.GooglePlayStore:
-            internal_payment_tx.google_payment_token        = payment_tx.google_payment_token
-            internal_payment_tx.google_order_id             = payment_tx.google_order_id
-        elif internal_payment_tx.provider == base.PaymentProvider.iOSAppStore:
-            internal_payment_tx.apple_tx_id                 = payment_tx.apple_tx_id
-            internal_payment_tx.apple_web_line_order_tx_id  = ''
-            internal_payment_tx.apple_original_tx_id        = payment_tx.apple_tx_id
-        elif internal_payment_tx.provider == base.PaymentProvider.Rangeproof:
-            internal_payment_tx.rangeproof_order_id         = payment_tx.rangeproof_order_id
-
-        already_exists = False
-        for it in get_unredeemed_payments_list(conn):
-            if internal_payment_tx.provider == base.PaymentProvider.GooglePlayStore:
-                if it.google_payment_token == payment_tx.google_payment_token and it.google_order_id == payment_tx.google_order_id:
-                    already_exists = True
-            elif internal_payment_tx.provider == base.PaymentProvider.iOSAppStore:
-                if it.apple.tx_id == payment_tx.apple_tx_id:
-                    already_exists = True
-            elif internal_payment_tx.provider == base.PaymentProvider.Rangeproof:
-                if it.rangeproof_order_id == payment_tx.rangeproof_order_id:
-                    already_exists = True
-
-            if already_exists:
-                break
-
-        if not already_exists:
-            THIS_WAS_A_DEBUG_PAYMENT_THAT_THE_DB_MADE_A_FAKE_UNCLAIMED_PAYMENT_TO_REDEEM_DO_NOT_USE_IN_PRODUCTION = True
-            expires_at = redeemed_at + dev_args.duration
-
-            platform_obfuscated_account_id: bytes | str = b''
-            if payment_tx.provider == base.PaymentProvider.GooglePlayStore:
-                platform_obfuscated_account_id = google_obfuscated_account_id_from_master_pkey(master_pkey)
-            elif payment_tx.provider == base.PaymentProvider.iOSAppStore:
-                platform_obfuscated_account_id = apple_obfuscated_account_id_from_master_pkey(master_pkey)
-            elif payment_tx.provider == base.PaymentProvider.Rangeproof:
-                pass
-            else:
-                assert False, "Invalid code path"
-
-            add_unredeemed_payment(conn                              = conn,
-                                   payment_tx                        = internal_payment_tx,
-                                   plan                              = dev_args.plan,
-                                   purchased_at             = redeemed_at,
-                                   platform_refund_expires_at = base.EPOCH,
-                                   platform_obfuscated_account_id    = platform_obfuscated_account_id,
-                                   expires_at                 = expires_at,
-                                   err                               = err)
-
-            _ = update_payment_renewal_info(conn                     = conn,
-                                            payment_tx               = internal_payment_tx,
-                                            grace_period = datetime.timedelta(minutes=1) if dev_args.auto_renewing else datetime.timedelta(0),
-                                            auto_renewing            = dev_args.auto_renewing,
-                                            err                      = err)
 
     # Verify some of the request parameters
     hash_to_sign: bytes = make_add_pro_payment_hash(master_pkey   = master_pkey,
@@ -1979,8 +1889,7 @@ def verify_and_add_pro_payment(conn:                psycopg.Connection,
                              master_pkey,
                              rotating_pkey,
                              payment_tx,
-                             err,
-                             THIS_WAS_A_DEBUG_PAYMENT_THAT_THE_DB_MADE_A_FAKE_UNCLAIMED_PAYMENT_TO_REDEEM_DO_NOT_USE_IN_PRODUCTION)
+                             err)
     return result
 
 def revoke_master_pkey_proofs_and_allocate_new_gen_id_tx(tx: db.SQLTransaction, master_pkey: nacl.signing.VerifyKey, created_at: datetime.datetime) -> AllocatedGenID:

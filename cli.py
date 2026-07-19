@@ -1305,7 +1305,6 @@ def cmd_voucher(args: argparse.Namespace) -> int:
                             rangeproof_order_id = rangeproof_order_id
                         ),
                         err                 = err,
-                        THIS_WAS_A_DEBUG_PAYMENT_THAT_THE_DB_MADE_A_FAKE_UNCLAIMED_PAYMENT_TO_REDEEM_DO_NOT_USE_IN_PRODUCTION=False,
                     )
 
                     if err.has():

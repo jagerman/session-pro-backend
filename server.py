@@ -699,38 +699,6 @@ def add_pro_payment():
     if len(err.msg_list):
         return make_error_response(status=RESPONSE_PARSE_ERROR, errors=err.msg_list)
 
-    # In dev mode, we allow some additional undocumented parameters to be added to the payload for
-    # development purposes
-    dev_add_pro_payment_args = backend.DevAddProPaymentArgs()
-    if base.DEV_BACKEND_MODE:
-        # NOTE: Sanity check dev mode
-        backend.assert_backend_is_in_dev_mode(flask.current_app.config[FLASK_CONFIG_BACKEND_SKEY_KEY])
-
-        plan_key     = 'dev_plan'
-        duration_key = 'dev_duration_ms'
-        if plan_key in get.json:
-            plan_value = get.json[plan_key]
-            plan       = base.ProPlan.from_string(typing.cast(str, plan_value))
-            if plan == None or dev_add_pro_payment_args.plan == base.ProPlan.Nil:
-                err.msg_list.append(f'{plan_key} must be specified as "OneMonth", "ThreeMonth" or "TwelveMonth", received: {plan_value}')
-            else:
-                dev_add_pro_payment_args.plan = plan
-
-        if duration_key in get.json:
-            duration_ms = base.json_dict_require_int(d=get.json, key=duration_key, err=err)   # wire is ms (5a)
-            if duration_ms <= 0 or duration_ms > (base.SECONDS_IN_YEAR * 1000):
-                err.msg_list.append(f'{duration_key} must be > 0 and <= year ind duration, received: {duration_ms/1000}s')
-            else:
-                dev_add_pro_payment_args.duration = base.timedelta_from_ms(duration_ms)
-
-        dev_add_pro_payment_args.auto_renewing = base.json_dict_optional_bool(d=get.json,
-                                                                              key='dev_auto_renewing',
-                                                                              default=dev_add_pro_payment_args.auto_renewing,
-                                                                              err=err)
-
-        if len(err.msg_list):
-            return make_error_response(status=RESPONSE_PARSE_ERROR, errors=err.msg_list)
-
     # Submit the payment to the DB
     redeemed_payment         = backend.RedeemPayment()
     with get_db(flask.current_app) as engine:
@@ -746,8 +714,7 @@ def add_pro_payment():
                                                                      payment_tx          = user_payment,
                                                                      master_sig          = master_sig_bytes,
                                                                      rotating_sig        = rotating_sig_bytes,
-                                                                     err                 = err,
-                                                                     dev_args            = dev_add_pro_payment_args)
+                                                                     err                 = err)
 
             if redeemed_payment.status != backend.RedeemPaymentStatus.Success:
                 status = AddProPaymentStatus.Error
