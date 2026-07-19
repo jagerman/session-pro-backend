@@ -117,7 +117,10 @@ class ProSubscriptionProof:
         # verifier pick the wrong personalisation → signature fails.
         result = {
             "version":        self.version,
-            "gen_index_hash": self.gen_index_hash.hex(),
+            # Wire key is `revocation_tag` (spec §2 / Delta #2). The stored value is still the
+            # gen-index hash internally; a client treats it as an opaque tag, so the eventual switch to
+            # a random token (Phase 3) is invisible on the wire.
+            "revocation_tag": self.gen_index_hash.hex(),
             "rotating_pkey":  bytes(self.rotating_pkey).hex(),
             # Proof expiry is day-aligned, so integer seconds is exact (wire spec §2).
             "expiry_ts":      base.unix_seconds_from_datetime(self.expires_at),

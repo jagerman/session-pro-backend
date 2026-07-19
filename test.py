@@ -785,7 +785,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
 
             # Extract the fields
             assert isinstance(result_json, dict)
-            result_gen_index_hash_hex: str = base.json_dict_require_str(d=result_json, key='gen_index_hash',   err=err)
+            result_gen_index_hash_hex: str = base.json_dict_require_str(d=result_json, key='revocation_tag',   err=err)
             result_rotating_pkey_hex:  str = base.json_dict_require_str(d=result_json, key='rotating_pkey',    err=err)
             result_expiry_ts:  int = base.json_dict_require_int(d=result_json, key='expiry_ts', err=err)
             result_sig_hex:            str = base.json_dict_require_str(d=result_json, key='sig',              err=err)
@@ -851,7 +851,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
             result_json = response_json['result']
 
             # Extract the fields
-            result_gen_index_hash_hex: str = base.json_dict_require_str(d=result_json, key='gen_index_hash',   err=err)
+            result_gen_index_hash_hex: str = base.json_dict_require_str(d=result_json, key='revocation_tag',   err=err)
             result_rotating_pkey_hex:  str = base.json_dict_require_str(d=result_json, key='rotating_pkey',    err=err)
             result_expiry_ts:  int = base.json_dict_require_int(d=result_json, key='expiry_ts', err=err)
             result_sig_hex:            str = base.json_dict_require_str(d=result_json, key='sig',              err=err)
@@ -936,7 +936,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
             result_json = response_json['result']
 
             # Extract the fields
-            result_gen_index_hash_hex: str = base.json_dict_require_str(d=result_json, key='gen_index_hash',   err=err)
+            result_gen_index_hash_hex: str = base.json_dict_require_str(d=result_json, key='revocation_tag',   err=err)
             result_rotating_pkey_hex:  str = base.json_dict_require_str(d=result_json, key='rotating_pkey',    err=err)
             result_expiry_ts:  int = base.json_dict_require_int(d=result_json, key='expiry_ts', err=err)
             result_sig_hex:            str = base.json_dict_require_str(d=result_json, key='sig',              err=err)
@@ -1046,9 +1046,11 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
                 result_items        = base.json_dict_require_array(d=result_json, key='items', err=err)
                 result_ticket:  int = base.json_dict_require_int(d=result_json, key='ticket',  err=err)
                 result_retry_in: int = base.json_dict_require_int(d=result_json, key='retry_in', err=err)
+                result_retain_for: int = base.json_dict_require_int(d=result_json, key='retain_for', err=err)
                 assert len(err.msg_list) == 0, '{err.msg_list}'
                 assert result_ticket  == 1
                 assert result_retry_in == base.SECONDS_IN_DAY
+                assert result_retain_for == base.SECONDS_IN_MONTH
                 curr_revocation_ticket = result_ticket
                 assert len(result_items) == 1
 
@@ -1060,11 +1062,12 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
 
                 for it in result_items:
                     it: dict[str, int | str]
-                    assert 'expiry_ts' in it and isinstance(it['expiry_ts'], int)
-                    assert 'gen_index_hash'   in it and isinstance(it['gen_index_hash'], str)
+                    # Per-entry wire shape (spec §4 / Delta #6): revocation_tag + effective_ts only; no
+                    # per-entry expiry_ts (clients age entries out via the list-level retain_for).
+                    assert 'revocation_tag' in it and isinstance(it['revocation_tag'], str)
                     assert 'effective_ts' in it and isinstance(it['effective_ts'], int)
-                    assert it['gen_index_hash'] == post_revoke_gen_index_hash.hex()
-                    assert it['expiry_ts']      == base.unix_seconds_from_datetime(get_user.user.expires_at)
+                    assert 'expiry_ts' not in it
+                    assert it['revocation_tag'] == post_revoke_gen_index_hash.hex()
                     # effective_ts should be creation time + 1 day (86400 seconds)
                     # Since we can't know exact creation time in the test, just verify it's a reasonable value
                     assert it['effective_ts'] > 0
@@ -1100,9 +1103,11 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
             result_items        = base.json_dict_require_array(d=result_json, key='items', err=err)
             result_ticket:  int = base.json_dict_require_int(d=result_json, key='ticket',  err=err)
             result_retry_in: int = base.json_dict_require_int(d=result_json, key='retry_in', err=err)
+            result_retain_for: int = base.json_dict_require_int(d=result_json, key='retain_for', err=err)
             assert len(err.msg_list) == 0, '{err.msg_list}'
             assert result_ticket  == 1, f'Response was: {json.dumps(response_json, indent=2)}'
             assert result_retry_in == base.SECONDS_IN_DAY
+            assert result_retain_for == base.SECONDS_IN_MONTH
 
             # List should be empty because we passed in the newest revocation
             # ticket. There are no changes to the revocation list so the backend
@@ -1822,7 +1827,7 @@ def test_platform_apple(pg_database):
 
         # NOTE: Extract the fields
         assert isinstance(result_json, dict)
-        result_gen_index_hash_hex: str = base.json_dict_require_str(d=result_json, key='gen_index_hash',   err=err)
+        result_gen_index_hash_hex: str = base.json_dict_require_str(d=result_json, key='revocation_tag',   err=err)
         result_rotating_pkey_hex:  str = base.json_dict_require_str(d=result_json, key='rotating_pkey',    err=err)
         result_expiry_ts:  int = base.json_dict_require_int(d=result_json, key='expiry_ts', err=err)
         result_sig_hex:            str = base.json_dict_require_str(d=result_json, key='sig',              err=err)

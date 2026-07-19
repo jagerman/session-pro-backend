@@ -15,7 +15,7 @@ hardcoded Ed25519 keypair (secret = [0xcd * 32]):
   Response: {
    "result": {
     "expiry_ts": 1762473660,
-    "gen_index_hash": "b330d8a3679ba0016169907bed1f49fa7d5ed8e1a73042197dd2949fecc7d174",
+    "revocation_tag": "b330d8a3679ba0016169907bed1f49fa7d5ed8e1a73042197dd2949fecc7d174",
     "rotating_pkey": "ecd0e9c371b5e1d9e116ba4d29b057e458c8b4bca40b5b3fea1cd5d5e89ae7b7",
     "sig": "4537d985f6ec0134ed80537affd04be10f44a0f658cf26c6a3f48da43f5056a51b1ae48d2287bbed72e72c92ea87253357d466c7319c7d3514b081f9f1337d0e"
    },
@@ -25,7 +25,7 @@ hardcoded Ed25519 keypair (secret = [0xcd * 32]):
 The produced Session Pro Proof should be verifiable by invoking this utility as per:
 
   python verify_pro_proof.py \
-          --gen-index-hash b330d8a3679ba0016169907bed1f49fa7d5ed8e1a73042197dd2949fecc7d174 \
+          --revocation-tag b330d8a3679ba0016169907bed1f49fa7d5ed8e1a73042197dd2949fecc7d174 \
           --rotating-pubkey ecd0e9c371b5e1d9e116ba4d29b057e458c8b4bca40b5b3fea1cd5d5e89ae7b7 \
           --expiry-ts 1762473660 \
           --signature 4537d985f6ec0134ed80537affd04be10f44a0f658cf26c6a3f48da43f5056a51b1ae48d2287bbed72e72c92ea87253357d466c7319c7d3514b081f9f1337d0e \
@@ -36,7 +36,7 @@ Which produces output of the form:
   Hash: <64 hex>
   Signature valid: True
 
-(The gen-index-hash / signature / hash hex above are illustrative values from one dev run; a fresh
+(The revocation-tag / signature / hash hex above are illustrative values from one dev run; a fresh
 run produces its own. What matters is the method: personalisation "ProProof_v0_____", little-endian
 field widths, and an integer-seconds 8-byte expiry.)
 """
@@ -45,8 +45,8 @@ from nacl.exceptions import BadSignatureError
 import hashlib
 import argparse
 
-parser = argparse.ArgumentParser(description='Verify the given signature signed the Session Pro Proof elements (gen-index-hash, rotating-pkey, expiry-ts)')
-_ = parser.add_argument('--gen-index-hash', type=str, required=True, help='32-byte gen index hash (in hex)')
+parser = argparse.ArgumentParser(description='Verify the given signature signed the Session Pro Proof elements (revocation-tag, rotating-pkey, expiry-ts)')
+_ = parser.add_argument('--revocation-tag', type=str, required=True, help='32-byte revocation tag (in hex)')
 _ = parser.add_argument('--rotating-pkey',  type=str, required=True, help='32-byte Ed25519 rotating public key (in hex)')
 _ = parser.add_argument('--expiry-ts',      type=int, required=True, help='Expiry timestamp (UNIX seconds)')
 _ = parser.add_argument('--signature',      type=str,                help='64-byte Ed25519 signature (in hex) that the Pro Backend produced by signing the proof to verify')
@@ -63,16 +63,16 @@ if 1:
     # discover from the signed content.
 
     # Strip 0x prefix if present and convert from hex
-    gen_hash      = args.gen_index_hash[2:] if args.gen_index_hash.startswith('0x') else args.gen_index_hash
+    tag      = args.revocation_tag[2:] if args.revocation_tag.startswith('0x') else args.revocation_tag
     rotating_pkey = args.rotating_pkey[2:]  if args.rotating_pkey.startswith('0x')  else args.rotating_pkey
 
-    h.update(bytes.fromhex(gen_hash))
+    h.update(bytes.fromhex(tag))
     h.update(bytes.fromhex(rotating_pkey))
     h.update(args.expiry_ts.to_bytes(byteorder='little', length=8))
     hash_result = h.digest()
     print(f"Hash: {hash_result.hex()}")
 
-# Verify that the signature signed the proof elements (gen-index-hash, rotating-pkey, expiry-ts-ms) in question
+# Verify that the signature signed the proof elements (revocation-tag, rotating-pkey, expiry-ts-ms) in question
 if 1:
     if args.signature and args.verify_pkey:
         sig_hex  = args.signature[2:]   if args.signature.startswith('0x')   else args.signature
