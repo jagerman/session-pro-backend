@@ -681,12 +681,21 @@ def revoke_payments_by_id_internal_tx(tx: db.SQLTransaction, rows: typing.Any, r
             id         = id)
 
     revoke_at_next_day = round_datetime_to_next_day_with_platform_testing_support(base.PaymentProvider.Nil, revoke_at)
+
+    # The furthest into the future any outstanding proof can certify: a proof clamps its expiry to
+    # round_up_day(request_at + 30d) (_build_proof_clamped_expiry_time) and request_at is only accepted
+    # within DEFAULT_TIMESTAMP_TOLERANCE of the server clock, so no live proof reaches beyond this
+    # relative to the revoke instant.
+    max_outstanding_proof_expiry = base.round_datetime_to_next_day(
+        revoke_at + base.DEFAULT_TIMESTAMP_TOLERANCE + datetime.timedelta(days=30))
+
     for it in master_pkey_dict:
         # NOTE: For each user we revoked a payment for, we have modified their 'auto_renewing' value
         # on the payment, we need to go and update their user row to track the, new, next best
         # expiry time so that the backend knows the new time-frame in which the user is allowed to
         # generate a Session Pro proof (now that one or more of their payments get revoked)
-        _update_user_expiry_grace_and_renew_flag_from_payment_list_tx(tx, nacl.signing.VerifyKey(it))
+        master_pkey = nacl.signing.VerifyKey(it)
+        _update_user_expiry_grace_and_renew_flag_from_payment_list_tx(tx, master_pkey)
 
         # NOTE: expires_at in the db is not rounded, but the proof's themselves have an
         # expiry timestamp rounded to the end of the UTC day. So we only actually want to revoke
@@ -694,11 +703,21 @@ def revoke_payments_by_id_internal_tx(tx: db.SQLTransaction, rows: typing.Any, r
         #
         # For different platforms in their testing environments, they have different timespans
         # for a day, for example in Google 1 day is 10s. We handle that explicitly here.
-
         expires_at = master_pkey_dict[it]
-        if expires_at > revoke_at_next_day:
-            master_pkey = nacl.signing.VerifyKey(it)
-            _ = revoke_master_pkey_proofs_and_allocate_new_gen_id_tx(tx, master_pkey, created_at=revoke_at)
+        if expires_at <= revoke_at_next_day:
+            continue
+
+        # Item 4: even when the revoked payment's own proof would outlive the day boundary, a broadcast
+        # revocation + generation roll is only needed if the refund drops the user's *remaining*
+        # entitlement below something an outstanding proof already certifies. If enough paid time
+        # survives the refund (aggregate expiry at or beyond the furthest a live proof can reach) every
+        # outstanding proof stays honest, so we skip the revocation entirely. The revocation list is
+        # fetched by every client, so keeping it minimal is the point.
+        post_refund_expiry = _lookup_user_expiry_tx(tx, master_pkey).best_expiry
+        if post_refund_expiry is not None and post_refund_expiry >= max_outstanding_proof_expiry:
+            continue
+
+        _ = revoke_master_pkey_proofs_and_allocate_new_gen_id_tx(tx, master_pkey, created_at=revoke_at)
 
     return result
 

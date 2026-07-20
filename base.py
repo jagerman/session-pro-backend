@@ -33,6 +33,19 @@ SECONDS_IN_MONTH:      int     = SECONDS_IN_DAY * 30
 MILLISECONDS_IN_YEAR:  int     = MILLISECONDS_IN_DAY * 365
 SECONDS_IN_YEAR:       int     = SECONDS_IN_DAY * 365
 
+# How far the timestamp in a signed request may differ from the backend's clock. This currently matches
+# the storage server's store tolerance for onion-request forwarded messages as per:
+#
+#   https://github.com/session-foundation/session-storage-server/blob/3d159a10d465678d758131c1075c9a6e5b4d95cc/oxenss/rpc/request_handler.h#L48
+#
+# We choose the upper-bound of tolerance for requests for maximum compatibility. Currently, in the flask
+# context, no information is available to indicate if the request was forwarded or not so we default to
+# assuming it is. All platforms are designed to interact with the backend using onion requests.
+#
+# It is a protocol constant, not merely a server-side check: the backend's revocation-skip math
+# (revoke_payments_by_id_internal_tx) depends on the same skew bound, so both must read this one value.
+DEFAULT_TIMESTAMP_TOLERANCE: datetime.timedelta = datetime.timedelta(seconds=70)
+
 # Every instant in this codebase is a tz-aware UTC `datetime` and every duration a `timedelta`. Integer
 # epochs live ONLY in the converters below, at two kinds of boundary with distinct units:
 #   - MILLISECONDS: the payment providers (Apple/Google App Store APIs) genuinely speak ms, so their

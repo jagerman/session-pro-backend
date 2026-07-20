@@ -545,18 +545,6 @@ FLASK_ROUTE_GET_PRO_DETAILS                         = '/get_pro_details'
 FLASK_ROUTE_SET_PAYMENT_REFUND_REQUESTED            = '/set_payment_refund_requested'
 FLASK_ROUTE_STATUS                                  = '/status'
 
-# How many seconds can the timestamp in requests can differ from the Pro Backend's clock. This
-# currently matches the storage server's store tolerance for onion-request forwarded messages as
-# per:
-#
-#   https://github.com/session-foundation/session-storage-server/blob/3d159a10d465678d758131c1075c9a6e5b4d95cc/oxenss/rpc/request_handler.h#L48
-#
-# We choose the upper-bound of tolerance for requests for maximum compatibility. Currently, in the
-# flask context, no information is available to indicate if the request was forwarded or not so we
-# default to assuming it is.
-#
-# All platforms are designed to interact with the backend using onion requests.
-DEFAULT_TIMESTAMP_TOLERANCE                         = datetime.timedelta(seconds=70)
 SET_PAYMENT_REFUND_REQUESTED_PERSONALISATION   = b'ProSetRefundReq_'
 GET_PRO_PAYMENTS_DETAIL_PERSONALISATION        = b'ProGetProDetReq_'
 assert len(SET_PAYMENT_REFUND_REQUESTED_PERSONALISATION) == hashlib.blake2b.PERSON_SIZE
@@ -687,7 +675,7 @@ def generate_pro_proof() -> flask.Response:
     # (§3); the comparison is datetime-native. Out of window → stale_request (client can re-sync + retry).
     request_at = base.datetime_from_unix_seconds(ts)
     now        = base.datetime_from_unix_ms(int(time_now() * 1000))
-    if abs(now - request_at) > DEFAULT_TIMESTAMP_TOLERANCE:
+    if abs(now - request_at) > base.DEFAULT_TIMESTAMP_TOLERANCE:
         raise base.FailError(f'Nonce timestamp is outside the tolerance window: {base.readable(request_at)} (now {base.readable(now)})',
                              code=base.ErrorCode.stale_request)
 
@@ -760,7 +748,7 @@ def get_pro_details():
     # replay ability for a read-only query.)
     request_at = base.datetime_from_unix_seconds(ts)
     now        = base.datetime_from_unix_ms(int(time_now() * 1000))
-    if abs(now - request_at) >= DEFAULT_TIMESTAMP_TOLERANCE:
+    if abs(now - request_at) >= base.DEFAULT_TIMESTAMP_TOLERANCE:
         raise base.FailError(f'Timestamp is outside the tolerance window, delta was {abs(now - request_at)}',
                              code=base.ErrorCode.stale_request)
 
@@ -895,7 +883,7 @@ def set_payment_refund_requested():
     request_at          = base.datetime_from_unix_seconds(ts)
     refund_requested_at = base.datetime_from_unix_seconds(refund_requested_ts)
     now                 = base.datetime_from_unix_ms(int(time_now() * 1000))
-    if abs(now - request_at) >= DEFAULT_TIMESTAMP_TOLERANCE:
+    if abs(now - request_at) >= base.DEFAULT_TIMESTAMP_TOLERANCE:
         raise base.FailError(f'Timestamp is outside the tolerance window, delta was {abs(now - request_at)}',
                              code=base.ErrorCode.stale_request)
 

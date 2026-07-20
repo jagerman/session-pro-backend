@@ -659,6 +659,81 @@ def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_d
             assert payments_list[3].auto_renewing            == True
             assert payments_list[3].grace_period == auto_redeem_scenarios[1].grace_period
 
+def test_revocation_cutting_refund_rolls_generation(monkeypatch, pg_database):
+    """Item 4 case 2: a refund that drops the user's remaining entitlement BELOW what an outstanding
+    proof can still certify (a proof's reach is clamped to ~30 days) must revoke the current generation
+    and roll the user onto a fresh one for the reduced-but-still-standing entitlement. This is the middle
+    case between the two already covered in test_server_add_payment_flow: a non-cutting refund that leaves
+    far-future entitlement (skip — no roll, no revocation entry) and a refund that leaves nothing (revoke
+    without a roll — the terminally-revoked generation stays put)."""
+    monkeypatch.setattr("platform_google_api.subscription_v1_acknowledge", lambda *a, **k: None)
+    monkeypatch.setattr("platform_google_api.fetch_subscription_v2_details", lambda *a, **k: platform_google_types.SubscriptionV2Data())
+
+    err                                           = base.ErrorSink()
+    db_engine: psycopg_pool.ConnectionPool | None = backend.bootstrap_db(database_url=pg_database(), err=err)
+    assert not err.has(), f'{err.msg_list}'
+    assert db_engine
+
+    backend_key  = nacl.signing.SigningKey.generate()
+    master_key   = nacl.signing.SigningKey.generate()
+    rotating_key = nacl.signing.SigningKey.generate()
+    now          = datetime.datetime.now(datetime.timezone.utc)
+    redeemed_at  = base.round_datetime_to_next_day(now)
+
+    db_conn = db_engine.getconn()
+
+    def seed_and_redeem(expires_at: datetime.datetime) -> str:
+        seed_tx                      = base.PaymentProviderTransaction()
+        seed_tx.provider             = base.PaymentProvider.GooglePlayStore
+        seed_tx.google_payment_token = os.urandom(backend.BLAKE2B_DIGEST_SIZE).hex()
+        seed_tx.google_order_id      = 'DEV.' + os.urandom(backend.BLAKE2B_DIGEST_SIZE).hex()
+        backend.add_unredeemed_payment(conn                           = db_conn,
+                                       payment_tx                     = seed_tx,
+                                       plan                           = base.ProPlan.OneMonth,
+                                       purchased_at                   = now,
+                                       expires_at                     = expires_at,
+                                       platform_refund_expires_at     = base.EPOCH,
+                                       platform_obfuscated_account_id = backend.google_obfuscated_account_id_from_master_pkey(master_key.verify_key),
+                                       err                            = err)
+        user_tx                      = backend.UserPaymentTransaction()
+        user_tx.provider             = base.PaymentProvider.GooglePlayStore
+        user_tx.google_payment_token = seed_tx.google_payment_token
+        user_tx.google_order_id      = seed_tx.google_order_id
+        msg = backend.make_add_pro_payment_message(master_pkey=master_key.verify_key, rotating_pkey=rotating_key.verify_key, payment_tx=user_tx)
+        redeemed = backend.verify_and_add_pro_payment(conn=db_conn, signing_key=backend_key, request_at=now, redeemed_at=redeemed_at,
+                                                      master_pkey=master_key.verify_key, rotating_pkey=rotating_key.verify_key, payment_tx=user_tx,
+                                                      master_sig=master_key.sign(msg).signature, rotating_sig=rotating_key.sign(msg).signature)
+        assert redeemed.status == backend.RedeemPaymentStatus.Success, f'{err.msg_list}'
+        return seed_tx.google_payment_token
+
+    try:
+        # Two stacked payments on one (shared, item-3) generation: a long one we will refund and a short
+        # survivor that leaves only ~5 days of entitlement — less than the ~30-day reach of a live proof.
+        long_token  = seed_and_redeem(redeemed_at + datetime.timedelta(days=90))
+        _           = seed_and_redeem(redeemed_at + datetime.timedelta(days=5))
+
+        with db.transaction(db_conn) as tx:
+            user_before = backend.get_user_and_payments(tx, master_key.verify_key).user
+        gen_before, token_before = user_before.current_generation_id, user_before.token
+
+        # Refund the long payment. The survivor leaves entitlement well inside the proof-reach window, so
+        # an outstanding proof would now over-certify: the generation must roll.
+        with db.transaction(db_conn) as tx:
+            revoked = backend.add_google_revocation_tx(tx=tx, google_payment_token=long_token, revoke_at=now, err=err)
+            assert revoked
+            assert not err.has()
+
+        with db.transaction(db_conn) as tx:
+            user_after = backend.get_user_and_payments(tx, master_key.verify_key)
+            assert user_after.user.current_generation_id != gen_before
+            assert user_after.user.token                 != token_before
+            assert not backend.is_generation_revoked_tx(tx, user_after.user.current_generation_id, now)
+            assert backend.is_generation_revoked_tx(tx, gen_before, now)
+        assert len(backend.get_revocations_list(db_conn)) == 1
+    finally:
+        db_engine.putconn(db_conn)
+        db_engine.close()
+
 def test_server_add_payment_flow(monkeypatch, pg_database):
     monkeypatch.setattr(
         "platform_google_api.subscription_v1_acknowledge",
@@ -1007,16 +1082,18 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
             # refreshing the connection and updating the "snapshot" that the following code sees.
             db_conn = db_engine.getconn()
 
-            # Capture the user's current generation. The manual revoke below revokes exactly this
-            # generation, so its token is what must appear (verbatim) in the served revocation list, and
-            # the user must roll off it onto a fresh one (they still have the unrevoked original payment).
+            # Capture the user's current generation. The manual revoke below targets only the shorter
+            # (30-day) payment while the original (~90-day) payment survives, so item 4 must SKIP the
+            # revocation entirely: the surviving entitlement still covers everything any outstanding proof
+            # can certify (≤ 30 days of reach), so the generation must NOT roll and nothing must land on
+            # the (network-costly) revocation list.
             with db.transaction(db_conn) as tx:
                 get_user = backend.get_user_and_payments(tx, master_key.verify_key)
                 assert len(get_user.user.token) == backend.BLAKE2B_DIGEST_SIZE
-            revoked_generation_token: bytes = get_user.user.token
-            revoked_generation_id:    int   = get_user.user.current_generation_id
+            kept_generation_token: bytes = get_user.user.token
+            kept_generation_id:    int   = get_user.user.current_generation_id
 
-            # We will now manually revoke the user and check the revocation list again
+            # We will now manually revoke the shorter payment and check the revocation list again
             with db.transaction(db_conn) as tx:
                 revoked = backend.add_google_revocation_tx(tx                   = tx,
                                                            google_payment_token = new_add_pro_payment_tx.google_payment_token,
@@ -1055,35 +1132,21 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
                 result_retry_in: int = base.json_dict_require_int(d=result_json, key='retry_in', err=err)
                 result_retain_for: int = base.json_dict_require_int(d=result_json, key='retain_for', err=err)
                 assert len(err.msg_list) == 0, '{err.msg_list}'
-                assert result_ticket  == 1
+                # Item 4: the non-cutting refund produced NO revocation entry, so the ticket is unchanged.
+                assert result_ticket  == 0
                 assert result_retry_in == base.SECONDS_IN_DAY
                 assert result_retain_for == base.SECONDS_IN_MONTH
                 curr_revocation_ticket = result_ticket
-                assert len(result_items) == 1
+                assert len(result_items) == 0
 
-                # The revoke rolled the user onto a FRESH generation (item 3: a revocation is the only
-                # thing that rolls a generation). We have two payments for this user — the later one was
-                # revoked, the original was not — so the user still has entitlement and must be on a NEW,
-                # LIVE generation, while the old generation is terminally revoked (and on the list above).
+                # The generation must be UNCHANGED and still LIVE: no roll happened, and the current
+                # generation is NOT on the revocation list (the surviving payment keeps it honest).
                 with db.transaction(db_conn) as tx:
                     get_user: backend.GetUserAndPayments = backend.get_user_and_payments(tx, master_key.verify_key)
                     now_dt = base.datetime_from_unix_ms(unix_ts_ms)
-                    assert get_user.user.current_generation_id != revoked_generation_id
-                    assert get_user.user.token                 != revoked_generation_token
+                    assert get_user.user.current_generation_id == kept_generation_id
+                    assert get_user.user.token                 == kept_generation_token
                     assert not backend.is_generation_revoked_tx(tx, get_user.user.current_generation_id, now_dt)
-                    assert backend.is_generation_revoked_tx(tx, revoked_generation_id, now_dt)
-
-                for it in result_items:
-                    it: dict[str, int | str]
-                    # Per-entry wire shape (spec §4 / Delta #6): revocation_tag + effective_ts only; no
-                    # per-entry expiry_ts (clients age entries out via the list-level retain_for).
-                    assert 'revocation_tag' in it and isinstance(it['revocation_tag'], str)
-                    assert 'effective_ts' in it and isinstance(it['effective_ts'], int)
-                    assert 'expiry_ts' not in it
-                    assert it['revocation_tag'] == revoked_generation_token.hex()
-                    # effective_ts should be creation time + 1 day (86400 seconds)
-                    # Since we can't know exact creation time in the test, just verify it's a reasonable value
-                    assert it['effective_ts'] > 0
 
             assert not err.has()
 
@@ -1118,7 +1181,8 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
             result_retry_in: int = base.json_dict_require_int(d=result_json, key='retry_in', err=err)
             result_retain_for: int = base.json_dict_require_int(d=result_json, key='retain_for', err=err)
             assert len(err.msg_list) == 0, '{err.msg_list}'
-            assert result_ticket  == 1, f'Response was: {json.dumps(response_json, indent=2)}'
+            # Item 4: the non-cutting refund above created no revocation entry, so the ticket is still 0.
+            assert result_ticket  == 0, f'Response was: {json.dumps(response_json, indent=2)}'
             assert result_retry_in == base.SECONDS_IN_DAY
             assert result_retain_for == base.SECONDS_IN_MONTH
 
@@ -1171,7 +1235,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
 
             # Retry the request but use a too old timestamp
             if 1:
-                unix_ts_ms:   int   = int((time.time() + server.DEFAULT_TIMESTAMP_TOLERANCE.total_seconds() * 2) * 1000)
+                unix_ts_ms:   int   = int((time.time() + base.DEFAULT_TIMESTAMP_TOLERANCE.total_seconds() * 2) * 1000)
                 hash_to_sign: bytes = backend.make_get_pro_details_message(master_pkey=master_key.verify_key, request_at=base.datetime_from_unix_seconds(unix_ts_ms // 1000), count=count)
                 onion_request = onion_req.make_request_v4(our_x25519_pkey=our_x25519_skey.public_key,
                                                           shared_key=shared_key,
