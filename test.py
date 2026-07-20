@@ -1007,12 +1007,14 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
             # refreshing the connection and updating the "snapshot" that the following code sees.
             db_conn = db_engine.getconn()
 
-            # Capture the user's current generation token. The manual revoke below revokes exactly this
-            # generation, so its token is what must appear (verbatim) in the served revocation list.
+            # Capture the user's current generation. The manual revoke below revokes exactly this
+            # generation, so its token is what must appear (verbatim) in the served revocation list, and
+            # the user must roll off it onto a fresh one (they still have the unrevoked original payment).
             with db.transaction(db_conn) as tx:
                 get_user = backend.get_user_and_payments(tx, master_key.verify_key)
                 assert len(get_user.user.token) == backend.BLAKE2B_DIGEST_SIZE
             revoked_generation_token: bytes = get_user.user.token
+            revoked_generation_id:    int   = get_user.user.current_generation_id
 
             # We will now manually revoke the user and check the revocation list again
             with db.transaction(db_conn) as tx:
@@ -1059,11 +1061,17 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
                 curr_revocation_ticket = result_ticket
                 assert len(result_items) == 1
 
-                # Check user entitlement updated after revoke. We should prefer the unrevoked payment
-                # as we have 2 payments for the user simultaneously where the latter was revoked but
-                # the original was not.
+                # The revoke rolled the user onto a FRESH generation (item 3: a revocation is the only
+                # thing that rolls a generation). We have two payments for this user — the later one was
+                # revoked, the original was not — so the user still has entitlement and must be on a NEW,
+                # LIVE generation, while the old generation is terminally revoked (and on the list above).
                 with db.transaction(db_conn) as tx:
                     get_user: backend.GetUserAndPayments = backend.get_user_and_payments(tx, master_key.verify_key)
+                    now_dt = base.datetime_from_unix_ms(unix_ts_ms)
+                    assert get_user.user.current_generation_id != revoked_generation_id
+                    assert get_user.user.token                 != revoked_generation_token
+                    assert not backend.is_generation_revoked_tx(tx, get_user.user.current_generation_id, now_dt)
+                    assert backend.is_generation_revoked_tx(tx, revoked_generation_id, now_dt)
 
                 for it in result_items:
                     it: dict[str, int | str]
@@ -1323,12 +1331,21 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
 
         if 1: # Revoke the original payment from the user (so we have ended up revoking everything)
             with db.transaction(db_conn) as tx:
+                gen_before_final_revoke = backend.get_user_and_payments(tx, master_key.verify_key).user.current_generation_id
                 revoked = backend.add_google_revocation_tx(tx                   = tx,
                                                            google_payment_token = payment_tx.google_payment_token,
                                                            revoke_at    = base.datetime_from_unix_ms(start_unix_ts_ms),
                                                            err                  = err)
             assert revoked
             assert not err.has()
+
+            # Revoking the LAST valid payment must NOT roll onto a fresh generation — there's no remaining
+            # entitlement to roll onto, so the current generation stays put and is now terminally revoked
+            # (contrast the partial revoke above, which DID roll). This is the "shouldn't roll" case.
+            with db.transaction(db_conn) as tx:
+                get_user_after = backend.get_user_and_payments(tx, master_key.verify_key)
+                assert get_user_after.user.current_generation_id == gen_before_final_revoke
+                assert backend.is_generation_revoked_tx(tx, get_user_after.user.current_generation_id, base.datetime_from_unix_ms(start_unix_ts_ms))
 
             # Try requesting a proof normally which should now fail as everything has been revoked
             generate_pro_proof_hash_version = 0
