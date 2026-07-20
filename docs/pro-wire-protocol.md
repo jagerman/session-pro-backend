@@ -15,11 +15,26 @@
 
 ## 1. Primitives & conventions
 
-- **Hash:** BLAKE2b, 32-byte digest, 16-byte **personalisation** (ASCII, `_`-right-padded to 16), **no
-  key, no salt**. (The one historical salted use — the generation token — is removed; see §Deltas.)
-- **Signatures:** Ed25519. A signature is over the 32-byte BLAKE2b digest described per message.
-- **Integer encoding in signed hashes:** every multi-byte integer is **explicit little-endian**, fixed
-  width as stated. (Implementations MUST serialize explicitly — never rely on host byte order.)
+- **Signatures:** Ed25519 over the **message directly** — NOT over a hash of it. Ed25519 already hashes
+  internally and these messages are tiny, so there is no pre-hash (no BLAKE2b). Each signed message is
+  built by the same rule (§1.1).
+- **§1.1 Signed-message construction.** A signed message is: a **16-byte domain prefix** (ASCII,
+  `_`-right-padded to 16 — the value that used to be the BLAKE2b personalisation) followed by the fields
+  in the stated order, each encoded by type:
+  - **public key / raw bytes** (`master_pkey`, `rotating_pkey`, `revocation_tag`): appended **verbatim**
+    (fixed width — 32 bytes — so self-delimiting).
+  - **integer** (`ts`, `count`, `expiry`, …): its **canonical decimal ASCII** — no grouping, no leading
+    zeros, `-` for negatives (Python `str(int).encode()`, C++ `std::to_chars` base 10; both are
+    locale-independent and MUST be used, not locale-aware formatters). This is why `count = -1` and
+    unbounded values need no special handling.
+  - **string** (`provider_code`, `payment_id`): its **UTF-8** bytes verbatim.
+  - **Framing:** a single `\0` (NUL) byte is inserted **between two adjacent variable-length fields** (i.e.
+    between two int/str fields). Fixed-width fields (keys/tag) need no separator. A `\0` cannot occur in a
+    decimal integer or a `provider_code`; the only field that can contain a `\0` is the opaque
+    `payment_id`, which is **always the final field**, so it is never followed by a separator and the
+    parse is unambiguous.
+  (The old scheme — sign a BLAKE2b-256 digest with fixed-width little-endian integers — is removed; see
+  §Deltas.)
 - **Time quantities:** **UNIX-epoch seconds** everywhere (never milliseconds), for both timestamps and
   durations. Almost every value is a JSON **integer**: every expiry, every duration, and anything the
   backend computes or rounds lands on a whole second (Session Pro expiries are day-aligned, never
@@ -27,9 +42,10 @@
   instants** — currently `purchased_ts` (provider purchase time) and `revoked_ts` (provider revocation
   time) — emitted as JSON **floats** so the provider's sub-second precision survives; the fractional part
   is just the sub-second remainder, still seconds. (A binary64 float resolves current-era timestamps to
-  ~238 ns, so this preserves milliseconds exactly.) Every value **serialized into a signed hash is an
-  integer**, 8-byte LE — the hashed quantities are all whole-second by nature, and a client-supplied
-  hashed timestamp (`ts`, `refund_requested_ts`) MUST be an integer. The DB stores every instant at full
+  ~238 ns, so this preserves milliseconds exactly.) A value that enters a **signed message is always a
+  whole-second integer** (encoded as canonical decimal ASCII per §1.1), never a float — the signed
+  timestamps (`ts`, `refund_requested_ts`, proof `expiry_ts`) are whole-second by nature; the float
+  `purchased_ts`/`revoked_ts` are get-details *response* fields, never signed. The DB stores every instant at full
   `timestamptz` (µs) precision regardless of wire type, so an integer wire field is a *display* choice,
   not data loss — a field can widen to a float later with no storage change.
 - **Field-name markers (no unit suffix, ever).** Seconds is the universal unit, so **no** field carries a
@@ -49,7 +65,7 @@
   a storage/type choice, not a value range. All `_ts` / `_duration` values likewise stay numbers
   (seconds ~1.7e9 « 2^53).
 - **Enums are transmitted as stable string `code`s, never integers** (backed by lookup tables — item 9;
-  the DB keeps a surrogate int `id`, but the wire *and the signed hashes* use the `code`, so no magic
+  the DB keeps a surrogate int `id`, but the wire *and the signed messages* use the `code`, so no magic
   number ever crosses the wire and new values are additive `INSERT`s):
   - `payment_provider`: `"google_play"`, `"app_store"`, `"rangeproof"`
   - `status`: TWO distinct fields share this name at different nesting levels. Each get-details **item**
@@ -63,16 +79,16 @@
     not `"12m"`). **Display/accounting only** (never computed with); recurrence is the separate
     `auto_renewing` field, *not* part of this code. Client maps/parses it for display; backend groups by it.
   - A `nil`/unset value is never valid on the wire — every stored row has a real code.
-- **No version byte in any digest; no `version` field on requests/responses** (Delta #11). Requests are
-  domain-separated by their **personalisation** (in the hash) and their **endpoint**; a new *request*
+- **No version byte in any signed message; no `version` field on requests/responses** (Delta #11).
+  Requests are domain-separated by their **domain prefix** (§1.1) and their **endpoint**; a new *request*
   shape earns a **new endpoint**, so requests carry no version at all. The **proof** is the exception: it
   is free-floating and offline-verified (no endpoint), so it keeps a **plaintext `version` field** — but
   that field is a verification *input*, not a signed byte. The verifier reads it and maps the proof
-  **data → (personalisation, digest)**: `version` selects the personalisation for that version (v0 →
-  `ProProof_v0_____`; the map is arbitrary per-version, so a future version may pick any personalisation),
+  **data → (domain prefix, message)**: `version` selects the domain prefix for that version (v0 →
+  `ProProof_v0_____`; the map is arbitrary per-version, so a future version may pick any prefix),
   which is what binds the version into the signature. You can't learn a version
-  *through* a signature you haven't verified — you must already know it to reconstruct the digest — so the
-  version rides in the clear as data and a version byte inside the digest would be redundant. The
+  *through* a signature you haven't verified — you must already know it to reconstruct the message — so the
+  version rides in the clear as data and a version byte inside the message would be redundant. The
   version→personalisation map is per-version and arbitrary — a future version may choose any
   personalisation; a verifier refuses versions it doesn't know, so nothing old breaks.
 
@@ -87,31 +103,30 @@ verified offline**; it carries **no user identity**.
   "revocation_tag": "<64 hex>",   // opaque 32-byte value; see §2.1
   "rotating_pkey":  "<64 hex>",   // Ed25519 public key the proof entitles
   "expiry_ts": <int>,             // seconds; entitlement valid until this instant
-  "sig": "<128 hex>" }            // Ed25519 over the digest below
+  "sig": "<128 hex>" }            // Ed25519 over the message below (§1.1)
 ```
-`version` is a **plaintext data element**, deliberately **not** a byte in the digest (§1, Delta #11).
-Verification is a mapping from the transmitted **data → (personalisation, digest)**: the verifier reads
-`version`, looks up the personalisation + field layout for that version (v0 → `ProProof_v0_____`),
-reconstructs the digest, and checks `sig`. So the version is a verification **input**, known before
+`version` is a **plaintext data element**, deliberately **not** a byte in the signed message (§1, Delta #11).
+Verification is a mapping from the transmitted **data → (domain prefix, message)**: the verifier reads
+`version`, looks up the domain prefix + field layout for that version (v0 → `ProProof_v0_____`),
+reconstructs the message, and checks `sig`. So the version is a verification **input**, known before
 verification — never something discovered *through* a signature (you must already know it to reconstruct
-the digest at all). It needs no signing: tampering with it just makes the verifier use the wrong
-personalisation and the signature fails. A verifier that doesn't recognise a `version` **refuses to
-interpret the proof** — it *cannot* verify a format it doesn't know. The version→personalisation map is
-arbitrary and per-version: a future version may pick **any** personalisation (or reshape the proof
+the message at all). It needs no signing: tampering with it just makes the verifier use the wrong
+prefix and the signature fails. A verifier that doesn't recognise a `version` **refuses to
+interpret the proof** — it *cannot* verify a format it doesn't know. The version→prefix map is
+arbitrary and per-version: a future version may pick **any** prefix (or reshape the proof
 entirely), and no existing verifier breaks because it never attempts an unknown version. (A version byte
-*inside* the digest would be pure redundancy — "extra bits for nothing" — since the version is already
-the plaintext input that picks the personalisation.)
+*inside* the message would be pure redundancy — "extra bits for nothing" — since the version is already
+the plaintext input that picks the prefix.)
 
-**Signed digest** — `sig = Ed25519(backend_key, H)`; the verifier picks `person` from the plaintext
-`version` (`0` → `ProProof_v0_____`), then:
+**Signed message** — `sig = Ed25519(backend_key, M)` over the message **directly** (no pre-hash; §1.1);
+the verifier picks the 16-byte domain prefix from the plaintext `version` (`0` → `ProProof_v0_____`), then:
 ```
-H = BLAKE2b-256(
-      person = "ProProof_v0_____",               # 16 bytes; the "_v0" is the version, chosen from the data
-      revocation_tag                             # 32 bytes, raw
-   ‖  rotating_pkey                              # 32 bytes, raw
-   ‖  expiry_ts.to_bytes(8,  'little'))          # seconds
+M =  "ProProof_v0_____"        # 16-byte domain prefix; the "_v0" is the version, chosen from the data
+  ‖  revocation_tag            # 32 bytes, raw
+  ‖  rotating_pkey             # 32 bytes, raw
+  ‖  dec(expiry_ts)            # canonical decimal ASCII seconds (trailing field → no separator)
 ```
-Verifiers reconstruct `H` from the proof fields and check `sig` against the backend's public key, then
+Verifiers reconstruct `M` from the proof fields and check `sig` against the backend's public key, then
 check `expiry_ts` against their clock and `revocation_tag` against the revocation list (§4).
 
 ### 2.1 `revocation_tag`
@@ -123,30 +138,31 @@ client can or should compute.)
 
 ## 3. Signed requests (signed by the user's master key)
 
-Each request is authorised by an Ed25519 signature from the account **master key** over a
-personalised BLAKE2b-256 digest. Field order and widths are exact. `ts` is the caller's clock
-(backend accepts it within a tolerance window, currently ±70 s). **No digest carries a `version`
-prefix** and no request body carries a `version` field (§1, Delta #11) — the personalisation + the
-endpoint already domain-separate each message; a new request shape gets a new endpoint.
+Each request is authorised by an Ed25519 signature from the account **master key** over the message built
+per §1.1 (16-byte domain prefix + typed fields, no pre-hash). Field order is exact. `ts` is the caller's
+clock (backend accepts it within a tolerance window, currently ±70 s). **No message carries a `version`**
+field or prefix (§1, Delta #11) — the domain prefix + the endpoint already domain-separate each message; a
+new request shape gets a new endpoint. Below, `dec(x)` = the canonical decimal-ASCII integer of §1.1, raw
+32-byte fields are self-delimiting, and `\0` separates adjacent variable-length fields.
 
-**3.1 generate-proof** — person `ProGenerateProof`
+**3.1 generate-proof** — domain `ProGenerateProof`
 ```
-master_pkey(32) ‖ rotating_pkey(32) ‖ ts(8)
-```
-
-**3.2 add-payment** — person `ProAddPayment___`  (note: **no timestamp**)
-```
-master_pkey(32) ‖ rotating_pkey(32) ‖ provider_code ‖ payment_id (§3.5)
+master_pkey(32) ‖ rotating_pkey(32) ‖ dec(ts)
 ```
 
-**3.3 set-refund-requested** — person `ProSetRefundReq_`  (note: **no rotating_pkey**, two timestamps)
+**3.2 add-payment** — domain `ProAddPayment___`  (note: **no timestamp**)
 ```
-master_pkey(32) ‖ ts(8) ‖ refund_requested_ts(8) ‖ provider_code ‖ payment_id (§3.5)
+master_pkey(32) ‖ rotating_pkey(32) ‖ provider_code ‖ \0 ‖ payment_id (§3.5)
 ```
 
-**3.4 get-pro-details** — person `ProGetProDetReq_`
+**3.3 set-refund-requested** — domain `ProSetRefundReq_`  (note: **no rotating_pkey**, two timestamps)
 ```
-master_pkey(32) ‖ ts(8) ‖ count(4)
+master_pkey(32) ‖ dec(ts) ‖ \0 ‖ dec(refund_requested_ts) ‖ \0 ‖ provider_code ‖ \0 ‖ payment_id (§3.5)
+```
+
+**3.4 get-pro-details** — domain `ProGetProDetReq_`
+```
+master_pkey(32) ‖ dec(ts) ‖ \0 ‖ dec(count)
 ```
 
 **3.5 payment_id** — one **opaque UTF-8 string** identifying the payment, appended verbatim for add-payment
@@ -154,7 +170,7 @@ master_pkey(32) ‖ ts(8) ‖ count(4)
 passed through unread); the backend, which alone acts on it, owns its encoding.
 
 **Each provider owns its `payment_id` encoding.** The one cross-cutting invariant is that `payment_id` is
-an **exact byte string** — it enters the signed hash verbatim, so both sides must agree on the exact bytes.
+an **exact byte string** — it enters the signed message verbatim, so both sides must agree on the exact bytes.
 Beyond that, structure is a private contract between the provider's client flow and the backend's ingest:
 - `google_play` → `google_payment_token + "|" + google_order_id`, **split once on the first `|`**. Safe
   today because the token is base64url (`[A-Za-z0-9._-]`) and the order id is `GPA.####-…` — neither
@@ -162,11 +178,11 @@ Beyond that, structure is a private contract between the provider's client flow 
 - `app_store`   → `apple_tx_id`
 - `rangeproof`  → `rangeproof_order_id`  *(add-payment only)*
 
-> This collapses the old per-provider wire fields to one opaque value: the wire/hash no longer needs to
+> This collapses the old per-provider wire fields to one opaque value: the wire/signed message no longer needs to
 > know a payment identifier has sub-fields. If a future provider's identifier can itself contain the
 > delimiter, **that provider** picks a scheme (length-prefix / fixed structure) — a local choice, because
 > using the value already requires provider-specific logic. No global length-prefixing: an ambiguous
-> composite is anyway unreachable (the digest is master-signed + onion-encrypted, and the backend splits
+> composite is anyway unreachable (the message is master-signed + onion-encrypted, and the backend splits
 > then looks up by the separate fields, never by the raw composite), so a prefix width would be pure
 > arbitrariness for no reachable gain.
 
@@ -240,9 +256,9 @@ Non-`ok` responses carry two fields:
 | `bad_signature` | fail | a request signature failed to verify. A correct client never sees this. |
 | `stale_request` | fail | request timestamp outside the replay-tolerance window. The client may re-fetch server time (`/status`) and retry. |
 | `unknown_payment` | fail | `add_pro_payment`: no payment matching those provider IDs is known for this user. Often transient (provider notification not yet received) → retry later. |
-| `expired` | fail | the user's entitlement has lapsed → "renew" CTA. |
+| `subscription_expired` | fail | the user's entitlement has lapsed → "renew" CTA. (Named to stay disjoint from `user_status: expired` — §5.2 — so no token belongs to two fields.) |
 | `not_subscribed` | fail | no entitlement on record (never subscribed, or pruned after long inactivity) → "subscribe" CTA. |
-| `revoked` | fail | the user's current entitlement was revoked. Treat as `expired` (renew) on clients today; the distinct slug is reserved for a future revoked-specific flow. |
+| `revoked` | fail | the user's current entitlement was revoked. Treat as `subscription_expired` (renew) on clients today; the distinct slug is reserved for a future revoked-specific flow. |
 | `internal_error` | error | backend fault; not the client's doing. |
 
 ### 5.2 Result payloads
@@ -254,7 +270,10 @@ enums are their string `code`s (§1), byte strings are hex, and no key name leak
 detail (see §6). (Their per-field shapes track `server.py`; only the naming/units rules here are normative
 for them.) Note some non-error outcomes live *in* `result`, not as a `fail`: get-details reports account
 state as `user_status` (`never`/`active`/`expired`; `user_` disambiguates it from the envelope `status`
-and the per-item payment `status`), and set-refund returns `{ "updated": <bool> }`.
+and the per-item payment `status`), and set-refund returns `{ "updated": <bool> }`. `user_status` is a
+distinct axis from the `error_code` slugs (§5.1) and their vocabularies are deliberately **disjoint** — the
+"lapsed" `error_code` is `subscription_expired`, not `expired`, so a value never belongs to two fields;
+`user_status: never` is the state behind an `error_code: not_subscribed` rejection.
 
 ## 6. Field-naming rule
 Wire (JSON) field names describe **purpose to the consumer**, never server implementation, and carry
@@ -265,8 +284,9 @@ a `_ts` marker, durations `…_duration`. Audit every response key against both 
 
 ## Deltas from the current code (what to change on both sides)
 
-1. **Timestamps ms → seconds** everywhere (proof `expiry`, all request-hash timestamps, all wire
-   `…_unix_ts_ms` → `…_ts`). 8-byte LE in hashes unchanged (value is seconds now). Integer seconds
+1. **Timestamps ms → seconds** everywhere (proof `expiry`, all request timestamps, all wire
+   `…_unix_ts_ms` → `…_ts`). (Their in-signature encoding is now canonical decimal ASCII, not 8-byte LE —
+   superseded by #13.) Integer seconds
    everywhere **except** the two upstream provider event instants in the get-details response,
    `purchased_ts` and `revoked_ts`, which are JSON **floats** carrying the provider's sub-second
    precision (§1). No `…_ts_ms`/`_ms` field survives — the unit is always seconds; precision that
@@ -277,11 +297,13 @@ a `_ts` marker, durations `…_duration`. Audit every response key against both 
 3. **`ticket`: uint32 → int64**, and restore-monotonic on the server (a wrap or a DR rollback must not
    let a client silently miss revocations).
 4. **Explicit little-endian** for every multi-byte integer in a signed hash (the client currently relies
-   on host byte order via `reinterpret_cast`; make it explicit).
+   on host byte order via `reinterpret_cast`; make it explicit). **[SUPERSEDED by #13 — signed inputs are
+   now messages, not hashes, and integers are canonical decimal-ASCII; no LE integer survives in a signed
+   input.]**
 5. **Payment identifier → single opaque `payment_id` (§3.5)** — *both-sides-flip*. The per-provider wire
    fields (`google_payment_token`/`google_order_id`/`apple_tx_id`/`rangeproof_order_id`/`order_id`) collapse
    to one opaque UTF-8 `payment_id` in `payment_tx`, get-details items, **and** the signed add-payment /
-   set-refund hash tail (`… ‖ provider_code ‖ payment_id`). Each provider owns its encoding; the only
+   set-refund signed-message tail (`… ‖ provider_code ‖ payment_id`). Each provider owns its encoding; the only
    invariant is exact bytes (it's signed). Google's is `token ‖ "|" ‖ order_id`, split once on the first
    `|`; the backend still stores the split-out fields in its own typed columns. Length-prefixing considered
    and dropped (collision unreachable: master-sig + onion + backend looks up by split fields, never the raw
@@ -302,15 +324,15 @@ a `_ts` marker, durations `…_duration`. Audit every response key against both 
    copies, so it must be right.
 9. Minor: generate-proof signing hardcodes `version = 0` despite a version field — thread the real value.
 10. **Enums → string `code`s** (§1): `payment_provider`, `status`, `plan` are transmitted as string codes,
-    not integers — backed by lookup tables (backend item 9; DB keeps an int `id`, wire/hash use the
+    not integers — backed by lookup tables (backend item 9; DB keeps an int `id`, wire/signed-message use the
     `code`). `status`/`plan` are wire-only (unsigned responses) → easy. **`provider` is also in the
-    add-payment / set-refund signed hashes** (was a 1-byte int, now the UTF-8 `provider_code`), so that's
+    add-payment / set-refund signed messages** (was a 1-byte int, now the UTF-8 `provider_code`), so that's
     a **both-sides-flip**. `plan` is `"1m"/"3m"/"1y"` (period code, not a lookup of tiers-with-attributes).
 11. **Drop the in-digest version byte everywhere; version requests via the endpoint, the proof via a
     plaintext field that selects its personalisation** (Q11 + Q12) — *both-sides-flip*. The leading
     `version(1)` byte is removed from all five signed digests. Rationale: you can never learn a version
     *through* a signature you have not yet verified, while verifying requires you to already know it — so
-    an in-hash byte discovers nothing. For **requests** the version goes entirely (field + any marker): a
+    an in-message byte discovers nothing. For **requests** the version goes entirely (field + any marker): a
     new request shape earns a **new endpoint**, whose personalisation is the discriminator. For the
     **proof** — a free-floating, offline-verified credential with no endpoint — the version stays as a
     **plaintext `version` field** (a verification input): the verifier reads it and maps the proof
@@ -335,7 +357,7 @@ a `_ts` marker, durations `…_duration`. Audit every response key against both 
       a freshly-signed proof for the user's current entitlement (identical to a first redemption), instead
       of the old `already_redeemed` (100) error — that slug is **deleted**. This establishes the invariant
       **`ok` ⟹ a proof is present** on the proof-returning endpoints. A genuinely lapsed entitlement
-      (`expired`/`revoked`) or unrecognised payment (`unknown_payment`) is a `fail` with that slug.
+      (`subscription_expired`/`revoked`) or unrecognised payment (`unknown_payment`) is a `fail` with that slug.
     - HTTP status is always **200**; the envelope `status` is authoritative.
     - Fixes current miscategorisation: signature failure and timestamp-out-of-tolerance (today variously
       `PARSE_ERROR`/`GENERIC_ERROR`) become `fail` + `bad_signature` / `stale_request`.
@@ -343,9 +365,26 @@ a `_ts` marker, durations `…_duration`. Audit every response key against both 
       present; map each `error_code` to a Crowdin string (developer-facing `invalid_request`/
       `bad_signature`/`internal_error` may share one generic message); **delete the already-redeemed
       special-case** (Android's no-op branch, iOS's `needsRefreshProProof` skip — the normal success path
-      now covers it); `expired`→renew, `not_subscribed`→subscribe, `revoked`→renew (until/unless a
+      now covers it); `subscription_expired`→renew, `not_subscribed`→subscribe, `revoked`→renew (until/unless a
       revoked-specific flow is built). *(Backend-internal, not wire: the `make_error_response` returns
       become raised exceptions and `ErrorSink` is removed — no client impact.)*
+13. **Sign the message, not a hash; canonical field encoding** (§1.1, §2, §3.1–3.4) — *both-sides-flip,
+    touches ALL FIVE signatures incl. the offline-verified proof.* Supersedes #4 (and the LE parts of #1).
+    - Ed25519 signs the **message directly** — no BLAKE2b pre-hash. Each message = 16-byte domain prefix
+      (the value that was the BLAKE2b personalisation, unchanged) + the fields.
+    - Field encoding by type: raw bytes for keys/`revocation_tag` (fixed width); **canonical decimal
+      ASCII** for integers (`ts`, `count`, `expiry`, `refund_requested_ts`) — Python `str(int)` / C++
+      `std::to_chars(base 10)`, both locale-independent (NOT `std::to_string`/`printf`/locale formatters);
+      UTF-8 for `provider_code`/`payment_id`.
+    - Framing: a single `\0` between two **adjacent variable-length** fields (int/str); fixed-width fields
+      unseparated. `payment_id` (the only field that may contain `\0`) is always last. This also fixes the
+      old undelimited `provider_code‖payment_id` ambiguity.
+    - Consequences: `count = -1` (unlimited) now works with no special-casing; no fixed-width/signedness
+      trap anywhere in a signed input; BLAKE2b is gone from the signing path entirely.
+    - Backend: done (`backend.signed_message` + the `make_*_message`/`build_proof_message` builders;
+      verify/sign sites unchanged since they already `verify(msg,sig)`/`sign(msg)`). libsession must
+      rebuild all five signed inputs to §1.1 in lockstep. The example files (`verify_pro_proof.py`,
+      `endpoint_example.py`) still show the old scheme → fix with #8's example sweep.
 
 ## Open (coordination)
 - **Spec home:** this file, in the backend repo (`docs/pro-wire-protocol.md`), is proposed as the
@@ -356,5 +395,7 @@ a `_ts` marker, durations `…_duration`. Audit every response key against both 
 - *(Resolved: response envelope reworked — §5 + Delta #12. `status` → `ok`/`fail`/`error`, single `error`
   string, `error_code` slug vocabulary. Confirmed with the client agent: `add_pro_payment` idempotent
   (`already_redeemed` deleted, `ok`+proof returned — both clients drop their special-case); lapsed slugs
-  `expired`/`not_subscribed` are distinct client CTAs (renew vs subscribe), `revoked` distinct on the wire
-  but treated as `expired` on clients for now.)*
+  `subscription_expired`/`not_subscribed` are distinct client CTAs (renew vs subscribe), `revoked` distinct
+  on the wire but treated as `subscription_expired` on clients for now. Note the `error_code` vocabulary is
+  deliberately DISJOINT from `user_status` {never,active,expired} — hence `subscription_expired`, not
+  `expired` — so no token identifies two different fields (Q16).)*

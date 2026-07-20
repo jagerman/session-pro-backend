@@ -790,7 +790,7 @@ def cmd_server_set_payment_refund_requested(args: argparse.Namespace) -> int:
 
     now_ts = int(time.time())
 
-    hash_bytes: bytes = backend.make_set_payment_refund_requested_hash(master_skey.verify_key, base.datetime_from_unix_seconds(now_ts), base.datetime_from_unix_seconds(refund_ts), payment_tx)
+    hash_bytes: bytes = backend.make_set_payment_refund_requested_message(master_skey.verify_key, base.datetime_from_unix_seconds(now_ts), base.datetime_from_unix_seconds(refund_ts), payment_tx)
 
     # Build request
     request_body = {
@@ -877,7 +877,7 @@ def cmd_server_get_pro_details(args: argparse.Namespace) -> int:
     ts = int(time.time())
 
     # Compute hash
-    hash_bytes = backend.make_get_pro_details_hash(
+    hash_bytes = backend.make_get_pro_details_message(
         master_pkey=master_skey.verify_key,
         request_at=base.datetime_from_unix_seconds(ts),
         count=args.count
@@ -938,7 +938,7 @@ def cmd_server_generate_pro_proof(args: argparse.Namespace) -> int:
     ts = int(time.time())
 
     # Compute hash
-    hash_bytes = backend.make_generate_pro_proof_hash(
+    hash_bytes = backend.make_generate_pro_proof_message(
         master_pkey=master_skey.verify_key,
         rotating_pkey=rotating_skey.verify_key,
         request_at=base.datetime_from_unix_seconds(ts)

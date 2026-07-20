@@ -298,7 +298,7 @@ def test_provider_dry_run_redeems_google_without_egress(monkeypatch, pg_database
         user_tx.provider             = base.PaymentProvider.GooglePlayStore
         user_tx.google_payment_token = seed_tx.google_payment_token
         user_tx.google_order_id      = seed_tx.google_order_id
-        add_payment_hash = backend.make_add_pro_payment_hash(master_pkey   = master_key.verify_key,
+        add_payment_hash = backend.make_add_pro_payment_message(master_pkey   = master_key.verify_key,
                                                              rotating_pkey = rotating_key.verify_key,
                                                              payment_tx    = user_tx)
         redeemed = backend.verify_and_add_pro_payment(conn         = db_conn,
@@ -411,7 +411,7 @@ def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_d
         add_pro_payment_tx.google_payment_token = payment_tx.google_payment_token
         add_pro_payment_tx.google_order_id      = payment_tx.google_order_id
 
-        add_payment_hash = backend.make_add_pro_payment_hash(
+        add_payment_hash = backend.make_add_pro_payment_message(
                                                              master_pkey=master_key.verify_key,
                                                              rotating_pkey=rotating_key.verify_key,
                                                              payment_tx=add_pro_payment_tx)
@@ -608,7 +608,7 @@ def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_d
             add_pro_payment_tx.provider             = payment_tx.provider
             add_pro_payment_tx.google_payment_token = payment_tx.google_payment_token
             add_pro_payment_tx.google_order_id      = payment_tx.google_order_id
-            add_payment_hash: bytes = backend.make_add_pro_payment_hash(
+            add_payment_hash: bytes = backend.make_add_pro_payment_message(
                                                                         master_pkey   = auto_redeem_user_master_key.verify_key,
                                                                         rotating_pkey = auto_redeem_user_rotating_key.verify_key,
                                                                         payment_tx    = add_pro_payment_tx)
@@ -711,7 +711,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
         if 1: # Grab the pro status before anything has happened
             version:      int   = 0
             count:        int   = 10_000
-            hash_to_sign: bytes = backend.make_get_pro_details_hash(master_pkey=master_key.verify_key, request_at=base.datetime_from_unix_seconds(unix_ts_ms // 1000), count=count)
+            hash_to_sign: bytes = backend.make_get_pro_details_message(master_pkey=master_key.verify_key, request_at=base.datetime_from_unix_seconds(unix_ts_ms // 1000), count=count)
             request_body={
                           'master_pkey': bytes(master_key.verify_key).hex(),
                           'master_sig':  bytes(master_key.sign(hash_to_sign).signature).hex(),
@@ -754,7 +754,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
             add_pro_payment_tx.google_order_id      = payment_tx.google_order_id
             add_pro_payment_tx.payment_id           = backend.payment_id_from_user_tx(add_pro_payment_tx)
 
-            payment_hash_to_sign: bytes = backend.make_add_pro_payment_hash(
+            payment_hash_to_sign: bytes = backend.make_add_pro_payment_message(
                                                                             master_pkey=master_key.verify_key,
                                                                             rotating_pkey=rotating_key.verify_key,
                                                                             payment_tx=add_pro_payment_tx)
@@ -808,7 +808,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
             assert result_rotating_pkey == rotating_key.verify_key
 
             # Check that the server signed our proof w/ their public key
-            proof_hash: bytes = backend.build_proof_hash(result_revocation_tag,
+            proof_hash: bytes = backend.build_proof_message(result_revocation_tag,
                                                          result_rotating_pkey,
                                                          base.datetime_from_unix_seconds(result_expiry_ts))
             _ = backend_key.verify_key.verify(smessage=proof_hash, signature=result_sig)
@@ -821,7 +821,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
             new_rotating_key    = nacl.signing.SigningKey.generate()
             version             = 0
             unix_ts_ms          = int(time.time() * 1000)
-            hash_to_sign: bytes = backend.make_generate_pro_proof_hash(
+            hash_to_sign: bytes = backend.make_generate_pro_proof_message(
                                                                        master_pkey=master_key.verify_key,
                                                                        rotating_pkey=new_rotating_key.verify_key,
                                                                        request_at=base.datetime_from_unix_seconds(unix_ts_ms // 1000))
@@ -873,7 +873,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
             assert result_rotating_pkey == new_rotating_key.verify_key
 
             # Check that the server signed our proof w/ their public key
-            proof_hash = backend.build_proof_hash(result_revocation_tag,
+            proof_hash = backend.build_proof_message(result_revocation_tag,
                                                   result_rotating_pkey,
                                                   base.datetime_from_unix_seconds(result_expiry_ts))
             _ = backend_key.verify_key.verify(smessage=proof_hash, signature=result_sig)
@@ -903,7 +903,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
             new_add_pro_payment_tx.google_payment_token = new_payment_tx.google_payment_token
             new_add_pro_payment_tx.google_order_id      = new_payment_tx.google_order_id
             new_add_pro_payment_tx.payment_id           = backend.payment_id_from_user_tx(new_add_pro_payment_tx)
-            payment_hash_to_sign: bytes = backend.make_add_pro_payment_hash(
+            payment_hash_to_sign: bytes = backend.make_add_pro_payment_message(
                                                                             master_pkey   = master_key.verify_key,
                                                                             rotating_pkey = rotating_key.verify_key,
                                                                             payment_tx    = new_add_pro_payment_tx)
@@ -958,7 +958,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
             assert result_rotating_pkey == rotating_key.verify_key
 
             # Check that the server signed our proof w/ their public key
-            proof_hash: bytes = backend.build_proof_hash(result_revocation_tag,
+            proof_hash: bytes = backend.build_proof_message(result_revocation_tag,
                                                          result_rotating_pkey,
                                                          base.datetime_from_unix_seconds(result_expiry_ts))
             _ = backend_key.verify_key.verify(smessage=proof_hash, signature=result_sig)
@@ -1123,7 +1123,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
             version:      int   = 0
             unix_ts_ms:   int   = int(time.time() * 1000)
             count:        int   = 10_000
-            hash_to_sign: bytes = backend.make_get_pro_details_hash(master_pkey=master_key.verify_key, request_at=base.datetime_from_unix_seconds(unix_ts_ms // 1000), count=count)
+            hash_to_sign: bytes = backend.make_get_pro_details_message(master_pkey=master_key.verify_key, request_at=base.datetime_from_unix_seconds(unix_ts_ms // 1000), count=count)
 
             request_body={
                           'master_pkey': bytes(master_key.verify_key).hex(),
@@ -1163,7 +1163,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
             # Retry the request but use a too old timestamp
             if 1:
                 unix_ts_ms:   int   = int((time.time() + server.DEFAULT_TIMESTAMP_TOLERANCE.total_seconds() * 2) * 1000)
-                hash_to_sign: bytes = backend.make_get_pro_details_hash(master_pkey=master_key.verify_key, request_at=base.datetime_from_unix_seconds(unix_ts_ms // 1000), count=count)
+                hash_to_sign: bytes = backend.make_get_pro_details_message(master_pkey=master_key.verify_key, request_at=base.datetime_from_unix_seconds(unix_ts_ms // 1000), count=count)
                 onion_request = onion_req.make_request_v4(our_x25519_pkey=our_x25519_skey.public_key,
                                                           shared_key=shared_key,
                                                           endpoint=server.FLASK_ROUTE_GET_PRO_DETAILS,
@@ -1191,7 +1191,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
             if 1:
                 unix_ts_ms:    int   = int(time.time() * 1000)
                 count:         int   = 10_000
-                hash_to_sign:  bytes = backend.make_get_pro_details_hash(master_pkey=rotating_key.verify_key, request_at=base.datetime_from_unix_seconds(unix_ts_ms // 1000), count=count)
+                hash_to_sign:  bytes = backend.make_get_pro_details_message(master_pkey=rotating_key.verify_key, request_at=base.datetime_from_unix_seconds(unix_ts_ms // 1000), count=count)
                 onion_request = onion_req.make_request_v4(our_x25519_pkey=our_x25519_skey.public_key,
                                                           shared_key=shared_key,
                                                           endpoint=server.FLASK_ROUTE_GET_PRO_DETAILS,
@@ -1219,7 +1219,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
             if 1:
                 unix_ts_ms:   int   = int(time.time() * 1000)
                 count:        int   = 0
-                hash_to_sign: bytes = backend.make_get_pro_details_hash(master_pkey=master_key.verify_key, request_at=base.datetime_from_unix_seconds(unix_ts_ms // 1000), count=count)
+                hash_to_sign: bytes = backend.make_get_pro_details_message(master_pkey=master_key.verify_key, request_at=base.datetime_from_unix_seconds(unix_ts_ms // 1000), count=count)
                 onion_request       = onion_req.make_request_v4(our_x25519_pkey=our_x25519_skey.public_key,
                                                           shared_key=shared_key,
                                                           endpoint=server.FLASK_ROUTE_GET_PRO_DETAILS,
@@ -1283,7 +1283,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
             # NOTE: Try to generate a proof on the deadline timestamp (which includes grace), should be permitted
             request_version: int   = 0
             unix_ts_ms:      int   = pro_proof_deadline_unix_ts_ms
-            hash_to_sign:    bytes = backend.make_generate_pro_proof_hash(
+            hash_to_sign:    bytes = backend.make_generate_pro_proof_message(
                                                                      master_pkey   = master_key.verify_key,
                                                                      rotating_pkey = rotating_key.verify_key,
                                                                      request_at    = base.datetime_from_unix_ms(unix_ts_ms))
@@ -1297,7 +1297,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
                                                                              rotating_sig   = bytes(rotating_key.sign(hash_to_sign).signature))
 
             # NOTE: Check that the proof verifies
-            proof_hash = backend.build_proof_hash(proof.revocation_tag,
+            proof_hash = backend.build_proof_message(proof.revocation_tag,
                                                   proof.rotating_pkey,
                                                   proof.expires_at)
             _ = backend_key.verify_key.verify(smessage=proof_hash, signature=proof.sig)
@@ -1305,7 +1305,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
 
             # NOTE: Generating a proof after the deadline must now fail — entitlement expired → FailError.
             unix_ts_ms: int = pro_proof_deadline_unix_ts_ms + 1
-            hash_to_sign: bytes = backend.make_generate_pro_proof_hash(
+            hash_to_sign: bytes = backend.make_generate_pro_proof_message(
                                                                   master_pkey   = master_key.verify_key,
                                                                   rotating_pkey = rotating_key.verify_key,
                                                                   request_at    = base.datetime_from_unix_ms(unix_ts_ms))
@@ -1318,7 +1318,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
                                                request_at    = base.datetime_from_unix_ms(unix_ts_ms),
                                                master_sig    = bytes(master_key.sign(hash_to_sign).signature),
                                                rotating_sig  = bytes(rotating_key.sign(hash_to_sign).signature))
-            assert exc_info.value.code == base.ErrorCode.expired
+            assert exc_info.value.code == base.ErrorCode.subscription_expired
 
         if 1: # Revoke the original payment from the user (so we have ended up revoking everything)
             with db.transaction(db_conn) as tx:
@@ -1331,7 +1331,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
 
             # Try requesting a proof normally which should now fail as everything has been revoked
             generate_pro_proof_hash_version = 0
-            hash_to_sign: bytes = backend.make_generate_pro_proof_hash(
+            hash_to_sign: bytes = backend.make_generate_pro_proof_message(
                                                                        master_pkey   = master_key.verify_key,
                                                                        rotating_pkey = rotating_key.verify_key,
                                                                        request_at    = base.datetime_from_unix_seconds(start_unix_ts_ms // 1000))
@@ -1388,7 +1388,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
                                            err                               = err)
 
             # Register the payment
-            payment_hash_to_sign: bytes = backend.make_add_pro_payment_hash(
+            payment_hash_to_sign: bytes = backend.make_add_pro_payment_message(
                                                                             master_pkey   = master_key.verify_key,
                                                                             rotating_pkey = rotating_key.verify_key,
                                                                             payment_tx    = apple_tx)
@@ -1410,7 +1410,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
 
             # Set refunded
             set_refund_requested_version = 0
-            hash_to_sign: bytes = backend.make_set_payment_refund_requested_hash(
+            hash_to_sign: bytes = backend.make_set_payment_refund_requested_message(
                                                                                  master_pkey                 = master_key.verify_key,
                                                                                  request_at                  = base.datetime_from_unix_seconds(start_unix_ts_ms // 1000),
                                                                                  refund_requested_at = base.datetime_from_unix_seconds(start_unix_ts_ms // 1000),
@@ -1455,7 +1455,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
             fake_payment.google_order_id      = 'non-existent-order-id-to-trigger-fail-response'
             fake_payment.payment_id           = backend.payment_id_from_user_tx(fake_payment)
 
-            hash_to_sign: bytes = backend.make_set_payment_refund_requested_hash(
+            hash_to_sign: bytes = backend.make_set_payment_refund_requested_message(
                                                                                  master_pkey                 = master_key.verify_key,
                                                                                  request_at                  = base.datetime_from_unix_seconds(start_unix_ts_ms // 1000),
                                                                                  refund_requested_at = base.datetime_from_unix_seconds(start_unix_ts_ms // 1000),
@@ -1783,7 +1783,7 @@ def test_platform_apple(pg_database):
         add_pro_payment_tx.provider    = base.PaymentProvider.iOSAppStore
         add_pro_payment_tx.apple_tx_id = unredeemed_list[0].apple.tx_id
         add_pro_payment_tx.payment_id  = backend.payment_id_from_user_tx(add_pro_payment_tx)
-        payment_hash_to_sign: bytes    = backend.make_add_pro_payment_hash(
+        payment_hash_to_sign: bytes    = backend.make_add_pro_payment_message(
                                                                            master_pkey   = master_key.verify_key,
                                                                            rotating_pkey = rotating_key.verify_key,
                                                                            payment_tx    = add_pro_payment_tx)
@@ -1830,7 +1830,7 @@ def test_platform_apple(pg_database):
         assert result_rotating_pkey == rotating_key.verify_key
 
         # NOTE: Check that the server signed our proof w/ their public key
-        proof_hash: bytes = backend.build_proof_hash(result_revocation_tag, result_rotating_pkey, base.datetime_from_unix_seconds(result_expiry_ts))
+        proof_hash: bytes = backend.build_proof_message(result_revocation_tag, result_rotating_pkey, base.datetime_from_unix_seconds(result_expiry_ts))
         _ = test.backend_key.verify_key.verify(smessage=proof_hash, signature=result_sig)
 
     # The following is a sequence of notifications/events that transpired for the same account under
@@ -3055,7 +3055,7 @@ def test_platform_apple(pg_database):
             add_pro_payment_tx.provider    = base.PaymentProvider.iOSAppStore
             add_pro_payment_tx.apple_tx_id = unredeemed_payment_list[0].apple.tx_id
             add_pro_payment_tx.payment_id  = backend.payment_id_from_user_tx(add_pro_payment_tx)
-            payment_hash_to_sign: bytes = backend.make_add_pro_payment_hash(
+            payment_hash_to_sign: bytes = backend.make_add_pro_payment_message(
                                                                             master_pkey=master_key.verify_key,
                                                                             rotating_pkey=rotating_key.verify_key,
                                                                             payment_tx=add_pro_payment_tx)
@@ -3750,7 +3750,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
         version:      int   = 0
         count:        int   = 10_000
         ts: int             = unix_ts_ms // 1000   # wire nonce is integer seconds (wire spec §3.4)
-        hash_to_sign: bytes = backend.make_get_pro_details_hash(master_pkey=user_ctx.master_key.verify_key, request_at=base.datetime_from_unix_seconds(ts), count=count)
+        hash_to_sign: bytes = backend.make_get_pro_details_message(master_pkey=user_ctx.master_key.verify_key, request_at=base.datetime_from_unix_seconds(ts), count=count)
         request_body={
                       'master_pkey': bytes(user_ctx.master_key.verify_key).hex(),
                       'master_sig':  bytes(user_ctx.master_key.sign(hash_to_sign).signature).hex(),
@@ -3770,7 +3770,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
         add_pro_payment_tx.google_payment_token = tx.purchase_token
         add_pro_payment_tx.google_order_id      = tx.order_id
         add_pro_payment_tx.payment_id           = backend.payment_id_from_user_tx(add_pro_payment_tx)
-        payment_hash_to_sign: bytes = backend.make_add_pro_payment_hash(
+        payment_hash_to_sign: bytes = backend.make_add_pro_payment_message(
                                                                         master_pkey   = user_ctx.master_key.verify_key,
                                                                         rotating_pkey = user_ctx.rotating_key.verify_key,
                                                                         payment_tx    = add_pro_payment_tx)

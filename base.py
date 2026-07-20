@@ -211,9 +211,11 @@ class ErrorCode(enum.StrEnum):
     bad_signature   = 'bad_signature'     # fail:  a request signature failed to verify
     stale_request   = 'stale_request'     # fail:  request timestamp outside the replay-tolerance window
     unknown_payment = 'unknown_payment'   # fail:  no payment matching those provider ids for this user
-    expired         = 'expired'           # fail:  the user's entitlement has lapsed
-    not_subscribed  = 'not_subscribed'    # fail:  no entitlement on record (never subscribed / pruned)
-    revoked         = 'revoked'           # fail:  the user's current entitlement was revoked
+    # NB: `subscription_expired`, NOT `expired` — the error_code vocabulary is deliberately DISJOINT from
+    # get-details `user_status` {never,active,expired}, so no token identifies two different fields.
+    subscription_expired = 'subscription_expired'  # fail:  the user's entitlement has lapsed
+    not_subscribed       = 'not_subscribed'        # fail:  no entitlement on record (never subscribed / pruned)
+    revoked              = 'revoked'               # fail:  the user's current entitlement was revoked
     internal_error  = 'internal_error'    # error: backend fault
 
 class ApiError(Exception):

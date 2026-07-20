@@ -557,10 +557,10 @@ FLASK_ROUTE_STATUS                                  = '/status'
 #
 # All platforms are designed to interact with the backend using onion requests.
 DEFAULT_TIMESTAMP_TOLERANCE                         = datetime.timedelta(seconds=70)
-SET_PAYMENT_REFUND_REQUESTED_HASH_PERSONALISATION   = b'ProSetRefundReq_'
-GET_PRO_PAYMENTS_DETAIL_HASH_PERSONALISATION        = b'ProGetProDetReq_'
-assert len(SET_PAYMENT_REFUND_REQUESTED_HASH_PERSONALISATION) == hashlib.blake2b.PERSON_SIZE
-assert len(GET_PRO_PAYMENTS_DETAIL_HASH_PERSONALISATION)      == hashlib.blake2b.PERSON_SIZE
+SET_PAYMENT_REFUND_REQUESTED_PERSONALISATION   = b'ProSetRefundReq_'
+GET_PRO_PAYMENTS_DETAIL_PERSONALISATION        = b'ProGetProDetReq_'
+assert len(SET_PAYMENT_REFUND_REQUESTED_PERSONALISATION) == hashlib.blake2b.PERSON_SIZE
+assert len(GET_PRO_PAYMENTS_DETAIL_PERSONALISATION)      == hashlib.blake2b.PERSON_SIZE
 
 # The object containing routes that you register onto a Flask app to turn it
 # into an app that accepts Session Pro Backend client requests.
@@ -766,7 +766,7 @@ def get_pro_details():
 
     # Validate the signature.
     master_pkey_nacl      = nacl.signing.VerifyKey(master_pkey_bytes)
-    hash_to_verify: bytes = backend.make_get_pro_details_hash(master_pkey=master_pkey_nacl, request_at=request_at, count=count)
+    hash_to_verify: bytes = backend.make_get_pro_details_message(master_pkey=master_pkey_nacl, request_at=request_at, count=count)
     try:
         _ = master_pkey_nacl.verify(smessage=hash_to_verify, signature=master_sig_bytes)
     except Exception:
@@ -901,7 +901,7 @@ def set_payment_refund_requested():
 
     # Validate the signature.
     master_pkey_nacl      = nacl.signing.VerifyKey(master_pkey_bytes)
-    hash_to_verify: bytes = backend.make_set_payment_refund_requested_hash(master_pkey         = master_pkey_nacl,
+    hash_to_verify: bytes = backend.make_set_payment_refund_requested_message(master_pkey         = master_pkey_nacl,
                                                                            request_at          = request_at,
                                                                            refund_requested_at = refund_requested_at,
                                                                            payment_tx          = user_payment)

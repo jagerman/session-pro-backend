@@ -23,16 +23,17 @@ import psycopg_pool
 ZERO_BYTES32               = bytes(32)
 BLAKE2B_DIGEST_SIZE        = 32
 log                        = logging.Logger("BACKEND")
-GENERATE_PROOF_HASH_PERSONALISATION               = b'ProGenerateProof'
-BUILD_PROOF_HASH_PERSONALISATION                  = b'ProProof_v0_____'  # version lives IN the personalisation (Q12), not a byte/field
-ADD_PRO_PAYMENT_HASH_PERSONALISATION              = b'ProAddPayment___'
-SET_PAYMENT_REFUND_REQUESTED_HASH_PERSONALISATION = b'ProSetRefundReq_'
-GET_PRO_DETAILS_HASH_PERSONALISATION              = b'ProGetProDetReq_'
-assert len(GENERATE_PROOF_HASH_PERSONALISATION)               == hashlib.blake2b.PERSON_SIZE
-assert len(BUILD_PROOF_HASH_PERSONALISATION)                  == hashlib.blake2b.PERSON_SIZE
-assert len(ADD_PRO_PAYMENT_HASH_PERSONALISATION)              == hashlib.blake2b.PERSON_SIZE
-assert len(SET_PAYMENT_REFUND_REQUESTED_HASH_PERSONALISATION) == hashlib.blake2b.PERSON_SIZE
-assert len(GET_PRO_DETAILS_HASH_PERSONALISATION)              == hashlib.blake2b.PERSON_SIZE
+# 16-byte domain-separation prefix on the signed MESSAGE (signatures are Ed25519 over the message
+# directly — not a BLAKE2b personalisation any more; see signed_message). Kept at 16 bytes with the same
+# values so the proof's version-selecting personalisation (Q12) is unchanged.
+PERSONALISATION_SIZE                         = 16
+GENERATE_PROOF_PERSONALISATION               = b'ProGenerateProof'
+BUILD_PROOF_PERSONALISATION                  = b'ProProof_v0_____'  # version lives IN the personalisation (Q12), not a byte/field
+ADD_PRO_PAYMENT_PERSONALISATION              = b'ProAddPayment___'
+SET_PAYMENT_REFUND_REQUESTED_PERSONALISATION = b'ProSetRefundReq_'
+GET_PRO_DETAILS_PERSONALISATION              = b'ProGetProDetReq_'
+assert all(len(p) == PERSONALISATION_SIZE for p in (GENERATE_PROOF_PERSONALISATION, BUILD_PROOF_PERSONALISATION,
+           ADD_PRO_PAYMENT_PERSONALISATION, SET_PAYMENT_REFUND_REQUESTED_PERSONALISATION, GET_PRO_DETAILS_PERSONALISATION))
 
 # Explicit column list for payments table queries. Rows are read with `db.dict_row` and unpacked by
 # name in `payment_row_from_dict`, so order here is cosmetic (no positional coupling).
@@ -112,7 +113,7 @@ class ProSubscriptionProof:
     def to_dict(self) -> dict[str, str | int]:
         # `version` is a PLAINTEXT field, deliberately NOT in the signed digest (Q12). It is the
         # external indicator a verifier reads to pick the personalisation + layout it must use to
-        # reconstruct and check the digest; v0's personalisation is BUILD_PROOF_HASH_PERSONALISATION
+        # reconstruct and check the digest; v0's personalisation is BUILD_PROOF_PERSONALISATION
         # (`ProProof_v0_____`). The version→personalisation map is per-version and arbitrary — a future
         # version may choose any personalisation (or reshape the proof entirely); a verifier simply
         # refuses a version it doesn't understand, so nothing old breaks. The version is thus a
@@ -354,51 +355,47 @@ def to_redeemed_at(at: datetime.datetime) -> datetime.datetime:
     # Round up to the next UTC-day boundary (masks the exact instant the payment was redeemed).
     return base.round_datetime_to_next_day(at)
 
-def make_blake2b_hasher(personalisation: bytes, salt: bytes | None = None) -> hashlib.blake2b:
-    final_salt      = salt  if salt else b''
-    result          = hashlib.blake2b(digest_size=BLAKE2B_DIGEST_SIZE, person=personalisation, salt=final_salt)
-    return result
+# The bytes we Ed25519-sign directly (NO pre-hash — wire spec §1): a 16-byte domain prefix then the fields,
+# each encoded by TYPE — VerifyKey/bytes verbatim (fixed-width, self-delimiting); datetime → its UNIX
+# **seconds** then decimal ASCII (pass an int explicitly if you ever need other units); int as canonical
+# locale-independent decimal ASCII (matches C++ std::to_chars: no grouping/leading zeros, '-' for
+# negatives, so count=-1 and unbounded values Just Work); str as UTF-8. A `\0` separates two ADJACENT
+# variable-length (datetime/int/str) fields; fixed-width fields need no separator. Only payment_id can
+# contain a `\0` and it is always the final field, so the framing is unambiguous.
+def signed_message(personalisation: bytes, *fields: nacl.signing.VerifyKey | bytes | datetime.datetime | int | str) -> bytes:
+    assert len(personalisation) == PERSONALISATION_SIZE
+    out           = bytearray(personalisation)
+    prev_variable = False
+    for field in fields:
+        if isinstance(field, (nacl.signing.VerifyKey, bytes, bytearray)):
+            data, variable = bytes(field), False
+        elif isinstance(field, datetime.datetime):
+            data, variable = str(base.unix_seconds_from_datetime(field)).encode('ascii'), True  # → int seconds
+        elif isinstance(field, int):
+            data, variable = str(field).encode('ascii'), True                                    # canonical decimal
+        elif isinstance(field, str):
+            data, variable = field.encode('utf-8'), True
+        else:
+            raise TypeError(f'signed_message: unsupported field type {type(field).__name__} (expected VerifyKey/bytes, datetime, int, or str)')
+        if variable and prev_variable:
+            out += b'\x00'
+        out          += data
+        prev_variable = variable
+    return bytes(out)
 
-def make_add_pro_payment_hash(master_pkey:   nacl.signing.VerifyKey,
-                              rotating_pkey: nacl.signing.VerifyKey,
-                              payment_tx:    UserPaymentTransaction) -> bytes:
-    hasher: hashlib.blake2b = make_blake2b_hasher(personalisation=ADD_PRO_PAYMENT_HASH_PERSONALISATION)
-    # No version byte (Q11 / wire spec Delta #11): the personalisation + endpoint already domain-separate.
-    hasher.update(bytes(master_pkey))
-    hasher.update(bytes(rotating_pkey))
+def make_add_pro_payment_message(master_pkey:   nacl.signing.VerifyKey,
+                                 rotating_pkey: nacl.signing.VerifyKey,
+                                 payment_tx:    UserPaymentTransaction) -> bytes:
+    return signed_message(ADD_PRO_PAYMENT_PERSONALISATION, master_pkey, rotating_pkey,
+                          payment_tx.provider.value, payment_tx.payment_id)
 
-    # Tail is `provider_code ‖ payment_id`, both UTF-8, undelimited (spec §3.2/§3.5, Q10). payment_id is
-    # the opaque value verbatim — one value, so the hash never learns a payment has sub-fields.
-    hasher.update(payment_tx.provider.value.encode('utf-8'))
-    hasher.update(payment_tx.payment_id.encode('utf-8'))
+def make_set_payment_refund_requested_message(master_pkey: nacl.signing.VerifyKey, request_at: datetime.datetime, refund_requested_at: datetime.datetime, payment_tx: UserPaymentTransaction) -> bytes:
+    return signed_message(SET_PAYMENT_REFUND_REQUESTED_PERSONALISATION, master_pkey,
+                          request_at, refund_requested_at,
+                          payment_tx.provider.value, payment_tx.payment_id)
 
-    result: bytes = hasher.digest()
-    return result
-
-def make_set_payment_refund_requested_hash(master_pkey: nacl.signing.VerifyKey, request_at: datetime.datetime, refund_requested_at: datetime.datetime, payment_tx: UserPaymentTransaction) -> bytes:
-    hasher: hashlib.blake2b = make_blake2b_hasher(personalisation=SET_PAYMENT_REFUND_REQUESTED_HASH_PERSONALISATION)
-    # No version byte (Q11 / wire spec Delta #11).
-    hasher.update(bytes(master_pkey))
-    # Signed timestamps are integer seconds, 8-byte LE (wire spec §1/§3.3).
-    hasher.update(base.unix_seconds_from_datetime(request_at).to_bytes(length=8, byteorder='little'))
-    hasher.update(base.unix_seconds_from_datetime(refund_requested_at).to_bytes(length=8, byteorder='little'))
-    # Tail is `provider_code ‖ payment_id`, both UTF-8, undelimited (spec §3.3/§3.5, Q10).
-    hasher.update(payment_tx.provider.value.encode('utf-8'))
-    hasher.update(payment_tx.payment_id.encode('utf-8'))
-    result: bytes = hasher.digest()
-    return result
-
-def make_get_pro_details_hash(master_pkey: nacl.signing.VerifyKey, request_at: datetime.datetime, count: int) -> bytes:
-    hasher: hashlib.blake2b = make_blake2b_hasher(personalisation=GET_PRO_DETAILS_HASH_PERSONALISATION)
-    # No version byte (Q11 / wire spec Delta #11).
-    hasher.update(bytes(master_pkey))
-    hasher.update(base.unix_seconds_from_datetime(request_at).to_bytes(length=8, byteorder='little'))
-    # TODO(signing-sanity, see refactor plan): count is UNSIGNED fixed-width LE, so count < 0 (the
-    # `-1` = unlimited sentinel that get_pro_details now understands) raises OverflowError here → those
-    # requests 500. `count = -1` is KNOWN BROKEN until the signed-input redesign settles integer encoding.
-    hasher.update(count.to_bytes(length=4, byteorder='little'))
-    result: bytes = hasher.digest()
-    return result
+def make_get_pro_details_message(master_pkey: nacl.signing.VerifyKey, request_at: datetime.datetime, count: int) -> bytes:
+    return signed_message(GET_PRO_DETAILS_PERSONALISATION, master_pkey, request_at, count)
 
 def payment_row_from_dict(row: dict[str, typing.Any]) -> PaymentRow:
     # Rows come from a dict row factory (SELECT PAYMENTS_COLUMNS FROM PAYMENTS_FROM, row_factory=
@@ -1528,31 +1525,18 @@ def _allocate_new_gen_id_if_master_pkey_has_payments(tx:          db.SQLTransact
 
     return result
 
-def make_generate_pro_proof_hash(master_pkey:   nacl.signing.VerifyKey,
-                                 rotating_pkey: nacl.signing.VerifyKey,
-                                 request_at:    datetime.datetime) -> bytes:
-    '''Make the hash to sign for a pre-existing subscription by authorising
-    a new rotating_pkey to be used for the Session Pro subscription associated
-    with master_pkey'''
-    hasher: hashlib.blake2b = make_blake2b_hasher(personalisation=GENERATE_PROOF_HASH_PERSONALISATION)
-    # No version byte (Q11 / wire spec Delta #11).
-    hasher.update(bytes(master_pkey))
-    hasher.update(bytes(rotating_pkey))
-    hasher.update(base.unix_seconds_from_datetime(request_at).to_bytes(length=8, byteorder='little'))
-    result: bytes = hasher.digest()
-    return result
+def make_generate_pro_proof_message(master_pkey:   nacl.signing.VerifyKey,
+                                    rotating_pkey: nacl.signing.VerifyKey,
+                                    request_at:    datetime.datetime) -> bytes:
+    '''The message the user signs to authorise a new rotating_pkey for master_pkey's Session Pro
+    subscription.'''
+    return signed_message(GENERATE_PROOF_PERSONALISATION, master_pkey, rotating_pkey, request_at)
 
-def build_proof_hash(revocation_tag: bytes,
-                     rotating_pkey:  nacl.signing.VerifyKey,
-                     expires_at:     datetime.datetime) -> bytes:
-    '''Make the hash to the backend signs for to certify the proof'''
-    hasher: hashlib.blake2b = make_blake2b_hasher(personalisation=BUILD_PROOF_HASH_PERSONALISATION)
-    # No version byte (Q11 / wire spec Delta #11).
-    hasher.update(revocation_tag)
-    hasher.update(bytes(rotating_pkey))
-    hasher.update(base.unix_seconds_from_datetime(expires_at).to_bytes(length=8, byteorder='little'))
-    result: bytes = hasher.digest()
-    return result
+def build_proof_message(revocation_tag: bytes,
+                        rotating_pkey:  nacl.signing.VerifyKey,
+                        expires_at:     datetime.datetime) -> bytes:
+    '''The message the backend signs to certify a proof.'''
+    return signed_message(BUILD_PROOF_PERSONALISATION, revocation_tag, rotating_pkey, expires_at)
 
 def _build_proof_clamped_expiry_time(request_at: datetime.datetime, proposed_expires_at: datetime.datetime) -> datetime.datetime:
     # NOTE: Clamp the expiry time of the proof to 1 month and also make it land on the day boundary
@@ -1573,33 +1557,33 @@ def build_proof(revocation_tag: bytes,
     result.rotating_pkey         = rotating_pkey
     result.expires_at            = expires_at
 
-    hash_to_sign: bytes = build_proof_hash(revocation_tag = result.revocation_tag,
-                                           rotating_pkey  = result.rotating_pkey,
-                                           expires_at     = result.expires_at)
-    result.sig = signing_key.sign(hash_to_sign).signature
+    message: bytes = build_proof_message(revocation_tag = result.revocation_tag,
+                                         rotating_pkey  = result.rotating_pkey,
+                                         expires_at     = result.expires_at)
+    result.sig = signing_key.sign(message).signature
     return result
 
 def internal_verify_add_payment_and_get_proof_common_arguments(signing_key:   nacl.signing.SigningKey,
                                                                master_pkey:   nacl.signing.VerifyKey,
                                                                rotating_pkey: nacl.signing.VerifyKey,
-                                                               hash_to_sign:  bytes,
+                                                               message:       bytes,
                                                                master_sig:    bytes,
                                                                rotating_sig:  bytes) -> None:
     # Verify the signatures first (authenticate that the message was not tampered with) — if these fail,
     # the rest of the payload is indeterminate, so raising bad_signature short-circuits everything else.
+    # `message` is the signed message (variable length; built by make_*_message), signed directly — no
+    # pre-hash — so there's no fixed-size assert here.
     try:
-        _ = master_pkey.verify(smessage=hash_to_sign, signature=master_sig)
+        _ = master_pkey.verify(smessage=message, signature=master_sig)
     except Exception as e:
         raise base.FailError(f'Failed to verify signature from master key {base.maybe_obfuscate_bytes(master_pkey)}: {e}', code=base.ErrorCode.bad_signature)
 
     try:
-        _ = rotating_pkey.verify(smessage=hash_to_sign, signature=rotating_sig)
+        _ = rotating_pkey.verify(smessage=message, signature=rotating_sig)
     except Exception as e:
         raise base.FailError(f'Failed to verify signature from rotating key {base.maybe_obfuscate_bytes(rotating_pkey)}: {e}', code=base.ErrorCode.bad_signature)
 
-    # The hash to sign is only passed by internal code, the user never passes the hash so this assert
-    # guards for a development error. Similar with the signing key check.
-    assert len(hash_to_sign) == BLAKE2B_DIGEST_SIZE and hash_to_sign != ZERO_BYTES32
+    # Dev/config sanity checks (the signing key never leaves the backend).
     assert bytes(signing_key) != ZERO_BYTES32 and bytes(signing_key.verify_key) != ZERO_BYTES32
 
     # Sanity check the signing key — a backend misconfiguration, not the client's fault.
@@ -1711,13 +1695,13 @@ def verify_and_add_pro_payment(conn:                psycopg.Connection,
     log.info(f'Add payment (redeemed={base.readable(redeemed_at)}, master={base.maybe_obfuscate_bytes(master_pkey)}, payment={payment_tx_label})')
 
     # Authenticate the request (raises FailError(bad_signature) / invalid_request on failure).
-    hash_to_sign: bytes = make_add_pro_payment_hash(master_pkey   = master_pkey,
+    message: bytes = make_add_pro_payment_message(master_pkey   = master_pkey,
                                                     rotating_pkey = rotating_pkey,
                                                     payment_tx    = payment_tx)
     internal_verify_add_payment_and_get_proof_common_arguments(signing_key   = signing_key,
                                                                master_pkey   = master_pkey,
                                                                rotating_pkey = rotating_pkey,
-                                                               hash_to_sign  = hash_to_sign,
+                                                               message       = message,
                                                                master_sig    = master_sig,
                                                                rotating_sig  = rotating_sig)
 
@@ -1777,7 +1761,7 @@ def build_current_entitlement_proof_tx(tx:            db.SQLTransaction,
     if request_at > proof_expires_at:
         payment_expires_at = get_user.user.expires_at - get_user.user.grace_period if get_user.user.auto_renewing else get_user.user.expires_at
         raise base.FailError(f'User {bytes(master_pkey).hex()} entitlement expired at {base.readable(get_user.user.expires_at)} ({base.readable(payment_expires_at)} + {get_user.user.grace_period})',
-                             code=base.ErrorCode.expired)
+                             code=base.ErrorCode.subscription_expired)
 
     return build_proof(revocation_tag = get_user.user.token,
                        rotating_pkey  = rotating_pkey,
@@ -1794,13 +1778,13 @@ def generate_pro_proof(conn: psycopg.Connection,
     log.info(f'Get pro proof (master={base.maybe_obfuscate_bytes(master_pkey)}, ts={base.readable(request_at)})')
 
     # Authenticate the request (raises FailError(bad_signature) / invalid_request on failure).
-    hash_to_sign: bytes = make_generate_pro_proof_hash(master_pkey   = master_pkey,
+    message: bytes = make_generate_pro_proof_message(master_pkey   = master_pkey,
                                                        rotating_pkey = rotating_pkey,
                                                        request_at    = request_at)
     internal_verify_add_payment_and_get_proof_common_arguments(signing_key   = signing_key,
                                                                master_pkey   = master_pkey,
                                                                rotating_pkey = rotating_pkey,
-                                                               hash_to_sign  = hash_to_sign,
+                                                               message       = message,
                                                                master_sig    = master_sig,
                                                                rotating_sig  = rotating_sig)
 
