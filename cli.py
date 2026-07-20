@@ -204,7 +204,7 @@ COMMAND FORMATS DETAILED:
     know the intended consequences! Make a backup of the DB before proceeding!
 
     Options:
-      message_id: Google's notification message ID (an integer)
+      message_id: Google's notification message ID (an opaque string, but typically an integer)
 
     Examples:
       python cli.py --config config.ini google-notification handle "12345"
@@ -327,20 +327,19 @@ def parse_payment_id_list(arg: str, err: base.ErrorSink) -> list[tuple[base.Paym
     return result
 
 
-def parse_message_id_list(arg: str, err: base.ErrorSink) -> list[int]:
-    """Parse a comma-separated string of message IDs."""
-    result: list[int] = []
+def parse_message_id_list(arg: str, err: base.ErrorSink) -> list[str]:
+    """Parse a comma-separated string of message IDs. Pub/Sub message ids are opaque strings, so entries
+    are taken verbatim (no numeric parsing)."""
+    result: list[str] = []
     if len(arg) == 0:
         return result
 
     for item in arg.split(','):
         item = item.strip()
-        try:
-            message_id = int(item)
-            result.append(message_id)
-        except Exception:
-            err.msg_list.append(f'Failed to parse message_id as integer ({item})')
+        if len(item) == 0:
+            err.msg_list.append('Empty message_id in list')
             return result
+        result.append(item)
     return result
 
 

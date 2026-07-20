@@ -159,7 +159,7 @@ AddRevocationIterator:               typing.TypeAlias = tuple[int,              
                                                               bytes | None,      # master_pkey
                                                               datetime.datetime] # expires_at
 
-GoogleUnhandledNotificationIterator: typing.TypeAlias = tuple[int,               # message_id
+GoogleUnhandledNotificationIterator: typing.TypeAlias = tuple[str,               # message_id (opaque string)
                                                               str | None,        # payload
                                                               datetime.datetime] # expires_at
 
@@ -2047,7 +2047,7 @@ def apple_notification_uuid_is_in_db_tx(tx: db.SQLTransaction, uuid: str) -> boo
 def apple_set_notification_checkpoint_at(tx: db.SQLTransaction, checkpoint_at: datetime.datetime):
     set_global_datetime(tx.conn, 'apple_notification_checkpoint_at', checkpoint_at)
 
-def google_add_notification_id_tx(tx: db.SQLTransaction, message_id: int, expires_at: datetime.datetime, payload: str):
+def google_add_notification_id_tx(tx: db.SQLTransaction, message_id: str, expires_at: datetime.datetime, payload: str):
     maybe_payload: str | None = None
     if len(payload):
         maybe_payload = payload
@@ -2059,7 +2059,7 @@ def google_add_notification_id_tx(tx: db.SQLTransaction, message_id: int, expire
           payload    = maybe_payload,
           expiry     = expires_at)
 
-def google_set_notification_handled(tx: db.SQLTransaction, message_id: int, delete: bool) -> bool:
+def google_set_notification_handled(tx: db.SQLTransaction, message_id: str, delete: bool) -> bool:
     if delete:
         rows = db.query(tx.conn, ('''DELETE FROM google_notification_history WHERE message_id = %s'''), message_id)
     else:
@@ -2071,7 +2071,7 @@ def google_get_unhandled_notification_iterator(tx: db.SQLTransaction) -> collect
     result_set = db.query(tx.conn, ('SELECT message_id, payload, expires_at FROM google_notification_history WHERE NOT handled'))
     return typing.cast(collections.abc.Iterator[GoogleUnhandledNotificationIterator], result_set)
 
-def google_notification_message_id_is_in_db_tx(tx: db.SQLTransaction, message_id: int) -> GoogleNotificationMessageIDInDB:
+def google_notification_message_id_is_in_db_tx(tx: db.SQLTransaction, message_id: str) -> GoogleNotificationMessageIDInDB:
     row    = typing.cast(tuple[int] | None, db.query_one(tx.conn, '''SELECT handled FROM google_notification_history WHERE message_id = %s''', message_id))
     result = GoogleNotificationMessageIDInDB()
     if row is not None:

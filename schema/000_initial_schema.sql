@@ -130,11 +130,14 @@ CREATE TABLE IF NOT EXISTS apple_notification_uuid_history (
 );
 
 CREATE TABLE IF NOT EXISTS google_notification_history (
-    message_id        BIGINT NOT NULL,
+    message_id        TEXT PRIMARY KEY,   -- Pub/Sub message id: opaque STRING, never a number (item 11)
     handled           BOOLEAN NOT NULL DEFAULT FALSE,
     payload           TEXT,
     expires_at        TIMESTAMPTZ NOT NULL
 );
+-- The startup drain reads `WHERE NOT handled`; a partial index keeps that off a full seq-scan as the
+-- buffer grows (item 10).
+CREATE INDEX IF NOT EXISTS google_notification_history_unhandled ON google_notification_history (message_id) WHERE NOT handled;
 
 CREATE TABLE IF NOT EXISTS user_errors (
     payment_id         TEXT NOT NULL,

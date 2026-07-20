@@ -72,7 +72,7 @@ class SortedMessage:
     event_unix_ts_ms:     int                                           = 0
     next_retry_unix_ts_s: float                                         = 0
     curr_retry_delay_s:   float                                         = 0
-    message_id:           int                                           = 0
+    message_id:           str                                           = ''
     ack_id:               str                                           = ''
     parse:                ParsedNotification                            = dataclasses.field(default_factory=ParsedNotification)
     raw:                  google.pubsub_v1.types.ReceivedMessage | None = None
@@ -262,7 +262,7 @@ def thread_entry_point(context: ThreadContext, app_credentials_path: str, cloud_
                         err                              = base.ErrorSink()
                         message_data: base.JSONObject    = json.loads(it.message.data) 
                         parse:        ParsedNotification = parse_notification(message_data, err);
-                        message_id:   int                = int(it.message.message_id)
+                        message_id:   str                = it.message.message_id  # Pub/Sub ids are opaque strings — never int()-cast (item 11)
                         if err.has():
                             log.warning(f'Discarding message #{index} because we encountered an error parsing it (message was published at {base.readable(base.datetime_from_unix_ms(it.message.publish_time.ToMilliseconds()))}. Message was:\n{base.maybe_obfuscate(str(it))}\nReason was:\n{err.build()}')
                         else:
