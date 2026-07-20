@@ -55,7 +55,7 @@ PAYMENTS_FROM = "payments p LEFT JOIN users u ON u.id = p.user_id"
 # users.current_generation_id is NOT NULL, so every user always has a current generation.
 USERS_COLUMNS = (
     "u.id, u.master_pkey, u.current_generation_id, g.token, u.expires_at, u.grace_period, u.auto_renewing, "
-    "u.refund_requested_at, u.google_obfuscated_account_id, u.apple_app_account_token"
+    "u.refund_requested_at"
 )
 USERS_FROM = "users u JOIN generations g ON g.id = u.current_generation_id"
 
@@ -271,8 +271,6 @@ class UserRow:
     grace_period:                 datetime.timedelta        = datetime.timedelta(0)
     auto_renewing:                bool                      = False
     refund_requested_at:          datetime.datetime | None  = None
-    google_obfuscated_account_id: bytes | None              = None
-    apple_app_account_token:      str | None                = None
 
 @dataclasses.dataclass
 class GetUserAndPayments:
@@ -483,9 +481,7 @@ def user_row_from_dict(row: dict[str, typing.Any]) -> UserRow:
                    expires_at                   = row['expires_at'],
                    grace_period                 = row['grace_period'],
                    auto_renewing                = bool(row['auto_renewing']),
-                   refund_requested_at          = row['refund_requested_at'],
-                   google_obfuscated_account_id = row['google_obfuscated_account_id'],
-                   apple_app_account_token      = row['apple_app_account_token'])
+                   refund_requested_at          = row['refund_requested_at'])
 
 def get_users_list(conn: psycopg.Connection) -> list[UserRow]:
     result: list[UserRow] = []
@@ -1272,12 +1268,10 @@ def add_unredeemed_payment_tx(tx:                                db.SQLTransacti
                 'google_order_id':                  payment_tx.google_order_id,
                 'expires_at':                expires_at,
                 'platform_refund_expires_at': platform_refund_expires_at,
-                'grace_period':         datetime.timedelta(0),
                 'purchased_at':            purchased_at,
                 'auto_renewing':                    True,  # on by default until Google notifies otherwise
                 'refund_requested_at':      None,
                 'google_obfuscated_account_id':     platform_obfuscated_account_id,
-                'apple_app_account_token':          '',    # n/a for Google
             })
 
     elif payment_tx.provider == base.PaymentProvider.iOSAppStore:
@@ -1307,7 +1301,6 @@ def add_unredeemed_payment_tx(tx:                                db.SQLTransacti
                 'apple_web_line_order_tx_id':       payment_tx.apple_web_line_order_tx_id,
                 'expires_at':                expires_at,
                 'platform_refund_expires_at': platform_refund_expires_at,
-                'grace_period':         datetime.timedelta(0),
                 'purchased_at':            purchased_at,
                 'auto_renewing':                    True,  # on by default until Apple notifies otherwise
                 'refund_requested_at':      None,
@@ -1329,11 +1322,9 @@ def add_unredeemed_payment_tx(tx:                                db.SQLTransacti
                 'rangeproof_order_id':              payment_tx.rangeproof_order_id,
                 'expires_at':                expires_at,
                 'platform_refund_expires_at': platform_refund_expires_at,
-                'grace_period':         datetime.timedelta(0),
                 'purchased_at':            purchased_at,
                 'auto_renewing':                    False,  # Rangeproof vouchers never auto-renew
                 'refund_requested_at':      None,
-                'apple_app_account_token':          '',     # n/a for Rangeproof
             })
 
     # NOTE: Find the latest master pkey associated with the common payment identifier (google payment
@@ -1491,15 +1482,13 @@ def get_or_create_user_and_generation(tx: db.SQLTransaction, master_pkey: nacl.s
     user_id, gen_id = seq_row[0], seq_row[1]
     token           = nacl.utils.random(BLAKE2B_DIGEST_SIZE)
     won = db.query_one(tx.conn, '''
-        INSERT INTO users (id, master_pkey, current_generation_id, expires_at, grace_period, google_obfuscated_account_id, apple_app_account_token)
-        VALUES            (%(id)s, %(master_pkey)s, %(gen_id)s, to_timestamp(0), '0'::interval, %(google_id)s, %(apple_id)s)
+        INSERT INTO users (id, master_pkey, current_generation_id, expires_at)
+        VALUES            (%(id)s, %(master_pkey)s, %(gen_id)s, to_timestamp(0))
         ON CONFLICT (master_pkey) DO NOTHING
         RETURNING id
     ''', id          = user_id,
          master_pkey = master_pkey_bytes,
-         gen_id      = gen_id,
-         google_id   = google_obfuscated_account_id_from_master_pkey(master_pkey),
-         apple_id    = apple_obfuscated_account_id_from_master_pkey(master_pkey))
+         gen_id      = gen_id)
     if won is None:
         # Lost a concurrent create — re-read the winner (our pre-allocated ids simply go unused).
         winner = get_user_from_sql_tx(tx, master_pkey)
@@ -1540,18 +1529,14 @@ def _allocate_new_gen_id_if_master_pkey_has_payments(tx:          db.SQLTransact
                expires_at                   = %(expiry)s,
                grace_period                 = %(grace)s,
                auto_renewing                = %(auto_renewing)s,
-               refund_requested_at          = %(refund_ts)s,
-               google_obfuscated_account_id = %(google_id)s,
-               apple_app_account_token      = %(apple_id)s
+               refund_requested_at          = %(refund_ts)s
         WHERE  id = %(user_id)s
     ''', gen_id        = result.generation_id,
          user_id       = user.id,
          expiry        = lookup.best_expiry,
          grace         = lookup.best_grace,
          auto_renewing = lookup.best_auto_renewing,
-         refund_ts     = lookup.best_refund_requested,
-         google_id     = google_obfuscated_account_id_from_master_pkey(master_pkey),
-         apple_id      = apple_obfuscated_account_id_from_master_pkey(master_pkey))
+         refund_ts     = lookup.best_refund_requested)
     result.grace_period = lookup.best_grace
 
     return result
@@ -1851,13 +1836,13 @@ def add_user_error_tx(tx: db.SQLTransaction, error: UserError, at: datetime.date
             pass
         case base.PaymentProvider.GooglePlayStore:
             assert len(error.google_payment_token) > 0
-            _ = db.query(tx.conn, '''INSERT INTO user_errors (payment_provider, payment_id, at) VALUES (%(provider)s, %(payment_id)s, %(ts)s) ON CONFLICT DO NOTHING''',
+            _ = db.query(tx.conn, '''INSERT INTO user_errors (payment_provider, payment_id, errored_at) VALUES (%(provider)s, %(payment_id)s, %(ts)s) ON CONFLICT DO NOTHING''',
                  provider=int(error.provider.value),
                  payment_id=error.google_payment_token,
                  ts=at)
         case base.PaymentProvider.iOSAppStore:
             assert len(error.apple_original_tx_id) > 0
-            _ = db.query(tx.conn, '''INSERT INTO user_errors (payment_provider, payment_id, at) VALUES (%(provider)s, %(payment_id)s, %(ts)s) ON CONFLICT DO NOTHING''',
+            _ = db.query(tx.conn, '''INSERT INTO user_errors (payment_provider, payment_id, errored_at) VALUES (%(provider)s, %(payment_id)s, %(ts)s) ON CONFLICT DO NOTHING''',
                  provider=int(error.provider.value),
                  payment_id=error.apple_original_tx_id,
                  ts=at)

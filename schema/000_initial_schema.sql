@@ -14,13 +14,13 @@ CREATE TABLE IF NOT EXISTS users (
     -- generation can be inserted together in one transaction.
     current_generation_id        BIGINT      NOT NULL,
     expires_at                   TIMESTAMPTZ NOT NULL,
-    grace_period                 INTERVAL    NOT NULL,
+    grace_period                 INTERVAL    NOT NULL DEFAULT '0'::interval,
     auto_renewing                BOOLEAN     NOT NULL DEFAULT FALSE,
     -- NULL = no refund requested.
-    refund_requested_at          TIMESTAMPTZ,
-    google_obfuscated_account_id BYTEA       CHECK (octet_length(google_obfuscated_account_id) = 32),
-    -- NULL = not an Apple account.
-    apple_app_account_token      TEXT
+    refund_requested_at          TIMESTAMPTZ
+    -- (No account-id columns here: the provider account ids are pure functions of master_pkey — see
+    -- {google,apple}_obfuscated_account_id_from_master_pkey — and are stored on `payments` only, where
+    -- they serve as the auto-redeem lookup key. Persisting them on the user row was redundant.)
 );
 
 -- Enumerated value sets. The code string is the canonical value used in Python, on the wire, and in the
@@ -45,8 +45,8 @@ CREATE TABLE IF NOT EXISTS payments (
     id                                BIGINT  GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     user_id                           BIGINT  REFERENCES users(id),   -- NULL until redeemed
     -- No `status` column: it is derived from the timestamps below (redeemed/revoked/expiry) — see
-    -- backend.derive_payment_status. redeemed_unix_ts_ms IS NULL = unredeemed; revoked_unix_ts_ms
-    -- IS NOT NULL = revoked; now >= expiry_unix_ts_ms = expired.
+    -- backend.derive_payment_status. redeemed_at IS NULL = unredeemed; revoked_at IS NOT NULL = revoked;
+    -- now >= expires_at = expired.
     plan                              TEXT        NOT     NULL REFERENCES pro_plans(code),
     payment_provider                  TEXT        NOT     NULL REFERENCES payment_providers(code),
     auto_renewing                     BOOLEAN     NOT     NULL DEFAULT FALSE,
@@ -56,7 +56,7 @@ CREATE TABLE IF NOT EXISTS payments (
 
     redeemed_at                       TIMESTAMPTZ,                    -- NULL until redeemed
     expires_at                        TIMESTAMPTZ NOT     NULL,
-    grace_period                      INTERVAL,
+    grace_period                      INTERVAL    NOT NULL DEFAULT '0'::interval,
     platform_refund_expires_at        TIMESTAMPTZ NOT     NULL,
     revoked_at                        TIMESTAMPTZ,                    -- NOT NULL once revoked
 
@@ -71,7 +71,20 @@ CREATE TABLE IF NOT EXISTS payments (
     refund_requested_at               TIMESTAMPTZ,
     google_obfuscated_account_id      BYTEA       CHECK (octet_length(google_obfuscated_account_id) = 32),
     -- NULL = not an Apple payment.
-    apple_app_account_token           TEXT
+    apple_app_account_token           TEXT,
+
+    -- Enforce in the schema what the ingest code assumes: a payment carries the identifying tx-id of its
+    -- own provider (item 15). Guards against a miswired insert storing e.g. a google_play row with no
+    -- google_payment_token, or another provider's ids.
+    CONSTRAINT payments_provider_tx_id CHECK (
+        (payment_provider = 'google_play' AND google_payment_token IS NOT NULL) OR
+        (payment_provider = 'app_store'   AND apple_tx_id          IS NOT NULL) OR
+        (payment_provider = 'rangeproof'  AND rangeproof_order_id  IS NOT NULL)
+    )
+    -- (No `redeemed_at IS NULL OR user_id IS NOT NULL` CHECK: redemption marks the payment redeemed and
+    -- backfills user_id in two statements of one transaction, so "redeemed ⟹ owned" holds only at COMMIT.
+    -- A CHECK fires per-statement and can't be DEFERRABLE, so it can't express this; the code ordering
+    -- guarantees it. A correctness-audit item, not a schema constraint.)
 );
 
 -- Indexes (item 13): partial where the column is NULL for rows it doesn't apply to (one provider's ids
@@ -147,7 +160,7 @@ CREATE INDEX IF NOT EXISTS google_notification_history_unhandled ON google_notif
 CREATE TABLE IF NOT EXISTS user_errors (
     payment_provider   TEXT NOT NULL REFERENCES payment_providers(code),
     payment_id         TEXT NOT NULL,
-    at                 TIMESTAMPTZ NOT NULL,
+    errored_at         TIMESTAMPTZ NOT NULL,
     PRIMARY KEY (payment_provider, payment_id)
 );
 
