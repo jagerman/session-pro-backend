@@ -38,7 +38,7 @@ assert len(GET_PRO_DETAILS_HASH_PERSONALISATION)              == hashlib.blake2b
 # name in `payment_row_from_dict`, so order here is cosmetic (no positional coupling).
 # `master_pkey` lives only in `users` now, so payments reads come from `PAYMENTS_FROM` (payments LEFT
 # JOIN users) and pull the pkey from the joined users row — NULL for an unredeemed payment (user_id
-# NULL), exactly as the per-row column used to be.
+# NULL).
 PAYMENTS_COLUMNS = (
     "p.id, u.master_pkey, p.plan, p.payment_provider, p.auto_renewing, "
     "p.purchased_at, p.redeemed_at, p.expires_at, "
@@ -130,7 +130,7 @@ class ProSubscriptionProof:
 
 @dataclasses.dataclass
 class LookupUserExpiry:
-    # `None` expiry = "no such payment found yet" (was a 0 sentinel). Durations default to zero.
+    # `None` expiry = "no such payment found yet". Durations default to zero.
     expiry_from_redeemed:           datetime.datetime  | None = None
     grace_from_redeemed:            datetime.timedelta        = datetime.timedelta(0)
     refund_requested_from_redeemed: datetime.datetime  | None = None
@@ -426,8 +426,7 @@ def payment_row_from_dict(row: dict[str, typing.Any]) -> PaymentRow:
 def derive_payment_status(payment: PaymentRow, now: datetime.datetime) -> base.PaymentStatus:
     """Derive the single display status from a payment's timestamps against `now`.
 
-    `status` is not stored; it's computed. Precedence matches the old stored-transition semantics:
-    revoked > expired > redeemed > unredeemed.
+    `status` is not stored; it's computed with precedence revoked > expired > redeemed > unredeemed.
     """
     if payment.revoked_at is not None:
         return base.PaymentStatus.Revoked
@@ -554,67 +553,6 @@ def set_global_datetime(conn: psycopg.Connection, key: str, value: datetime.date
 
 def get_revocation_ticket(conn: psycopg.Connection) -> int:
     return get_global_int(conn, 'revocation_ticket')
-
-def db_info_string(conn: psycopg.Connection, db_url: str, err: base.ErrorSink, backend_pkey: nacl.signing.VerifyKey | None = None) -> str:
-    unredeemed_payments             = 0
-    payments                        = 0
-    users                           = 0
-    revocations                     = 0
-    db_size                         = 0
-    user_errors                     = 0
-    apple_notification_uuid_history = 0
-    google_notification_history     = 0
-    with db.transaction(conn) as tx:
-        try:
-            row = db.query_one(tx.conn, 'SELECT COUNT(*) FROM payments WHERE redeemed_at IS NULL AND revoked_at IS NULL')
-            if row:
-                unredeemed_payments = row[0]
-
-            row = db.query_one(tx.conn, 'SELECT COUNT(*) FROM payments')
-            if row:
-                payments = row[0]
-
-            row = db.query_one(tx.conn, 'SELECT COUNT(*) FROM users')
-            if row:
-                users = row[0]
-
-            row = db.query_one(tx.conn, 'SELECT COUNT(*) FROM generations WHERE revoked_at IS NOT NULL')
-            if row:
-                revocations = row[0]
-
-            row = db.query_one(tx.conn, 'SELECT COUNT(*) FROM user_errors')
-            if row:
-                user_errors = row[0]
-
-            row = db.query_one(tx.conn, 'SELECT COUNT(*) FROM apple_notification_uuid_history')
-            if row:
-                apple_notification_uuid_history = row[0]
-
-            row = db.query_one(tx.conn, 'SELECT COUNT(*) FROM google_notification_history')
-            if row:
-                google_notification_history = row[0]
-        except Exception as e:
-            err.msg_list.append(f"Failed to retrieve DB metadata: {e}")
-
-    result = ''
-    if len(err.msg_list) == 0:
-        size_row = db.query_one(conn, 'SELECT pg_database_size(current_database())')
-        if size_row:
-            db_size = size_row[0]
-
-        generations_count = db.query_one(conn, 'SELECT COUNT(*) FROM generations')
-        generations       = generations_count[0] if generations_count else 0
-
-        lines: list[str] = []
-        lines.append('  DB:                               {} ({})'.format(db_url, base.format_bytes(db_size)))
-        lines.append('  Users/Revoked/Payments/Unredeemed: {}/{}/{}/{}'.format(users, revocations, payments, unredeemed_payments))
-        lines.append('  U.Errors/Google/Apple Notifs.:    {}/{}/{}'.format(user_errors, google_notification_history, apple_notification_uuid_history))
-        lines.append('  Generations:                      {}'.format(generations))
-        backend_key_str = bytes(backend_pkey).hex() if backend_pkey is not None else 'n/a (loaded from disk at runtime)'
-        lines.append('  Backend Key:                      {}'.format(backend_key_str))
-        result = '\n'.join(lines)
-
-    return result
 
 def bootstrap_db(database_url: str, err: base.ErrorSink) -> psycopg_pool.ConnectionPool | None:
     """ Opens the database pool and bootstraps/migrates the schema if needed. """
@@ -1046,9 +984,9 @@ def _lookup_user_expiry_tx(tx: db.SQLTransaction, master_pkey: nacl.signing.Veri
     # By definition we can't lookup unredeemed payments because they don't have a master public key
     # registered for it yet (e.g. the user has not associated a master public key with the payment
     # yet by redeeming it).
-    # All of a user's linked payments are redeemed-or-later (user_id is set only at redemption), so the
-    # user_id filter alone replaces the old `status IN (redeemed, revoked, expired)` — unredeemed
-    # payments have no user_id. redeemed/expired/revoked are derived from the timestamps below.
+    # All of a user's linked payments are redeemed-or-later (user_id is set only at redemption), so
+    # filtering on user_id selects exactly those — unredeemed payments have no user_id.
+    # redeemed/expired/revoked are then derived from the timestamps below.
     result_set = db.query(tx.conn, ('''
         SELECT    expires_at, grace_period, auto_renewing, redeemed_at, refund_requested_at, payment_provider, apple_original_tx_id, google_order_id, rangeproof_order_id, revoked_at
         FROM      payments
@@ -1920,10 +1858,9 @@ def expire_payments_revocations_and_users(conn: psycopg.Connection, now: datetim
     # windowing / cross-process "only one wins" guard: a redundant run simply deletes nothing.
     result = ExpireResult()
     with db.transaction(conn) as tx:
-        # Revocations are no longer a separate prunable table: a revocation is generations.revoked_at, and
-        # generations are entitlement history (and FK'd from users.current_generation_id), so they aren't
-        # deleted here — the served revocation list filters by retain_for instead. (Safely pruning ancient,
-        # unreferenced revoked generations is a later item.)
+        # A revocation is generations.revoked_at, and generations are entitlement history (FK'd from
+        # users.current_generation_id), so they aren't deleted here — the served revocation list filters
+        # by retain_for instead. (Safely pruning ancient, unreferenced revoked generations is a later item.)
         users_result  = db.query(tx.conn, '''DELETE FROM users WHERE id NOT IN (SELECT user_id FROM payments WHERE user_id IS NOT NULL)''')
         apple_result  = db.query(tx.conn, '''DELETE FROM apple_notification_uuid_history WHERE %s >= expires_at''', now)
         google_result = db.query(tx.conn, '''DELETE FROM google_notification_history WHERE %s >= expires_at AND handled = TRUE''', now)

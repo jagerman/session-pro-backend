@@ -92,14 +92,8 @@ def entry_point() -> flask.Flask:
     assert engine
 
     with db.connection(engine) as conn:
-        # NOTE: Dump some startup diagnostics
-        info_string: str = backend.db_info_string(conn=conn, db_url=parsed_args.db_url, backend_pkey=backend_key.verify_key, err=err)
-        if len(err.msg_list) > 0:
-            log.error(f"{err.msg_list}")
-            sys.exit(1)
-
         startup_log = '\n'
-        startup_log += f'Session Pro Backend\n{info_string}\n'
+        startup_log += f'Session Pro Backend\n'
         startup_log += f'  Features:\n'
         if len(parsed_args.ini_path) > 0:
             startup_log += f'    Config .INI file loaded: {parsed_args.ini_path}\n'
