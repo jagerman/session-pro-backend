@@ -505,7 +505,6 @@ import datetime
 import dataclasses
 import enum
 import flask
-import hashlib
 import json
 import nacl.bindings
 import nacl.public
@@ -544,11 +543,6 @@ FLASK_ROUTE_GET_PRO_REVOCATIONS                     = '/get_pro_revocations'
 FLASK_ROUTE_GET_PRO_DETAILS                         = '/get_pro_details'
 FLASK_ROUTE_SET_PAYMENT_REFUND_REQUESTED            = '/set_payment_refund_requested'
 FLASK_ROUTE_STATUS                                  = '/status'
-
-SET_PAYMENT_REFUND_REQUESTED_PERSONALISATION   = b'ProSetRefundReq_'
-GET_PRO_PAYMENTS_DETAIL_PERSONALISATION        = b'ProGetProDetReq_'
-assert len(SET_PAYMENT_REFUND_REQUESTED_PERSONALISATION) == hashlib.blake2b.PERSON_SIZE
-assert len(GET_PRO_PAYMENTS_DETAIL_PERSONALISATION)      == hashlib.blake2b.PERSON_SIZE
 
 # The object containing routes that you register onto a Flask app to turn it
 # into an app that accepts Session Pro Backend client requests.

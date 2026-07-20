@@ -24,16 +24,16 @@ ZERO_BYTES32               = bytes(32)
 BLAKE2B_DIGEST_SIZE        = 32
 log                        = logging.Logger("BACKEND")
 # 16-byte domain-separation prefix on the signed MESSAGE (signatures are Ed25519 over the message
-# directly — not a BLAKE2b personalisation any more; see signed_message). Kept at 16 bytes with the same
-# values so the proof's version-selecting personalisation (Q12) is unchanged.
-PERSONALISATION_SIZE                         = 16
-GENERATE_PROOF_PERSONALISATION               = b'ProGenerateProof'
-BUILD_PROOF_PERSONALISATION                  = b'ProProof_v0_____'  # version lives IN the personalisation (Q12), not a byte/field
-ADD_PRO_PAYMENT_PERSONALISATION              = b'ProAddPayment___'
-SET_PAYMENT_REFUND_REQUESTED_PERSONALISATION = b'ProSetRefundReq_'
-GET_PRO_DETAILS_PERSONALISATION              = b'ProGetProDetReq_'
-assert all(len(p) == PERSONALISATION_SIZE for p in (GENERATE_PROOF_PERSONALISATION, BUILD_PROOF_PERSONALISATION,
-           ADD_PRO_PAYMENT_PERSONALISATION, SET_PAYMENT_REFUND_REQUESTED_PERSONALISATION, GET_PRO_DETAILS_PERSONALISATION))
+# directly — no BLAKE2b, so this is a domain prefix, not a hash personalisation; see signed_message).
+# Kept at 16 bytes with the same values so the proof's version-selecting domain prefix (Q12) is unchanged.
+DOMAIN_SIZE                         = 16
+GENERATE_PROOF_DOMAIN               = b'ProGenerateProof'
+BUILD_PROOF_DOMAIN                  = b'ProProof_v0_____'  # version lives IN the domain prefix (Q12), not a byte/field
+ADD_PRO_PAYMENT_DOMAIN              = b'ProAddPayment___'
+SET_PAYMENT_REFUND_REQUESTED_DOMAIN = b'ProSetRefundReq_'
+GET_PRO_DETAILS_DOMAIN              = b'ProGetProDetReq_'
+assert all(len(p) == DOMAIN_SIZE for p in (GENERATE_PROOF_DOMAIN, BUILD_PROOF_DOMAIN,
+           ADD_PRO_PAYMENT_DOMAIN, SET_PAYMENT_REFUND_REQUESTED_DOMAIN, GET_PRO_DETAILS_DOMAIN))
 
 # Explicit column list for payments table queries. Rows are read with `db.dict_row` and unpacked by
 # name in `payment_row_from_dict`, so order here is cosmetic (no positional coupling).
@@ -111,14 +111,14 @@ class ProSubscriptionProof:
     sig:            bytes                  = b''
 
     def to_dict(self) -> dict[str, str | int]:
-        # `version` is a PLAINTEXT field, deliberately NOT in the signed digest (Q12). It is the
-        # external indicator a verifier reads to pick the personalisation + layout it must use to
-        # reconstruct and check the digest; v0's personalisation is BUILD_PROOF_PERSONALISATION
-        # (`ProProof_v0_____`). The version→personalisation map is per-version and arbitrary — a future
-        # version may choose any personalisation (or reshape the proof entirely); a verifier simply
+        # `version` is a PLAINTEXT field, deliberately NOT bound into the signature (Q12). It is the
+        # external indicator a verifier reads to pick the domain prefix + layout it must use to
+        # reconstruct and check the signed message; v0's domain prefix is BUILD_PROOF_DOMAIN
+        # (`ProProof_v0_____`). The version→domain-prefix map is per-version and arbitrary — a future
+        # version may choose any domain prefix (or reshape the proof entirely); a verifier simply
         # refuses a version it doesn't understand, so nothing old breaks. The version is thus a
         # verification *input*, never discovered through the signature; tampering with it just makes the
-        # verifier pick the wrong personalisation → signature fails.
+        # verifier pick the wrong domain prefix → signature fails.
         result = {
             "version":        self.version,
             "revocation_tag": self.revocation_tag.hex(),
@@ -362,9 +362,9 @@ def to_redeemed_at(at: datetime.datetime) -> datetime.datetime:
 # negatives, so count=-1 and unbounded values Just Work); str as UTF-8. A `\0` separates two ADJACENT
 # variable-length (datetime/int/str) fields; fixed-width fields need no separator. Only payment_id can
 # contain a `\0` and it is always the final field, so the framing is unambiguous.
-def signed_message(personalisation: bytes, *fields: nacl.signing.VerifyKey | bytes | datetime.datetime | int | str) -> bytes:
-    assert len(personalisation) == PERSONALISATION_SIZE
-    out           = bytearray(personalisation)
+def signed_message(domain: bytes, *fields: nacl.signing.VerifyKey | bytes | datetime.datetime | int | str) -> bytes:
+    assert len(domain) == DOMAIN_SIZE
+    out           = bytearray(domain)
     prev_variable = False
     for field in fields:
         if isinstance(field, (nacl.signing.VerifyKey, bytes, bytearray)):
@@ -386,16 +386,16 @@ def signed_message(personalisation: bytes, *fields: nacl.signing.VerifyKey | byt
 def make_add_pro_payment_message(master_pkey:   nacl.signing.VerifyKey,
                                  rotating_pkey: nacl.signing.VerifyKey,
                                  payment_tx:    UserPaymentTransaction) -> bytes:
-    return signed_message(ADD_PRO_PAYMENT_PERSONALISATION, master_pkey, rotating_pkey,
+    return signed_message(ADD_PRO_PAYMENT_DOMAIN, master_pkey, rotating_pkey,
                           payment_tx.provider.value, payment_tx.payment_id)
 
 def make_set_payment_refund_requested_message(master_pkey: nacl.signing.VerifyKey, request_at: datetime.datetime, refund_requested_at: datetime.datetime, payment_tx: UserPaymentTransaction) -> bytes:
-    return signed_message(SET_PAYMENT_REFUND_REQUESTED_PERSONALISATION, master_pkey,
+    return signed_message(SET_PAYMENT_REFUND_REQUESTED_DOMAIN, master_pkey,
                           request_at, refund_requested_at,
                           payment_tx.provider.value, payment_tx.payment_id)
 
 def make_get_pro_details_message(master_pkey: nacl.signing.VerifyKey, request_at: datetime.datetime, count: int) -> bytes:
-    return signed_message(GET_PRO_DETAILS_PERSONALISATION, master_pkey, request_at, count)
+    return signed_message(GET_PRO_DETAILS_DOMAIN, master_pkey, request_at, count)
 
 def payment_row_from_dict(row: dict[str, typing.Any]) -> PaymentRow:
     # Rows come from a dict row factory (SELECT PAYMENTS_COLUMNS FROM PAYMENTS_FROM, row_factory=
@@ -1551,13 +1551,13 @@ def make_generate_pro_proof_message(master_pkey:   nacl.signing.VerifyKey,
                                     request_at:    datetime.datetime) -> bytes:
     '''The message the user signs to authorise a new rotating_pkey for master_pkey's Session Pro
     subscription.'''
-    return signed_message(GENERATE_PROOF_PERSONALISATION, master_pkey, rotating_pkey, request_at)
+    return signed_message(GENERATE_PROOF_DOMAIN, master_pkey, rotating_pkey, request_at)
 
 def build_proof_message(revocation_tag: bytes,
                         rotating_pkey:  nacl.signing.VerifyKey,
                         expires_at:     datetime.datetime) -> bytes:
     '''The message the backend signs to certify a proof.'''
-    return signed_message(BUILD_PROOF_PERSONALISATION, revocation_tag, rotating_pkey, expires_at)
+    return signed_message(BUILD_PROOF_DOMAIN, revocation_tag, rotating_pkey, expires_at)
 
 def _build_proof_clamped_expiry_time(request_at: datetime.datetime, proposed_expires_at: datetime.datetime) -> datetime.datetime:
     # NOTE: Clamp the expiry time of the proof to 1 month and also make it land on the day boundary

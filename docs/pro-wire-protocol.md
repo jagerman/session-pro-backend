@@ -89,8 +89,8 @@
   which is what binds the version into the signature. You can't learn a version
   *through* a signature you haven't verified — you must already know it to reconstruct the message — so the
   version rides in the clear as data and a version byte inside the message would be redundant. The
-  version→personalisation map is per-version and arbitrary — a future version may choose any
-  personalisation; a verifier refuses versions it doesn't know, so nothing old breaks.
+  version→domain-prefix map is per-version and arbitrary — a future version may choose any
+  domain prefix; a verifier refuses versions it doesn't know, so nothing old breaks.
 
 ## 2. The Pro proof (signed by the backend)
 
@@ -99,7 +99,7 @@ verified offline**; it carries **no user identity**.
 
 **Wire (JSON):**
 ```
-{ "version": 0,                   // plaintext; selects the personalisation (see below). NOT hashed.
+{ "version": 0,                   // plaintext; selects the domain prefix (see below). NOT hashed.
   "revocation_tag": "<64 hex>",   // opaque 32-byte value; see §2.1
   "rotating_pkey":  "<64 hex>",   // Ed25519 public key the proof entitles
   "expiry_ts": <int>,             // seconds; entitlement valid until this instant
@@ -329,19 +329,19 @@ a `_ts` marker, durations `…_duration`. Audit every response key against both 
     add-payment / set-refund signed messages** (was a 1-byte int, now the UTF-8 `provider_code`), so that's
     a **both-sides-flip**. `plan` is `"1m"/"3m"/"1y"` (period code, not a lookup of tiers-with-attributes).
 11. **Drop the in-digest version byte everywhere; version requests via the endpoint, the proof via a
-    plaintext field that selects its personalisation** (Q11 + Q12) — *both-sides-flip*. The leading
+    plaintext field that selects its domain prefix** (Q11 + Q12) — *both-sides-flip*. The leading
     `version(1)` byte is removed from all five signed digests. Rationale: you can never learn a version
     *through* a signature you have not yet verified, while verifying requires you to already know it — so
     an in-message byte discovers nothing. For **requests** the version goes entirely (field + any marker): a
-    new request shape earns a **new endpoint**, whose personalisation is the discriminator. For the
+    new request shape earns a **new endpoint**, whose domain prefix is the discriminator. For the
     **proof** — a free-floating, offline-verified credential with no endpoint — the version stays as a
     **plaintext `version` field** (a verification input): the verifier reads it and maps the proof
-    **data → (personalisation, digest)**, looking up the personalisation for that version (v0 →
+    **data → (domain prefix, layout)**, looking up the domain prefix for that version (v0 →
     `ProProof_v0_____`; the map is per-version and arbitrary — a future version may pick any
-    personalisation, and a verifier just refuses versions it doesn't know). The personalisation — not a
+    domain prefix, and a verifier just refuses versions it doesn't know). The domain prefix — not a
     byte — is what binds the version into the signature; tampering with the plaintext field just makes
     verification fail. Backend + libsession flip
-    in lockstep (proof personalisation `ProProof________` → `ProProof_v0_____`).
+    in lockstep (proof domain prefix `ProProof________` → `ProProof_v0_____`).
 12. **Response envelope: string `status` + `error_code` slug + single `error` string** (§5) —
     *both-sides-flip*. Replaces the integer status codes (`0` ok, `1` generic error, `2` parse error,
     `100` already-redeemed, `101` unknown-payment). Concretely:
