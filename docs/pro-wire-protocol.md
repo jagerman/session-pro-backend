@@ -199,14 +199,55 @@ prunes its *own* served list on the same basis (`creation + retain_for`) to keep
 bumping `ticket`, so a prune never triggers a client re-fetch. (This kills the old per-entry `expiry_ts`,
 whose value was the entitlement expiry — up to a *year* for long subs, absurd for a cleanup timer.)
 
-## 5. Other JSON responses
+## 5. Response envelope
 
-`get-pro-details` and payment/refund responses are unsigned JSON data. They carry the same conventions:
-timestamps are `_ts` seconds — **integer** everywhere except the two upstream provider event instants
-`purchased_ts` and `revoked_ts`, which are **floats** to keep provider sub-second precision (§1) — enums
-are their string `code`s (§1), byte strings are hex, and no key name leaks an internal implementation
-detail (see §6). (Their per-field shapes track `server.py`; only the naming/units rules here are
-normative for them.)
+Every endpoint returns HTTP 200 with a JSON object discriminated by **`status`** (the envelope `status` is
+authoritative for the application outcome; HTTP status is not used for it):
+
+- `"ok"` — success; the payload is in **`result`** (an object, shape per endpoint). No `error`/`error_code`.
+- `"fail"` — the request was understood but rejected by the client's input or a state precondition (the
+  HTTP-4xx family: bad args, not-found, conflict). The client's to fix or accept; retrying the *identical*
+  request generally won't help (the one exception is `stale_request`).
+- `"error"` — the backend faulted while handling it (HTTP-5xx family: unhandled exception, DB fault). The
+  client did nothing wrong; the same request may succeed later.
+
+Non-`ok` responses carry two fields:
+- **`error_code`** — a stable lowercase-`snake_case` machine slug, **always present** on non-`ok`. This is
+  the identifier a client keys its localized (Crowdin) message off; an unrecognized (newer) slug degrades
+  gracefully — the client falls back to `status`-level handling and/or shows `error`.
+- **`error`** — a single human English string. It is a **fallback + diagnostic, NOT the user-facing text**
+  (the user-facing text comes from the `error_code`→translation map). A client shows it only when it does
+  not recognize the slug, and logs it. (Was an array `errors`; it is now one string, and on a malformed
+  request the server reports the *first* bad field, not an accumulated list.)
+
+```
+{ "status": "ok",    "result": { … } }
+{ "status": "fail",  "error_code": "<slug>", "error": "<english>" }
+{ "status": "error", "error_code": "<slug>", "error": "<english>" }
+```
+
+### 5.1 `error_code` vocabulary
+
+| slug | status | when / client action |
+| --- | --- | --- |
+| `invalid_request` | fail | malformed JSON, missing/wrong-type field, bad hex, out-of-range value, unsupported/disabled provider. A correct client never sees this. |
+| `bad_signature` | fail | a request signature failed to verify. A correct client never sees this. |
+| `stale_request` | fail | request timestamp outside the replay-tolerance window. The client may re-fetch server time (`/status`) and retry. |
+| `unknown_payment` | fail | `add_pro_payment`: no payment matching those provider IDs is known for this user. Often transient (provider notification not yet received) → retry later. |
+| `expired` | fail | the user's entitlement has lapsed → "renew" CTA. |
+| `not_subscribed` | fail | no entitlement on record (never subscribed, or pruned after long inactivity) → "subscribe" CTA. |
+| `revoked` | fail | the user's current entitlement was revoked. Treat as `expired` (renew) on clients today; the distinct slug is reserved for a future revoked-specific flow. |
+| `internal_error` | error | backend fault; not the client's doing. |
+
+### 5.2 Result payloads
+
+`get-pro-details` and payment/refund `result` bodies are unsigned JSON data. They carry the same
+conventions: timestamps are `_ts` seconds — **integer** everywhere except the two upstream provider event
+instants `purchased_ts` and `revoked_ts`, which are **floats** to keep provider sub-second precision (§1) —
+enums are their string `code`s (§1), byte strings are hex, and no key name leaks an internal implementation
+detail (see §6). (Their per-field shapes track `server.py`; only the naming/units rules here are normative
+for them.) Note some non-error outcomes live *in* `result`, not as a `fail`: get-details reports account
+state as `user_pro_status` (`never`/`active`/`expired`), and set-refund returns `{ "updated": <bool> }`.
 
 ## 6. Field-naming rule
 Wire (JSON) field names describe **purpose to the consumer**, never server implementation, and carry
@@ -272,6 +313,32 @@ a `_ts` marker, durations `…_duration`. Audit every response key against both 
     byte — is what binds the version into the signature; tampering with the plaintext field just makes
     verification fail. Backend + libsession flip
     in lockstep (proof personalisation `ProProof________` → `ProProof_v0_____`).
+12. **Response envelope: string `status` + `error_code` slug + single `error` string** (§5) —
+    *both-sides-flip*. Replaces the integer status codes (`0` ok, `1` generic error, `2` parse error,
+    `100` already-redeemed, `101` unknown-payment). Concretely:
+    - **`status`**: int → `"ok"` / `"fail"` / `"error"` — `fail` = client's fault / precondition (4xx
+      family), `error` = backend fault (5xx family). Success payload stays in `result`.
+    - **`errors` (array) → `error` (single string)**, and it is now *fallback/diagnostic only* — the
+      user-facing text comes from mapping `error_code` to a localized (Crowdin) string. On a malformed
+      request the server reports the **first** bad field, not an accumulated list.
+    - new **`error_code`** slug, always present on non-`ok`; full vocabulary in §5.1. Slugs are plain (no
+      `pro_` prefix on the wire); clients own their prefixed translation keys. New slugs are additive —
+      an unrecognized one must degrade to `status`-level handling, never hard-fail the parse.
+    - **`add_pro_payment` is now idempotent.** A re-redeem of an already-redeemed payment returns `"ok"` +
+      a freshly-signed proof for the user's current entitlement (identical to a first redemption), instead
+      of the old `already_redeemed` (100) error — that slug is **deleted**. This establishes the invariant
+      **`ok` ⟹ a proof is present** on the proof-returning endpoints. A genuinely lapsed entitlement
+      (`expired`/`revoked`) or unrecognised payment (`unknown_payment`) is a `fail` with that slug.
+    - HTTP status is always **200**; the envelope `status` is authoritative.
+    - Fixes current miscategorisation: signature failure and timestamp-out-of-tolerance (today variously
+      `PARSE_ERROR`/`GENERIC_ERROR`) become `fail` + `bad_signature` / `stale_request`.
+    - **Client actions:** parse `{status, result}` vs `{status, error_code, error}`; treat `ok`⟹proof
+      present; map each `error_code` to a Crowdin string (developer-facing `invalid_request`/
+      `bad_signature`/`internal_error` may share one generic message); **delete the already-redeemed
+      special-case** (Android's no-op branch, iOS's `needsRefreshProProof` skip — the normal success path
+      now covers it); `expired`→renew, `not_subscribed`→subscribe, `revoked`→renew (until/unless a
+      revoked-specific flow is built). *(Backend-internal, not wire: the `make_error_response` returns
+      become raised exceptions and `ErrorSink` is removed — no client impact.)*
 
 ## Open (coordination)
 - **Spec home:** this file, in the backend repo (`docs/pro-wire-protocol.md`), is proposed as the
@@ -279,3 +346,8 @@ a `_ts` marker, durations `…_duration`. Audit every response key against both 
   location is preferred.
 - *(Resolved: revocation per-entry `expiry_ts` dropped in favour of a single `retain_for` window +
   memory-only client aging — §4. The old entitlement-based expiry is gone.)*
+- *(Resolved: response envelope reworked — §5 + Delta #12. `status` → `ok`/`fail`/`error`, single `error`
+  string, `error_code` slug vocabulary. Confirmed with the client agent: `add_pro_payment` idempotent
+  (`already_redeemed` deleted, `ok`+proof returned — both clients drop their special-case); lapsed slugs
+  `expired`/`not_subscribed` are distinct client CTAs (renew vs subscribe), `revoked` distinct on the wire
+  but treated as `expired` on clients for now.)*
