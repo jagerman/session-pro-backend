@@ -1073,30 +1073,20 @@ def cmd_voucher(args: argparse.Namespace) -> int:
                             print(f"ERROR: Failed to load backend signing key: {e}", file=sys.stderr)
                             return 1
 
-                    # Step 2: Redeem the payment via add_pro_payment
+                    # Step 2: Redeem the payment via add_pro_payment (raises on failure → caught below).
                     print('\nStep 2: Redeeming payment and generating pro proof...')
-                    err = base.ErrorSink()
                     redeem_result = backend.add_pro_payment_tx(
-                        tx                  = tx,
-                        signing_key         = backend_key,
-                        request_at          = request_at,
-                        redeemed_at         = backend.to_redeemed_at(request_at),
-                        master_pkey         = master_pkey,
-                        rotating_pkey       = rotating_pkey,
-                        payment_tx          = backend.UserPaymentTransaction(
+                        tx            = tx,
+                        signing_key   = backend_key,
+                        request_at    = request_at,
+                        redeemed_at   = backend.to_redeemed_at(request_at),
+                        master_pkey   = master_pkey,
+                        rotating_pkey = rotating_pkey,
+                        payment_tx    = backend.UserPaymentTransaction(
                             provider            = base.PaymentProvider.Rangeproof,
                             rangeproof_order_id = rangeproof_order_id
                         ),
-                        err                 = err,
                     )
-
-                    if err.has():
-                        print(f"ERROR: Failed to redeem payment:\n  " + "\n  ".join(err.msg_list), file=sys.stderr)
-                        return 1
-
-                    if redeem_result.status != backend.RedeemPaymentStatus.Success:
-                        print(f"ERROR: Payment redemption failed with status: {redeem_result.status}", file=sys.stderr)
-                        return 1
 
                     print("Success: Payment redeemed and pro proof generated")
                     print(f'\nProof Details:')

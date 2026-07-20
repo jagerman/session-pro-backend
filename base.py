@@ -204,6 +204,39 @@ class ErrorSink:
         result = '\n  '.join(self.msg_list)
         return result
 
+class ErrorCode(enum.StrEnum):
+    '''Machine slugs for the response envelope's `error_code` (wire spec §5.1). Stable, additive: a client
+    keys its localized (Crowdin) message off these; an unrecognised one degrades to status-level handling.'''
+    invalid_request = 'invalid_request'   # fail:  malformed/missing/wrong-type field, bad hex, bad provider
+    bad_signature   = 'bad_signature'     # fail:  a request signature failed to verify
+    stale_request   = 'stale_request'     # fail:  request timestamp outside the replay-tolerance window
+    unknown_payment = 'unknown_payment'   # fail:  no payment matching those provider ids for this user
+    expired         = 'expired'           # fail:  the user's entitlement has lapsed
+    not_subscribed  = 'not_subscribed'    # fail:  no entitlement on record (never subscribed / pruned)
+    revoked         = 'revoked'           # fail:  the user's current entitlement was revoked
+    internal_error  = 'internal_error'    # error: backend fault
+
+class ApiError(Exception):
+    '''An error that renders as a response envelope `{status, error_code, error}` (server.py's error
+    handler catches it). Raise these instead of threading an ErrorSink through the HTTP request path.'''
+    wire_status:  str       = 'error'
+    default_code: ErrorCode = ErrorCode.internal_error
+
+    def __init__(self, message: str, code: ErrorCode | None = None):
+        super().__init__(message)
+        self.code: ErrorCode = code if code is not None else self.default_code
+
+class FailError(ApiError):
+    '''The request was understood but rejected by the client's input or a state precondition (wire
+    `status: "fail"`). Default slug `invalid_request`; pass a more specific `code` where one applies.'''
+    wire_status  = 'fail'
+    default_code = ErrorCode.invalid_request
+
+class ServerError(ApiError):
+    '''The backend faulted handling the request (wire `status: "error"`). The client did nothing wrong.'''
+    wire_status  = 'error'
+    default_code = ErrorCode.internal_error
+
 @dataclasses.dataclass
 class TableStrings:
     name:     str = ''
@@ -283,35 +316,31 @@ class AsyncSessionWebhookLogHandler(logging.Handler):
             self._submit_thread.join(timeout=2)
         super().close()
 
-def verify_payment_provider(payment_provider: PaymentProvider | str, err: ErrorSink | None) -> bool:
-    result = False
-    provider = PaymentProvider.Nil
+def verify_payment_provider(payment_provider: PaymentProvider | str, err: ErrorSink | None = None) -> bool:
     if isinstance(payment_provider, PaymentProvider):
         provider = payment_provider
-        result = True
     else:
         try:
             provider = PaymentProvider(payment_provider)
-            result = True
         except ValueError:
-            if err:
-                err.msg_list.append('Unrecognised payment provider: {}'.format(payment_provider))
+            _require_fail('Unrecognised payment provider: {}'.format(payment_provider), err)
+            return False
 
-    if err and len(err.msg_list) == 0 and provider == PaymentProvider.Nil:
-        err.msg_list.append('Nil payment provider is invalid, must be set to a provider')
+    if provider == PaymentProvider.Nil:
+        _require_fail('Nil payment provider is invalid, must be set to a provider', err)
+        return False
 
-    return result
+    return True
 
-def hex_to_bytes(hex: str, label: str, hex_len: int, err: ErrorSink) -> bytes:
-    result = b''
+def hex_to_bytes(hex: str, label: str, hex_len: int, err: ErrorSink | None = None) -> bytes:
     if len(hex) != hex_len:
-        err.msg_list.append(f'{label} was not {hex_len} characters, was {len(hex)} characters')
-    else:
-        try:
-            result = bytes.fromhex(hex)
-        except Exception as e:
-            err.msg_list.append(f'{label} was not valid hex: {e}')
-    return result
+        _require_fail(f'{label} was not {hex_len} characters, was {len(hex)} characters', err)
+        return b''
+    try:
+        return bytes.fromhex(hex)
+    except Exception as e:
+        _require_fail(f'{label} was not valid hex: {e}', err)
+    return b''
 
 def readable(value: datetime.datetime) -> str:
     # Compact UTC timestamp for logs, millisecond precision (no strftime %f-slice hack).
@@ -568,134 +597,81 @@ def safe_get_dict_value_type(d: dict[str, typing.Any], key: str) -> str:
     v = d.get(key)
     return safe_dump_arbitrary_value_or_type(v)
 
-def json_dict_require_str(d: JSONObject, key: str, err: ErrorSink) -> str:
-    result = ''
-    if key in d:
-        if isinstance(d[key], str):
-            result = typing.cast(str, d[key])
-        else:
-            err.msg_list.append(f'Key "{key}" value was not a string: "{safe_get_dict_value_type(d, key)}"')
+# Typed JSON accessors. Two callers, two error models, ONE branch point (`_require_fail`): the HTTP
+# request path (server.py) omits `err` → the first bad field raises a client-facing FailError; the
+# platform-notification parsers (platform_google*) pass an `err` sink → errors accumulate. (The `err`
+# arm is transitional — it retires when platform_google's error flow moves to exceptions in the
+# ErrorSink-removal sweep; see the refactor plan.)
+def _require_fail(msg: str, err: ErrorSink | None) -> None:
+    if err is not None:
+        err.msg_list.append(msg)
     else:
-        err.msg_list.append(f'Required key "{key}" is missing from JSON: {safe_dump_dict_keys_or_data(d)}')
-    return result
+        raise FailError(msg, code=ErrorCode.invalid_request)
 
-def json_dict_require_int(d: JSONObject, key: str, err: ErrorSink) -> int:
-    result = 0
-    if key in d:
-        if isinstance(d[key], int):
-            result = typing.cast(int, d[key])
-        else:
-            err.msg_list.append(f'Key "{key}" value was not an integer: "{safe_get_dict_value_type(d, key)}"')
-    else:
-        err.msg_list.append(f'Required key "{key}" is missing from JSON: {safe_dump_dict_keys_or_data(d)}')
-    return result
+# A JSON bool is-a int in Python; exclude it so `true` never satisfies an int/number field.
+def _json_is_int(v:    typing.Any) -> bool: return isinstance(v, int) and not isinstance(v, bool)
+def _json_is_number(v: typing.Any) -> bool: return isinstance(v, (int, float)) and not isinstance(v, bool)
 
-def json_dict_require_float(d: JSONObject, key: str, err: ErrorSink) -> float:
-    # Accepts a JSON number (int or float) and returns it as a float. Used for the wire's fractional
-    # -second fields (`purchased_ts`, `revoked_ts`) which may serialise as either `X` or `X.0`.
-    result = 0.0
-    if key in d:
-        if isinstance(d[key], (int, float)) and not isinstance(d[key], bool):
-            result = float(typing.cast(float, d[key]))
-        else:
-            err.msg_list.append(f'Key "{key}" value was not a number: "{safe_get_dict_value_type(d, key)}"')
-    else:
-        err.msg_list.append(f'Required key "{key}" is missing from JSON: {safe_dump_dict_keys_or_data(d)}')
-    return result
+# Single core for every typed accessor below: `ok` tests the value, `convert` normalises it. `required`
+# selects the missing-key behaviour — an error (require_*) vs. return `default` (optional_*).
+def _json_get(d: JSONObject, key: str, type_name: str, ok: typing.Callable[[typing.Any], bool],
+              convert: typing.Callable[[typing.Any], typing.Any], default: typing.Any,
+              required: bool, err: ErrorSink | None) -> typing.Any:
+    if key not in d:
+        if required:
+            _require_fail(f'Required key "{key}" is missing from JSON: {safe_dump_dict_keys_or_data(d)}', err)
+        return default
+    if ok(d[key]):
+        return convert(d[key])
+    _require_fail(f'Key "{key}" value was not {type_name}: "{safe_get_dict_value_type(d, key)}"', err)
+    return default
 
-def json_dict_require_bool(d: JSONObject, key: str, err: ErrorSink) -> bool:
-    result = False
-    if key in d:
-        if isinstance(d[key], bool):
-            result = typing.cast(bool, d[key])
-        else:
-            err.msg_list.append(f'Key "{key}" value was not a bool: "{safe_get_dict_value_type(d, key)}"')
-    else:
-        err.msg_list.append(f'Required key "{key}" is missing from JSON: {safe_dump_dict_keys_or_data(d)}')
-    return result
+def json_dict_require_str(d: JSONObject, key: str, err: ErrorSink | None = None) -> str:
+    return _json_get(d, key, 'a string',  lambda v: isinstance(v, str),  lambda v: v, '',    True, err)
 
-def json_dict_require_array(d: JSONObject, key: str, err: ErrorSink) -> JSONArray:
-    result: list[JSONValue] = []
-    if key in d:
-        if isinstance(d[key], list):
-            result = typing.cast(list[JSONValue], d[key])
-        else:
-            err.msg_list.append(f'Key "{key}" value was not an array: "{safe_get_dict_value_type(d, key)}"')
-    else:
-        err.msg_list.append(f'Required key "{key}" is missing from JSON: {safe_dump_dict_keys_or_data(d)}')
-    return result
+def json_dict_require_int(d: JSONObject, key: str, err: ErrorSink | None = None) -> int:
+    return _json_get(d, key, 'an integer', _json_is_int,                 lambda v: v, 0,     True, err)
 
-def json_dict_require_obj(d: dict[str, JSONValue], key: str, err: ErrorSink) -> JSONObject:
-    result: dict[str, JSONValue] = {}
-    if key in d:
-        if isinstance(d[key], dict):
-            result = typing.cast(dict[str, JSONValue], d[key])
-        else:
-            err.msg_list.append(f'Key "{key}" value was not an object: "{safe_get_dict_value_type(d, key)}"')
-    else:
-        err.msg_list.append(f'Required key "{key}" is missing from JSON: {safe_dump_dict_keys_or_data(d)}')
-    return result
+def json_dict_require_float(d: JSONObject, key: str, err: ErrorSink | None = None) -> float:
+    # Accepts a JSON int or float (the wire's fractional-second fields may serialise as `X` or `X.0`).
+    return _json_get(d, key, 'a number',   _json_is_number,              float,       0.0,   True, err)
 
-def json_dict_require_str_coerce_to_int(d: JSONObject, key: str, err: ErrorSink) -> int:
+def json_dict_require_bool(d: JSONObject, key: str, err: ErrorSink | None = None) -> bool:
+    return _json_get(d, key, 'a bool',     lambda v: isinstance(v, bool), lambda v: v, False, True, err)
+
+def json_dict_require_array(d: JSONObject, key: str, err: ErrorSink | None = None) -> JSONArray:
+    return _json_get(d, key, 'an array',   lambda v: isinstance(v, list), lambda v: v, [],    True, err)
+
+def json_dict_require_obj(d: dict[str, JSONValue], key: str, err: ErrorSink | None = None) -> JSONObject:
+    return _json_get(d, key, 'an object',  lambda v: isinstance(v, dict), lambda v: v, {},    True, err)
+
+def json_dict_optional_bool(d: JSONObject, key: str, default: bool, err: ErrorSink | None = None) -> bool:
+    return _json_get(d, key, 'a bool',     lambda v: isinstance(v, bool), lambda v: v, default, False, err)
+
+def json_dict_optional_str(d: JSONObject, key: str, err: ErrorSink | None = None) -> str | None:
+    return _json_get(d, key, 'a string',   lambda v: isinstance(v, str),  lambda v: v, None,  False, err)
+
+def json_dict_optional_obj(d: JSONObject, key: str, err: ErrorSink | None = None) -> JSONObject | None:
+    return _json_get(d, key, 'an object',  lambda v: isinstance(v, dict), lambda v: v, None,  False, err)
+
+def json_dict_require_str_coerce_to_int(d: JSONObject, key: str, err: ErrorSink | None = None) -> int:
     result_str = json_dict_require_str(d, key, err)
-    result = 0
     try:
-        result = int(result_str)
+        return int(result_str)
     except Exception as e:
-        err.msg_list.append(f'Unable to parse {key} type to an int: {e}')
-    return result
+        _require_fail(f'Unable to parse {key} type to an int: {e}', err)
+    return 0
 
-def json_dict_require_str_coerce_to_enum(d: JSONObject, key: str, my_enum: typing.Type[enum.StrEnum], err: ErrorSink):
-    result_str = json_dict_require_str(d, key, err)
-    result = my_enum._value2member_map_.get(result_str)
+def json_dict_require_str_coerce_to_enum(d: JSONObject, key: str, my_enum: typing.Type[enum.StrEnum], err: ErrorSink | None = None):
+    result = my_enum._value2member_map_.get(json_dict_require_str(d, key, err))
     if result is None:
-        err.msg_list.append(f'Unable to parse {key} type to an enum')
+        _require_fail(f'Unable to parse {key} type to an enum', err)
     return result
 
-def json_dict_require_int_coerce_to_enum(d: JSONObject, key: str, my_enum: typing.Type[enum.IntEnum], err: ErrorSink):
-    result = None
-    result_int = None
-    if key in d:
-        if isinstance(d[key], int):
-            result_int = typing.cast(int, d[key])
-        else:
-            err.msg_list.append(f'Key "{key}" value was not an integer: "{safe_get_dict_value_type(d, key)}"')
-    else:
-        err.msg_list.append(f'Required key "{key}" is missing from JSON: {safe_dump_dict_keys_or_data(d)}')
-
-    if result_int is not None:
-        result = my_enum._value2member_map_.get(result_int)
-
+def json_dict_require_int_coerce_to_enum(d: JSONObject, key: str, my_enum: typing.Type[enum.IntEnum], err: ErrorSink | None = None):
+    result = my_enum._value2member_map_.get(json_dict_require_int(d, key, err))
     if result is None:
-        err.msg_list.append(f'Unable to parse {key} type to an enum')
-
-    return result
-
-def json_dict_optional_bool(d: JSONObject, key: str, default: bool, err: ErrorSink) -> bool:
-    result = default
-    if key in d:
-        if isinstance(d[key], bool):
-            result = typing.cast(bool, d[key])
-        else:
-            err.msg_list.append(f'Key "{key}" value was not a bool: "{safe_get_dict_value_type(d, key)}"')
-    return result
-
-def json_dict_optional_str(d: JSONObject, key: str, err: ErrorSink) -> str | None:
-    result = None
-    if key in d:
-        if isinstance(d[key], str):
-            result = typing.cast(str, d[key])
-        else:
-            err.msg_list.append(f'Key "{key}" value was not a string: "{safe_get_dict_value_type(d, key)}"')
-    return result
-
-def json_dict_optional_obj(d: JSONObject, key: str, err: ErrorSink) -> JSONObject | None:
-    result: dict[str, JSONValue] | None = None
-    if key in d:
-        if isinstance(d[key], dict):
-            result = typing.cast(dict[str, JSONValue], d[key])
-        else:
-            err.msg_list.append(f'Key "{key}" value was not an object: "{safe_get_dict_value_type(d, key)}"')
+        _require_fail(f'Unable to parse {key} type to an enum', err)
     return result
 
 def validate_string_list(items: list[JSONValue]) -> typing.TypeGuard[list[str]]:

@@ -203,7 +203,7 @@ def test_status_endpoint(pg_database):
         response = ctx.flask_client.get(server.FLASK_ROUTE_STATUS)
         assert response.status_code == 200
         body = response.get_json()
-        assert body['status'] == server.RESPONSE_SUCCESS, body
+        assert body['status'] == 'ok', body
         check(body['result'])
 
         # (b) Through the v4 onion transport (make_request_v4 sends POST; /status accepts GET+POST)
@@ -218,7 +218,7 @@ def test_status_endpoint(pg_database):
         onion_response = onion_req.make_response_v4(shared_key=shared_key, encrypted_response=response.data)
         assert onion_response.success
         body = json.loads(onion_response.body)
-        assert body['status'] == server.RESPONSE_SUCCESS, body
+        assert body['status'] == 'ok', body
         check(body['result'])
 
 def test_stale_revocation_is_not_served(pg_database):
@@ -309,10 +309,8 @@ def test_provider_dry_run_redeems_google_without_egress(monkeypatch, pg_database
                                                       rotating_pkey = rotating_key.verify_key,
                                                       payment_tx    = user_tx,
                                                       master_sig    = master_key.sign(add_payment_hash).signature,
-                                                      rotating_sig  = rotating_key.sign(add_payment_hash).signature,
-                                                      err           = err)
+                                                      rotating_sig  = rotating_key.sign(add_payment_hash).signature)
 
-        assert len(err.msg_list) == 0, f'{err.msg_list}'
         assert redeemed.status == backend.RedeemPaymentStatus.Success
         assert redeemed.proof is not None
         assert len(backend.get_unredeemed_payments_list(db_conn)) == 0
@@ -427,8 +425,7 @@ def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_d
                                                    rotating_pkey       = rotating_key.verify_key,
                                                    payment_tx          = add_pro_payment_tx,
                                                    master_sig          = master_key.sign(add_payment_hash).signature,
-                                                   rotating_sig        = rotating_key.sign(add_payment_hash).signature,
-                                                   err                 = err)
+                                                   rotating_sig        = rotating_key.sign(add_payment_hash).signature)
         it.proof = redeemed_payment.proof
 
         # Verify payment was redeemed
@@ -436,7 +433,8 @@ def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_d
         assert len(unredeemed_payment_list) == 0
         assert redeemed_payment.status == backend.RedeemPaymentStatus.Success
 
-        # Try claiming it again, this should fail because it has already been claimed
+        # Claiming it again is idempotent: it returns ok + a freshly-signed proof for the user's current
+        # entitlement (identical to the first claim), rather than an AlreadyRedeemed error.
         redeemed_payment_2nd = backend.verify_and_add_pro_payment(
                                                        conn                = db_conn,
                                                        signing_key         = backend_key,
@@ -446,13 +444,10 @@ def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_d
                                                        rotating_pkey       = rotating_key.verify_key,
                                                        payment_tx          = add_pro_payment_tx,
                                                        master_sig          = master_key.sign(add_payment_hash).signature,
-                                                       rotating_sig        = rotating_key.sign(add_payment_hash).signature,
-                                                       err                 = err)
+                                                       rotating_sig        = rotating_key.sign(add_payment_hash).signature)
 
-        assert err.has()
-        assert redeemed_payment_2nd.status                     == backend.RedeemPaymentStatus.AlreadyRedeemed, err.msg_list
-        assert len(redeemed_payment_2nd.proof.revocation_tag)  == 0
-        err.msg_list.clear()
+        assert redeemed_payment_2nd.status                    == backend.RedeemPaymentStatus.Success
+        assert len(redeemed_payment_2nd.proof.revocation_tag) == backend.BLAKE2B_DIGEST_SIZE
 
     # Two payments stacked for one user → two generations minted (item 1/2 rolls the generation on every
     # payment). The user's active generation is the most recent of the two.
@@ -627,10 +622,8 @@ def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_d
                                                                               rotating_pkey       = auto_redeem_user_rotating_key.verify_key,
                                                                               payment_tx          = add_pro_payment_tx,
                                                                               master_sig          = auto_redeem_user_master_key.sign(add_payment_hash).signature,
-                                                                              rotating_sig        = auto_redeem_user_rotating_key.sign(add_payment_hash).signature,
-                                                                              err                 = err)
+                                                                              rotating_sig        = auto_redeem_user_rotating_key.sign(add_payment_hash).signature)
 
-            assert not err.has(), redeemed_payment
             assert redeemed_payment.status == backend.RedeemPaymentStatus.Success, redeemed_payment
 
             # Verify payment was redeemed
@@ -739,8 +732,8 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
             response_json = json.loads(onion_response.body)
             assert isinstance(response_json, dict), f'Response {onion_response.body}'
             # Parse status from response
-            assert response_json['status'] == 0, f'Response was: {json.dumps(response_json, indent=2)}'
-            assert 'errors' not in response_json, f'Response was: {json.dumps(response_json, indent=2)}'
+            assert response_json['status'] == 'ok', f'Response was: {json.dumps(response_json, indent=2)}'
+            assert 'error' not in response_json, f'Response was: {json.dumps(response_json, indent=2)}'
 
             # Parse result object is at root
             assert 'result' in response_json, f'Response was: {json.dumps(response_json, indent=2)}'
@@ -748,7 +741,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
 
             # Extract the fields
             result_items                               = base.json_dict_require_array(d=result_json, key='items',  err=err)
-            result_status:  str                        = base.json_dict_require_str(d=result_json, key='status',  err=err)
+            result_status:  str                        = base.json_dict_require_str(d=result_json, key='user_status',  err=err)
             assert len(err.msg_list) == 0,                                       '{err.msg_list}'
             assert result_status     == server.UserProStatus.Never.value, f'Response was: {json.dumps(response_json, indent=2)}'
             assert len(result_items) == 0,                                       f'Response was: {json.dumps(response_json, indent=2)}'
@@ -790,8 +783,8 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
             assert isinstance(response_json, dict), f'Response {onion_response.body}'
 
             # Parse status from response
-            assert response_json['status'] == 0,  f'Response was: {json.dumps(response_json, indent=2)}'
-            assert 'errors' not in response_json, f'Response was: {json.dumps(response_json, indent=2)}'
+            assert response_json['status'] == 'ok',  f'Response was: {json.dumps(response_json, indent=2)}'
+            assert 'error' not in response_json, f'Response was: {json.dumps(response_json, indent=2)}'
 
             # Parse result object is at root
             assert 'result' in response_json, f'Response was: {json.dumps(response_json, indent=2)}'
@@ -856,8 +849,8 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
             assert isinstance(response_json, dict), f'Response {onion_response.body}'
 
             # Parse status from response
-            assert response_json['status'] == 0, f'Response was: {json.dumps(response_json, indent=2)}'
-            assert 'errors' not in response_json, f'Response was: {json.dumps(response_json, indent=2)}'
+            assert response_json['status'] == 'ok', f'Response was: {json.dumps(response_json, indent=2)}'
+            assert 'error' not in response_json, f'Response was: {json.dumps(response_json, indent=2)}'
 
             # Parse result object is at root
             assert 'result' in response_json, f'Response was: {json.dumps(response_json, indent=2)}'
@@ -941,8 +934,8 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
             assert isinstance(response_json, dict), f'Response {onion_response.body}'
 
             # Parse status from response
-            assert response_json['status'] == 0, f'Response was: {json.dumps(response_json, indent=2)}'
-            assert 'errors' not in response_json, f'Response was: {json.dumps(response_json, indent=2)}'
+            assert response_json['status'] == 'ok', f'Response was: {json.dumps(response_json, indent=2)}'
+            assert 'error' not in response_json, f'Response was: {json.dumps(response_json, indent=2)}'
 
             # Parse result object is at root
             assert 'result' in response_json, f'Response was: {json.dumps(response_json, indent=2)}'
@@ -989,8 +982,8 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
             assert isinstance(response_json, dict), f'Response {onion_response.body}'
 
             # Parse status from response
-            assert response_json['status'] == 0, f'Response was: {json.dumps(response_json, indent=2)}'
-            assert 'errors' not in response_json, f'Response was: {json.dumps(response_json, indent=2)}'
+            assert response_json['status'] == 'ok', f'Response was: {json.dumps(response_json, indent=2)}'
+            assert 'error' not in response_json, f'Response was: {json.dumps(response_json, indent=2)}'
 
             # Parse result object is at root
             assert 'result' in response_json, f'Response was: {json.dumps(response_json, indent=2)}'
@@ -1046,8 +1039,8 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
                 assert isinstance(response_json, dict), f'Response {onion_response.body}'
 
                 # Parse status from response
-                assert response_json['status'] == 0, f'Response was: {json.dumps(response_json, indent=2)}'
-                assert 'errors' not in response_json, f'Response was: {json.dumps(response_json, indent=2)}'
+                assert response_json['status'] == 'ok', f'Response was: {json.dumps(response_json, indent=2)}'
+                assert 'error' not in response_json, f'Response was: {json.dumps(response_json, indent=2)}'
 
                 # Parse result object is at root
                 assert 'result' in response_json, f'Response was: {json.dumps(response_json, indent=2)}'
@@ -1103,8 +1096,8 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
             assert isinstance(response_json, dict), f'Response {onion_response.body}'
 
             # Parse status from response
-            assert response_json['status'] == 0, f'Response was: {json.dumps(response_json, indent=2)}'
-            assert 'errors' not in response_json, f'Response was: {json.dumps(response_json, indent=2)}'
+            assert response_json['status'] == 'ok', f'Response was: {json.dumps(response_json, indent=2)}'
+            assert 'error' not in response_json, f'Response was: {json.dumps(response_json, indent=2)}'
 
             # Parse result object is at root
             assert 'result' in response_json, f'Response was: {json.dumps(response_json, indent=2)}'
@@ -1153,8 +1146,8 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
             assert isinstance(response_json, dict), f'Response {onion_response.body}'
 
             # Parse status from response
-            assert response_json['status'] == 0, f'Response was: {json.dumps(response_json, indent=2)}'
-            assert 'errors' not in response_json, f'Response was: {json.dumps(response_json, indent=2)}'
+            assert response_json['status'] == 'ok', f'Response was: {json.dumps(response_json, indent=2)}'
+            assert 'error' not in response_json, f'Response was: {json.dumps(response_json, indent=2)}'
 
             # Parse result object is at root
             assert 'result' in response_json, f'Response was: {json.dumps(response_json, indent=2)}'
@@ -1162,7 +1155,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
 
             # Extract the fields
             result_items = base.json_dict_require_array(d=result_json, key='items',  err=err)
-            result_status:  str                        = base.json_dict_require_str(d=result_json, key='status',  err=err)
+            result_status:  str                        = base.json_dict_require_str(d=result_json, key='user_status',  err=err)
             assert len(err.msg_list) == 0,                                 '{err.msg_list}'
             assert result_status     == server.UserProStatus.Active.value, f'Response was: {json.dumps(response_json, indent=2)}'
             assert len(result_items) == 2,                                 f'Response was: {json.dumps(response_json, indent=2)}'
@@ -1190,8 +1183,8 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
                 assert isinstance(response_json, dict), f'Response {onion_response.body}'
 
                 # Parse status from response
-                assert response_json['status'] == server.RESPONSE_PARSE_ERROR, f'Response was: {json.dumps(response_json, indent=2)}'
-                assert len(response_json['errors']) > 0, f'Response was: {json.dumps(response_json, indent=2)}'
+                assert response_json['status'] == 'fail', f'Response was: {json.dumps(response_json, indent=2)}'
+                assert len(response_json['error']) > 0, f'Response was: {json.dumps(response_json, indent=2)}'
                 assert 'result' not in response_json, f'Response was: {json.dumps(response_json, indent=2)}'
 
             # Retry the request but create a hash with the rotating key
@@ -1218,8 +1211,8 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
                 assert isinstance(response_json, dict), f'Response {onion_response.body}'
 
                 # Parse status from response
-                assert response_json['status'] == server.RESPONSE_PARSE_ERROR, f'Response was: {json.dumps(response_json, indent=2)}'
-                assert len(response_json['errors']) > 0, f'Response was: {json.dumps(response_json, indent=2)}'
+                assert response_json['status'] == 'fail', f'Response was: {json.dumps(response_json, indent=2)}'
+                assert len(response_json['error']) > 0, f'Response was: {json.dumps(response_json, indent=2)}'
                 assert 'result' not in response_json, f'Response was: {json.dumps(response_json, indent=2)}'
 
             # Retry the request but with no history
@@ -1301,44 +1294,31 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
                                                                              rotating_pkey  = rotating_key.verify_key,
                                                                              request_at     = base.datetime_from_unix_ms(unix_ts_ms),
                                                                              master_sig     = bytes(master_key.sign(hash_to_sign).signature),
-                                                                             rotating_sig   = bytes(rotating_key.sign(hash_to_sign).signature),
-                                                                             err            = err)
-            assert not err.has(), base.readable(pro_proof_deadline_unix_ts_ms)
+                                                                             rotating_sig   = bytes(rotating_key.sign(hash_to_sign).signature))
 
-            # NOTE: Check that the proof is invalid
+            # NOTE: Check that the proof verifies
             proof_hash = backend.build_proof_hash(proof.revocation_tag,
                                                   proof.rotating_pkey,
                                                   proof.expires_at)
             _ = backend_key.verify_key.verify(smessage=proof_hash, signature=proof.sig)
 
 
-            # NOTE: Try to generate a proof after the deadline (should fail)
+            # NOTE: Generating a proof after the deadline must now fail — entitlement expired → FailError.
             unix_ts_ms: int = pro_proof_deadline_unix_ts_ms + 1
             hash_to_sign: bytes = backend.make_generate_pro_proof_hash(
                                                                   master_pkey   = master_key.verify_key,
                                                                   rotating_pkey = rotating_key.verify_key,
                                                                   request_at    = base.datetime_from_unix_ms(unix_ts_ms))
 
-            proof = backend.generate_pro_proof(conn           = db_conn,
-                                               signing_key    = backend_key,
-                                               master_pkey    = master_key.verify_key,
-                                               rotating_pkey  = rotating_key.verify_key,
-                                               request_at     = base.datetime_from_unix_ms(unix_ts_ms),
-                                               master_sig     = bytes(master_key.sign(hash_to_sign).signature),
-                                               rotating_sig   = bytes(rotating_key.sign(hash_to_sign).signature),
-                                               err            = err)
-
-            proof_hash = backend.build_proof_hash(proof.revocation_tag,
-                                                  proof.rotating_pkey,
-                                                  proof.expires_at)
-
-            failed: bool = False
-            try:
-                _ = backend_key.verify_key.verify(smessage=proof_hash, signature=proof.sig)
-            except:
-                failed = True
-            assert err.has() and failed
-            err.msg_list.clear()
+            with pytest.raises(base.FailError) as exc_info:
+                _ = backend.generate_pro_proof(conn          = db_conn,
+                                               signing_key   = backend_key,
+                                               master_pkey   = master_key.verify_key,
+                                               rotating_pkey = rotating_key.verify_key,
+                                               request_at    = base.datetime_from_unix_ms(unix_ts_ms),
+                                               master_sig    = bytes(master_key.sign(hash_to_sign).signature),
+                                               rotating_sig  = bytes(rotating_key.sign(hash_to_sign).signature))
+            assert exc_info.value.code == base.ErrorCode.expired
 
         if 1: # Revoke the original payment from the user (so we have ended up revoking everything)
             with db.transaction(db_conn) as tx:
@@ -1379,8 +1359,8 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
             assert isinstance(response_json, dict), f'Response {onion_response.body}'
 
             # Parse status from the pro proof response
-            assert response_json['status'] == server.RESPONSE_GENERIC_ERROR, f'Response was: {json.dumps(response_json, indent=2)}'
-            assert 'errors' in response_json, f'Response was: {json.dumps(response_json, indent=2)}'
+            assert response_json['status'] == 'fail', f'Response was: {json.dumps(response_json, indent=2)}'
+            assert 'error' in response_json, f'Response was: {json.dumps(response_json, indent=2)}'
 
         if 1: # Initiate a "refund" request on the payment
 
@@ -1462,8 +1442,8 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
             assert isinstance(response_json, dict), f'Response {onion_response.body}'
 
             # Parse fields in the JSON
-            assert 'errors' not in response_json, f'Request was: {json.dumps(request_body, indent=2)}\nResponse was: {json.dumps(response_json, indent=2)}'
-            assert response_json['status']            == server.RESPONSE_SUCCESS, f'Response was: {json.dumps(response_json, indent=2)}'
+            assert 'error' not in response_json, f'Request was: {json.dumps(request_body, indent=2)}\nResponse was: {json.dumps(response_json, indent=2)}'
+            assert response_json['status']            == 'ok', f'Response was: {json.dumps(response_json, indent=2)}'
             assert response_json['result']['updated'] == True,                    f'Response was: {json.dumps(response_json, indent=2)}'
 
         if 1: # Initiate a "refund" on a non-existing payment
@@ -1507,7 +1487,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
             assert isinstance(response_json, dict), f'Response {onion_response.body}'
 
             # Parse fields in the JSON, we expect it to fail
-            assert 'errors' in response_json, f'Response was: {json.dumps(response_json, indent=2)}'
+            assert 'error' in response_json, f'Response was: {json.dumps(response_json, indent=2)}'
 
 def test_onion_request_response_lifecycle():
     # Also call into and test the vendored onion request (as we are currently
@@ -1825,8 +1805,8 @@ def test_platform_apple(pg_database):
         assert isinstance(response_json, dict), f'Response {response.body}'
 
         # NOTE: Parse status from response
-        assert response_json['status'] == 0,  f'Response was: {json.dumps(response_json, indent=2)}'
-        assert 'errors' not in response_json, f'Response was: {json.dumps(response_json, indent=2)}'
+        assert response_json['status'] == 'ok',  f'Response was: {json.dumps(response_json, indent=2)}'
+        assert 'error' not in response_json, f'Response was: {json.dumps(response_json, indent=2)}'
 
         # NOTE: Parse result object is at root
         assert 'result' in response_json, f'Response was: {json.dumps(response_json, indent=2)}'
@@ -3904,7 +3884,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
         res_auto_renewing         = base.json_dict_require_bool(result, "auto_renewing", err)
         res_expiry_ts             = base.json_dict_require_int(result, "expiry_ts", err)
         res_grace_period_duration = base.json_dict_require_int(result, "grace_period_duration", err)
-        res_pro_status            = base.json_dict_require_str_coerce_to_enum(result, "status", server.UserProStatus, err)
+        res_pro_status            = base.json_dict_require_str_coerce_to_enum(result, "user_status", server.UserProStatus, err)
         res_items                 = base.json_dict_require_array(result, "items", err)
         assert not err.has(), status
         assert res_auto_renewing == auto_renew, json.dumps(result, indent=1)

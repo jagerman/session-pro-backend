@@ -211,6 +211,12 @@ authoritative for the application outcome; HTTP status is not used for it):
 - `"error"` — the backend faulted while handling it (HTTP-5xx family: unhandled exception, DB fault). The
   client did nothing wrong; the same request may succeed later.
 
+**`status` is a closed, exhaustive set** — `"ok"` / `"fail"` / `"error"` and nothing else, ever. A client
+SHOULD treat any other `status` value as a protocol error (fail-closed), NOT a gracefully-ignored unknown.
+The envelope will never grow a fourth `status`; a new category or extra detail is always conveyed by a new
+**`error_code`** slug (which *is* open/additive — see §5.1) or a new field. Two deliberate extensibility
+contracts: `status` is rigid (clients may model it as a fixed enum), `error_code` is extensible.
+
 Non-`ok` responses carry two fields:
 - **`error_code`** — a stable lowercase-`snake_case` machine slug, **always present** on non-`ok`. This is
   the identifier a client keys its localized (Crowdin) message off; an unrecognized (newer) slug degrades
@@ -247,7 +253,8 @@ instants `purchased_ts` and `revoked_ts`, which are **floats** to keep provider 
 enums are their string `code`s (§1), byte strings are hex, and no key name leaks an internal implementation
 detail (see §6). (Their per-field shapes track `server.py`; only the naming/units rules here are normative
 for them.) Note some non-error outcomes live *in* `result`, not as a `fail`: get-details reports account
-state as `user_pro_status` (`never`/`active`/`expired`), and set-refund returns `{ "updated": <bool> }`.
+state as `user_status` (`never`/`active`/`expired`; `user_` disambiguates it from the envelope `status`
+and the per-item payment `status`), and set-refund returns `{ "updated": <bool> }`.
 
 ## 6. Field-naming rule
 Wire (JSON) field names describe **purpose to the consumer**, never server implementation, and carry

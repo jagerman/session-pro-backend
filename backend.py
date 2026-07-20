@@ -142,11 +142,12 @@ class LookupUserExpiry:
     best_auto_renewing:             bool                      = False
 
 class RedeemPaymentStatus(enum.Enum):
+    # redeem_payment_tx now returns Success or raises (FailError(unknown_payment)/revoked/expired), so the
+    # old AlreadyRedeemed/UnknownPayment result codes are gone — a re-redeem is idempotent success and a
+    # missing payment is a raised fail. (Error remains only as the pre-success init sentinel.)
     Nil             = 0
     Error           = 1
     Success         = 2
-    AlreadyRedeemed = 3
-    UnknownPayment  = 4
 
 @dataclasses.dataclass
 class RedeemPayment:
@@ -392,6 +393,9 @@ def make_get_pro_details_hash(master_pkey: nacl.signing.VerifyKey, request_at: d
     # No version byte (Q11 / wire spec Delta #11).
     hasher.update(bytes(master_pkey))
     hasher.update(base.unix_seconds_from_datetime(request_at).to_bytes(length=8, byteorder='little'))
+    # TODO(signing-sanity, see refactor plan): count is UNSIGNED fixed-width LE, so count < 0 (the
+    # `-1` = unlimited sentinel that get_pro_details now understands) raises OverflowError here → those
+    # requests 500. `count = -1` is KNOWN BROKEN until the signed-input redesign settles integer encoding.
     hasher.update(count.to_bytes(length=4, byteorder='little'))
     result: bytes = hasher.digest()
     return result
@@ -774,8 +778,7 @@ def redeem_payment_tx(tx:                  db.SQLTransaction,
                       signing_key:         nacl.signing.SigningKey | None,
                       request_at:          datetime.datetime,
                       redeemed_at: datetime.datetime,
-                      payment_tx:          UserPaymentTransaction,
-                      err:                 base.ErrorSink) -> RedeemPayment:
+                      payment_tx:          UserPaymentTransaction) -> RedeemPayment:
     """
     request_at: The timestamp typically accurate to the current time, used as a frame-of-reference
     to clamp the duration of the proof returned to the user to at most 1 month, also used to mask
@@ -861,15 +864,12 @@ def redeem_payment_tx(tx:                  db.SQLTransaction,
               provider            = payment_tx.provider.value,
               rangeproof_order_id = payment_tx.rangeproof_order_id,)
     else:
-        err.msg_list.append('Payment to register specifies an unknown payment provider')
-        return result
+        raise base.FailError('Payment to register specifies an unknown payment provider')
 
     redeemed_ids = [row[0] for row in row_result.fetchall()]
     rowcount     = len(redeemed_ids)
     if rowcount >= 1:
         assert rowcount == 1
-        if rowcount > 1:
-            err.msg_list.append(f'Payment was redeemed for {base.maybe_obfuscate_bytes(master_pkey)} at {base.readable(redeemed_at)} but more than 1 row was updated, updated {rowcount}')
 
         # master_pkey lives only in `users`: ensure the identity row (+ its first generation) exists,
         # then link the just-redeemed payment(s) to it.
@@ -886,28 +886,23 @@ def redeem_payment_tx(tx:                  db.SQLTransaction,
         # client keeps its old proof until it expires and simply requests a new one (no revoke-list churn).
         allocated: AllocatedGenID = _allocate_new_gen_id_if_master_pkey_has_payments(
             tx, master_pkey, issued_at=redeemed_at, reuse=(init_gen_id, init_token) if was_created else None)
-        if allocated.found:
-            # NOTE: Only generate the proof if a rotating public key otherwise skip it (i.e.
-            # its possible to redeem a payment without automatically creating the corresponding proof)
-            if rotating_pkey:
-                assert signing_key, "Rotating public key and signing key have to be given in tandem, either both set or both set to nil"
-                proposed_proof_expires_at: datetime.datetime = base.round_datetime_to_next_day(allocated.expires_at)
-
-                result.proof = build_proof(revocation_tag = allocated.token,
-                                           rotating_pkey  = rotating_pkey,
-                                           expires_at     = _build_proof_clamped_expiry_time(request_at=request_at, proposed_expires_at=proposed_proof_expires_at),
-                                           signing_key    = signing_key)
-
-                assert result.proof.expires_at == base.round_datetime_to_start_of_day(result.proof.expires_at), f"Proof expiry must land on a UTC day boundary, was {base.readable(result.proof.expires_at)}"
-        else:
-            err.msg_list.append(f'Failed to update DB after new payment was redeemed for {base.maybe_obfuscate_bytes(master_pkey)}')
-
         assert allocated.found, "We just added the user's payment we expect to find the latest expiry date for the pkey"
 
+        # NOTE: Only generate the proof if a rotating public key was given — a payment can be redeemed
+        # without automatically creating the corresponding proof.
+        if rotating_pkey:
+            assert signing_key, "Rotating public key and signing key have to be given in tandem, either both set or both set to nil"
+            proposed_proof_expires_at: datetime.datetime = base.round_datetime_to_next_day(allocated.expires_at)
+            result.proof = build_proof(revocation_tag = allocated.token,
+                                       rotating_pkey  = rotating_pkey,
+                                       expires_at     = _build_proof_clamped_expiry_time(request_at=request_at, proposed_expires_at=proposed_proof_expires_at),
+                                       signing_key    = signing_key)
+            assert result.proof.expires_at == base.round_datetime_to_start_of_day(result.proof.expires_at), f"Proof expiry must land on a UTC day boundary, was {base.readable(result.proof.expires_at)}"
+
     else:
-        # NOTE: We dump the payment TX to the error list. This does not leak
-        # any information because this is all data populated by the user who
-        # is sending the redeeming request.
+        # Nothing claimable matched. Distinguish "this user already redeemed this exact payment"
+        # (replay/double-submit → idempotent success) from "no such payment for this user" (a genuine
+        # dead-end → unknown_payment). The COUNT below only reads data the user themselves sent.
         if payment_tx.provider == base.PaymentProvider.GooglePlayStore:
             row_result = db.query(tx.conn, '''
                 SELECT COUNT(*)
@@ -946,16 +941,18 @@ def redeem_payment_tx(tx:                  db.SQLTransaction,
 
         first_row = row_result.fetchone()
         if first_row and first_row[0] > 0:
-            err.msg_list.append(f'Payment was not redeemed, already redeemed TX: {user_payment_tx_to_safe_string(payment_tx)}')
-            result.status = RedeemPaymentStatus.AlreadyRedeemed
+            # Already redeemed by this user → idempotent: hand back a proof for their CURRENT entitlement
+            # via the existing generation (no roll), identical to generate_pro_proof. If that entitlement
+            # is since revoked/expired the helper raises the truthful slug.
+            log.info(f'Payment already redeemed for this user (idempotent): {user_payment_tx_to_safe_string(payment_tx)}')
+            if rotating_pkey:
+                assert signing_key, "Rotating public key and signing key have to be given in tandem"
+                result.proof = build_current_entitlement_proof_tx(tx, master_pkey, rotating_pkey, request_at, signing_key)
         else:
-            err.msg_list.append(f'Payment was not redeemed, no payments were found matching the request tx: {user_payment_tx_to_safe_string(payment_tx)}')
-            result.status = RedeemPaymentStatus.UnknownPayment
+            raise base.FailError(f'Payment was not redeemed, no payments were found matching the request tx: {user_payment_tx_to_safe_string(payment_tx)}',
+                                 code=base.ErrorCode.unknown_payment)
 
-    if not err.has():
-        assert result.status == RedeemPaymentStatus.Error
-        result.status = RedeemPaymentStatus.Success
-
+    result.status = RedeemPaymentStatus.Success
     return result
 
 def verify_payment_provider_tx(payment_tx: base.PaymentProviderTransaction, err: base.ErrorSink):
@@ -1397,25 +1394,21 @@ def add_unredeemed_payment_tx(tx:                                db.SQLTransacti
                     add_pro_payment_user_tx.google_payment_token = payment_tx.google_payment_token
                     add_pro_payment_user_tx.google_order_id      = payment_tx.google_order_id
 
-                    # NOTE: We use a temp error sink as we don't mind if auto-redeeming failed the user
-                    # can always try manually by claiming the payment themselves. If this errors
-                    # returning that to the platform layers (google and apple) can stall them
-                    # unnecessarily.
-                    #
-                    # For internal logging though however, we can report this
-                    tmp_err = base.ErrorSink()
-                    _ = redeem_payment_tx(tx                  = tx,
-                                          master_pkey         = master_pkey,
-                                          rotating_pkey       = None,
-                                          signing_key         = None,
-                                          request_at          = purchased_at,
-                                          redeemed_at = to_redeemed_at(purchased_at),
-                                          payment_tx          = add_pro_payment_user_tx,
-                                          err                 = tmp_err)
-
-                    if tmp_err.has():
-                        err_str = '\n'.join(tmp_err.msg_list)
-                        log.error(f'Failed to auto-redeem a payment we witnessed from. (auto_redeem_deadline={base.readable(auto_redeem_deadline_at)}) {err_str}')
+                    # A failed auto-redeem is swallowed: the user can still claim the payment manually
+                    # later, and propagating the failure to the platform layers (google/apple) would stall
+                    # them unnecessarily. The savepoint keeps a failed redeem from poisoning the outer
+                    # transaction; we log it for internal visibility.
+                    try:
+                        with tx.conn.transaction():
+                            _ = redeem_payment_tx(tx            = tx,
+                                                  master_pkey   = master_pkey,
+                                                  rotating_pkey = None,
+                                                  signing_key   = None,
+                                                  request_at    = purchased_at,
+                                                  redeemed_at   = to_redeemed_at(purchased_at),
+                                                  payment_tx    = add_pro_payment_user_tx)
+                    except base.ApiError as e:
+                        log.error(f'Failed to auto-redeem a payment we witnessed from. (auto_redeem_deadline={base.readable(auto_redeem_deadline_at)}) {e}')
 
 def add_unredeemed_payment(conn:                              psycopg.Connection,
                            payment_tx:                        base.PaymentProviderTransaction,
@@ -1591,48 +1584,40 @@ def internal_verify_add_payment_and_get_proof_common_arguments(signing_key:   na
                                                                rotating_pkey: nacl.signing.VerifyKey,
                                                                hash_to_sign:  bytes,
                                                                master_sig:    bytes,
-                                                               rotating_sig:  bytes,
-                                                               err:           base.ErrorSink) -> bool:
-    # Verify the signatures first (authenticate that the message was not
-    # tampered with first) if these fail, early exit as the contents of the rest
-    # of the payload is indeterminate.
+                                                               rotating_sig:  bytes) -> None:
+    # Verify the signatures first (authenticate that the message was not tampered with) — if these fail,
+    # the rest of the payload is indeterminate, so raising bad_signature short-circuits everything else.
     try:
         _ = master_pkey.verify(smessage=hash_to_sign, signature=master_sig)
     except Exception as e:
-        err.msg_list.append(f'Failed to verify signature from master key {base.maybe_obfuscate_bytes(master_pkey)}: {e}');
-        return False
+        raise base.FailError(f'Failed to verify signature from master key {base.maybe_obfuscate_bytes(master_pkey)}: {e}', code=base.ErrorCode.bad_signature)
 
     try:
         _ = rotating_pkey.verify(smessage=hash_to_sign, signature=rotating_sig)
     except Exception as e:
-        err.msg_list.append(f'Failed to verify signature from rotating key {base.maybe_obfuscate_bytes(rotating_pkey)}: {e}');
-        return False
+        raise base.FailError(f'Failed to verify signature from rotating key {base.maybe_obfuscate_bytes(rotating_pkey)}: {e}', code=base.ErrorCode.bad_signature)
 
-    # The hash to sign is only passed by internal code, the user never passes
-    # the hash so this assert guards for a development error. Similar with the
-    # signing key check.
+    # The hash to sign is only passed by internal code, the user never passes the hash so this assert
+    # guards for a development error. Similar with the signing key check.
     assert len(hash_to_sign) == BLAKE2B_DIGEST_SIZE and hash_to_sign != ZERO_BYTES32
     assert bytes(signing_key) != ZERO_BYTES32 and bytes(signing_key.verify_key) != ZERO_BYTES32
 
-    # Sanity check the signing key
+    # Sanity check the signing key — a backend misconfiguration, not the client's fault.
     if signing_key.verify_key == master_pkey or signing_key.verify_key == rotating_pkey:
-        err.msg_list.append(f'Internal key error during adding payment: please notify the devs')
+        raise base.ServerError('Internal key error during adding payment: please notify the devs')
 
-    # Sanity check the user key's and their signatures
+    # Sanity check the user's keys and signatures (client-supplied → their fault).
     if master_pkey == rotating_pkey:
-        err.msg_list.append(f'Master and rotating key cannot be the same was: {base.maybe_obfuscate_bytes(master_pkey)}')
+        raise base.FailError(f'Master and rotating key cannot be the same was: {base.maybe_obfuscate_bytes(master_pkey)}')
 
     if bytes(master_pkey) == ZERO_BYTES32:
-        err.msg_list.append(f'Master key cannot be the zero key')
+        raise base.FailError('Master key cannot be the zero key')
 
     if bytes(rotating_pkey) == ZERO_BYTES32:
-        err.msg_list.append(f'Rotating key cannot be the zero key')
+        raise base.FailError('Rotating key cannot be the zero key')
 
     if master_sig == rotating_sig:
-        err.msg_list.append(f'Master and rotating signature cannot be the same')
-
-    result = len(err.msg_list) == 0
-    return result
+        raise base.FailError('Master and rotating signature cannot be the same')
 
 def add_pro_payment_tx(tx:                  db.SQLTransaction,
                        signing_key:         nacl.signing.SigningKey,
@@ -1640,8 +1625,7 @@ def add_pro_payment_tx(tx:                  db.SQLTransaction,
                        redeemed_at: datetime.datetime,
                        master_pkey:         nacl.signing.VerifyKey,
                        rotating_pkey:       nacl.signing.VerifyKey,
-                       payment_tx:          UserPaymentTransaction,
-                       err:                 base.ErrorSink) -> RedeemPayment:
+                       payment_tx:          UserPaymentTransaction) -> RedeemPayment:
 
     # Note being able to pass in the creation unix timestamp is mainly for
     # testing purposes to allow time-travel. User space should never be
@@ -1651,52 +1635,38 @@ def add_pro_payment_tx(tx:                  db.SQLTransaction,
     assert redeemed_at == base.round_datetime_to_start_of_day(redeemed_at), \
             "The passed in creation (and or activated) timestamp must lie on a day boundary: {}".format(base.readable(redeemed_at))
 
-    # All verified. Redeem the payment
-    result: RedeemPayment = redeem_payment_tx(tx                  = tx,
-                                              master_pkey         = master_pkey,
-                                              rotating_pkey       = rotating_pkey,
-                                              signing_key         = signing_key,
-                                              request_at          = request_at,
-                                              redeemed_at = redeemed_at,
-                                              payment_tx          = payment_tx,
-                                              err                 = err)
+    # Redeem the payment (raises FailError(unknown_payment)/revoked/expired on failure).
+    result: RedeemPayment = redeem_payment_tx(tx            = tx,
+                                              master_pkey   = master_pkey,
+                                              rotating_pkey = rotating_pkey,
+                                              signing_key   = signing_key,
+                                              request_at    = request_at,
+                                              redeemed_at   = redeemed_at,
+                                              payment_tx    = payment_tx)
 
-    # NOTE: We put this _inside_ the transaction block, because, for Google Payments we ack
-    # the payment against Google's servers. If we have a network failure, this will throw an
-    # exception and we want the transaction to be reverted because, redeeming and
-    # acknowledgement must be done atomically.
-    #
-    # Ack-ing should be done after redeeming because we can't undo an ack on Google, so first we
-    # make sure we can redeem it safely before lastly notifying Google that the payment is good
-    # to go.
-    if result.status == RedeemPaymentStatus.Success and payment_tx.provider == base.PaymentProvider.GooglePlayStore:
-        # NOTE: For Google, we acknowledge the payment here on demand when the user claims the payment
-        # Unfortunately this leaks in platform details into the DB layer but acknowledgement on claim is
-        # the most sensible option and binds the Session client's knowledge of their own payment and
-        # that the backend acknowledges the payment in the same step which simplifies implementation
-        # greatly. It avoids race conditions such as the client acknowledging but the server hasn't
-        # acknowledged yet so it needs to poll the server e.t.c.
-        #
-        # Yes generating proofs for Google then blocks on the subscription acknowledge, that is
-        # unfortunate but intentional, if Google can't be contacted, we can't approve and so the payment
-        # cannot be claimed and should be re-attempted.
-        # (Under provider_dry_run these Google calls are stubbed inside platform_google_api — a synthetic
-        # already-acknowledged fetch and a no-op acknowledge — so this block runs unconditionally.)
+    # For Google we acknowledge the payment against Google's servers in the SAME transaction as the
+    # redeem: an ack can't be undone, so we redeem first and ack last, and if Google can't be reached we
+    # raise — the exception rolls the transaction back (undoing the redeem) and the client re-attempts.
+    # Acknowledging on claim binds the client's knowledge of its own payment to the backend ack in one
+    # step, avoiding a client-acks-but-server-hasn't poll race. (Under provider_dry_run these Google calls
+    # are stubbed in platform_google_api — a synthetic already-acknowledged fetch + no-op acknowledge.)
+    if payment_tx.provider == base.PaymentProvider.GooglePlayStore:
+        # platform_google_api is still ErrorSink-based (the deferred sweep); bridge with a local sink and
+        # translate its failure into a raise.
+        google_err = base.ErrorSink()
         sub_data: platform_google_types.SubscriptionV2Data | None = platform_google_api.fetch_subscription_v2_details(package_name=platform_google_api.package_name,
                                                                                                                       purchase_token=payment_tx.google_payment_token,
-                                                                                                                      err=err)
-        if not sub_data:
-            tx.cancel = True
-            return result
+                                                                                                                      err=google_err)
+        if sub_data is None or google_err.has():
+            raise base.ServerError(f'Google subscription lookup failed during redeem: {google_err.build()}')
 
         payment_tx_label = _add_pro_payment_user_tx_log_label_safe(payment_tx)
         log.info(f'Google ack. payment check (master={base.maybe_obfuscate_bytes(master_pkey)}, payment={payment_tx_label}, acked={sub_data.acknowledgement_state})')
 
         if sub_data.acknowledgement_state != platform_google_types.SubscriptionsV2AcknowledgementState.ACKNOWLEDGED:
-            platform_google_api.subscription_v1_acknowledge(purchase_token=payment_tx.google_payment_token, err=err)
-            if len(err.msg_list) > 0:
-                tx.cancel = True
-                return result
+            platform_google_api.subscription_v1_acknowledge(purchase_token=payment_tx.google_payment_token, err=google_err)
+            if google_err.has():
+                raise base.ServerError(f'Google subscription acknowledgement failed during redeem: {google_err.build()}')
     return result
 
 
@@ -1706,8 +1676,7 @@ def add_pro_payment(conn:                psycopg.Connection,
                     redeemed_at: datetime.datetime,
                     master_pkey:         nacl.signing.VerifyKey,
                     rotating_pkey:       nacl.signing.VerifyKey,
-                    payment_tx:          UserPaymentTransaction,
-                    err:                 base.ErrorSink) -> RedeemPayment:
+                    payment_tx:          UserPaymentTransaction) -> RedeemPayment:
     result = RedeemPayment()
     with db.transaction(conn) as tx:
         result = add_pro_payment_tx(tx,
@@ -1716,8 +1685,7 @@ def add_pro_payment(conn:                psycopg.Connection,
                                      redeemed_at,
                                      master_pkey,
                                      rotating_pkey,
-                                     payment_tx,
-                                     err)
+                                     payment_tx)
     return result
 
 def verify_and_add_pro_payment(conn:                psycopg.Connection,
@@ -1728,8 +1696,7 @@ def verify_and_add_pro_payment(conn:                psycopg.Connection,
                                rotating_pkey:       nacl.signing.VerifyKey,
                                payment_tx:          UserPaymentTransaction,
                                master_sig:          bytes,
-                               rotating_sig:        bytes,
-                               err:                 base.ErrorSink) -> RedeemPayment:
+                               rotating_sig:        bytes) -> RedeemPayment:
     """
     request_at: The timestamp typically accurate to the current time, used as a frame-of-reference
     to clamp the duration of the proof returned to the user to at most 1 month, also used to mask
@@ -1743,34 +1710,24 @@ def verify_and_add_pro_payment(conn:                psycopg.Connection,
     payment_tx_label = _add_pro_payment_user_tx_log_label_safe(payment_tx)
     log.info(f'Add payment (redeemed={base.readable(redeemed_at)}, master={base.maybe_obfuscate_bytes(master_pkey)}, payment={payment_tx_label})')
 
-    result        = RedeemPayment()
-    result.status = RedeemPaymentStatus.Error
-
-    # Verify some of the request parameters
+    # Authenticate the request (raises FailError(bad_signature) / invalid_request on failure).
     hash_to_sign: bytes = make_add_pro_payment_hash(master_pkey   = master_pkey,
                                                     rotating_pkey = rotating_pkey,
                                                     payment_tx    = payment_tx)
+    internal_verify_add_payment_and_get_proof_common_arguments(signing_key   = signing_key,
+                                                               master_pkey   = master_pkey,
+                                                               rotating_pkey = rotating_pkey,
+                                                               hash_to_sign  = hash_to_sign,
+                                                               master_sig    = master_sig,
+                                                               rotating_sig  = rotating_sig)
 
-    _ = internal_verify_add_payment_and_get_proof_common_arguments(signing_key   = signing_key,
-                                                                   master_pkey   = master_pkey,
-                                                                   rotating_pkey = rotating_pkey,
-                                                                   hash_to_sign  = hash_to_sign,
-                                                                   master_sig    = master_sig,
-                                                                   rotating_sig  = rotating_sig,
-                                                                   err           = err)
-    if len(err.msg_list) > 0:
-        return result
-
-    # Pre-verification steps complete, continue to add the payment
-    result = add_pro_payment(conn,
-                             signing_key,
-                             request_at,
-                             redeemed_at,
-                             master_pkey,
-                             rotating_pkey,
-                             payment_tx,
-                             err)
-    return result
+    return add_pro_payment(conn,
+                           signing_key,
+                           request_at,
+                           redeemed_at,
+                           master_pkey,
+                           rotating_pkey,
+                           payment_tx)
 
 def revoke_master_pkey_proofs_and_allocate_new_gen_id_tx(tx: db.SQLTransaction, master_pkey: nacl.signing.VerifyKey, created_at: datetime.datetime) -> AllocatedGenID:
     # Revoke the user's current generation (terminal): sets revoked_at, which blocks every proof issued
@@ -1799,56 +1756,56 @@ def round_datetime_to_next_day_with_platform_testing_support(payment_provider: b
         return base.EPOCH + units * google_day
     return base.round_datetime_to_next_day(at)
 
+def build_current_entitlement_proof_tx(tx:            db.SQLTransaction,
+                                       master_pkey:   nacl.signing.VerifyKey,
+                                       rotating_pkey: nacl.signing.VerifyKey,
+                                       request_at:    datetime.datetime,
+                                       signing_key:   nacl.signing.SigningKey) -> ProSubscriptionProof:
+    '''Sign a proof for the user's CURRENT entitlement using their existing generation token (NO roll).
+    Shared by generate_pro_proof and the idempotent add_pro_payment replay path. Raises a FailError with
+    the matching slug when there is nothing to sign: `not_subscribed` (no user row), `revoked` (current
+    generation revoked), `expired` (entitlement lapsed past the clamped proof window).'''
+    get_user = get_user_and_payments(tx, master_pkey)
+    if get_user.user.master_pkey != bytes(master_pkey):
+        raise base.FailError(f'User {bytes(master_pkey).hex()} does not have an active payment registered for it',
+                             code=base.ErrorCode.not_subscribed)
+
+    if is_generation_revoked_tx(tx, get_user.user.current_generation_id, request_at):
+        raise base.FailError(f'User {bytes(master_pkey).hex()} payment has been revoked', code=base.ErrorCode.revoked)
+
+    proof_expires_at = _build_proof_clamped_expiry_time(request_at=request_at, proposed_expires_at=get_user.user.expires_at)
+    if request_at > proof_expires_at:
+        payment_expires_at = get_user.user.expires_at - get_user.user.grace_period if get_user.user.auto_renewing else get_user.user.expires_at
+        raise base.FailError(f'User {bytes(master_pkey).hex()} entitlement expired at {base.readable(get_user.user.expires_at)} ({base.readable(payment_expires_at)} + {get_user.user.grace_period})',
+                             code=base.ErrorCode.expired)
+
+    return build_proof(revocation_tag = get_user.user.token,
+                       rotating_pkey  = rotating_pkey,
+                       expires_at     = proof_expires_at,
+                       signing_key    = signing_key)
+
 def generate_pro_proof(conn: psycopg.Connection,
                        signing_key:    nacl.signing.SigningKey,
                        master_pkey:    nacl.signing.VerifyKey,
                        rotating_pkey:  nacl.signing.VerifyKey,
                        request_at:     datetime.datetime,
                        master_sig:     bytes,
-                       rotating_sig:   bytes,
-                       err:            base.ErrorSink) -> ProSubscriptionProof:
-    result: ProSubscriptionProof = ProSubscriptionProof()
+                       rotating_sig:   bytes) -> ProSubscriptionProof:
     log.info(f'Get pro proof (master={base.maybe_obfuscate_bytes(master_pkey)}, ts={base.readable(request_at)})')
 
-    # Verify some of the request parameters
+    # Authenticate the request (raises FailError(bad_signature) / invalid_request on failure).
     hash_to_sign: bytes = make_generate_pro_proof_hash(master_pkey   = master_pkey,
                                                        rotating_pkey = rotating_pkey,
                                                        request_at    = request_at)
+    internal_verify_add_payment_and_get_proof_common_arguments(signing_key   = signing_key,
+                                                               master_pkey   = master_pkey,
+                                                               rotating_pkey = rotating_pkey,
+                                                               hash_to_sign  = hash_to_sign,
+                                                               master_sig    = master_sig,
+                                                               rotating_sig  = rotating_sig)
 
-    _ = internal_verify_add_payment_and_get_proof_common_arguments(signing_key   = signing_key,
-                                                                   master_pkey   = master_pkey,
-                                                                   rotating_pkey = rotating_pkey,
-                                                                   hash_to_sign  = hash_to_sign,
-                                                                   master_sig    = master_sig,
-                                                                   rotating_sig  = rotating_sig,
-                                                                   err           = err)
-    if len(err.msg_list) > 0:
-        return result
-
-    # All verified, now generate proof
-    get_user: GetUserAndPayments | None = None
     with db.transaction(conn) as tx:
-        get_user = get_user_and_payments(tx, master_pkey)
-    assert get_user
-
-    if get_user.user.master_pkey == bytes(master_pkey):
-        # Don't mint a proof on a revoked generation.
-        if is_generation_revoked(conn, get_user.user.current_generation_id, request_at):
-            err.msg_list.append(f'User {bytes(master_pkey).hex()} payment has been revoked')
-        else:
-            proof_expires_at = _build_proof_clamped_expiry_time(request_at=request_at, proposed_expires_at=get_user.user.expires_at)
-            if request_at <= proof_expires_at:
-                result = build_proof(revocation_tag = get_user.user.token,
-                                     rotating_pkey  = rotating_pkey,
-                                     expires_at     = proof_expires_at,
-                                     signing_key    = signing_key);
-            else:
-                payment_expires_at = get_user.user.expires_at - get_user.user.grace_period if get_user.user.auto_renewing else get_user.user.expires_at
-                err.msg_list.append(f'User {bytes(master_pkey).hex()} entitlement expired at {base.readable(get_user.user.expires_at)} ({base.readable(payment_expires_at)} + {get_user.user.grace_period})')
-    else:
-        err.msg_list.append(f'User {bytes(master_pkey).hex()} does not have an active payment registered for it')
-
-    return result
+        return build_current_entitlement_proof_tx(tx, master_pkey, rotating_pkey, request_at, signing_key)
 
 def expire_payments_revocations_and_users(conn: psycopg.Connection, now: datetime.datetime) -> ExpireResult:
     # Pure idempotent housekeeping: prune rows whose expiry has passed (and orphaned users). Nothing
