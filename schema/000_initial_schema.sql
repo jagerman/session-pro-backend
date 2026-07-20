@@ -60,42 +60,47 @@ CREATE TABLE IF NOT EXISTS payments (
     platform_refund_expires_at        TIMESTAMPTZ NOT     NULL,
     revoked_at                        TIMESTAMPTZ,                    -- NOT NULL once revoked
 
-    apple_original_tx_id              TEXT,
-    apple_tx_id                       TEXT,
-    apple_web_line_order_tx_id        TEXT,
-    google_payment_token              TEXT,
-    google_order_id                   TEXT,
-    rangeproof_order_id               TEXT,
-
     -- NULL = no refund requested.
-    refund_requested_at               TIMESTAMPTZ,
-    google_obfuscated_account_id      BYTEA       CHECK (octet_length(google_obfuscated_account_id) = 32),
-    -- NULL = not an Apple payment.
-    apple_app_account_token           TEXT,
+    refund_requested_at               TIMESTAMPTZ
 
-    -- Enforce in the schema what the ingest code assumes: a payment carries the identifying tx-id of its
-    -- own provider (item 15). Guards against a miswired insert storing e.g. a google_play row with no
-    -- google_payment_token, or another provider's ids.
-    CONSTRAINT payments_provider_tx_id CHECK (
-        (payment_provider = 'google_play' AND google_payment_token IS NOT NULL) OR
-        (payment_provider = 'app_store'   AND apple_tx_id          IS NOT NULL) OR
-        (payment_provider = 'rangeproof'  AND rangeproof_order_id  IS NOT NULL)
-    )
-    -- (No `redeemed_at IS NULL OR user_id IS NOT NULL` CHECK: redemption marks the payment redeemed and
-    -- backfills user_id in two statements of one transaction, so "redeemed ⟹ owned" holds only at COMMIT.
-    -- A CHECK fires per-statement and can't be DEFERRABLE, so it can't express this; the code ordering
-    -- guarantees it. A correctness-audit item, not a schema constraint.)
+    -- Provider-specific identifiers do NOT live here — they're in the per-provider *_payment_details
+    -- tables below (one row, keyed by payment_id, in exactly the table matching payment_provider). That
+    -- keeps this table provider-agnostic: a new provider is a new focused detail table, not another
+    -- batch of nullable columns crudding up `payments`.
 );
 
--- Indexes (item 13): partial where the column is NULL for rows it doesn't apply to (one provider's ids
--- per payment; user_id NULL until redeemed) — the `= <value>` lookups never target NULL. google_order_id
--- and apple_web_line_order_tx_id are only ever secondary AND-filters, so they need no index of their own.
-CREATE INDEX IF NOT EXISTS payments_user_id_idx              ON payments (user_id)              WHERE user_id              IS NOT NULL;  -- owner lookups + PAYMENTS_FROM join
-CREATE INDEX IF NOT EXISTS payments_google_payment_token_idx ON payments (google_payment_token) WHERE google_payment_token IS NOT NULL;  -- provider tx-id lookup
-CREATE INDEX IF NOT EXISTS payments_apple_original_tx_id_idx ON payments (apple_original_tx_id)  WHERE apple_original_tx_id  IS NOT NULL;  -- provider tx-id lookup
-CREATE INDEX IF NOT EXISTS payments_apple_tx_id_idx          ON payments (apple_tx_id)           WHERE apple_tx_id          IS NOT NULL;  -- provider tx-id lookup
-CREATE INDEX IF NOT EXISTS payments_rangeproof_order_id_idx  ON payments (rangeproof_order_id)   WHERE rangeproof_order_id  IS NOT NULL;  -- provider tx-id lookup
-CREATE INDEX IF NOT EXISTS payments_expires_at_idx           ON payments (expires_at);                                                    -- daily expiry sweep
+CREATE INDEX IF NOT EXISTS payments_user_id_idx    ON payments (user_id) WHERE user_id IS NOT NULL;  -- owner lookups + PAYMENTS_FROM join
+CREATE INDEX IF NOT EXISTS payments_expires_at_idx ON payments (expires_at);                         -- daily expiry sweep
+
+-- Per-provider payment identifiers (item 15 follow-up). Exactly one of these has a row for a given
+-- payment, in the table matching payments.payment_provider; payment_id is the PK *and* FK, so the 1:1 is
+-- structural and the detail row is pruned with its payment (ON DELETE CASCADE). Typed columns with real
+-- NOT NULLs replace the old sparse provider columns on `payments`.
+CREATE TABLE IF NOT EXISTS google_play_payment_details (
+    payment_id            BIGINT PRIMARY KEY REFERENCES payments(id) ON DELETE CASCADE,
+    payment_token         TEXT  NOT NULL,
+    order_id              TEXT  NOT NULL,
+    obfuscated_account_id BYTEA NOT NULL CHECK (octet_length(obfuscated_account_id) = 32)
+);
+-- Auto-redeem matches (payment_token, order_id, obfuscated_account_id); revocation matches payment_token.
+CREATE INDEX IF NOT EXISTS google_play_payment_details_token_idx ON google_play_payment_details (payment_token);
+
+CREATE TABLE IF NOT EXISTS app_store_payment_details (
+    payment_id           BIGINT PRIMARY KEY REFERENCES payments(id) ON DELETE CASCADE,
+    original_tx_id       TEXT NOT NULL,
+    tx_id                TEXT NOT NULL,
+    web_line_order_tx_id TEXT NOT NULL,
+    app_account_token    TEXT NOT NULL
+);
+-- Auto-redeem matches (tx_id, app_account_token); revocation matches original_tx_id.
+CREATE INDEX IF NOT EXISTS app_store_payment_details_tx_id_idx       ON app_store_payment_details (tx_id);
+CREATE INDEX IF NOT EXISTS app_store_payment_details_original_tx_idx ON app_store_payment_details (original_tx_id);
+
+CREATE TABLE IF NOT EXISTS rangeproof_payment_details (
+    payment_id  BIGINT PRIMARY KEY REFERENCES payments(id) ON DELETE CASCADE,
+    order_id    TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS rangeproof_payment_details_order_id_idx ON rangeproof_payment_details (order_id);
 
 -- A generation is a user's signed-entitlement epoch (the aggregate of their stacked payments), NOT
 -- per-payment and NOT per-proof. `token` is a random 32-byte value embedded verbatim in proofs and the

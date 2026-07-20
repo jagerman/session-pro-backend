@@ -40,15 +40,24 @@ assert all(len(p) == DOMAIN_SIZE for p in (GENERATE_PROOF_DOMAIN, BUILD_PROOF_DO
 # `master_pkey` lives only in `users` now, so payments reads come from `PAYMENTS_FROM` (payments LEFT
 # JOIN users) and pull the pkey from the joined users row — NULL for an unredeemed payment (user_id
 # NULL).
+# Provider-specific ids come from the per-provider detail tables (LEFT JOINed below — a payment is in
+# exactly one, the rest are NULL) and are aliased back to the historical column names so the row→PaymentRow
+# mapping (payment_row_from_dict) is unchanged.
 PAYMENTS_COLUMNS = (
     "p.id, u.master_pkey, p.plan, p.payment_provider, p.auto_renewing, "
     "p.purchased_at, p.redeemed_at, p.expires_at, "
     "p.grace_period, p.platform_refund_expires_at, p.revoked_at, "
-    "p.apple_original_tx_id, p.apple_tx_id, p.apple_web_line_order_tx_id, "
-    "p.google_payment_token, p.google_order_id, p.rangeproof_order_id, "
-    "p.refund_requested_at, p.google_obfuscated_account_id, p.apple_app_account_token"
+    "ad.original_tx_id AS apple_original_tx_id, ad.tx_id AS apple_tx_id, ad.web_line_order_tx_id AS apple_web_line_order_tx_id, "
+    "gd.payment_token AS google_payment_token, gd.order_id AS google_order_id, rd.order_id AS rangeproof_order_id, "
+    "p.refund_requested_at, gd.obfuscated_account_id AS google_obfuscated_account_id, ad.app_account_token AS apple_app_account_token"
 )
-PAYMENTS_FROM = "payments p LEFT JOIN users u ON u.id = p.user_id"
+PAYMENTS_FROM = (
+    "payments p "
+    "LEFT JOIN users u                      ON u.id  = p.user_id "
+    "LEFT JOIN google_play_payment_details gd    ON gd.payment_id = p.id "
+    "LEFT JOIN app_store_payment_details ad     ON ad.payment_id = p.id "
+    "LEFT JOIN rangeproof_payment_details rd ON rd.payment_id = p.id"
+)
 
 # Single source of truth for reading a user row (mirrors PAYMENTS_*). The join to `generations` pulls the
 # current generation's `token` (the proof's revocation_tag); it's an INNER JOIN because
@@ -750,11 +759,9 @@ def add_apple_revocation_tx(tx: db.SQLTransaction, apple_original_tx_id: str, re
     rows_result = db.query(tx.conn, f'''
     SELECT p.id, u.master_pkey, p.expires_at
     FROM   {PAYMENTS_FROM}
-    WHERE  p.apple_original_tx_id  = %(orig_tx)s AND
-           p.payment_provider      = %(provider)s;
+    WHERE  ad.original_tx_id = %(orig_tx)s;
     ''',
-        orig_tx    = apple_original_tx_id,
-        provider   = base.PaymentProvider.iOSAppStore.value)
+        orig_tx    = apple_original_tx_id)
 
     log.info(f'Revoking Apple payment (orig. TX ID={base.maybe_obfuscate(apple_original_tx_id)}, revoke={base.readable(revoke_at)})')
     rows         = rows_result.fetchall()
@@ -780,11 +787,9 @@ def add_google_revocation_tx(tx: db.SQLTransaction, google_payment_token: str, r
     rows_result = db.query(tx.conn, f'''
     SELECT p.id, u.master_pkey, p.expires_at
     FROM   {PAYMENTS_FROM}
-    WHERE  p.google_payment_token = %(token)s AND
-           p.payment_provider     = %(provider)s
+    WHERE  gd.payment_token = %(token)s
     ''',
-        token=google_payment_token,
-        provider   = base.PaymentProvider.GooglePlayStore.value)
+        token=google_payment_token)
 
     log.info(f'Revoking Google payment (token={base.maybe_obfuscate(google_payment_token)}, revoke={base.readable(revoke_at)})')
     rows         = rows_result.fetchall()
@@ -844,16 +849,13 @@ def redeem_payment_tx(tx:                  db.SQLTransaction,
         row_result = db.query(tx.conn, f'''
             UPDATE payments
             SET    {set_expr}
-            WHERE  payment_provider             = %(provider)s
-              AND  google_payment_token         = %(token)s
-              AND  google_order_id              = %(order_id)s
+            WHERE  id IN (SELECT payment_id FROM google_play_payment_details
+                          WHERE payment_token = %(token)s AND order_id = %(order_id)s AND obfuscated_account_id = %(account_id)s)
               AND  redeemed_at IS NULL AND revoked_at IS NULL
-              AND  google_obfuscated_account_id = %(account_id)s
             RETURNING id
         ''', # SET values
               redeemed_at = redeemed_at,
               # WHERE values
-              provider            = payment_tx.provider.value,
               token               = payment_tx.google_payment_token,
               order_id            = payment_tx.google_order_id,
               account_id          = google_obfuscated_account_id_from_master_pkey(master_pkey))
@@ -861,29 +863,25 @@ def redeem_payment_tx(tx:                  db.SQLTransaction,
         row_result = db.query(tx.conn, f'''
             UPDATE payments
             SET    {set_expr}
-            WHERE  payment_provider       = %(provider)s
-              AND apple_tx_id             = %(tx_id)s
+            WHERE  id IN (SELECT payment_id FROM app_store_payment_details
+                          WHERE tx_id = %(tx_id)s AND app_account_token = %(account_token)s)
               AND  redeemed_at IS NULL AND revoked_at IS NULL
-              AND apple_app_account_token = %(account_token)s
             RETURNING id
         ''', # SET fields
               redeemed_at = redeemed_at,
               # WHERE fields
-              provider            = payment_tx.provider.value,
               tx_id               = payment_tx.apple_tx_id,
               account_token       = apple_obfuscated_account_id_from_master_pkey(master_pkey))
     elif payment_tx.provider == base.PaymentProvider.Rangeproof:
         row_result = db.query(tx.conn, f'''
             UPDATE payments
             SET    {set_expr}
-            WHERE payment_provider    = %(provider)s
-              AND rangeproof_order_id = %(rangeproof_order_id)s
+            WHERE  id IN (SELECT payment_id FROM rangeproof_payment_details WHERE order_id = %(rangeproof_order_id)s)
               AND  redeemed_at IS NULL AND revoked_at IS NULL
             RETURNING id
         ''', # SET fields
               redeemed_at = redeemed_at,
               # WHERE fields
-              provider            = payment_tx.provider.value,
               rangeproof_order_id = payment_tx.rangeproof_order_id,)
     else:
         raise base.FailError('Payment to register specifies an unknown payment provider')
@@ -927,37 +925,31 @@ def redeem_payment_tx(tx:                  db.SQLTransaction,
         if payment_tx.provider == base.PaymentProvider.GooglePlayStore:
             row_result = db.query(tx.conn, '''
                 SELECT COUNT(*)
-                FROM   payments
-                WHERE  payment_provider     = %(provider)s
-                  AND  google_payment_token = %(token)s
-                  AND  google_order_id      = %(order_id)s
-                  AND  redeemed_at IS NOT NULL
-                  AND  user_id              = (SELECT id FROM users WHERE master_pkey = %(master_pkey)s)
-            ''', provider    = payment_tx.provider.value,
-                 token       = payment_tx.google_payment_token,
+                FROM   payments p JOIN google_play_payment_details gd ON gd.payment_id = p.id
+                WHERE  gd.payment_token = %(token)s
+                  AND  gd.order_id      = %(order_id)s
+                  AND  p.redeemed_at IS NOT NULL
+                  AND  p.user_id        = (SELECT id FROM users WHERE master_pkey = %(master_pkey)s)
+            ''', token       = payment_tx.google_payment_token,
                  order_id    = payment_tx.google_order_id,
                  master_pkey = master_pkey_bytes)
         elif payment_tx.provider == base.PaymentProvider.iOSAppStore:
             row_result = db.query(tx.conn, '''
                 SELECT COUNT(*)
-                FROM   payments
-                WHERE  payment_provider = %(provider)s
-                  AND  apple_tx_id      = %(tx_id)s
-                  AND  redeemed_at IS NOT NULL
-                  AND  user_id          = (SELECT id FROM users WHERE master_pkey = %(master_pkey)s)
-            ''', provider    = payment_tx.provider.value,
-                 tx_id       = payment_tx.apple_tx_id,
+                FROM   payments p JOIN app_store_payment_details ad ON ad.payment_id = p.id
+                WHERE  ad.tx_id = %(tx_id)s
+                  AND  p.redeemed_at IS NOT NULL
+                  AND  p.user_id  = (SELECT id FROM users WHERE master_pkey = %(master_pkey)s)
+            ''', tx_id       = payment_tx.apple_tx_id,
                  master_pkey = master_pkey_bytes)
         elif payment_tx.provider == base.PaymentProvider.Rangeproof:
             row_result = db.query(tx.conn, '''
                 SELECT COUNT(*)
-                FROM   payments
-                WHERE  payment_provider    = %(provider)s
-                  AND  rangeproof_order_id = %(order_id)s
-                  AND  redeemed_at IS NOT NULL
-                  AND  user_id             = (SELECT id FROM users WHERE master_pkey = %(master_pkey)s)
-            ''', provider    = payment_tx.provider.value,
-                 order_id    = payment_tx.rangeproof_order_id,
+                FROM   payments p JOIN rangeproof_payment_details rd ON rd.payment_id = p.id
+                WHERE  rd.order_id = %(order_id)s
+                  AND  p.redeemed_at IS NOT NULL
+                  AND  p.user_id     = (SELECT id FROM users WHERE master_pkey = %(master_pkey)s)
+            ''', order_id    = payment_tx.rangeproof_order_id,
                  master_pkey = master_pkey_bytes)
 
         first_row = row_result.fetchone()
@@ -1006,10 +998,14 @@ def _lookup_user_expiry_tx(tx: db.SQLTransaction, master_pkey: nacl.signing.Veri
     # filtering on user_id selects exactly those — unredeemed payments have no user_id.
     # redeemed/expired/revoked are then derived from the timestamps below.
     result_set = db.query(tx.conn, ('''
-        SELECT    expires_at, grace_period, auto_renewing, redeemed_at, refund_requested_at, payment_provider, apple_original_tx_id, google_order_id, rangeproof_order_id, revoked_at
-        FROM      payments
-        WHERE     user_id = (SELECT id FROM users WHERE master_pkey = %(master_pkey)s)
-        ORDER BY  id DESC
+        SELECT    p.expires_at, p.grace_period, p.auto_renewing, p.redeemed_at, p.refund_requested_at, p.payment_provider,
+                  ad.original_tx_id, gd.order_id, rd.order_id, p.revoked_at
+        FROM      payments p
+                  LEFT JOIN app_store_payment_details ad      ON ad.payment_id = p.id
+                  LEFT JOIN google_play_payment_details gd     ON gd.payment_id = p.id
+                  LEFT JOIN rangeproof_payment_details rd ON rd.payment_id = p.id
+        WHERE     p.user_id = (SELECT id FROM users WHERE master_pkey = %(master_pkey)s)
+        ORDER BY  p.id DESC
     '''), master_pkey = bytes(master_pkey))
 
     used_google_order_ids:     list[str] = []
@@ -1159,7 +1155,7 @@ def update_payment_renewal_info_tx(tx:                       db.SQLTransaction,
             result_set = db.query(tx.conn, f'''
                 UPDATE    payments
                 SET       {sql_set_fields}
-                WHERE     google_payment_token = %(token)s AND google_order_id = %(order_id)s
+                WHERE     id IN (SELECT payment_id FROM google_play_payment_details WHERE payment_token = %(token)s AND order_id = %(order_id)s)
                 RETURNING (SELECT master_pkey FROM users WHERE users.id = payments.user_id)
             ''', token    = payment_tx.google_payment_token,
                  order_id = payment_tx.google_order_id,
@@ -1169,7 +1165,7 @@ def update_payment_renewal_info_tx(tx:                       db.SQLTransaction,
             result_set = db.query(tx.conn, f'''
                 UPDATE    payments
                 SET       {sql_set_fields}
-                WHERE     apple_original_tx_id = %(orig_tx_id)s AND apple_tx_id = %(tx_id)s AND apple_web_line_order_tx_id = %(line_order_tx_id)s
+                WHERE     id IN (SELECT payment_id FROM app_store_payment_details WHERE original_tx_id = %(orig_tx_id)s AND tx_id = %(tx_id)s AND web_line_order_tx_id = %(line_order_tx_id)s)
                 RETURNING (SELECT master_pkey FROM users WHERE users.id = payments.user_id)
             ''', orig_tx_id       = payment_tx.apple_original_tx_id,
                  tx_id            = payment_tx.apple_tx_id,
@@ -1180,7 +1176,7 @@ def update_payment_renewal_info_tx(tx:                       db.SQLTransaction,
             result_set = db.query(tx.conn, f'''
                 UPDATE    payments
                 SET       {sql_set_fields}
-                WHERE     rangeproof_order_id = %(rangeproof_order_id)s
+                WHERE     id IN (SELECT payment_id FROM rangeproof_payment_details WHERE order_id = %(rangeproof_order_id)s)
                 RETURNING (SELECT master_pkey FROM users WHERE users.id = payments.user_id)
             ''', rangeproof_order_id = payment_tx.rangeproof_order_id,
                  **kwparams)
@@ -1220,15 +1216,22 @@ def update_payment_renewal_info(conn:                     psycopg.Connection,
         result = update_payment_renewal_info_tx(sql_tx, payment_tx, grace_period, auto_renewing, err)
     return result
 
-def _insert_payment_row_tx(tx: db.SQLTransaction, row: dict[str, typing.Any]) -> None:
-    """INSERT a payments row from a column→value mapping.
+def _insert_payment_row_tx(tx: db.SQLTransaction, payment: dict[str, typing.Any], detail_table: str, detail: dict[str, typing.Any]) -> None:
+    """INSERT a payment: the provider-agnostic `payment` columns into `payments` (RETURNING the new id),
+    then the provider-specific `detail` columns into `detail_table`, keyed by that id.
 
-    A dict is self-aligning: the column name and its value live together, so there is no pair of
-    parallel lists to drift out of index-lock. Placeholders are generated from the same keys.
+    Each dict is self-aligning — the column name lives with its value, so there is no pair of parallel
+    lists to drift out of index-lock; placeholders are generated from the same keys.
     """
-    columns      = ', '.join(row)
-    placeholders = ', '.join(f'%({column})s' for column in row)
-    _ = db.query(tx.conn, f'INSERT INTO payments ({columns}) VALUES ({placeholders})', row)
+    p_columns      = ', '.join(payment)
+    p_placeholders = ', '.join(f'%({column})s' for column in payment)
+    result         = db.query(tx.conn, f'INSERT INTO payments ({p_columns}) VALUES ({p_placeholders}) RETURNING id', payment)
+    payment_id     = result.fetchone()[0]
+
+    detail_row      = {'payment_id': payment_id, **detail}
+    d_columns       = ', '.join(detail_row)
+    d_placeholders  = ', '.join(f'%({column})s' for column in detail_row)
+    _ = db.query(tx.conn, f'INSERT INTO {detail_table} ({d_columns}) VALUES ({d_placeholders})', detail_row)
 
 def add_unredeemed_payment_tx(tx:                                db.SQLTransaction,
                               payment_tx:                        base.PaymentProviderTransaction,
@@ -1251,81 +1254,85 @@ def add_unredeemed_payment_tx(tx:                                db.SQLTransacti
         assert isinstance(platform_obfuscated_account_id, bytes)
         assert len(platform_obfuscated_account_id) == 32
 
-        # NOTE: Insert into the table, IFF, the payment token hash doesn't already exist in the
-        # payments table
+        # NOTE: Insert IFF this (token, order_id) isn't already recorded.
         result_set = db.query(tx.conn, '''
-            SELECT 1
-            FROM payments
-            WHERE payment_provider = %(provider)s AND google_payment_token = %(token)s AND google_order_id = %(order_id)s
-        ''', provider=payment_tx.provider.value, token=payment_tx.google_payment_token, order_id=payment_tx.google_order_id)
+            SELECT 1 FROM google_play_payment_details WHERE payment_token = %s AND order_id = %s
+        ''', payment_tx.google_payment_token, payment_tx.google_order_id)
 
         record = result_set.fetchone()
         if not record:
-            _insert_payment_row_tx(tx, {
-                'plan':                              plan.value,
-                'payment_provider':                 payment_tx.provider.value,
-                'google_payment_token':             payment_tx.google_payment_token,
-                'google_order_id':                  payment_tx.google_order_id,
-                'expires_at':                expires_at,
-                'platform_refund_expires_at': platform_refund_expires_at,
-                'purchased_at':            purchased_at,
-                'auto_renewing':                    True,  # on by default until Google notifies otherwise
-                'refund_requested_at':      None,
-                'google_obfuscated_account_id':     platform_obfuscated_account_id,
-            })
+            _insert_payment_row_tx(tx,
+                payment = {
+                    'plan':                       plan.value,
+                    'payment_provider':           payment_tx.provider.value,
+                    'expires_at':                 expires_at,
+                    'platform_refund_expires_at': platform_refund_expires_at,
+                    'purchased_at':               purchased_at,
+                    'auto_renewing':              True,  # on by default until Google notifies otherwise
+                    'refund_requested_at':        None,
+                },
+                detail_table = 'google_play_payment_details',
+                detail = {
+                    'payment_token':         payment_tx.google_payment_token,
+                    'order_id':              payment_tx.google_order_id,
+                    'obfuscated_account_id': platform_obfuscated_account_id,
+                })
 
     elif payment_tx.provider == base.PaymentProvider.iOSAppStore:
         assert isinstance(platform_obfuscated_account_id, str)
-        # NOTE: Insert into the table, IFF, the apple payment doesn't already exist somewhere else.
+        # NOTE: Insert IFF this apple payment isn't already recorded.
         #
         # For Apple each apple_tx_id is always unique.
         # apple_web_line_order_tx_id is unique for the payment of the billing
         # cycle for that subscription and the apple_original_tx_id is reused
         # across all subscriptions of the same type.
         result_set = db.query(tx.conn, '''
-                SELECT 1
-                FROM payments
-                WHERE payment_provider = %(provider)s AND apple_original_tx_id = %(orig_tx_id)s AND apple_tx_id = %(tx_id)s AND apple_web_line_order_tx_id = %(line_order_tx_id)s
-        ''', provider=payment_tx.provider.value,
-              orig_tx_id=payment_tx.apple_original_tx_id,
+                SELECT 1 FROM app_store_payment_details WHERE original_tx_id = %(orig_tx_id)s AND tx_id = %(tx_id)s AND web_line_order_tx_id = %(line_order_tx_id)s
+        ''', orig_tx_id=payment_tx.apple_original_tx_id,
               tx_id=payment_tx.apple_tx_id,
               line_order_tx_id=payment_tx.apple_web_line_order_tx_id)
 
         record = result_set.fetchone()
         if not record:
-            _insert_payment_row_tx(tx, {
-                'plan':                              plan.value,
-                'payment_provider':                 payment_tx.provider.value,
-                'apple_original_tx_id':             payment_tx.apple_original_tx_id,
-                'apple_tx_id':                      payment_tx.apple_tx_id,
-                'apple_web_line_order_tx_id':       payment_tx.apple_web_line_order_tx_id,
-                'expires_at':                expires_at,
-                'platform_refund_expires_at': platform_refund_expires_at,
-                'purchased_at':            purchased_at,
-                'auto_renewing':                    True,  # on by default until Apple notifies otherwise
-                'refund_requested_at':      None,
-                'apple_app_account_token':          platform_obfuscated_account_id,
-            })
+            _insert_payment_row_tx(tx,
+                payment = {
+                    'plan':                       plan.value,
+                    'payment_provider':           payment_tx.provider.value,
+                    'expires_at':                 expires_at,
+                    'platform_refund_expires_at': platform_refund_expires_at,
+                    'purchased_at':               purchased_at,
+                    'auto_renewing':              True,  # on by default until Apple notifies otherwise
+                    'refund_requested_at':        None,
+                },
+                detail_table = 'app_store_payment_details',
+                detail = {
+                    'original_tx_id':       payment_tx.apple_original_tx_id,
+                    'tx_id':                payment_tx.apple_tx_id,
+                    'web_line_order_tx_id': payment_tx.apple_web_line_order_tx_id,
+                    'app_account_token':    platform_obfuscated_account_id,
+                })
     elif payment_tx.provider == base.PaymentProvider.Rangeproof:
-        # NOTE: Insert into the table, IFF, the rangeproof order id doesn't already exist somewhere else.
+        # NOTE: Insert IFF this rangeproof order id isn't already recorded.
         result_set = db.query(tx.conn, '''
-                SELECT 1
-                FROM payments
-                WHERE payment_provider = %s AND rangeproof_order_id = %s
-        ''', payment_tx.provider.value, payment_tx.rangeproof_order_id)
+                SELECT 1 FROM rangeproof_payment_details WHERE order_id = %s
+        ''', payment_tx.rangeproof_order_id)
 
         record = result_set.fetchone()
         if not record:
-            _insert_payment_row_tx(tx, {
-                'plan':                              plan.value,
-                'payment_provider':                 payment_tx.provider.value,
-                'rangeproof_order_id':              payment_tx.rangeproof_order_id,
-                'expires_at':                expires_at,
-                'platform_refund_expires_at': platform_refund_expires_at,
-                'purchased_at':            purchased_at,
-                'auto_renewing':                    False,  # Rangeproof vouchers never auto-renew
-                'refund_requested_at':      None,
-            })
+            _insert_payment_row_tx(tx,
+                payment = {
+                    'plan':                       plan.value,
+                    'payment_provider':           payment_tx.provider.value,
+                    'expires_at':                 expires_at,
+                    'platform_refund_expires_at': platform_refund_expires_at,
+                    'purchased_at':               purchased_at,
+                    'auto_renewing':              False,  # Rangeproof vouchers never auto-renew
+                    'refund_requested_at':        None,
+                },
+                detail_table = 'rangeproof_payment_details',
+                detail = {
+                    'order_id': payment_tx.rangeproof_order_id,
+                })
 
     # NOTE: Find the latest master pkey associated with the common payment identifier (google payment
     # token or apple original tx id). Then find the user if it exists, if the user is still entitled
@@ -1349,18 +1356,20 @@ def add_unredeemed_payment_tx(tx:                                db.SQLTransacti
         result_set = db.query(tx.conn, ('''
             SELECT   u.master_pkey
             FROM     payments p JOIN users u ON u.id = p.user_id
-            WHERE    p.payment_provider = %s AND p.google_payment_token = %s
+                     JOIN google_play_payment_details gd ON gd.payment_id = p.id
+            WHERE    gd.payment_token = %s
             ORDER BY p.id DESC
             LIMIT    1
-        '''), payment_tx.provider.value, payment_tx.google_payment_token)
+        '''), payment_tx.google_payment_token)
     elif payment_tx.provider == base.PaymentProvider.iOSAppStore:
         result_set = db.query(tx.conn, ('''
             SELECT   u.master_pkey
             FROM     payments p JOIN users u ON u.id = p.user_id
-            WHERE    p.payment_provider = %s AND p.apple_original_tx_id = %s
+                     JOIN app_store_payment_details ad ON ad.payment_id = p.id
+            WHERE    ad.original_tx_id = %s
             ORDER BY p.id DESC
             LIMIT    1
-        '''), payment_tx.provider.value, payment_tx.apple_original_tx_id)
+        '''), payment_tx.apple_original_tx_id)
     elif payment_tx.provider == base.PaymentProvider.Rangeproof:
         # TODO: There is currently no auto-redeeming for Rangeproof payments. These are currently
         # granted to a user directly by creating a voucher payment attributed under their master pro
@@ -1866,9 +1875,11 @@ def has_user_error_from_master_pkey_tx(tx: db.SQLTransaction, master_pkey: nacl.
 SELECT EXISTS (
     SELECT 1
     FROM payments p
+    LEFT JOIN app_store_payment_details  ad ON ad.payment_id = p.id
+    LEFT JOIN google_play_payment_details gd ON gd.payment_id = p.id
     LEFT JOIN user_errors ue
-        ON (p.payment_provider = '{base.PaymentProvider.iOSAppStore.value}'     AND p.apple_original_tx_id = ue.payment_id)
-        OR (p.payment_provider = '{base.PaymentProvider.GooglePlayStore.value}' AND p.google_payment_token = ue.payment_id)
+        ON (p.payment_provider = '{base.PaymentProvider.iOSAppStore.value}'     AND ad.original_tx_id = ue.payment_id)
+        OR (p.payment_provider = '{base.PaymentProvider.GooglePlayStore.value}' AND gd.payment_token  = ue.payment_id)
     WHERE p.user_id = (SELECT id FROM users WHERE master_pkey = %s)
     AND ue.payment_id IS NOT NULL
 ) AS has_error;
@@ -1905,9 +1916,8 @@ def get_payment_tx(tx:          db.SQLTransaction,
         result_set = db.query(tx.conn, f'''
             SELECT {PAYMENTS_COLUMNS}
             FROM {PAYMENTS_FROM}
-            WHERE p.payment_provider = %(provider)s AND p.google_payment_token = %(token)s AND p.google_order_id = %(order_id)s
-        ''', provider  = payment_tx.provider.value,
-              token    = payment_tx.google_payment_token,
+            WHERE gd.payment_token = %(token)s AND gd.order_id = %(order_id)s
+        ''', token    = payment_tx.google_payment_token,
               order_id = payment_tx.google_order_id, row_factory=db.dict_row)
 
         record = result_set.fetchone()
@@ -1918,9 +1928,8 @@ def get_payment_tx(tx:          db.SQLTransaction,
         result_set = db.query(tx.conn, f'''
                 SELECT {PAYMENTS_COLUMNS}
                 FROM {PAYMENTS_FROM}
-                WHERE p.payment_provider = %(provider)s AND p.apple_original_tx_id = %(orig_tx_id)s AND p.apple_tx_id = %(tx_id)s AND p.apple_web_line_order_tx_id = %(line_order_tx_id)s
-        ''', provider          = payment_tx.provider.value,
-              orig_tx_id       = payment_tx.apple_original_tx_id,
+                WHERE ad.original_tx_id = %(orig_tx_id)s AND ad.tx_id = %(tx_id)s AND ad.web_line_order_tx_id = %(line_order_tx_id)s
+        ''', orig_tx_id       = payment_tx.apple_original_tx_id,
               tx_id            = payment_tx.apple_tx_id,
               line_order_tx_id = payment_tx.apple_web_line_order_tx_id, row_factory=db.dict_row)
 
@@ -1931,8 +1940,8 @@ def get_payment_tx(tx:          db.SQLTransaction,
         result_set = db.query(tx.conn, f'''
                 SELECT {PAYMENTS_COLUMNS}
                 FROM {PAYMENTS_FROM}
-                WHERE p.payment_provider = %s AND p.rangeproof_order_id = %s
-        ''', payment_tx.provider.value, payment_tx.rangeproof_order_id, row_factory=db.dict_row)
+                WHERE rd.order_id = %s
+        ''', payment_tx.rangeproof_order_id, row_factory=db.dict_row)
 
         record = result_set.fetchone()
         if record:
@@ -1957,18 +1966,16 @@ def set_refund_requested_tx(tx: db.SQLTransaction, payment_tx: UserPaymentTransa
         rows = db.query(tx.conn, '''
             UPDATE payments
             SET    refund_requested_at = %(ts)s
-            WHERE  payment_provider = %(provider)s AND google_payment_token = %(token)s AND google_order_id = %(order_id)s
+            WHERE  id IN (SELECT payment_id FROM google_play_payment_details WHERE payment_token = %(token)s AND order_id = %(order_id)s)
         ''', ts        = refund_requested_at,
-            provider = payment_tx.provider.value,
             token    = payment_tx.google_payment_token,
             order_id = payment_tx.google_order_id)
     elif payment_tx.provider == base.PaymentProvider.iOSAppStore:
         rows = db.query(tx.conn, '''
             UPDATE payments
             SET    refund_requested_at = %(ts)s
-            WHERE  payment_provider = %(provider)s AND apple_tx_id = %(tx_id)s
+            WHERE  id IN (SELECT payment_id FROM app_store_payment_details WHERE tx_id = %(tx_id)s)
         ''', ts        = refund_requested_at,
-              provider = payment_tx.provider.value,
               tx_id    = payment_tx.apple_tx_id)
 
     assert rows and (rows.rowcount == 0 or rows.rowcount == 1)
@@ -1986,16 +1993,17 @@ def set_refund_requested_tx(tx: db.SQLTransaction, payment_tx: UserPaymentTransa
             row = db.query_one(tx.conn, '''
                 SELECT u.master_pkey
                 FROM   payments p JOIN users u ON u.id = p.user_id
-                WHERE  p.payment_provider = %(provider)s AND p.google_payment_token = %(token)s AND p.google_order_id = %(order_id)s
-            ''', provider = payment_tx.provider.value,
-                 token    = payment_tx.google_payment_token,
+                       JOIN google_play_payment_details gd ON gd.payment_id = p.id
+                WHERE  gd.payment_token = %(token)s AND gd.order_id = %(order_id)s
+            ''', token    = payment_tx.google_payment_token,
                  order_id = payment_tx.google_order_id)
         elif payment_tx.provider == base.PaymentProvider.iOSAppStore:
             row = db.query_one(tx.conn, '''
                 SELECT u.master_pkey
                 FROM   payments p JOIN users u ON u.id = p.user_id
-                WHERE  p.payment_provider = %s AND p.apple_tx_id = %s
-            ''', payment_tx.provider.value, payment_tx.apple_tx_id)
+                       JOIN app_store_payment_details ad ON ad.payment_id = p.id
+                WHERE  ad.tx_id = %s
+            ''', payment_tx.apple_tx_id)
 
         if row:
             master_pkey = nacl.signing.VerifyKey(bytes(row[0]))
