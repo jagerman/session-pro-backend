@@ -1898,7 +1898,7 @@ def has_user_error(conn: psycopg.Connection, payment_provider: base.PaymentProvi
     return result;
 
 def delete_user_errors_tx(tx: db.SQLTransaction, payment_provider: base.PaymentProvider, payment_id: str) -> bool:
-    row    = db.query(tx.conn, 'DELETE FROM user_errors WHERE payment_provider = %s AND payment_id = %s', int(payment_provider.value), payment_id)
+    row    = db.query(tx.conn, 'DELETE FROM user_errors WHERE payment_provider = %s AND payment_id = %s', payment_provider.value, payment_id)
     result = row.rowcount > 0
     return result
 

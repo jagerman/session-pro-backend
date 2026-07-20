@@ -139,11 +139,16 @@ CREATE TABLE IF NOT EXISTS google_notification_history (
 -- buffer grows (item 10).
 CREATE INDEX IF NOT EXISTS google_notification_history_unhandled ON google_notification_history (message_id) WHERE NOT handled;
 
+-- `payment_id` here is the provider's tx-id STRING (Apple original_tx_id / Google payment_token), NOT
+-- payments.id — there is deliberately no FK: payments stores these under provider-specific typed columns
+-- (see has_user_error_from_master_pkey_tx's provider-branched join), so no single key matches. The
+-- (provider, tx-id) pair is the natural identity, declared as the PK (was a stray UNIQUE); ordered
+-- provider-first to match every lookup (always by both columns) and the INSERT column order.
 CREATE TABLE IF NOT EXISTS user_errors (
-    payment_id         TEXT NOT NULL,
     payment_provider   TEXT NOT NULL REFERENCES payment_providers(code),
+    payment_id         TEXT NOT NULL,
     at                 TIMESTAMPTZ NOT NULL,
-    UNIQUE(payment_id, payment_provider)
+    PRIMARY KEY (payment_provider, payment_id)
 );
 
 -- Single-row aggregate view of table counts for ad-hoc operator inspection: `SELECT * FROM db_stats`.
