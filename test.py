@@ -172,12 +172,12 @@ def test_migrations_bootstrap_and_idempotency(pg_database):
     with db.connection(pool) as conn:
         applied = {row[0] for row in db.query(conn, 'SELECT name FROM migrations_applied')}
         assert applied == expected
-        assert db.query_one(conn, 'SELECT COUNT(*) FROM globals')[0] == 4
+        assert db.query_one(conn, 'SELECT COUNT(*) FROM globals')[0] == 2
 
         # Idempotent: re-running applies nothing new and does not duplicate the globals seed.
         migrations.apply_migrations(conn)
         assert {row[0] for row in db.query(conn, 'SELECT name FROM migrations_applied')} == expected
-        assert db.query_one(conn, 'SELECT COUNT(*) FROM globals')[0] == 4
+        assert db.query_one(conn, 'SELECT COUNT(*) FROM globals')[0] == 2
     pool.close()
 
 def test_migrations_reject_duplicate_basename(tmp_path, monkeypatch):
@@ -221,31 +221,41 @@ def test_status_endpoint(pg_database):
         assert body['status'] == server.RESPONSE_SUCCESS, body
         check(body['result'])
 
-def test_expired_revocation_is_not_reported(pg_database):
-    # A revocation must stop counting the instant it passes expires_at — independent of whether the
-    # cleanup sweep has pruned it. A lapsed revocation is moot (the proof it revokes has itself
-    # expired); treating it as still-revoked would make expires_at a "not before" floor, not an expiry,
-    # and would make live results depend on cleanup timing.
+def test_stale_revocation_is_not_served(pg_database):
+    # Revocation is terminal (a set revoked_at is always in effect — there is no per-entry expiry now),
+    # so relevance is governed by the server's list-level retention window: a generation revoked longer
+    # ago than RETAIN_FOR drops out of the served list, independent of whether the prune sweep has run.
+    # Filtering by the window (rather than depending on a prune) keeps the served answer independent of
+    # housekeeping timing. This mirrors the guard in server.get_pro_revocations.
     err  = base.ErrorSink()
     pool = backend.bootstrap_db(database_url=pg_database(), err=err)
     assert not err.msg_list, err.msg_list
     assert pool
 
-    created = base.datetime_from_unix_seconds(1_700_000_000)
-    expires = created + datetime.timedelta(days=30)
-    before  = expires - datetime.timedelta(seconds=1)
-    after   = expires + datetime.timedelta(seconds=1)
+    RETAIN_FOR  = base.SECONDS_IN_MONTH
+    now         = base.datetime_from_unix_seconds(1_700_000_000)
+    master_pkey = nacl.signing.SigningKey.generate().verify_key
     with db.connection(pool) as conn:
-        # Insert a revocation directly (no prune has run — the row is still present after `expires`).
+        # A user with two generations: one revoked recently (still inside the window) and one revoked
+        # long ago (past the window). Neither prune has run, so both rows are still present.
         with db.transaction(conn) as tx:
-            _ = db.query(tx.conn,
-                         'INSERT INTO revocations (gen_index, created_at, expires_at) VALUES (%(g)s, %(c)s, %(e)s)',
-                         g=7, c=created, e=expires)
+            user_id, gen_recent, token_recent, _created = backend.get_or_create_user_and_generation(tx, master_pkey, now)
+            gen_stale, token_stale                       = backend.mint_generation(tx, user_id, now)
+        with db.transaction(conn) as tx:
+            _ = db.query(tx.conn, "UPDATE generations SET revoked_at = %s WHERE id = %s", now - datetime.timedelta(seconds=1),              gen_recent)
+            _ = db.query(tx.conn, "UPDATE generations SET revoked_at = %s WHERE id = %s", now - datetime.timedelta(seconds=RETAIN_FOR + 1), gen_stale)
 
-        # Revoked before expiry, NOT revoked after — despite the row still existing (unpruned). The
-        # client-served list in get_pro_revocations applies the identical `expires_at > now` guard.
-        assert backend.is_gen_index_revoked(conn, 7, before) is True
-        assert backend.is_gen_index_revoked(conn, 7, after)  is False
+        # Both are terminally revoked regardless of `now` (revocation has no per-entry expiry).
+        assert backend.is_generation_revoked(conn, gen_recent, now) is True
+        assert backend.is_generation_revoked(conn, gen_stale,  now) is True
+
+        # The served list applies the retention window: recent is in, stale is filtered out.
+        retain_cutoff = now - datetime.timedelta(seconds=RETAIN_FOR)
+        with db.transaction(conn) as tx:
+            served = {bytes(row[0]) for row in db.query(tx.conn,
+                      "SELECT token FROM generations WHERE revoked_at IS NOT NULL AND revoked_at > %s", retain_cutoff)}
+        assert bytes(token_recent) in served
+        assert bytes(token_stale) not in served
     pool.close()
 
 def test_provider_dry_run_redeems_google_without_egress(monkeypatch, pg_database):
@@ -440,17 +450,22 @@ def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_d
                                                        err                 = err)
 
         assert err.has()
-        assert redeemed_payment_2nd.status                    == backend.RedeemPaymentStatus.AlreadyRedeemed, err.msg_list
-        assert len(redeemed_payment_2nd.proof.gen_index_hash) == 0
+        assert redeemed_payment_2nd.status                     == backend.RedeemPaymentStatus.AlreadyRedeemed, err.msg_list
+        assert len(redeemed_payment_2nd.proof.revocation_tag)  == 0
         err.msg_list.clear()
 
-    gen_index: int                                          = backend.get_global_int(db_conn, 'gen_index')
-    assert gen_index                                       == 2
+    # Two payments stacked for one user → two generations minted (item 1/2 rolls the generation on every
+    # payment). The user's active generation is the most recent of the two.
+    gen_ids: list[int]                                      = [row[0] for row in db.query(db_conn,
+        "SELECT g.id FROM generations g JOIN users u ON u.id = g.user_id WHERE u.master_pkey = %s ORDER BY g.id",
+        bytes(master_key.verify_key))]
+    assert len(gen_ids)                                    == 2
 
     user_list: list[backend.UserRow]                        = backend.get_users_list(db_conn)
     assert len(user_list)                                  == 1
     assert user_list[0].master_pkey                        == bytes(master_key.verify_key), 'lhs={}, rhs={}'.format(user_list[0].master_pkey.hex(), bytes(master_key.verify_key).hex())
-    assert user_list[0].gen_index                          == gen_index - 1
+    assert user_list[0].current_generation_id              == gen_ids[-1]
+    assert len(user_list[0].token)                         == backend.BLAKE2B_DIGEST_SIZE
     assert user_list[0].expires_at                  == scenarios[1].expires_at
 
     payment_list: list[backend.PaymentRow]                  = backend.get_payments_list(db_conn)
@@ -784,7 +799,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
 
             # Extract the fields
             assert isinstance(result_json, dict)
-            result_gen_index_hash_hex: str = base.json_dict_require_str(d=result_json, key='revocation_tag',   err=err)
+            result_revocation_tag_hex: str = base.json_dict_require_str(d=result_json, key='revocation_tag',   err=err)
             result_rotating_pkey_hex:  str = base.json_dict_require_str(d=result_json, key='rotating_pkey',    err=err)
             result_expiry_ts:  int = base.json_dict_require_int(d=result_json, key='expiry_ts', err=err)
             result_sig_hex:            str = base.json_dict_require_str(d=result_json, key='sig',              err=err)
@@ -793,21 +808,21 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
             # Parse hex fields to bytes
             result_rotating_pkey  = nacl.signing.VerifyKey(base.hex_to_bytes(hex=result_rotating_pkey_hex,  label='Rotating public key',   hex_len=nacl.bindings.crypto_sign_PUBLICKEYBYTES * 2, err=err))
             result_sig            =                        base.hex_to_bytes(hex=result_sig_hex,            label='Signature',             hex_len=nacl.bindings.crypto_sign_BYTES * 2,          err=err)
-            result_gen_index_hash =                        base.hex_to_bytes(hex=result_gen_index_hash_hex, label='Generation index hash', hex_len=backend.BLAKE2B_DIGEST_SIZE * 2, err=err)
+            result_revocation_tag =                        base.hex_to_bytes(hex=result_revocation_tag_hex, label='Revocation tag', hex_len=backend.BLAKE2B_DIGEST_SIZE * 2, err=err)
             assert len(err.msg_list) == 0, '{err.msg_list}'
 
             # Check the rotating key returned matches what we asked the server to sign
             assert result_rotating_pkey == rotating_key.verify_key
 
             # Check that the server signed our proof w/ their public key
-            proof_hash: bytes = backend.build_proof_hash(result_gen_index_hash,
+            proof_hash: bytes = backend.build_proof_hash(result_revocation_tag,
                                                          result_rotating_pkey,
                                                          base.datetime_from_unix_seconds(result_expiry_ts))
             _ = backend_key.verify_key.verify(smessage=proof_hash, signature=result_sig)
 
             with db.transaction(db_conn) as tx:
                 get_user: backend.GetUserAndPayments = backend.get_user_and_payments(tx, master_key.verify_key)
-                assert get_user.user.gen_index == 0
+                assert len(get_user.user.token) == backend.BLAKE2B_DIGEST_SIZE
 
         if 1: # Authorise a new rotated key for the pro subscription
             new_rotating_key    = nacl.signing.SigningKey.generate()
@@ -849,7 +864,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
             result_json = response_json['result']
 
             # Extract the fields
-            result_gen_index_hash_hex: str = base.json_dict_require_str(d=result_json, key='revocation_tag',   err=err)
+            result_revocation_tag_hex: str = base.json_dict_require_str(d=result_json, key='revocation_tag',   err=err)
             result_rotating_pkey_hex:  str = base.json_dict_require_str(d=result_json, key='rotating_pkey',    err=err)
             result_expiry_ts:  int = base.json_dict_require_int(d=result_json, key='expiry_ts', err=err)
             result_sig_hex:            str = base.json_dict_require_str(d=result_json, key='sig',              err=err)
@@ -858,14 +873,14 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
             # Parse hex fields to bytes
             result_rotating_pkey  = nacl.signing.VerifyKey(base.hex_to_bytes(hex=result_rotating_pkey_hex,  label='Rotating public key',   hex_len=nacl.bindings.crypto_sign_PUBLICKEYBYTES * 2, err=err))
             result_sig            =                        base.hex_to_bytes(hex=result_sig_hex,            label='Signature',             hex_len=nacl.bindings.crypto_sign_BYTES * 2,          err=err)
-            result_gen_index_hash =                        base.hex_to_bytes(hex=result_gen_index_hash_hex, label='Generation index hash', hex_len=backend.BLAKE2B_DIGEST_SIZE * 2,              err=err)
+            result_revocation_tag =                        base.hex_to_bytes(hex=result_revocation_tag_hex, label='Revocation tag', hex_len=backend.BLAKE2B_DIGEST_SIZE * 2,              err=err)
             assert len(err.msg_list) == 0, '{err.msg_list}'
 
             # Check the rotating key returned matches what we asked the server to sign
             assert result_rotating_pkey == new_rotating_key.verify_key
 
             # Check that the server signed our proof w/ their public key
-            proof_hash = backend.build_proof_hash(result_gen_index_hash,
+            proof_hash = backend.build_proof_hash(result_revocation_tag,
                                                   result_rotating_pkey,
                                                   base.datetime_from_unix_seconds(result_expiry_ts))
             _ = backend_key.verify_key.verify(smessage=proof_hash, signature=result_sig)
@@ -934,7 +949,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
             result_json = response_json['result']
 
             # Extract the fields
-            result_gen_index_hash_hex: str = base.json_dict_require_str(d=result_json, key='revocation_tag',   err=err)
+            result_revocation_tag_hex: str = base.json_dict_require_str(d=result_json, key='revocation_tag',   err=err)
             result_rotating_pkey_hex:  str = base.json_dict_require_str(d=result_json, key='rotating_pkey',    err=err)
             result_expiry_ts:  int = base.json_dict_require_int(d=result_json, key='expiry_ts', err=err)
             result_sig_hex:            str = base.json_dict_require_str(d=result_json, key='sig',              err=err)
@@ -943,14 +958,14 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
             # Parse hex fields to bytes
             result_rotating_pkey         = nacl.signing.VerifyKey(base.hex_to_bytes(hex=result_rotating_pkey_hex,  label='Rotating public key',   hex_len=nacl.bindings.crypto_sign_PUBLICKEYBYTES * 2, err=err))
             result_sig:            bytes =                        base.hex_to_bytes(hex=result_sig_hex,            label='Signature',             hex_len=nacl.bindings.crypto_sign_BYTES * 2,          err=err)
-            result_gen_index_hash: bytes =                        base.hex_to_bytes(hex=result_gen_index_hash_hex, label='Generation index hash', hex_len=backend.BLAKE2B_DIGEST_SIZE * 2,              err=err)
+            result_revocation_tag: bytes =                        base.hex_to_bytes(hex=result_revocation_tag_hex, label='Revocation tag', hex_len=backend.BLAKE2B_DIGEST_SIZE * 2,              err=err)
             assert len(err.msg_list) == 0, '{err.msg_list}'
 
             # Check the rotating key returned matches what we asked the server to sign
             assert result_rotating_pkey == rotating_key.verify_key
 
             # Check that the server signed our proof w/ their public key
-            proof_hash: bytes = backend.build_proof_hash(result_gen_index_hash,
+            proof_hash: bytes = backend.build_proof_hash(result_revocation_tag,
                                                          result_rotating_pkey,
                                                          base.datetime_from_unix_seconds(result_expiry_ts))
             _ = backend_key.verify_key.verify(smessage=proof_hash, signature=result_sig)
@@ -998,14 +1013,12 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
             # refreshing the connection and updating the "snapshot" that the following code sees.
             db_conn = db_engine.getconn()
 
-            # Grab the generation index, and then calculate the expected generation index hash
-            gen_index = 0
+            # Capture the user's current generation token. The manual revoke below revokes exactly this
+            # generation, so its token is what must appear (verbatim) in the served revocation list.
             with db.transaction(db_conn) as tx:
                 get_user = backend.get_user_and_payments(tx, master_key.verify_key)
-                assert get_user.user.gen_index == 1
-                gen_index = get_user.user.gen_index
-
-            post_revoke_gen_index_hash: bytes = backend.make_gen_index_hash(gen_index, backend.get_global_bytes(db_conn, 'gen_index_salt'))
+                assert len(get_user.user.token) == backend.BLAKE2B_DIGEST_SIZE
+            revoked_generation_token: bytes = get_user.user.token
 
             # We will now manually revoke the user and check the revocation list again
             with db.transaction(db_conn) as tx:
@@ -1065,7 +1078,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
                     assert 'revocation_tag' in it and isinstance(it['revocation_tag'], str)
                     assert 'effective_ts' in it and isinstance(it['effective_ts'], int)
                     assert 'expiry_ts' not in it
-                    assert it['revocation_tag'] == post_revoke_gen_index_hash.hex()
+                    assert it['revocation_tag'] == revoked_generation_token.hex()
                     # effective_ts should be creation time + 1 day (86400 seconds)
                     # Since we can't know exact creation time in the test, just verify it's a reasonable value
                     assert it['effective_ts'] > 0
@@ -1284,7 +1297,6 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
 
             proof: backend.ProSubscriptionProof = backend.generate_pro_proof(conn           = db_conn,
                                                                              signing_key    = backend_key,
-                                                                             gen_index_salt = backend.get_global_bytes(db_conn, 'gen_index_salt'),
                                                                              master_pkey    = master_key.verify_key,
                                                                              rotating_pkey  = rotating_key.verify_key,
                                                                              request_at     = base.datetime_from_unix_ms(unix_ts_ms),
@@ -1294,7 +1306,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
             assert not err.has(), base.readable(pro_proof_deadline_unix_ts_ms)
 
             # NOTE: Check that the proof is invalid
-            proof_hash = backend.build_proof_hash(proof.gen_index_hash,
+            proof_hash = backend.build_proof_hash(proof.revocation_tag,
                                                   proof.rotating_pkey,
                                                   proof.expires_at)
             _ = backend_key.verify_key.verify(smessage=proof_hash, signature=proof.sig)
@@ -1309,7 +1321,6 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
 
             proof = backend.generate_pro_proof(conn           = db_conn,
                                                signing_key    = backend_key,
-                                               gen_index_salt = backend.get_global_bytes(db_conn, 'gen_index_salt'),
                                                master_pkey    = master_key.verify_key,
                                                rotating_pkey  = rotating_key.verify_key,
                                                request_at     = base.datetime_from_unix_ms(unix_ts_ms),
@@ -1317,7 +1328,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
                                                rotating_sig   = bytes(rotating_key.sign(hash_to_sign).signature),
                                                err            = err)
 
-            proof_hash = backend.build_proof_hash(proof.gen_index_hash,
+            proof_hash = backend.build_proof_hash(proof.revocation_tag,
                                                   proof.rotating_pkey,
                                                   proof.expires_at)
 
@@ -1823,7 +1834,7 @@ def test_platform_apple(pg_database):
 
         # NOTE: Extract the fields
         assert isinstance(result_json, dict)
-        result_gen_index_hash_hex: str = base.json_dict_require_str(d=result_json, key='revocation_tag',   err=err)
+        result_revocation_tag_hex: str = base.json_dict_require_str(d=result_json, key='revocation_tag',   err=err)
         result_rotating_pkey_hex:  str = base.json_dict_require_str(d=result_json, key='rotating_pkey',    err=err)
         result_expiry_ts:  int = base.json_dict_require_int(d=result_json, key='expiry_ts', err=err)
         result_sig_hex:            str = base.json_dict_require_str(d=result_json, key='sig',              err=err)
@@ -1832,14 +1843,14 @@ def test_platform_apple(pg_database):
         # NOTE: Parse hex fields to bytes
         result_rotating_pkey  = nacl.signing.VerifyKey(base.hex_to_bytes(hex=result_rotating_pkey_hex,  label='Rotating public key',   hex_len=nacl.bindings.crypto_sign_PUBLICKEYBYTES * 2, err=err))
         result_sig            =                        base.hex_to_bytes(hex=result_sig_hex,            label='Signature',             hex_len=nacl.bindings.crypto_sign_BYTES * 2,          err=err)
-        result_gen_index_hash =                        base.hex_to_bytes(hex=result_gen_index_hash_hex, label='Generation index hash', hex_len=backend.BLAKE2B_DIGEST_SIZE * 2, err=err)
+        result_revocation_tag =                        base.hex_to_bytes(hex=result_revocation_tag_hex, label='Revocation tag', hex_len=backend.BLAKE2B_DIGEST_SIZE * 2, err=err)
         assert len(err.msg_list) == 0, '{err.msg_list}'
 
         # NOTE: Check the rotating key returned matches what we asked the server to sign
         assert result_rotating_pkey == rotating_key.verify_key
 
         # NOTE: Check that the server signed our proof w/ their public key
-        proof_hash: bytes = backend.build_proof_hash(result_gen_index_hash, result_rotating_pkey, base.datetime_from_unix_seconds(result_expiry_ts))
+        proof_hash: bytes = backend.build_proof_hash(result_revocation_tag, result_rotating_pkey, base.datetime_from_unix_seconds(result_expiry_ts))
         _ = test.backend_key.verify_key.verify(smessage=proof_hash, signature=result_sig)
 
     # The following is a sequence of notifications/events that transpired for the same account under
@@ -3864,7 +3875,12 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             user = backend.get_user(conn=conn, master_pkey=user_ctx.master_key.verify_key)
             assert isinstance(user, backend.UserRow)
             assert user.master_pkey == bytes(user_ctx.master_key.verify_key)
-            assert user.gen_index == user_ctx.payments - 1 # NOTE: this is wrong, but it wont be a problem until we have tests which revoke then resubscribe, fix this when that happens
+            # One generation is minted per payment (item 1/2 rolls on every redeem); the user points at
+            # the newest, with a populated 32-byte token.
+            gen_ids = [row[0] for row in db.query(conn, "SELECT id FROM generations WHERE user_id = %s ORDER BY id", user.id)]
+            assert len(gen_ids) == user_ctx.payments
+            assert user.current_generation_id == gen_ids[-1]
+            assert len(user.token) == backend.BLAKE2B_DIGEST_SIZE
             assert user.expires_at == base.datetime_from_unix_ms(tx.expires_at) + base.DEFAULT_GOOGLE_GRACE_PERIOD
 
     def assert_pro_details(tx:                                TestTx,

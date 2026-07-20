@@ -1,5 +1,6 @@
 import traceback
 import nacl.signing
+import nacl.utils
 import hashlib
 import os
 import typing
@@ -48,17 +49,19 @@ PAYMENTS_COLUMNS = (
 )
 PAYMENTS_FROM = "payments p LEFT JOIN users u ON u.id = p.user_id"
 
+# Single source of truth for reading a user row (mirrors PAYMENTS_*). The join to `generations` pulls the
+# current generation's `token` (the proof's revocation_tag); it's an INNER JOIN because
+# users.current_generation_id is NOT NULL, so every user always has a current generation.
+USERS_COLUMNS = (
+    "u.id, u.master_pkey, u.current_generation_id, g.token, u.expires_at, u.grace_period, u.auto_renewing, "
+    "u.refund_requested_at, u.google_obfuscated_account_id, u.apple_app_account_token"
+)
+USERS_FROM = "users u JOIN generations g ON g.id = u.current_generation_id"
+
 # payments.payment_provider / .plan and user_errors.payment_provider store the string `code` directly
 # (the lookup tables payment_providers/pro_plans use the code as their PRIMARY KEY, FK'd for validity).
 # So there's no id indirection: the enum's `.value` IS the stored value, and reads map it straight back
 # via base.PaymentProvider(...)/base.ProPlan(...).
-
-class SetRevocationResult(enum.StrEnum):
-    UserDoesNotExist = 'User does not exist'
-    Skipped          = 'Skipped'
-    Updated          = 'Updated'
-    Created          = 'Created'
-    Deleted          = 'Deleted'
 
 class ReportPeriod(enum.Enum):
     Daily   = 0
@@ -101,7 +104,7 @@ class ExpireResult:
 @dataclasses.dataclass
 class ProSubscriptionProof:
     version:        int                    = 0
-    gen_index_hash: bytes                  = b''
+    revocation_tag: bytes                  = b''   # the generation's stored random 32-byte token
     rotating_pkey:  nacl.signing.VerifyKey = nacl.signing.VerifyKey(ZERO_BYTES32)
     expires_at:     datetime.datetime      = base.EPOCH
     sig:            bytes                  = b''
@@ -117,10 +120,7 @@ class ProSubscriptionProof:
         # verifier pick the wrong personalisation → signature fails.
         result = {
             "version":        self.version,
-            # Wire key is `revocation_tag` (spec §2 / Delta #2). The stored value is still the
-            # gen-index hash internally; a client treats it as an opaque tag, so the eventual switch to
-            # a random token (Phase 3) is invisible on the wire.
-            "revocation_tag": self.gen_index_hash.hex(),
+            "revocation_tag": self.revocation_tag.hex(),
             "rotating_pkey":  bytes(self.rotating_pkey).hex(),
             # Proof expiry is day-aligned, so integer seconds is exact (wire spec §2).
             "expiry_ts":      base.unix_seconds_from_datetime(self.expires_at),
@@ -160,16 +160,6 @@ AddRevocationIterator:               typing.TypeAlias = tuple[int,              
 GoogleUnhandledNotificationIterator: typing.TypeAlias = tuple[int,               # message_id
                                                               str | None,        # payload
                                                               datetime.datetime] # expires_at
-
-UserRowTuple:                        typing.TypeAlias = tuple[bytes,                     # master_pkey
-                                                              int,                       # gen_index
-                                                              datetime.datetime,         # expires_at
-                                                              datetime.timedelta,        # grace_period
-                                                              bool,                      # auto_renewing
-                                                              datetime.datetime | None,  # refund_requested_at
-                                                              bytes | None,              # google_obfuscated_account_id
-                                                              str | None,                # apple_app_account_token
-                                                             ]
 
 @dataclasses.dataclass
 class UserError:
@@ -271,8 +261,10 @@ def payment_id_from_payment_row(row: PaymentRow) -> str:
 @dataclasses.dataclass
 class UserRow:
     found:                        bool                      = False
+    id:                           int                       = 0
     master_pkey:                  bytes | None              = None
-    gen_index:                    int                       = 0
+    current_generation_id:        int                       = 0
+    token:                        bytes                     = b''   # current generation's token (proof revocation_tag)
     expires_at:                   datetime.datetime         = base.EPOCH
     grace_period:                 datetime.timedelta        = datetime.timedelta(0)
     auto_renewing:                bool                      = False
@@ -288,24 +280,18 @@ class GetUserAndPayments:
 
 @dataclasses.dataclass
 class RevocationRow:
-    gen_index:   int               = 0
-    created_at:  datetime.datetime = base.EPOCH
-    expires_at:  datetime.datetime = base.EPOCH
-
-@dataclasses.dataclass
-class RevocationItem:
-    '''A revocation object that has only the fields necessary for clients to block Session Pro
-    subscription proofs.'''
-    gen_index_hash: bytes             = b''
-    expires_at:     datetime.datetime = base.EPOCH
+    '''A revoked generation (admin/raw view of the revocation list).'''
+    generation_id: int               = 0
+    token:         bytes             = b''
+    revoked_at:    datetime.datetime = base.EPOCH
 
 @dataclasses.dataclass
 class AllocatedGenID:
-    found:          bool                      = False
-    expires_at:     datetime.datetime | None  = None
-    grace_period:   datetime.timedelta        = datetime.timedelta(0)
-    gen_index:      int                       = 0
-    gen_index_salt: bytes                     = b''
+    found:         bool                      = False
+    expires_at:    datetime.datetime | None  = None
+    grace_period:  datetime.timedelta        = datetime.timedelta(0)
+    generation_id: int                       = 0
+    token:         bytes                     = b''
 
 def load_backend_signing_key(path: str) -> nacl.signing.SigningKey:
     '''Load the backend Ed25519 signing key from disk.
@@ -370,13 +356,6 @@ def to_redeemed_at(at: datetime.datetime) -> datetime.datetime:
 def make_blake2b_hasher(personalisation: bytes, salt: bytes | None = None) -> hashlib.blake2b:
     final_salt      = salt  if salt else b''
     result          = hashlib.blake2b(digest_size=BLAKE2B_DIGEST_SIZE, person=personalisation, salt=final_salt)
-    return result
-
-def make_gen_index_hash(gen_index: int, gen_index_salt: bytes) -> bytes:
-    assert len(gen_index_salt) == hashlib.blake2b.SALT_SIZE
-    hasher = make_blake2b_hasher(personalisation=b'', salt=gen_index_salt)
-    hasher.update(gen_index.to_bytes(length=8, byteorder='little'))
-    result = hasher.digest()
     return result
 
 def make_add_pro_payment_hash(master_pkey:   nacl.signing.VerifyKey,
@@ -495,47 +474,32 @@ def get_user_and_payments(tx: db.SQLTransaction, master_pkey: nacl.signing.Verif
     result.payments_count = row[0] if row else 0
     return result
 
-def _user_from_row_iterator(row: UserRowTuple) -> UserRow:
-    (master_pkey, gen_index, expires_at, grace_period, auto_renewing,
-     refund_requested_at, google_obfuscated_account_id, apple_app_account_token) = row
+def user_row_from_dict(row: dict[str, typing.Any]) -> UserRow:
     return UserRow(found                        = True,
-                   master_pkey                  = bytes(master_pkey),
-                   gen_index                    = gen_index,
-                   expires_at                   = expires_at,
-                   grace_period                 = grace_period,
-                   auto_renewing                = bool(auto_renewing),
-                   refund_requested_at          = refund_requested_at,
-                   google_obfuscated_account_id = google_obfuscated_account_id,
-                   apple_app_account_token      = apple_app_account_token)
+                   id                           = row['id'],
+                   master_pkey                  = bytes(row['master_pkey']),
+                   current_generation_id        = row['current_generation_id'],
+                   token                        = bytes(row['token']),
+                   expires_at                   = row['expires_at'],
+                   grace_period                 = row['grace_period'],
+                   auto_renewing                = bool(row['auto_renewing']),
+                   refund_requested_at          = row['refund_requested_at'],
+                   google_obfuscated_account_id = row['google_obfuscated_account_id'],
+                   apple_app_account_token      = row['apple_app_account_token'])
 
 def get_users_list(conn: psycopg.Connection) -> list[UserRow]:
     result: list[UserRow] = []
     with db.transaction(conn):
-        for row in db.query(conn,
-                            ("SELECT master_pkey,"
-                             "gen_index,"
-                             "expires_at,"
-                             "grace_period,"
-                             "auto_renewing,"
-                             "refund_requested_at,"
-                             "google_obfuscated_account_id,"
-                             "apple_app_account_token FROM users")):
-            result.append(_user_from_row_iterator(tuple(row)))
+        for row in db.query(conn, f"SELECT {USERS_COLUMNS} FROM {USERS_FROM}", row_factory=db.dict_row):
+            result.append(user_row_from_dict(row))
     return result
 
 def get_user_from_sql_tx(tx: db.SQLTransaction, master_pkey: nacl.signing.VerifyKey) -> UserRow:
     result: UserRow = UserRow()
-    row = db.query_one(tx.conn, ("SELECT master_pkey,"
-                                 "gen_index,"
-                                 "expires_at,"
-                                 "grace_period,"
-                                 "auto_renewing,"
-                                 "refund_requested_at,"
-                                 "google_obfuscated_account_id,"
-                                 "apple_app_account_token FROM users WHERE master_pkey = %s"),
-                       bytes(master_pkey))
+    row = db.query_one(tx.conn, f"SELECT {USERS_COLUMNS} FROM {USERS_FROM} WHERE u.master_pkey = %s",
+                       bytes(master_pkey), row_factory=db.dict_row)
     if row:
-        result = _user_from_row_iterator(tuple(row))
+        result = user_row_from_dict(row)
     return result
 
 def get_user(conn: psycopg.Connection, master_pkey: nacl.signing.VerifyKey) -> UserRow:
@@ -547,22 +511,22 @@ def get_user(conn: psycopg.Connection, master_pkey: nacl.signing.VerifyKey) -> U
 def get_revocations_list(conn: psycopg.Connection) -> list[RevocationRow]:
     result: list[RevocationRow] = []
     with db.transaction(conn) as tx:
-        for row in db.query(tx.conn, "SELECT gen_index, created_at, expires_at FROM revocations"):
-            gen_index, created_at, expires_at = row
-            result.append(RevocationRow(gen_index=gen_index, created_at=created_at, expires_at=expires_at))
+        for row in db.query(tx.conn, "SELECT id, token, revoked_at FROM generations WHERE revoked_at IS NOT NULL"):
+            generation_id, token, revoked_at = row
+            result.append(RevocationRow(generation_id=generation_id, token=bytes(token), revoked_at=revoked_at))
     return result
 
-def is_gen_index_revoked_tx(tx: db.SQLTransaction, gen_index: int, now: datetime.datetime) -> bool:
-    # `expires_at > now` guard: an expired revocation is moot (the proof it revokes has itself expired),
-    # so it must NOT count as revoked. Guarding here also makes the answer independent of whether the
-    # cleanup sweep has run — a lapsed revocation is invisible the instant it expires, pruned or not.
-    row = db.query_one(tx.conn, "SELECT EXISTS (SELECT 1 FROM revocations WHERE gen_index = %s AND expires_at > %s)", gen_index, now)
+def is_generation_revoked_tx(tx: db.SQLTransaction, generation_id: int, now: datetime.datetime) -> bool:
+    # A generation is revoked iff revoked_at is set (revocation is terminal). `now` is accepted for a
+    # uniform signature; a set revoked_at is always in effect (there is no per-entry expiry now — the
+    # served-list retention window is list-level and memory-only on the client).
+    row = db.query_one(tx.conn, "SELECT EXISTS (SELECT 1 FROM generations WHERE id = %s AND revoked_at IS NOT NULL)", generation_id)
     return bool(row[0]) if row else False
 
-def is_gen_index_revoked(conn: psycopg.Connection, gen_index: int, now: datetime.datetime) -> bool:
+def is_generation_revoked(conn: psycopg.Connection, generation_id: int, now: datetime.datetime) -> bool:
     result: bool = False
     with db.transaction(conn) as tx:
-        result = is_gen_index_revoked_tx(tx, gen_index, now)
+        result = is_generation_revoked_tx(tx, generation_id, now)
     return result
 
 # Typed accessors for the `globals` key/value store (one row per app-global; see schema/000). Each
@@ -614,7 +578,7 @@ def db_info_string(conn: psycopg.Connection, db_url: str, err: base.ErrorSink, b
             if row:
                 users = row[0]
 
-            row = db.query_one(tx.conn, 'SELECT COUNT(*) FROM revocations')
+            row = db.query_one(tx.conn, 'SELECT COUNT(*) FROM generations WHERE revoked_at IS NOT NULL')
             if row:
                 revocations = row[0]
 
@@ -638,13 +602,14 @@ def db_info_string(conn: psycopg.Connection, db_url: str, err: base.ErrorSink, b
         if size_row:
             db_size = size_row[0]
 
-        gen_index = get_global_int(conn, 'gen_index')
+        generations_count = db.query_one(conn, 'SELECT COUNT(*) FROM generations')
+        generations       = generations_count[0] if generations_count else 0
 
         lines: list[str] = []
         lines.append('  DB:                               {} ({})'.format(db_url, base.format_bytes(db_size)))
-        lines.append('  Users/Revocs/Payments/Unredeemed: {}/{}/{}/{}'.format(users, revocations, payments, unredeemed_payments))
+        lines.append('  Users/Revoked/Payments/Unredeemed: {}/{}/{}/{}'.format(users, revocations, payments, unredeemed_payments))
         lines.append('  U.Errors/Google/Apple Notifs.:    {}/{}/{}'.format(user_errors, google_notification_history, apple_notification_uuid_history))
-        lines.append('  Gen Index:                        {}'.format(gen_index))
+        lines.append('  Generations:                      {}'.format(generations))
         backend_key_str = bytes(backend_pkey).hex() if backend_pkey is not None else 'n/a (loaded from disk at runtime)'
         lines.append('  Backend Key:                      {}'.format(backend_key_str))
         result = '\n'.join(lines)
@@ -796,33 +761,6 @@ def revoke_payments_by_id_internal_tx(tx: db.SQLTransaction, rows: typing.Any, r
             master_pkey = nacl.signing.VerifyKey(it)
             _ = revoke_master_pkey_proofs_and_allocate_new_gen_id_tx(tx, master_pkey, created_at=revoke_at)
 
-    return result
-
-def set_revocation_tx(tx: db.SQLTransaction, master_pkey: nacl.signing.VerifyKey, created_at: datetime.datetime, expires_at: datetime.datetime, delete_item: bool) -> SetRevocationResult:
-    user:   UserRow = get_user_from_sql_tx(tx, master_pkey)
-    result          = SetRevocationResult.UserDoesNotExist
-    if user.found:
-        assert user.master_pkey == bytes(master_pkey), f"user.master_pkey={user.master_pkey.hex()} vs master_pkey={bytes(master_pkey).hex()}"
-        row = db.query_one(tx.conn, "SELECT EXISTS (SELECT 1 FROM revocations WHERE gen_index = %s)", user.gen_index)
-        existed = row[0] if row else False
-
-        if delete_item:
-            if existed:
-                _      = db.query(tx.conn, 'DELETE FROM revocations WHERE gen_index = %s', user.gen_index)
-                result = SetRevocationResult.Deleted
-            else:
-                result = SetRevocationResult.Skipped
-        else:
-            _ = db.query(tx.conn, '''
-                INSERT INTO revocations (gen_index, created_at, expires_at)
-                VALUES      (%(index)s, %(created_at)s, %(expires_at)s)
-                ON CONFLICT (gen_index) DO UPDATE SET
-                    expires_at   = excluded.expires_at,
-                    created_at = excluded.created_at
-            ''', index       = user.gen_index,
-                 created_at = created_at,
-                 expires_at   = expires_at)
-            result = SetRevocationResult.Updated if existed else SetRevocationResult.Created
     return result
 
 def add_apple_revocation_tx(tx: db.SQLTransaction, apple_original_tx_id: str, revoke_at: datetime.datetime, err: base.ErrorSink) -> bool:
@@ -995,42 +933,32 @@ def redeem_payment_tx(tx:                  db.SQLTransaction,
         if rowcount > 1:
             err.msg_list.append(f'Payment was redeemed for {base.maybe_obfuscate_bytes(master_pkey)} at {base.readable(redeemed_at)} but more than 1 row was updated, updated {rowcount}')
 
-        # master_pkey lives only in `users`: ensure the identity row exists, then link the
-        # just-redeemed payment(s) to it. The placeholder gen/expiry here are overwritten by
-        # _allocate_new_gen_id… below (which recomputes them from the now-linked payment set).
-        _ = db.query(tx.conn, '''
-            INSERT INTO users (master_pkey, gen_index, expires_at, grace_period, google_obfuscated_account_id, apple_app_account_token)
-            VALUES            (%(master_pkey)s, 0, to_timestamp(0), '0'::interval, %(google_id)s, %(apple_id)s)
-            ON CONFLICT (master_pkey) DO NOTHING
-        ''', master_pkey = master_pkey_bytes,
-             google_id   = google_obfuscated_account_id_from_master_pkey(master_pkey),
-             apple_id    = apple_obfuscated_account_id_from_master_pkey(master_pkey))
+        # master_pkey lives only in `users`: ensure the identity row (+ its first generation) exists,
+        # then link the just-redeemed payment(s) to it.
+        user_id, init_gen_id, init_token, was_created = get_or_create_user_and_generation(tx, master_pkey, issued_at=redeemed_at)
         _ = db.query(tx.conn, '''
             UPDATE payments
-            SET    user_id = (SELECT id FROM users WHERE master_pkey = %(master_pkey)s)
+            SET    user_id = %(user_id)s
             WHERE  id = ANY(%(ids)s)
-        ''', master_pkey = master_pkey_bytes, ids = redeemed_ids)
+        ''', user_id = user_id, ids = redeemed_ids)
 
-        # proofs will be given a new gen index hash. We used to revoke the old gen index hash
-        # but there's no need for that and creates churn in the revoke list. The user will hold
-        # onto their proof until it expires and simply request a new one.
-        #
-        # The key change leading to not requiring a revoke is that we separated the idea that a
-        # proof is related to, but not representative of a user's pro payment information (e.g.
-        #the proof expiry may or may not co-incide with the pro-plan they are entitled to).
-        allocated: AllocatedGenID = _allocate_new_gen_id_if_master_pkey_has_payments(tx, master_pkey)
+        # Roll the user onto a fresh generation reflecting the now-linked payments. A brand-new user
+        # reuses the generation just minted for it; an existing user gets a fresh one. We do NOT revoke
+        # the old generation — a proof is related to, but not representative of, payment state, so the
+        # client keeps its old proof until it expires and simply requests a new one (no revoke-list churn).
+        allocated: AllocatedGenID = _allocate_new_gen_id_if_master_pkey_has_payments(
+            tx, master_pkey, issued_at=redeemed_at, reuse=(init_gen_id, init_token) if was_created else None)
         if allocated.found:
             # NOTE: Only generate the proof if a rotating public key otherwise skip it (i.e.
             # its possible to redeem a payment without automatically creating the corresponding proof)
             if rotating_pkey:
                 assert signing_key, "Rotating public key and signing key have to be given in tandem, either both set or both set to nil"
-                proposed_proof_expires_at: int = base.round_datetime_to_next_day(allocated.expires_at)
+                proposed_proof_expires_at: datetime.datetime = base.round_datetime_to_next_day(allocated.expires_at)
 
-                result.proof = build_proof(gen_index         = allocated.gen_index,
-                                           rotating_pkey     = rotating_pkey,
-                                           expires_at = _build_proof_clamped_expiry_time(request_at=request_at, proposed_expires_at=proposed_proof_expires_at),
-                                           signing_key       = signing_key,
-                                           gen_index_salt    = allocated.gen_index_salt)
+                result.proof = build_proof(revocation_tag = allocated.token,
+                                           rotating_pkey  = rotating_pkey,
+                                           expires_at     = _build_proof_clamped_expiry_time(request_at=request_at, proposed_expires_at=proposed_proof_expires_at),
+                                           signing_key    = signing_key)
 
                 assert result.proof.expires_at == base.round_datetime_to_start_of_day(result.proof.expires_at), f"Proof expiry must land on a UTC day boundary, was {base.readable(result.proof.expires_at)}"
         else:
@@ -1569,50 +1497,103 @@ def add_unredeemed_payment(conn:                              psycopg.Connection
                                   platform_obfuscated_account_id    = platform_obfuscated_account_id,
                                   err                               = err)
 
-def _allocate_new_gen_id_if_master_pkey_has_payments(tx: db.SQLTransaction, master_pkey: nacl.signing.VerifyKey) -> AllocatedGenID:
-    result:            AllocatedGenID = AllocatedGenID()
-    master_pkey_bytes: bytes          = bytes(master_pkey)
+def mint_generation(tx: db.SQLTransaction, user_id: int, issued_at: datetime.datetime) -> tuple[int, bytes]:
+    '''Insert a fresh generation (new random 32-byte token) for an existing user; returns
+    (generation_id, token). Retries on a token-unique collision — astronomically unlikely for 32 CSPRNG
+    bytes, but cheap insurance against a degraded RNG; each attempt is a savepoint so a collision can't
+    poison the outer transaction.'''
+    for _attempt in range(3):
+        token = nacl.utils.random(BLAKE2B_DIGEST_SIZE)
+        try:
+            with tx.conn.transaction():
+                row = db.query_one(tx.conn,
+                                   "INSERT INTO generations (user_id, token, issued_at) VALUES (%s, %s, %s) RETURNING id",
+                                   user_id, token, issued_at)
+            assert row is not None
+            return (row[0], token)
+        except psycopg.errors.UniqueViolation:
+            continue
+    raise RuntimeError('mint_generation: exhausted token-collision retries (CSPRNG failure?)')
 
+def get_or_create_user_and_generation(tx: db.SQLTransaction, master_pkey: nacl.signing.VerifyKey, issued_at: datetime.datetime) -> tuple[int, int, bytes, bool]:
+    '''Ensure a user row AND its first generation exist for master_pkey. Race-free via ON CONFLICT on the
+    master_pkey unique index. Returns (user_id, current_generation_id, token, was_created). Must run inside
+    a transaction (the circular users<->generations FK is deferred to COMMIT).'''
+    master_pkey_bytes = bytes(master_pkey)
+
+    # Common path: the user already exists — a plain read, no id/generation allocation burned.
+    existing = get_user_from_sql_tx(tx, master_pkey)
+    if existing.found:
+        return (existing.id, existing.current_generation_id, existing.token, False)
+
+    # New user: pre-allocate both ids so the circular NOT NULL FKs are satisfied at insert time (the
+    # deferred users->generations FK is validated at COMMIT). Insert the user first (ON CONFLICT arbitrates
+    # a concurrent create), then the generation it points at. The expiry here is a placeholder overwritten
+    # by _allocate… below.
+    seq_row = db.query_one(tx.conn, "SELECT nextval(pg_get_serial_sequence('users','id')), nextval(pg_get_serial_sequence('generations','id'))")
+    assert seq_row is not None
+    user_id, gen_id = seq_row[0], seq_row[1]
+    token           = nacl.utils.random(BLAKE2B_DIGEST_SIZE)
+    won = db.query_one(tx.conn, '''
+        INSERT INTO users (id, master_pkey, current_generation_id, expires_at, grace_period, google_obfuscated_account_id, apple_app_account_token)
+        VALUES            (%(id)s, %(master_pkey)s, %(gen_id)s, to_timestamp(0), '0'::interval, %(google_id)s, %(apple_id)s)
+        ON CONFLICT (master_pkey) DO NOTHING
+        RETURNING id
+    ''', id          = user_id,
+         master_pkey = master_pkey_bytes,
+         gen_id      = gen_id,
+         google_id   = google_obfuscated_account_id_from_master_pkey(master_pkey),
+         apple_id    = apple_obfuscated_account_id_from_master_pkey(master_pkey))
+    if won is None:
+        # Lost a concurrent create — re-read the winner (our pre-allocated ids simply go unused).
+        winner = get_user_from_sql_tx(tx, master_pkey)
+        return (winner.id, winner.current_generation_id, winner.token, False)
+    db.query(tx.conn, "INSERT INTO generations (id, user_id, token, issued_at) VALUES (%s, %s, %s, %s)",
+             gen_id, user_id, token, issued_at)
+    return (user_id, gen_id, token, True)
+
+def _allocate_new_gen_id_if_master_pkey_has_payments(tx:          db.SQLTransaction,
+                                                     master_pkey: nacl.signing.VerifyKey,
+                                                     issued_at:   datetime.datetime,
+                                                     reuse:       tuple[int, bytes] | None = None) -> AllocatedGenID:
+    # Roll the user onto a fresh generation reflecting their current best payment (if any), and refresh
+    # the top-level user fields consumers read. `reuse` lets a brand-new user reuse the generation just
+    # minted for it (avoids a stray extra generation); otherwise a fresh one is minted. The user row must
+    # already exist (redeem creates it via get_or_create_user_and_generation; revoke's user exists).
+    result: AllocatedGenID = AllocatedGenID()
     lookup: LookupUserExpiry = _lookup_user_expiry_tx(tx, master_pkey)
-    result.expires_at         = lookup.expiry_from_redeemed
-    if lookup.expiry_from_redeemed is not None:
-        # NOTE: Master pkey has a payment we can use. Allocate a new generation ID (bump the counter global)
-        result.found = True
-        gen_result = db.query(tx.conn, '''
-            UPDATE    globals
-            SET       int_val = int_val + 1
-            WHERE     key = 'gen_index'
-            RETURNING int_val - 1
-        ''')
-        result.gen_index      = typing.cast(tuple[int], gen_result.fetchone())[0]
-        result.gen_index_salt = get_global_bytes(tx.conn, 'gen_index_salt')
+    result.expires_at = lookup.expiry_from_redeemed
+    if lookup.expiry_from_redeemed is None:
+        return result  # no usable payment → nothing to allocate
 
-        # NOTE: Also update the user table with this payment we found that is currently the "best"
-        # payment (e.g. the latest and most up to date payment and hence has the best expiry time)
-        # for the user into their user record.
-        #
-        # This means that for the most part, consumers can just rely on the top level object to
-        # determine the current state of the user subscription payment.
-        _ = db.query(tx.conn, '''
-            INSERT INTO users (master_pkey, gen_index, expires_at, grace_period, auto_renewing, refund_requested_at, google_obfuscated_account_id, apple_app_account_token)
-            VALUES            (%(master_pkey)s, %(gen_index)s, %(expiry)s, %(grace)s, %(auto_renewing)s, %(refund_ts)s, %(google_id)s, %(apple_id)s)
-            ON CONFLICT (master_pkey) DO UPDATE SET
-                gen_index                    = excluded.gen_index,
-                expires_at            = excluded.expires_at,
-                grace_period     = excluded.grace_period,
-                auto_renewing                = excluded.auto_renewing,
-                refund_requested_at  = excluded.refund_requested_at,
-                google_obfuscated_account_id = excluded.google_obfuscated_account_id,
-                apple_app_account_token      = excluded.apple_app_account_token
-        ''', master_pkey   = master_pkey_bytes,
-             gen_index     = result.gen_index,
-             expiry        = lookup.best_expiry,
-             grace         = lookup.best_grace,
-             auto_renewing = lookup.best_auto_renewing,
-             refund_ts     = lookup.best_refund_requested,
-             google_id     = google_obfuscated_account_id_from_master_pkey(master_pkey),
-             apple_id      = apple_obfuscated_account_id_from_master_pkey(master_pkey),
-             )
+    result.found = True
+    user = get_user_from_sql_tx(tx, master_pkey)
+    assert user.found, "user must exist before allocating a generation"
+
+    if reuse is not None:
+        result.generation_id, result.token = reuse
+    else:
+        result.generation_id, result.token = mint_generation(tx, user.id, issued_at)
+
+    _ = db.query(tx.conn, '''
+        UPDATE users
+        SET    current_generation_id        = %(gen_id)s,
+               expires_at                   = %(expiry)s,
+               grace_period                 = %(grace)s,
+               auto_renewing                = %(auto_renewing)s,
+               refund_requested_at          = %(refund_ts)s,
+               google_obfuscated_account_id = %(google_id)s,
+               apple_app_account_token      = %(apple_id)s
+        WHERE  id = %(user_id)s
+    ''', gen_id        = result.generation_id,
+         user_id       = user.id,
+         expiry        = lookup.best_expiry,
+         grace         = lookup.best_grace,
+         auto_renewing = lookup.best_auto_renewing,
+         refund_ts     = lookup.best_refund_requested,
+         google_id     = google_obfuscated_account_id_from_master_pkey(master_pkey),
+         apple_id      = apple_obfuscated_account_id_from_master_pkey(master_pkey))
+    result.grace_period = lookup.best_grace
 
     return result
 
@@ -1630,13 +1611,13 @@ def make_generate_pro_proof_hash(master_pkey:   nacl.signing.VerifyKey,
     result: bytes = hasher.digest()
     return result
 
-def build_proof_hash(gen_index_hash: bytes,
+def build_proof_hash(revocation_tag: bytes,
                      rotating_pkey:  nacl.signing.VerifyKey,
                      expires_at:     datetime.datetime) -> bytes:
     '''Make the hash to the backend signs for to certify the proof'''
     hasher: hashlib.blake2b = make_blake2b_hasher(personalisation=BUILD_PROOF_HASH_PERSONALISATION)
     # No version byte (Q11 / wire spec Delta #11).
-    hasher.update(gen_index_hash)
+    hasher.update(revocation_tag)
     hasher.update(bytes(rotating_pkey))
     hasher.update(base.unix_seconds_from_datetime(expires_at).to_bytes(length=8, byteorder='little'))
     result: bytes = hasher.digest()
@@ -1650,20 +1631,20 @@ def _build_proof_clamped_expiry_time(request_at: datetime.datetime, proposed_exp
     result             = min(clamped_expires_at, proposed_expires_at)
     return result
 
-def build_proof(gen_index:      int,
+def build_proof(revocation_tag: bytes,
                 rotating_pkey:  nacl.signing.VerifyKey,
                 expires_at:     datetime.datetime,
-                signing_key:    nacl.signing.SigningKey,
-                gen_index_salt: bytes) -> ProSubscriptionProof:
-    assert len(gen_index_salt) == hashlib.blake2b.SALT_SIZE
+                signing_key:    nacl.signing.SigningKey) -> ProSubscriptionProof:
+    # The revocation_tag is the generation's stored random token, embedded verbatim (no hashing).
+    assert len(revocation_tag) == BLAKE2B_DIGEST_SIZE
     result: ProSubscriptionProof = ProSubscriptionProof()
-    result.gen_index_hash        = make_gen_index_hash(gen_index=gen_index, gen_index_salt=gen_index_salt)
+    result.revocation_tag        = revocation_tag
     result.rotating_pkey         = rotating_pkey
-    result.expires_at     = expires_at
+    result.expires_at            = expires_at
 
-    hash_to_sign: bytes = build_proof_hash(gen_index_hash    = result.gen_index_hash,
-                                           rotating_pkey     = result.rotating_pkey,
-                                           expires_at = result.expires_at)
+    hash_to_sign: bytes = build_proof_hash(revocation_tag = result.revocation_tag,
+                                           rotating_pkey  = result.rotating_pkey,
+                                           expires_at     = result.expires_at)
     result.sig = signing_key.sign(hash_to_sign).signature
     return result
 
@@ -1854,25 +1835,20 @@ def verify_and_add_pro_payment(conn:                psycopg.Connection,
     return result
 
 def revoke_master_pkey_proofs_and_allocate_new_gen_id_tx(tx: db.SQLTransaction, master_pkey: nacl.signing.VerifyKey, created_at: datetime.datetime) -> AllocatedGenID:
-    # Revoke the generation index allocated to the master pkey. This blocks all of the proofs
-    # generated by the client that were using that payment.
-    _ = db.query(tx.conn, ('''
-        WITH prev_user AS (
-            SELECT gen_index, expires_at
-            FROM   users
-            WHERE  master_pkey = %(master_pkey)s
-        )
-        INSERT INTO revocations (gen_index, created_at, expires_at)
-        SELECT      gen_index, %(created_at)s, expires_at
-        FROM        prev_user
-    '''), master_pkey         = bytes(master_pkey),
-          created_at = created_at)
+    # Revoke the user's current generation (terminal): sets revoked_at, which blocks every proof issued
+    # under that generation and (via the trigger) bumps the revocation ticket. The `revoked_at IS NULL`
+    # guard makes a double-revoke a no-op rather than tripping the terminal-immutability trigger.
+    _ = db.query(tx.conn, '''
+        UPDATE generations
+        SET    revoked_at = %(created_at)s
+        WHERE  id = (SELECT current_generation_id FROM users WHERE master_pkey = %(master_pkey)s)
+          AND  revoked_at IS NULL
+    ''', master_pkey = bytes(master_pkey),
+         created_at  = created_at)
 
-    # If the use had any left over payments that are valid to use, we can allocate them a new
-    # generation ID for subsequent proofs to be generated under. Clients will notice that their
-    # current proofs on the old generation ID are revoked (via the previous function here) and
-    # re-query the backend to generate a new one.
-    result = _allocate_new_gen_id_if_master_pkey_has_payments(tx, master_pkey)
+    # If the user still has usable payments, roll them onto a fresh generation for subsequent proofs.
+    # Clients see the old generation revoked (via the revocation list) and re-query for a new proof.
+    result = _allocate_new_gen_id_if_master_pkey_has_payments(tx, master_pkey, issued_at=created_at)
     return result
 
 def round_datetime_to_next_day_with_platform_testing_support(payment_provider: base.PaymentProvider, at: datetime.datetime) -> datetime.datetime:
@@ -1887,7 +1863,6 @@ def round_datetime_to_next_day_with_platform_testing_support(payment_provider: b
 
 def generate_pro_proof(conn: psycopg.Connection,
                        signing_key:    nacl.signing.SigningKey,
-                       gen_index_salt: bytes,
                        master_pkey:    nacl.signing.VerifyKey,
                        rotating_pkey:  nacl.signing.VerifyKey,
                        request_at:     datetime.datetime,
@@ -1919,17 +1894,16 @@ def generate_pro_proof(conn: psycopg.Connection,
     assert get_user
 
     if get_user.user.master_pkey == bytes(master_pkey):
-        # Check that the gen index hash is not revoked
-        if is_gen_index_revoked(conn, get_user.user.gen_index, request_at):
+        # Don't mint a proof on a revoked generation.
+        if is_generation_revoked(conn, get_user.user.current_generation_id, request_at):
             err.msg_list.append(f'User {bytes(master_pkey).hex()} payment has been revoked')
         else:
             proof_expires_at = _build_proof_clamped_expiry_time(request_at=request_at, proposed_expires_at=get_user.user.expires_at)
             if request_at <= proof_expires_at:
-                result = build_proof(gen_index         = get_user.user.gen_index,
-                                     rotating_pkey     = rotating_pkey,
-                                     expires_at        = proof_expires_at,
-                                     signing_key       = signing_key,
-                                     gen_index_salt    = gen_index_salt);
+                result = build_proof(revocation_tag = get_user.user.token,
+                                     rotating_pkey  = rotating_pkey,
+                                     expires_at     = proof_expires_at,
+                                     signing_key    = signing_key);
             else:
                 payment_expires_at = get_user.user.expires_at - get_user.user.grace_period if get_user.user.auto_renewing else get_user.user.expires_at
                 err.msg_list.append(f'User {bytes(master_pkey).hex()} entitlement expired at {base.readable(get_user.user.expires_at)} ({base.readable(payment_expires_at)} + {get_user.user.grace_period})')
@@ -1941,16 +1915,19 @@ def generate_pro_proof(conn: psycopg.Connection,
 def expire_payments_revocations_and_users(conn: psycopg.Connection, now: datetime.datetime) -> ExpireResult:
     # Pure idempotent housekeeping: prune rows whose expiry has passed (and orphaned users). Nothing
     # here affects live results — payment expiry is derived on read, and every consuming query
-    # self-guards on expiry (e.g. is_gen_index_revoked) — so this can run on any schedule, any number
+    # self-guards on expiry (e.g. is_generation_revoked) — so this can run on any schedule, any number
     # of times, in any process, and only ever frees storage. Hence no `last_expire` checkpoint /
     # windowing / cross-process "only one wins" guard: a redundant run simply deletes nothing.
     result = ExpireResult()
     with db.transaction(conn) as tx:
-        rev_result    = db.query(tx.conn, '''DELETE FROM revocations WHERE %s >= expires_at''', now)
+        # Revocations are no longer a separate prunable table: a revocation is generations.revoked_at, and
+        # generations are entitlement history (and FK'd from users.current_generation_id), so they aren't
+        # deleted here — the served revocation list filters by retain_for instead. (Safely pruning ancient,
+        # unreferenced revoked generations is a later item.)
         users_result  = db.query(tx.conn, '''DELETE FROM users WHERE id NOT IN (SELECT user_id FROM payments WHERE user_id IS NOT NULL)''')
         apple_result  = db.query(tx.conn, '''DELETE FROM apple_notification_uuid_history WHERE %s >= expires_at''', now)
         google_result = db.query(tx.conn, '''DELETE FROM google_notification_history WHERE %s >= expires_at AND handled = TRUE''', now)
-        result.revocations                     = rev_result.rowcount
+        result.revocations                     = 0
         result.users                           = users_result.rowcount
         result.apple_notification_uuid_history = apple_result.rowcount
         result.google_notification_history     = google_result.rowcount

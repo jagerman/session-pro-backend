@@ -39,13 +39,9 @@ QUICK START EXAMPLES:
   google-notification list                                                                                                                  (requires --config)
 
   revoke              list                         <master_pkey_hex>                                                                        (requires --config)
-  revoke              delete                       <master_pkey_hex>                                                                        (requires --config)
-  revoke              timestamp                    [--creation-unix-ts-s <ts>] <master_pkey_hex> <unix_ts_s>                                (requires --config)
+  revoke              user                         [--creation-unix-ts-s <ts>] <master_pkey_hex>                                            (requires --config)
 
   report              generate                     <daily|weekly|monthly> [--format <human|csv>] [--count <n>]                              (requires --config)
-
-  db                  info                                                                                                                  (requires --config)
-  db                  print                                                                                                                 (requires --config)
 """
 
 DETAILED_EPILOG = """
@@ -229,27 +225,22 @@ COMMAND FORMATS DETAILED:
       python cli.py --config config.ini revoke list aaaa...aaaa
       python cli.py --config config.ini revoke list 0xaaaa...aaaa
 
-  revoke delete <master_pkey_hex> (requires --config)
-    Removes the revocation entry for the specified master public key
+  revoke user [--creation-unix-ts-s <ts>] <master_pkey_hex> (requires --config)
+    Revoke the user's current generation and roll them onto a fresh one (if they still have valid
+    payments). Revocation is terminal: once a generation is revoked it can never be un-revoked, so
+    there is no delete/timestamp-edit counterpart.
 
-    The current generation index associated with the pkey will be looked up and the corresponding
-    hash will be revoked. If the user is not known by the database (e.g. the user doesn't exist, or,
-    the user's master public key mapping has been pruned because the user was inactive for example)
-    then no action is taken.
-
-  revoke timestamp [--creation-unix-ts-s <ts>] <master_pkey_hex> <unix_ts_s> (requires --config)
-    Add or update the time (or create a new revocation entry if it doesn't exist) at which the
-    revocation item will be effective until.
-
-    Note that executing any revoke action increments the global generation index counter to the next
-    value. This is expected behaviour as a side effect of modifying the revocation table.
+    The user's current generation is looked up from their master public key and its token is added to
+    the served revocation list. If the user is not known to the database (never existed, or their
+    master public key mapping was pruned after a period of inactivity) then no action is taken.
 
     Options:
-      master_pkey_hex:  64-character hex string
-      unix_ts_s:        Unix timestamp in seconds (not milliseconds!)
+      master_pkey_hex:      64-character hex string
+      --creation-unix-ts-s: Unix timestamp in seconds for the revocation instant (default: now)
 
     Examples:
-      python cli.py --config config.ini revoke timestamp --creation-unix-ts-s 1741170600 aaaa...aaaa 1741170720
+      python cli.py --config config.ini revoke user aaaa...aaaa
+      python cli.py --config config.ini revoke user --creation-unix-ts-s 1741170600 aaaa...aaaa
 
   report generate <period> [--format <format>] [--count <n>] (requires --config)
     Generate a report of the payments for the given report type, period and optional count. The
@@ -270,12 +261,6 @@ COMMAND FORMATS DETAILED:
       python cli.py --config config.ini report generate daily
       python cli.py --config config.ini report generate weekly --format csv --count 4
       python cli.py --config config.ini report generate monthly --count 3
-
-  db info (requires --config)
-    Shows database statistics and info
-
-  db print (requires --config)
-    Prints all tables to stdout (for debugging)
 """
 
 
@@ -702,7 +687,7 @@ def cmd_revoke_list(args: argparse.Namespace) -> int:
         print(f"ERROR: Database error: {e}", file=sys.stderr)
         return 1
 
-def cmd_revoke_delete(args: argparse.Namespace, dry_run: bool) -> int:
+def cmd_revoke(args: argparse.Namespace, dry_run: bool) -> int:
     config = require_config(args)
     err = base.ErrorSink()
     master_pkey = parse_master_pkey(args.master_pkey, err)
@@ -715,49 +700,21 @@ def cmd_revoke_delete(args: argparse.Namespace, dry_run: bool) -> int:
         print("ERROR: Master public key is required", file=sys.stderr)
         return 1
 
+    # Revocation is terminal, so there is no un-revoke; the manual revoke uses the one real revoke path
+    # (revoke the user's current generation + roll them onto a fresh one if they still have valid payments).
+    revoke_at = base.datetime_from_unix_ms(args.creation_unix_ts_s * 1000) if args.creation_unix_ts_s else datetime.datetime.now(datetime.timezone.utc)
+
     if dry_run:
-        print(f"(DRY RUN) Would delete revocation for {args.master_pkey}")
+        print(f"(DRY RUN) Would revoke {args.master_pkey} at {base.readable(revoke_at)}")
         return 0
 
     try:
         with db.open_database(config.db_url) as engine:
             with db.connection(engine) as conn:
                 with db.transaction(conn) as tx:
-                    set_result = backend.set_revocation_tx(tx=tx, master_pkey=master_pkey, created_at=datetime.datetime.now(datetime.timezone.utc), expires_at=base.EPOCH, delete_item=True)
-                    print(f"Deleted revocation for {args.master_pkey} ({set_result.value.lower()})")
-                    return 0
-
-    except Exception as e:
-        print(f"ERROR: Database error: {e}", file=sys.stderr)
-        return 1
-
-
-def cmd_revoke_timestamp(args: argparse.Namespace, dry_run: bool) -> int:
-    config = require_config(args)
-    err = base.ErrorSink()
-    master_pkey = parse_master_pkey(args.master_pkey, err)
-
-    if err.has():
-        print(f"ERROR: Failed to parse arguments:\n  " + "\n  ".join(err.msg_list), file=sys.stderr)
-        return 1
-
-    if master_pkey is None:
-        print("ERROR: Master public key is required", file=sys.stderr)
-        return 1
-
-    if dry_run:
-        print(f"(DRY RUN) Would set revocation timestamp for {args.master_pkey} to {base.readable(base.datetime_from_unix_ms(args.unix_ts_s * 1000))}")
-        return 0
-
-    try:
-        with db.open_database(config.db_url) as engine:
-            with db.connection(engine) as conn:
-                with db.transaction(conn) as tx:
-                    expires_at   = base.datetime_from_unix_ms(args.expiry_unix_ts_s * 1000)
-                    created_at = base.datetime_from_unix_ms(args.creation_unix_ts_s * 1000)
-                    set_result          = backend.set_revocation_tx(tx=tx, master_pkey=master_pkey, created_at=created_at, expires_at=expires_at, delete_item=False)
-                    print(f"Set revocation for {args.master_pkey} to {base.readable(created_at)} to {base.readable(expires_at)} ({set_result.value.lower()})")
-                    return 0
+                    backend.revoke_master_pkey_proofs_and_allocate_new_gen_id_tx(tx, master_pkey, created_at=revoke_at)
+                print(f"Revoked current generation for {args.master_pkey} at {base.readable(revoke_at)}")
+                return 0
 
     except Exception as e:
         print(f"ERROR: Database error: {e}", file=sys.stderr)
@@ -788,47 +745,6 @@ def cmd_report_generate(args: argparse.Namespace) -> int:
     except Exception as e:
         print(f"ERROR: Database error: {e}", file=sys.stderr)
         return 1
-
-
-def cmd_db_info(args: argparse.Namespace) -> int:
-    config = require_config(args)
-    # Best-effort load of the backend public key so `db info` can show it. The key lives on disk
-    # now (not in the DB) and may simply be unavailable wherever the CLI is run.
-    backend_pkey: nacl.signing.VerifyKey | None = None
-    if config.backend_key_path:
-        try:
-            backend_pkey = backend.load_backend_signing_key(config.backend_key_path).verify_key
-        except Exception:
-            backend_pkey = None
-    try:
-        with db.open_database(config.db_url) as engine:
-            with db.connection(engine) as conn:
-                err = base.ErrorSink()
-                info_str = backend.db_info_string(conn=conn, db_url=config.db_url, err=err, backend_pkey=backend_pkey)
-                if err.has():
-                    print(f"ERROR: Failed to get DB info: {err.msg_list}", file=sys.stderr)
-                    return 1
-
-                print(info_str)
-                return 0
-
-    except Exception as e:
-        print(f"ERROR: Database error: {e}", file=sys.stderr)
-        return 1
-
-
-def cmd_db_print(args: argparse.Namespace) -> int:
-    config = require_config(args)
-    try:
-        with db.open_database(config.db_url) as engine:
-            with db.connection(engine) as conn:
-                base.print_db_to_stdout(conn)
-                return 0
-
-    except Exception as e:
-        print(f"ERROR: Database error: {e}", file=sys.stderr)
-        return 1
-
 
 
 def cmd_server_set_payment_refund_requested(args: argparse.Namespace) -> int:
@@ -1185,7 +1101,7 @@ def cmd_voucher(args: argparse.Namespace) -> int:
                     print("Success: Payment redeemed and pro proof generated")
                     print(f'\nProof Details:')
                     print(f'  Expiry: {base.readable(redeem_result.proof.expires_at)}')
-                    print(f'  Gen Index Hash: {redeem_result.proof.gen_index_hash.hex()}')
+                    print(f'  Revocation Tag: {redeem_result.proof.revocation_tag.hex()}')
 
                     return 0
 
@@ -1278,13 +1194,9 @@ def main() -> int:
     revoke_list             = revoke_subparsers.add_parser('list',                help='List revocable payments for a user')
     _                       = revoke_list.add_argument('master_pkey',             help='Master public key (64 hex chars)')
 
-    revoke_delete           = revoke_subparsers.add_parser('delete',              help='Delete revocation entry')
-    _                       = revoke_delete.add_argument('master_pkey',           help='Master public key (64 hex chars)')
-
-    revoke_timestamp        = revoke_subparsers.add_parser('timestamp',             help='Set revocation with timestamp')
-    _                       = revoke_timestamp.add_argument('master_pkey',          help='Master public key (64 hex chars)')
-    _                       = revoke_timestamp.add_argument('--creation-unix-ts-s', type=int, default=int(time.time()), help='Revoke creation timestamp in seconds')
-    _                       = revoke_timestamp.add_argument('expiry_unix_ts_s',     type=int,                           help='Expiry unix timestamp in seconds')
+    revoke_now              = revoke_subparsers.add_parser('user',                help="Revoke a user's current generation (terminal — no un-revoke)")
+    _                       = revoke_now.add_argument('master_pkey',              help='Master public key (64 hex chars)')
+    _                       = revoke_now.add_argument('--creation-unix-ts-s', type=int, default=int(time.time()), help='Revocation instant in unix seconds (default: now)')
 
     # Report commands
     report_parser           = subparsers.add_parser('report',                     help='Generate reports')
@@ -1294,12 +1206,6 @@ def main() -> int:
     _                       = report_generate.add_argument('period',   choices=['daily', 'weekly',  'monthly'],                   help='Report period')
     _                       = report_generate.add_argument('--format', choices=['human', 'csv'],                 default='human', help='Report format')
     _                       = report_generate.add_argument('--count',  type=int,                                 default=7,       help='Number of periods to report')
-
-    # DB commands
-    db_parser               = subparsers.add_parser('db',                 help='Database operations')
-    db_subparsers           = db_parser.add_subparsers(dest='db_command', help='Database subcommands')
-    _                       = db_subparsers.add_parser('info',            help='Show database info')
-    _                       = db_subparsers.add_parser('print',           help='Print all tables')
 
     args = parser.parse_args()
 
@@ -1349,10 +1255,8 @@ def main() -> int:
     elif args.command == 'revoke':
         if args.revoke_command == 'list':
             return cmd_revoke_list(args)
-        elif args.revoke_command == 'delete':
-            return cmd_revoke_delete(args, dry_run)
-        elif args.revoke_command == 'timestamp':
-            return cmd_revoke_timestamp(args, dry_run)
+        elif args.revoke_command == 'user':
+            return cmd_revoke(args, dry_run)
         else:
             revoke_parser.print_help()
             return 1
@@ -1362,15 +1266,6 @@ def main() -> int:
             return cmd_report_generate(args)
         else:
             report_parser.print_help()
-            return 1
-
-    elif args.command == 'db':
-        if args.db_command == 'info':
-            return cmd_db_info(args)
-        elif args.db_command == 'print':
-            return cmd_db_print(args)
-        else:
-            db_parser.print_help()
             return 1
 
     else:
