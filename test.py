@@ -457,11 +457,18 @@ def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_d
         bytes(master_key.verify_key))]
     assert len(gen_ids)                                    == 1
 
+    # Item 5 (privacy — subscription-cadence leak): the revocation_tag a group member observes on the
+    # user's proofs is STABLE across the stack. Both redeems produced proofs carrying the SAME tag (the
+    # reused generation's token), so bump frequency can't leak the renewal cadence — the tag changes only
+    # on a binding revocation (test_revocation_cutting_refund_rolls_generation).
+    assert scenarios[0].proof.revocation_tag               == scenarios[1].proof.revocation_tag
+
     user_list: list[backend.UserRow]                        = backend.get_users_list(db_conn)
     assert len(user_list)                                  == 1
     assert user_list[0].master_pkey                        == bytes(master_key.verify_key), 'lhs={}, rhs={}'.format(user_list[0].master_pkey.hex(), bytes(master_key.verify_key).hex())
     assert user_list[0].current_generation_id              == gen_ids[0]
     assert len(user_list[0].token)                         == backend.BLAKE2B_DIGEST_SIZE
+    assert user_list[0].token                              == scenarios[1].proof.revocation_tag
     assert user_list[0].expires_at                  == scenarios[1].expires_at
 
     payment_list: list[backend.PaymentRow]                  = backend.get_payments_list(db_conn)
@@ -634,6 +641,12 @@ def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_d
             payment_list = backend.get_payments_list(db_conn)
             assert len(payment_list) == 3
 
+            # Item 5 (privacy): capture the tag the manual redeem established. The proof carries it, and
+            # the server-side auto-redeem below must leave it unchanged.
+            with db.transaction(db_conn) as tx:
+                auto_redeem_tag_after_manual = backend.get_user_and_payments(tx, auto_redeem_user_master_key.verify_key).user.token
+            assert redeemed_payment.proof.revocation_tag == auto_redeem_tag_after_manual
+
         # NOTE: This is the payment that was not claimed via add_pro_payment. If we check the
         # payments table there should be 4 payments (2 from the first test, 2 from this test). The 2
         # from this test should be set to redeemed.
@@ -658,6 +671,12 @@ def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_d
             assert payments_list[3].redeemed_at      == backend.to_redeemed_at(payments_list[3].purchased_at)
             assert payments_list[3].auto_renewing            == True
             assert payments_list[3].grace_period == auto_redeem_scenarios[1].grace_period
+
+            # Item 5 (privacy — cadence leak): the SERVER-SIDE auto-redeem (the exact renewal path that
+            # used to roll the generation on every cycle) must NOT change the observable revocation_tag.
+            with db.transaction(db_conn) as tx:
+                auto_redeem_tag_after_auto = backend.get_user_and_payments(tx, auto_redeem_user_master_key.verify_key).user.token
+            assert auto_redeem_tag_after_auto == auto_redeem_tag_after_manual
 
 def test_revocation_cutting_refund_rolls_generation(monkeypatch, pg_database):
     """Item 4 case 2: a refund that drops the user's remaining entitlement BELOW what an outstanding
