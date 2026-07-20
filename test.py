@@ -449,17 +449,18 @@ def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_d
         assert redeemed_payment_2nd.status                    == backend.RedeemPaymentStatus.Success
         assert len(redeemed_payment_2nd.proof.revocation_tag) == backend.BLAKE2B_DIGEST_SIZE
 
-    # Two payments stacked for one user → two generations minted (item 1/2 rolls the generation on every
-    # payment). The user's active generation is the most recent of the two.
+    # Two payments stacked for one user → ONE generation, REUSED (item 3: a generation is an epoch, not a
+    # per-payment value — a redeem reuses the current generation rather than rolling, since neither payment
+    # was revoked). So the revocation_tag is stable across the stack.
     gen_ids: list[int]                                      = [row[0] for row in db.query(db_conn,
         "SELECT g.id FROM generations g JOIN users u ON u.id = g.user_id WHERE u.master_pkey = %s ORDER BY g.id",
         bytes(master_key.verify_key))]
-    assert len(gen_ids)                                    == 2
+    assert len(gen_ids)                                    == 1
 
     user_list: list[backend.UserRow]                        = backend.get_users_list(db_conn)
     assert len(user_list)                                  == 1
     assert user_list[0].master_pkey                        == bytes(master_key.verify_key), 'lhs={}, rhs={}'.format(user_list[0].master_pkey.hex(), bytes(master_key.verify_key).hex())
-    assert user_list[0].current_generation_id              == gen_ids[-1]
+    assert user_list[0].current_generation_id              == gen_ids[0]
     assert len(user_list[0].token)                         == backend.BLAKE2B_DIGEST_SIZE
     assert user_list[0].expires_at                  == scenarios[1].expires_at
 
@@ -3855,11 +3856,13 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             user = backend.get_user(conn=conn, master_pkey=user_ctx.master_key.verify_key)
             assert isinstance(user, backend.UserRow)
             assert user.master_pkey == bytes(user_ctx.master_key.verify_key)
-            # One generation is minted per payment (item 1/2 rolls on every redeem); the user points at
-            # the newest, with a populated 32-byte token.
-            gen_ids = [row[0] for row in db.query(conn, "SELECT id FROM generations WHERE user_id = %s ORDER BY id", user.id)]
-            assert len(gen_ids) == user_ctx.payments
-            assert user.current_generation_id == gen_ids[-1]
+            # The user points at a live current generation with a populated 32-byte token. We do NOT
+            # assert a generation count here: a generation is an epoch (item 3), reused across payments and
+            # rolled only on revocation, so the count is scenario-dependent, not one-per-payment. The
+            # current generation must be one of the user's, and (for these non-revoked scenarios) live.
+            user_gen_ids = {row[0] for row in db.query(conn, "SELECT id FROM generations WHERE user_id = %s", user.id)}
+            assert user.current_generation_id in user_gen_ids
+            assert not backend.is_generation_revoked(conn, user.current_generation_id, base.datetime_from_unix_ms(tx.event_ms))
             assert len(user.token) == backend.BLAKE2B_DIGEST_SIZE
             assert user.expires_at == base.datetime_from_unix_ms(tx.expires_at) + base.DEFAULT_GOOGLE_GRACE_PERIOD
 

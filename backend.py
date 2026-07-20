@@ -870,19 +870,18 @@ def redeem_payment_tx(tx:                  db.SQLTransaction,
 
         # master_pkey lives only in `users`: ensure the identity row (+ its first generation) exists,
         # then link the just-redeemed payment(s) to it.
-        user_id, init_gen_id, init_token, was_created = get_or_create_user_and_generation(tx, master_pkey, issued_at=redeemed_at)
+        user_id, *_ = get_or_create_user_and_generation(tx, master_pkey, issued_at=redeemed_at)
         _ = db.query(tx.conn, '''
             UPDATE payments
             SET    user_id = %(user_id)s
             WHERE  id = ANY(%(ids)s)
         ''', user_id = user_id, ids = redeemed_ids)
 
-        # Roll the user onto a fresh generation reflecting the now-linked payments. A brand-new user
-        # reuses the generation just minted for it; an existing user gets a fresh one. We do NOT revoke
-        # the old generation — a proof is related to, but not representative of, payment state, so the
-        # client keeps its old proof until it expires and simply requests a new one (no revoke-list churn).
-        allocated: AllocatedGenID = _allocate_new_gen_id_if_master_pkey_has_payments(
-            tx, master_pkey, issued_at=redeemed_at, reuse=(init_gen_id, init_token) if was_created else None)
+        # Refresh the user's entitlement to reflect the now-linked payments. A generation is an epoch
+        # (item 3): this REUSES the user's current generation (brand-new user → its initial one; existing
+        # user → the same one they already had), so a redeem never rolls the generation or the client's
+        # revocation_tag. (_allocate mints a fresh generation only if the current one is revoked.)
+        allocated: AllocatedGenID = _allocate_new_gen_id_if_master_pkey_has_payments(tx, master_pkey, issued_at=redeemed_at)
         assert allocated.found, "We just added the user's payment we expect to find the latest expiry date for the pkey"
 
         # NOTE: Only generate the proof if a rotating public key was given — a payment can be redeemed
@@ -1482,12 +1481,15 @@ def get_or_create_user_and_generation(tx: db.SQLTransaction, master_pkey: nacl.s
 
 def _allocate_new_gen_id_if_master_pkey_has_payments(tx:          db.SQLTransaction,
                                                      master_pkey: nacl.signing.VerifyKey,
-                                                     issued_at:   datetime.datetime,
-                                                     reuse:       tuple[int, bytes] | None = None) -> AllocatedGenID:
-    # Roll the user onto a fresh generation reflecting their current best payment (if any), and refresh
-    # the top-level user fields consumers read. `reuse` lets a brand-new user reuse the generation just
-    # minted for it (avoids a stray extra generation); otherwise a fresh one is minted. The user row must
-    # already exist (redeem creates it via get_or_create_user_and_generation; revoke's user exists).
+                                                     issued_at:   datetime.datetime) -> AllocatedGenID:
+    # Refresh the user's top-level entitlement fields from their current best payment, and settle which
+    # generation they're on. A generation is an EPOCH, not a per-payment value (item 3): REUSE the user's
+    # current generation across payments — stacking, renewals, auto-redeem, natural-lapse reactivation — so
+    # the revocation_tag stays stable (no per-payment revocation-list churn, no subscription-cadence leak).
+    # Mint a FRESH generation only when the current one is REVOKED (reusing it would mint proofs born
+    # already-revoked). The revoke path depends on exactly this: it sets revoked_at first, then calls here,
+    # so it rolls onto a fresh generation. The user row must already exist (redeem creates it via
+    # get_or_create_user_and_generation; revoke's user exists).
     result: AllocatedGenID = AllocatedGenID()
     lookup: LookupUserExpiry = _lookup_user_expiry_tx(tx, master_pkey)
     result.expires_at = lookup.expiry_from_redeemed
@@ -1498,10 +1500,10 @@ def _allocate_new_gen_id_if_master_pkey_has_payments(tx:          db.SQLTransact
     user = get_user_from_sql_tx(tx, master_pkey)
     assert user.found, "user must exist before allocating a generation"
 
-    if reuse is not None:
-        result.generation_id, result.token = reuse
-    else:
+    if is_generation_revoked_tx(tx, user.current_generation_id, issued_at):
         result.generation_id, result.token = mint_generation(tx, user.id, issued_at)
+    else:
+        result.generation_id, result.token = user.current_generation_id, user.token
 
     _ = db.query(tx.conn, '''
         UPDATE users
