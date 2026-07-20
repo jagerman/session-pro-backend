@@ -321,9 +321,11 @@ a `_ts` marker, durations `…_duration`. Audit every response key against both 
    field), (d) prune its served list at `creation + retain_for` **without** bumping `ticket`.
 7. **Delete the dead `SeshProBackend__` personalisation** (libsession-util) — unused decoy; the live
    proof personalisation is `ProProof________`.
-8. **Fix `examples/verify_pro_proof.py`** (backend) — it hashes with `SeshProBackend__` (wrong) and takes
-   `--expiry-ts-ms` (wrong unit); correct to `ProProof________` + seconds. It's the file an implementer
-   copies, so it must be right.
+8. **Example scripts DELETED** (backend) — `examples/verify_pro_proof.py` and `examples/endpoint_example.py`
+   were removed. They re-bitrotted against every wire change (BLAKE2b hashing, a version byte, int-enum
+   provider, split payment fields) and a "reference" that verifies nothing the backend signs is a trap. The
+   authoritative references are now this byte-level spec and libsession-util's proof-verification test
+   apparatus. (Supersedes the earlier plan to fix `verify_pro_proof.py` in place.)
 9. Minor: generate-proof signing hardcodes `version = 0` despite a version field — thread the real value.
 10. **Enums → string `code`s** (§1): `payment_provider`, `status`, `plan` are transmitted as string codes,
     not integers — backed by lookup tables (backend item 9; DB keeps an int `id`, wire/signed-message use the
@@ -385,8 +387,8 @@ a `_ts` marker, durations `…_duration`. Audit every response key against both 
       trap anywhere in a signed input; BLAKE2b is gone from the signing path entirely.
     - Backend: done (`backend.signed_message` + the `make_*_message`/`build_proof_message` builders;
       verify/sign sites unchanged since they already `verify(msg,sig)`/`sign(msg)`). libsession must
-      rebuild all five signed inputs to §1.1 in lockstep. The example files (`verify_pro_proof.py`,
-      `endpoint_example.py`) still show the old scheme → fix with #8's example sweep.
+      rebuild all five signed inputs to §1.1 in lockstep. (The `examples/` scripts that showed the old
+      scheme have been deleted — see #8; the spec + libsession's test apparatus are the reference.)
 
 ## Open (coordination)
 - **Spec home:** this file, in the backend repo (`docs/pro-wire-protocol.md`), is proposed as the
