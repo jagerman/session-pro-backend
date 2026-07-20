@@ -40,6 +40,7 @@ QUICK START EXAMPLES:
 
   revoke              list                         <master_pkey_hex>                                                                        (requires --config)
   revoke              user                         [--creation-unix-ts-s <ts>] <master_pkey_hex>                                            (requires --config)
+  revoke              bump-ticket                  <amount>                                                                                 (requires --config)
 
   report              generate                     <daily|weekly|monthly> [--format <human|csv>] [--count <n>]                              (requires --config)
 """
@@ -720,6 +721,29 @@ def cmd_revoke(args: argparse.Namespace, dry_run: bool) -> int:
         print(f"ERROR: Database error: {e}", file=sys.stderr)
         return 1
 
+def cmd_revoke_bump_ticket(args: argparse.Namespace, dry_run: bool) -> int:
+    config = require_config(args)
+
+    # The ticket only ever moves forward (clients treat "my cached ticket < server's" as "list changed").
+    if args.amount < 1:
+        print("ERROR: amount must be a positive integer", file=sys.stderr)
+        return 1
+
+    if dry_run:
+        print(f"(DRY RUN) Would advance the revocation ticket by {args.amount}")
+        return 0
+
+    try:
+        with db.open_database(config.db_url) as engine:
+            with db.connection(engine) as conn:
+                with db.transaction(conn) as tx:
+                    new_ticket = backend.bump_revocation_ticket(tx.conn, args.amount)
+                print(f"Advanced the revocation ticket by {args.amount} to {new_ticket}")
+                return 0
+    except Exception as e:
+        print(f"ERROR: Database error: {e}", file=sys.stderr)
+        return 1
+
 def cmd_report_generate(args: argparse.Namespace) -> int:
     config = require_config(args)
     try:
@@ -1188,6 +1212,9 @@ def main() -> int:
     _                       = revoke_now.add_argument('master_pkey',              help='Master public key (64 hex chars)')
     _                       = revoke_now.add_argument('--creation-unix-ts-s', type=int, default=int(time.time()), help='Revocation instant in unix seconds (default: now)')
 
+    revoke_bump_ticket      = revoke_subparsers.add_parser('bump-ticket',         help='Advance the revocation ticket forward (DR: run after restoring the DB from an older backup)')
+    _                       = revoke_bump_ticket.add_argument('amount', type=int, help='Positive integer to add to the current revocation ticket')
+
     # Report commands
     report_parser           = subparsers.add_parser('report',                     help='Generate reports')
     report_subparsers       = report_parser.add_subparsers(dest='report_command', help='Report subcommands')
@@ -1247,6 +1274,8 @@ def main() -> int:
             return cmd_revoke_list(args)
         elif args.revoke_command == 'user':
             return cmd_revoke(args, dry_run)
+        elif args.revoke_command == 'bump-ticket':
+            return cmd_revoke_bump_ticket(args, dry_run)
         else:
             revoke_parser.print_help()
             return 1

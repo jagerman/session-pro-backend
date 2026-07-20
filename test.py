@@ -753,6 +753,26 @@ def test_revocation_cutting_refund_rolls_generation(monkeypatch, pg_database):
         db_engine.putconn(db_conn)
         db_engine.close()
 
+def test_bump_revocation_ticket(pg_database):
+    """Item 7: the manual DR bump (backing the `revoke bump-ticket` CLI command) advances the monotonic
+    revocation ticket by the given amount and returns the new value. Used to recover after a DB restore
+    from an older backup rolls the counter backward (see docs/deploy.md)."""
+    err                                           = base.ErrorSink()
+    db_engine: psycopg_pool.ConnectionPool | None = backend.bootstrap_db(database_url=pg_database(), err=err)
+    assert not err.has(), f'{err.msg_list}'
+    assert db_engine
+
+    conn = db_engine.getconn()
+    try:
+        assert backend.get_revocation_ticket(conn)      == 0
+        assert backend.bump_revocation_ticket(conn, 1000) == 1000   # returns the new value
+        assert backend.get_revocation_ticket(conn)      == 1000     # and it persisted
+        assert backend.bump_revocation_ticket(conn, 5)  == 1005     # cumulative, not absolute
+        assert backend.get_revocation_ticket(conn)      == 1005
+    finally:
+        db_engine.putconn(conn)
+        db_engine.close()
+
 def test_server_add_payment_flow(monkeypatch, pg_database):
     monkeypatch.setattr(
         "platform_google_api.subscription_v1_acknowledge",

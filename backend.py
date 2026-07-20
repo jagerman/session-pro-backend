@@ -555,6 +555,16 @@ def set_global_datetime(conn: psycopg.Connection, key: str, value: datetime.date
 def get_revocation_ticket(conn: psycopg.Connection) -> int:
     return get_global_int(conn, 'revocation_ticket')
 
+def bump_revocation_ticket(conn: psycopg.Connection, amount: int) -> int:
+    """Advance the monotonic revocation ticket by `amount`, returning the new value. Manual DR tool: the
+    ticket is a plain counter, so restoring the database from an older backup rolls it backward — and a
+    client holding a higher cached ticket then reads the list as "unchanged" and silently stops seeing
+    revocations. After such a restore, bump the ticket past its pre-restore value to force every client to
+    re-fetch. See docs/deploy.md ("After ANY restore")."""
+    row = db.query_one(conn, "UPDATE globals SET int_val = int_val + %s WHERE key = 'revocation_ticket' RETURNING int_val", amount)
+    assert row is not None, 'missing revocation_ticket global'
+    return row[0]
+
 def bootstrap_db(database_url: str, err: base.ErrorSink) -> psycopg_pool.ConnectionPool | None:
     """ Opens the database pool and bootstraps/migrates the schema if needed. """
     result: psycopg_pool.ConnectionPool | None = None

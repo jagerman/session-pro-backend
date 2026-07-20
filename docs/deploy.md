@@ -179,17 +179,24 @@ runuser -u postgres -- pg_restore --cluster <ver>/session_pro -d session_pro \
      --clean --if-exists /path/to/session_pro_YYYYMMDD_HHMMSS.dump
 ```
 
-### After ANY restore: advance the generation counter
+### After ANY restore: advance the revocation ticket
 
-A restore rewinds `runtime.gen_index`. Because that counter is baked (hashed) into issued
-proofs and keyed for revocations, reuse could collide a recovered index with one already held
-by a client. Advance it past anything that could have been issued in the lost window (this is
-invisible to clients — they only ever see the salted hash):
+A restore rewinds the `revocation_ticket` (a plain monotonic counter in `globals`). Clients poll
+`/get_pro_revocations` with their last-seen ticket and treat "my ticket == the server's" as "nothing
+changed", so a client holding a ticket **higher** than the rewound value silently stops fetching the
+list — and worse, new post-restore revocations reuse ticket numbers it has already passed, so it never
+sees them. After any restore, bump the ticket past anything that could have been issued in the lost
+window so every client re-fetches the list once:
 
 ```bash
-runuser -u postgres -- psql --cluster <ver>/session_pro -d session_pro \
-     -c "UPDATE runtime SET gen_index = gen_index + 1000000;"
+# from the app's install dir, as the app user:
+python cli.py --config <config.ini> revoke bump-ticket 1000000
 ```
+
+(Generation ids and revocation tokens need no such fixup: a recovered generation id just mints a fresh
+random token when reused, and the wire revocation tag is that token — never the id — so nothing a client
+cached can collide. This replaces the old `gen_index` counter fixup, which the random-token design
+retired.)
 
 ## Wipe and start over
 

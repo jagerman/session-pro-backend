@@ -199,8 +199,8 @@ API
       mandated revocations, e.g.: rare).
 
     Request
-      ticket:  4 byte monotonic integer that represents the current iteration of the revocation list
-               held by the caller. Initially callers will set this to 0 if they do not know the
+      ticket:  monotonic integer (int64 domain, sent as a JSON number) that represents the current
+               iteration of the revocation list held by the caller. Initially callers will set this to 0 if they do not know the
                latest ticket. In subsequent requests the latest known `ticket` should be passed in
                so that the backend only returns the updated revocation list if the contents of said
                list has changed.
@@ -208,15 +208,15 @@ API
     Response
       status: envelope status — "ok" (with `result`) / "fail" / "error" (with `error_code` + `error`); see §5
       result:
-        ticket:  4 byte integer of the latest ticket for the current revocation list of the Session
-                 Pro backend. If this value is the same as the request's `ticket` then the list will
+        ticket:  the latest ticket (int64 domain, JSON number) for the current revocation list of the
+                 Session Pro backend. If this value is the same as the request's `ticket` then the list will
                  be empty as there are no changes to the revocation list.
          items:   Array of revocations, can be empty if there are no revocations or the request ticket
                   is the latest ticket managed by the backend.
           revocation_tag:  32 byte opaque tag of the Session Pro proof that has been revoked.
           effective_ts: 8 byte UNIX timestamp indicating when the revocation becomes effective
                                 (i.e., clients should start rejecting proofs at this time).
-        retry_in: 4 byte integer of the recommended time in seconds that the client should wait to
+        retry_in: recommended time in integer seconds that the client should wait to
                     send the request for the pro-revocation list again to avoid being throttled.
         retain_for: integer seconds (~proof validity window) after which the client drops a seen
                     revocation from its in-memory list. Memory-only aging with no correctness

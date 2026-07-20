@@ -194,7 +194,7 @@ last-seen `ticket`; the backend returns the full list only if the ticket advance
 **Request:** `{ "ticket": <int64> }`  (no `version` field — §1, Delta #11)
 **Response:**
 ```
-{ "ticket":     <int64>,   // int64 type; VALUE stays « 2^53, so a JSON number (see §1); restore-safe
+{ "ticket":     <int64>,   // int64 type; VALUE stays « 2^53, so a JSON number (see §1)
   "retry_in":   <int>,     // recommended poll interval / throttle (seconds)
   "retain_for": <int>,     // seconds a client should keep each entry after seeing it (≈ the max
                            //   proof-validity window, ~30d). Sent, not hardcoded, so it can vary.
@@ -294,8 +294,10 @@ a `_ts` marker, durations `…_duration`. Audit every response key against both 
 2. **`gen_index_hash` → `revocation_tag`**: rename the wire key **and** change its nature — it is now a
    stored **random** 32-byte value, not `BLAKE2b(gen_index, salt)`. The server-side counter + salt
    derivation is deleted; clients already treat it as opaque, so client-side this is a rename only.
-3. **`ticket`: uint32 → int64**, and restore-monotonic on the server (a wrap or a DR rollback must not
-   let a client silently miss revocations).
+3. **`ticket`: uint32 → int64** (client-side domain, so a wrap can't silently drop revocations). A DB
+   restore from an older backup still rolls the server's counter backward; rather than automate a
+   server-side monotonic guard, the operator advances it manually after a restore (`revoke bump-ticket`
+   CLI + the deploy runbook). No wire effect — the ticket stays an opaque int64 JSON number to clients.
 4. **Explicit little-endian** for every multi-byte integer in a signed hash (the client currently relies
    on host byte order via `reinterpret_cast`; make it explicit). **[SUPERSEDED by #13 — signed inputs are
    now messages, not hashes, and integers are canonical decimal-ASCII; no LE integer survives in a signed
