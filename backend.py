@@ -1337,9 +1337,9 @@ def add_unredeemed_payment(tx:                                db.SQLTransaction,
     #
     # So the backend tries automatically redeem the payment on behalf of the user (if it seems
     # reasonable to do so according to that heuristic) for UX.
-    result_set: db.Result | None = None
+    master_pkey_set: db.Result | None = None
     if payment_tx.provider == base.PaymentProvider.GooglePlayStore:
-        result_set = db.query(tx.conn, ('''
+        master_pkey_set = db.query(tx.conn, ('''
             SELECT   u.master_pkey
             FROM     payments p JOIN users u ON u.id = p.user_id
                      JOIN google_play_payment_details gd ON gd.payment_id = p.id
@@ -1348,7 +1348,7 @@ def add_unredeemed_payment(tx:                                db.SQLTransaction,
             LIMIT    1
         '''), payment_tx.google_payment_token)
     elif payment_tx.provider == base.PaymentProvider.iOSAppStore:
-        result_set = db.query(tx.conn, ('''
+        master_pkey_set = db.query(tx.conn, ('''
             SELECT   u.master_pkey
             FROM     payments p JOIN users u ON u.id = p.user_id
                      JOIN app_store_payment_details ad ON ad.payment_id = p.id
@@ -1364,8 +1364,8 @@ def add_unredeemed_payment(tx:                                db.SQLTransaction,
         # in their client.
         pass
 
-    if result_set:
-        master_pkey_record = typing.cast(tuple[bytes] | None, result_set.fetchone())
+    if master_pkey_set:
+        master_pkey_record = typing.cast(tuple[bytes] | None, master_pkey_set.fetchone())
         if master_pkey_record and master_pkey_record[0]:
             master_pkey   = nacl.signing.VerifyKey(bytes(master_pkey_record[0]))
             user: UserRow = get_user(tx.conn, master_pkey)
@@ -1409,7 +1409,7 @@ def add_unredeemed_payment(tx:                                db.SQLTransaction,
                     # transaction; we log it for internal visibility.
                     try:
                         with tx.conn.transaction():
-                            _ = redeem_payment(tx            = tx,
+                            redeem_payment(tx,
                                                   master_pkey   = master_pkey,
                                                   rotating_pkey = None,
                                                   signing_key   = None,
@@ -1613,7 +1613,7 @@ def add_pro_payment(tx:                  db.SQLTransaction,
             "The passed in creation (and or activated) timestamp must lie on a day boundary: {}".format(base.readable(redeemed_at))
 
     # Redeem the payment (raises FailError(unknown_payment)/revoked/expired on failure).
-    result: RedeemPayment = redeem_payment(tx            = tx,
+    result = redeem_payment(tx,
                                               master_pkey   = master_pkey,
                                               rotating_pkey = rotating_pkey,
                                               signing_key   = signing_key,
