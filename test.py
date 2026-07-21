@@ -63,6 +63,9 @@ from appstoreserverlibrary.models.RevocationReason             import Revocation
 from appstoreserverlibrary.models.AutoRenewStatus              import AutoRenewStatus              as AppleAutoRenewStatus
 from appstoreserverlibrary.models.ConsumptionRequestReason     import ConsumptionRequestReason     as AppleConsumptionRequestReason
 
+def pk_hex(pk : bytes | nacl.signing.VerifyKey | None) -> str:
+    return 'None' if pk is None else bytes(pk).hex()
+
 def derived_status(payment: backend.PaymentRow, at: datetime.datetime | None = None) -> base.PaymentStatus:
     """A payment's status is derived from its timestamps, not stored (see backend.derive_payment_status).
 
@@ -417,12 +420,12 @@ def test_migrations_bootstrap_and_idempotency(pg_database):
     with db.connection(pool) as conn:
         applied = {row[0] for row in db.query(conn, 'SELECT name FROM migrations_applied')}
         assert applied == expected
-        assert db.query_one(conn, 'SELECT COUNT(*) FROM globals')[0] == 2
+        assert db.query_scalar(conn, 'SELECT COUNT(*) FROM globals') == 2
 
         # Idempotent: re-running applies nothing new and does not duplicate the globals seed.
         migrations.apply_migrations(conn)
         assert {row[0] for row in db.query(conn, 'SELECT name FROM migrations_applied')} == expected
-        assert db.query_one(conn, 'SELECT COUNT(*) FROM globals')[0] == 2
+        assert db.query_scalar(conn, 'SELECT COUNT(*) FROM globals') == 2
     pool.close()
 
 def test_migrations_reject_duplicate_basename(tmp_path, monkeypatch):
@@ -646,7 +649,6 @@ def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_d
         assert unredeemed_payment_list[0].plan                    == it.plan
 
         # Register the payment
-        version                                 = 0
         add_pro_payment_tx                      = backend.UserPaymentTransaction()
         add_pro_payment_tx.provider             = payment_tx.provider
         add_pro_payment_tx.google_payment_token = payment_tx.google_payment_token
@@ -706,7 +708,7 @@ def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_d
 
     user_list: list[backend.UserRow]                        = backend.get_users_list(db_conn)
     assert len(user_list)                                  == 1
-    assert user_list[0].master_pkey                        == bytes(master_key.verify_key), 'lhs={}, rhs={}'.format(user_list[0].master_pkey.hex(), bytes(master_key.verify_key).hex())
+    assert user_list[0].master_pkey                        == bytes(master_key.verify_key), 'lhs={}, rhs={}'.format(pk_hex(user_list[0].master_pkey), pk_hex(master_key.verify_key))
     assert user_list[0].current_generation_id              == gen_ids[0]
     assert len(user_list[0].token)                         == backend.BLAKE2B_DIGEST_SIZE
     assert user_list[0].token                              == scenarios[1].proof.revocation_tag
@@ -714,7 +716,7 @@ def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_d
 
     payment_list: list[backend.PaymentRow]                  = backend.get_payments_list(db_conn)
     assert len(payment_list)                               == 2
-    assert payment_list[0].master_pkey                     == bytes(master_key.verify_key), 'lhs={}, rhs={}'.format(payment_list[0].master_pkey.hex(), bytes(master_key.verify_key).hex())
+    assert payment_list[0].master_pkey                     == bytes(master_key.verify_key), 'lhs={}, rhs={}'.format(pk_hex(payment_list[0].master_pkey), pk_hex(master_key.verify_key))
     assert payment_list[0].plan                            == scenarios[0].plan
     assert payment_list[0].payment_provider                == scenarios[0].payment_provider
     assert payment_list[0].auto_renewing
@@ -727,7 +729,7 @@ def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_d
     assert len(payment_list[0].apple.original_tx_id)       == 0
     assert len(payment_list[0].apple.web_line_order_tx_id) == 0
 
-    assert payment_list[1].master_pkey                     == bytes(master_key.verify_key), 'lhs={}, rhs={}'.format(payment_list[0].master_pkey.hex(), bytes(master_key.verify_key).hex())
+    assert payment_list[1].master_pkey                     == bytes(master_key.verify_key), 'lhs={}, rhs={}'.format(pk_hex(payment_list[0].master_pkey), pk_hex(master_key.verify_key))
     assert payment_list[1].plan                            == scenarios[1].plan
     assert payment_list[1].payment_provider                == scenarios[1].payment_provider
     assert payment_list[1].auto_renewing
@@ -762,9 +764,9 @@ def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_d
     assert not err.has() and updated
 
     # NOTE: Verify that the new grace was assigned to the user
-    payment_list: list[backend.PaymentRow]                  = backend.get_payments_list(db_conn)
+    payment_list = backend.get_payments_list(db_conn)
     assert len(payment_list)                               == 2
-    assert payment_list[0].master_pkey                     == bytes(master_key.verify_key), 'lhs={}, rhs={}'.format(payment_list[0].master_pkey.hex(), bytes(master_key.verify_key).hex())
+    assert payment_list[0].master_pkey                     == bytes(master_key.verify_key), 'lhs={}, rhs={}'.format(pk_hex(payment_list[0].master_pkey), pk_hex(master_key.verify_key))
     assert payment_list[0].plan         == scenarios[0].plan
     assert payment_list[0].payment_provider                == scenarios[0].payment_provider
     assert payment_list[0].auto_renewing
@@ -778,7 +780,7 @@ def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_d
     assert len(payment_list[0].apple.original_tx_id)       == 0
     assert len(payment_list[0].apple.web_line_order_tx_id) == 0
 
-    assert payment_list[1].master_pkey                     == bytes(master_key.verify_key), 'lhs={}, rhs={}'.format(payment_list[0].master_pkey.hex(), bytes(master_key.verify_key).hex())
+    assert payment_list[1].master_pkey                     == bytes(master_key.verify_key), 'lhs={}, rhs={}'.format(pk_hex(payment_list[0].master_pkey), pk_hex(master_key.verify_key))
     assert payment_list[1].plan                            == scenarios[1].plan
     assert payment_list[1].payment_provider                == scenarios[1].payment_provider
     assert not payment_list[1].auto_renewing
@@ -800,10 +802,10 @@ def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_d
 
     # NOTE: Verify the DB invariants
     _ = backend.verify_db(db_conn, err)
-    if len(err.msg_list) > 0:
-        for it in err.msg_list:
-            print(f"ERROR: {it}")
-        assert len(err.msg_list) == 0
+    if err.msg_list:
+        for error in err.msg_list:
+            print(f"ERROR: {error}")
+        assert not err.msg_list
 
     # NOTE: Now test that if a user submits 2 payments with the same payment token the 2nd one gets
     # automatically redeemed (because the payment token matches the first payment) so the user
@@ -852,7 +854,6 @@ def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_d
             assert len(unredeemed_payment_list) == 1
 
             # Register the payment
-            version: int = 0
             add_pro_payment_tx                      = backend.UserPaymentTransaction()
             add_pro_payment_tx.provider             = payment_tx.provider
             add_pro_payment_tx.google_payment_token = payment_tx.google_payment_token
@@ -1061,7 +1062,6 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
         assert len(err.msg_list) == 0, f'{err.msg_list}'
 
         if 1: # Grab the pro status before anything has happened
-            version:      int   = 0
             count:        int   = 10_000
             hash_to_sign: bytes = backend.make_get_pro_details_message(master_pkey=master_key.verify_key, request_at=base.datetime_from_unix_seconds(unix_ts_ms // 1000), count=count)
             request_body={
@@ -1099,7 +1099,6 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
             assert len(result_items) == 0,                                       f'Response was: {json.dumps(response_json, indent=2)}'
 
         if 1: # Simulate client request to register a payment
-            version: int                            = 0
             add_pro_payment_tx                      = backend.UserPaymentTransaction()
             add_pro_payment_tx.provider             = payment_tx.provider
             add_pro_payment_tx.google_payment_token = payment_tx.google_payment_token
@@ -1171,7 +1170,6 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
 
         if 1: # Authorise a new rotated key for the pro subscription
             new_rotating_key    = nacl.signing.SigningKey.generate()
-            version             = 0
             unix_ts_ms          = int(time.time() * 1000)
             hash_to_sign: bytes = backend.make_generate_pro_proof_message(
                                                                        master_pkey=master_key.verify_key,
@@ -1469,7 +1467,6 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
 
         # Get the pro status now w/ a bunch of payments
         if 1:
-            version:      int   = 0
             unix_ts_ms:   int   = int(time.time() * 1000)
             count:        int   = 10_000
             hash_to_sign: bytes = backend.make_get_pro_details_message(master_pkey=master_key.verify_key, request_at=base.datetime_from_unix_seconds(unix_ts_ms // 1000), count=count)
@@ -1731,7 +1728,6 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
             apple_payment_tx.apple_tx_id                = throwaway_id
             apple_payment_tx.apple_web_line_order_tx_id = throwaway_id
 
-            version              = 0
             apple_tx             = backend.UserPaymentTransaction()
             apple_tx.provider    = base.PaymentProvider.iOSAppStore
             apple_tx.apple_tx_id = throwaway_id
@@ -2136,7 +2132,6 @@ def test_platform_apple(pg_database):
         master_key   = nacl.signing.SigningKey.generate()
         rotating_key = nacl.signing.SigningKey.generate()
 
-        version = 0
         add_pro_payment_tx             = backend.UserPaymentTransaction()
         add_pro_payment_tx.provider    = base.PaymentProvider.iOSAppStore
         add_pro_payment_tx.apple_tx_id = unredeemed_list[0].apple.tx_id
@@ -3408,7 +3403,6 @@ def test_platform_apple(pg_database):
             assert unredeemed_payment_list[0].apple.web_line_order_tx_id        == e00_sub_to_3_months_tx_info.webOrderLineItemId
 
             # NOTE: Then redeem the payment
-            version = 0
             add_pro_payment_tx             = backend.UserPaymentTransaction()
             add_pro_payment_tx.provider    = base.PaymentProvider.iOSAppStore
             add_pro_payment_tx.apple_tx_id = unredeemed_payment_list[0].apple.tx_id
@@ -4105,7 +4099,6 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
     """
 
     def get_pro_details(user_ctx: TestUserCtx, ctx: TestingContext, unix_ts_ms: int) -> base.JSONObject:
-        version:      int   = 0
         count:        int   = 10_000
         ts: int             = unix_ts_ms // 1000   # wire nonce is integer seconds (wire spec §3.4)
         hash_to_sign: bytes = backend.make_get_pro_details_message(master_pkey=user_ctx.master_key.verify_key, request_at=base.datetime_from_unix_seconds(ts), count=count)
@@ -4122,7 +4115,6 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
         return response_json
 
     def add_payment(tx: TestTx, user_ctx: TestUserCtx, ctx: TestingContext) -> int:
-        version: int                            = 0
         add_pro_payment_tx                      = backend.UserPaymentTransaction()
         add_pro_payment_tx.provider             = base.PaymentProvider.GooglePlayStore
         add_pro_payment_tx.google_payment_token = tx.purchase_token
