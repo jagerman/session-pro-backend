@@ -970,7 +970,7 @@ def notifications_apple_app_connect_sandbox() -> flask.Response:
 
             with server.get_db(flask.current_app) as engine:
                 with db.connection(engine) as conn:
-                    backend.add_user_error(conn=conn, error=user_error, at=base.datetime_from_unix_ms(int(time.time() * 1000)))
+                    backend.add_user_error(conn, error=user_error, at=base.datetime_from_unix_ms(int(time.time() * 1000)))
 
         # NOTE: Log and abort request
         log.error(f'Failed to parse notification ({resp.signedDate}) signed payload was:\n{base.maybe_obfuscate(signed_payload)}\nErrors:' + '\n  '.join(err.msg_list))

@@ -374,7 +374,7 @@ def cmd_user_error_set(args: argparse.Namespace, dry_run: bool) -> int:
                         if backend.has_user_error(conn=conn, payment_provider=payment_provider, payment_id=payment_id):
                             label += ' (skipped - already exists)'
                         else:
-                            backend.add_user_error(conn=conn, error=error, at=base.datetime_from_unix_ms(int(time.time() * 1000)))
+                            backend.add_user_error(conn, error=error, at=base.datetime_from_unix_ms(int(time.time() * 1000)))
                             count += 1
                             label += ' (added)'
                     else:

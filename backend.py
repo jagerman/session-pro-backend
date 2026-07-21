@@ -1792,7 +1792,8 @@ def expire_payments_revocations_and_users(conn: psycopg.Connection, now: datetim
         result.success                         = True
     return result
 
-def add_user_error_tx(tx: db.SQLTransaction, error: UserError, at: datetime.datetime):
+@db.transactional
+def add_user_error(tx: db.SQLTransaction, error: UserError, at: datetime.datetime):
     match error.provider:
         case base.PaymentProvider.Rangeproof:
             pass
@@ -1801,20 +1802,15 @@ def add_user_error_tx(tx: db.SQLTransaction, error: UserError, at: datetime.date
         case base.PaymentProvider.GooglePlayStore:
             assert len(error.google_payment_token) > 0
             _ = db.query(tx.conn, '''INSERT INTO user_errors (payment_provider, payment_id, errored_at) VALUES (%(provider)s, %(payment_id)s, %(ts)s) ON CONFLICT DO NOTHING''',
-                 provider=int(error.provider.value),
+                 provider=error.provider.value,
                  payment_id=error.google_payment_token,
                  ts=at)
         case base.PaymentProvider.iOSAppStore:
             assert len(error.apple_original_tx_id) > 0
             _ = db.query(tx.conn, '''INSERT INTO user_errors (payment_provider, payment_id, errored_at) VALUES (%(provider)s, %(payment_id)s, %(ts)s) ON CONFLICT DO NOTHING''',
-                 provider=int(error.provider.value),
+                 provider=error.provider.value,
                  payment_id=error.apple_original_tx_id,
                  ts=at)
-
-def add_user_error(conn: psycopg.Connection, error: UserError, at: datetime.datetime):
-    assert error.provider != base.PaymentProvider.Nil
-    with db.transaction(conn) as tx:
-        add_user_error_tx(tx, error, at)
 
 @db.transactional
 def has_user_error_from_master_pkey(tx: db.SQLTransaction, master_pkey: nacl.signing.VerifyKey) -> bool:

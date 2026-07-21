@@ -209,7 +209,7 @@ def _process_notification_message(conn: psycopg.Connection, msg: SortedMessage, 
                 user_error                      = backend.UserError()
                 user_error.provider             = base.PaymentProvider.GooglePlayStore
                 user_error.google_payment_token = msg.parse.purchase_token
-                backend.add_user_error_tx(tx, error = user_error, unix_ts_ms = int(now_s * 1000))
+                backend.add_user_error(tx, error = user_error, at = base.datetime_from_unix_ms(int(now_s * 1000)))
     return handled
 
 def thread_entry_point(context: ThreadContext, app_credentials_path: str, cloud_project_id: str, cloud_subscription_name: str):

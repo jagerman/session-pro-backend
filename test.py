@@ -331,10 +331,10 @@ def test_google_handle_parsed_notification_deep_failure_cancels(monkeypatch, pg_
 
 def test_google_process_notification_message(monkeypatch, pg_database):
     # CHARACTERIZATION of _process_notification_message (the per-message tx block extracted from the pull
-    # loop in 91ad5fe). Pins the control flow the ErrorSink rewrite must preserve. DELIBERATELY avoids the
-    # present+unhandled+no-prior-error FAILURE branch: it calls the doubly-broken add_user_error_tx
-    # (unix_ts_ms= kwarg + int(provider.value)), so it currently raises -- that branch is fixed in the
-    # conversion, not pinned here. Seeds user_errors via direct SQL (the writer is broken).
+    # loop in 91ad5fe). Pins the control flow the ErrorSink rewrite must preserve, INCLUDING the
+    # present+unhandled+no-prior-error FAILURE branch that records a poison user_error -- add_user_error was
+    # fixed here (string-code provider + at= datetime; it was int()/unix_ts_ms= broken, refactor-introduced).
+    # Seeds prior user_errors via direct SQL to stay independent of the writer under test.
     now_s  = 1_600_000_000.0
     expiry = base.datetime_from_unix_ms(int(now_s * 1000) + base.MILLISECONDS_IN_DAY)
     seeded_at = base.datetime_from_unix_ms(int(now_s * 1000))
@@ -391,18 +391,18 @@ def test_google_process_notification_message(monkeypatch, pg_database):
             assert is_handled(conn, 'm-fail') is False
             assert backend.has_user_error(conn, base.PaymentProvider.GooglePlayStore, 'tok-d') is True
 
-        # (E) TRIPWIRE for the known-broken branch: present + unhandled + failure + NO prior error reaches
-        #     add_user_error_tx(unix_ts_ms=…) which is doubly broken (bad kwarg + int('google_play')) and
-        #     raises. The `user_is_in_error_state == False` guard is exactly what shields (C)/(D) from this,
-        #     so pin the crash here: if a refactor moves the guard, this fails instead of C/D passing green
-        #     over a relocated crash. When the conversion fixes add_user_error_tx, THIS test must be flipped
-        #     to assert the correct write (poison recorded) rather than a raise.
+        # (E) present + unhandled + FAILURE (no tx.cancel) + NO prior error -> RECORDS a poison user_error
+        #     (add_user_error, now fixed: string-code provider + at= datetime). Returns False, notification
+        #     stays unhandled, the token is now flagged. The poison ride the same tx, and this failure did
+        #     not cancel, so it commits. (This branch used to raise TypeError before the add_user_error fix.)
         monkeypatch.setattr('platform_google.handle_parsed_notification', lambda tx, parse, err: False)  # self-contained (not relying on (D))
         with ctx.connection() as conn:
             with db.transaction(conn) as tx:
-                backend.google_add_notification_id(tx, 'm-crash', expiry, '')
-            with pytest.raises(TypeError):
-                platform_google._process_notification_message(conn, make_msg('m-crash', 'tok-e'), base.ErrorSink(), now_s)
+                backend.google_add_notification_id(tx, 'm-poison', expiry, '')
+            assert backend.has_user_error(conn, base.PaymentProvider.GooglePlayStore, 'tok-e') is False
+            assert platform_google._process_notification_message(conn, make_msg('m-poison', 'tok-e'), base.ErrorSink(), now_s) is False
+            assert is_handled(conn, 'm-poison') is False
+            assert backend.has_user_error(conn, base.PaymentProvider.GooglePlayStore, 'tok-e') is True
 
 def test_migrations_bootstrap_and_idempotency(pg_database):
     # bootstrap_db runs the schema/ migrations; every migration file should be recorded, the globals
