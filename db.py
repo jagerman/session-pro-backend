@@ -174,6 +174,16 @@ def query_one(conn: psycopg.Connection, sql: str, *args: typing.Any, row_factory
     return query(conn, sql, *args, row_factory=row_factory, **kwargs).fetchone()
 
 
+def query_scalar(conn: psycopg.Connection, sql: str, *args: typing.Any, **kwargs: typing.Any) -> typing.Any:
+    """Run a query that always returns exactly one row of one column — an aggregate (`COUNT`/`SUM`),
+    an `EXISTS`, or a `RETURNING` on a guaranteed row — and return that scalar. Asserts the row is present
+    (it can't be absent for these shapes), so callers don't need the `if row:` guard that `query_one`'s
+    `Optional` forces. Use `query_one` for lookups that genuinely might miss (find-by-key, etc.)."""
+    row = query(conn, sql, *args, **kwargs).fetchone()
+    assert row is not None, 'query_scalar: expected exactly one row, got none'
+    return row[0]
+
+
 def run_and_log_errors(callback: typing.Callable[[], typing.Any], log: logging.Logger, error_prefix: str) -> None:
     """Run `callback`, logging (and swallowing) any exception under `error_prefix`."""
     try:

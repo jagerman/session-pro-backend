@@ -473,12 +473,11 @@ def get_user_and_payments(tx: db.SQLTransaction, master_pkey: nacl.signing.Verif
     result      = GetUserAndPayments(payments_it=payments_it)
     result.user = get_user_from_sql_tx(tx, master_pkey)
 
-    row = db.query_one(tx.conn, '''
+    result.payments_count = db.query_scalar(tx.conn, '''
         SELECT COUNT(*)
         FROM   payments
         WHERE  user_id = (SELECT id FROM users WHERE master_pkey = %s)
     ''', bytes(master_pkey))
-    result.payments_count = row[0] if row else 0
     return result
 
 def user_row_from_dict(row: dict[str, typing.Any]) -> UserRow:
@@ -525,8 +524,7 @@ def is_generation_revoked_tx(tx: db.SQLTransaction, generation_id: int, now: dat
     # A generation is revoked iff revoked_at is set (revocation is terminal). `now` is accepted for a
     # uniform signature; a set revoked_at is always in effect (there is no per-entry expiry now — the
     # served-list retention window is list-level and memory-only on the client).
-    row = db.query_one(tx.conn, "SELECT EXISTS (SELECT 1 FROM generations WHERE id = %s AND revoked_at IS NOT NULL)", generation_id)
-    return bool(row[0]) if row else False
+    return bool(db.query_scalar(tx.conn, "SELECT EXISTS (SELECT 1 FROM generations WHERE id = %s AND revoked_at IS NOT NULL)", generation_id))
 
 def is_generation_revoked(conn: psycopg.Connection, generation_id: int, now: datetime.datetime) -> bool:
     result: bool = False
@@ -922,8 +920,9 @@ def redeem_payment_tx(tx:                  db.SQLTransaction,
         # Nothing claimable matched. Distinguish "this user already redeemed this exact payment"
         # (replay/double-submit → idempotent success) from "no such payment for this user" (a genuine
         # dead-end → unknown_payment). The COUNT below only reads data the user themselves sent.
+        redeemed_count = 0
         if payment_tx.provider == base.PaymentProvider.GooglePlayStore:
-            row_result = db.query(tx.conn, '''
+            redeemed_count = db.query_scalar(tx.conn, '''
                 SELECT COUNT(*)
                 FROM   payments p JOIN google_play_payment_details gd ON gd.payment_id = p.id
                 WHERE  gd.payment_token = %(token)s
@@ -934,7 +933,7 @@ def redeem_payment_tx(tx:                  db.SQLTransaction,
                  order_id    = payment_tx.google_order_id,
                  master_pkey = master_pkey_bytes)
         elif payment_tx.provider == base.PaymentProvider.iOSAppStore:
-            row_result = db.query(tx.conn, '''
+            redeemed_count = db.query_scalar(tx.conn, '''
                 SELECT COUNT(*)
                 FROM   payments p JOIN app_store_payment_details ad ON ad.payment_id = p.id
                 WHERE  ad.tx_id = %(tx_id)s
@@ -943,7 +942,7 @@ def redeem_payment_tx(tx:                  db.SQLTransaction,
             ''', tx_id       = payment_tx.apple_tx_id,
                  master_pkey = master_pkey_bytes)
         elif payment_tx.provider == base.PaymentProvider.Rangeproof:
-            row_result = db.query(tx.conn, '''
+            redeemed_count = db.query_scalar(tx.conn, '''
                 SELECT COUNT(*)
                 FROM   payments p JOIN rangeproof_payment_details rd ON rd.payment_id = p.id
                 WHERE  rd.order_id = %(order_id)s
@@ -952,8 +951,7 @@ def redeem_payment_tx(tx:                  db.SQLTransaction,
             ''', order_id    = payment_tx.rangeproof_order_id,
                  master_pkey = master_pkey_bytes)
 
-        first_row = row_result.fetchone()
-        if first_row and first_row[0] > 0:
+        if redeemed_count > 0:
             # Already redeemed by this user → idempotent: hand back a proof for their CURRENT entitlement
             # via the existing generation (no roll), identical to generate_pro_proof. If that entitlement
             # is since revoked/expired the helper raises the truthful slug.
@@ -1871,7 +1869,7 @@ def has_user_error_tx(tx: db.SQLTransaction, payment_provider: base.PaymentProvi
 
 def has_user_error_from_master_pkey_tx(tx: db.SQLTransaction, master_pkey: nacl.signing.VerifyKey) -> bool:
     # NOTE: Rangeproof payments cannot have user errors
-    row = db.query_one(tx.conn, (f'''
+    return bool(db.query_scalar(tx.conn, (f'''
 SELECT EXISTS (
     SELECT 1
     FROM payments p
@@ -1883,9 +1881,7 @@ SELECT EXISTS (
     WHERE p.user_id = (SELECT id FROM users WHERE master_pkey = %s)
     AND ue.payment_id IS NOT NULL
 ) AS has_error;
-'''), bytes(master_pkey))
-    result = bool(row[0] == 1) if row else False
-    return result
+'''), bytes(master_pkey)))
 
 def has_user_error(conn: psycopg.Connection, payment_provider: base.PaymentProvider, payment_id: str) -> bool:
     result = False
