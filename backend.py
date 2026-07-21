@@ -127,7 +127,7 @@ class ProSubscriptionProof:
         # refuses a version it doesn't understand, so nothing old breaks. The version is thus a
         # verification *input*, never discovered through the signature; tampering with it just makes the
         # verifier pick the wrong domain prefix → signature fails.
-        result = {
+        result: dict[str, str | int] = {
             "version":        self.version,
             "revocation_tag": self.revocation_tag.hex(),
             "rotating_pkey":  bytes(self.rotating_pkey).hex(),
@@ -633,11 +633,11 @@ def verify_db(conn: psycopg.Connection, err: base.ErrorSink) -> bool:
 
     # NOTE: Verify the users
     users: list[UserRow] = get_users_list(conn)
-    for index, it in enumerate(users):
-        if it.master_pkey == ZERO_BYTES32:
+    for index, user in enumerate(users):
+        if user.master_pkey == ZERO_BYTES32:
             err.msg_list.append(f'User #{index} has a master public key set to the zero key')
-        if it.expires_at < PRO_ENABLED_AT:
-          err.msg_list.append(f'Payment #{index} specified a expiry date before PRO was enabled: {base.readable(it.expires_at)}')
+        if user.expires_at < PRO_ENABLED_AT:
+          err.msg_list.append(f'Payment #{index} specified a expiry date before PRO was enabled: {base.readable(user.expires_at)}')
 
     result = len(err.msg_list) == 0
     return result

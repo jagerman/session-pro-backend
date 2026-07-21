@@ -271,7 +271,7 @@ class AsyncSessionWebhookLogHandler(logging.Handler):
         self._lock          = threading.Lock()
         self._stop_event    = threading.Event()
         self._queue_dirtied = threading.Event()
-        self.msg_queue      = []
+        self.msg_queue: list[str] = []
         self._submit_thread = threading.Thread(target=self._worker, daemon=True)
         self._stop_event    = threading.Event()
         self._submit_thread.start()
