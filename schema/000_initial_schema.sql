@@ -80,27 +80,37 @@ CREATE TABLE IF NOT EXISTS google_play_payment_details (
     payment_id            BIGINT PRIMARY KEY REFERENCES payments(id) ON DELETE CASCADE,
     payment_token         TEXT  NOT NULL,
     order_id              TEXT  NOT NULL,
-    obfuscated_account_id BYTEA NOT NULL CHECK (octet_length(obfuscated_account_id) = 32)
+    obfuscated_account_id BYTEA NOT NULL CHECK (octet_length(obfuscated_account_id) = 32),
+    -- Google reuses payment_token across billing cycles, so the per-payment identity is (token, order_id).
+    -- This UNIQUE enforces dedup and makes the insert-if-absent atomic (a racing duplicate insert errors
+    -- rather than silently creating a second row). Its index also serves the payment_token-prefix lookups
+    -- (auto-redeem, revocation) that the old standalone token_idx used to.
+    UNIQUE (payment_token, order_id)
 );
--- Auto-redeem matches (payment_token, order_id, obfuscated_account_id); revocation matches payment_token.
-CREATE INDEX IF NOT EXISTS google_play_payment_details_token_idx ON google_play_payment_details (payment_token);
 
 CREATE TABLE IF NOT EXISTS app_store_payment_details (
     payment_id           BIGINT PRIMARY KEY REFERENCES payments(id) ON DELETE CASCADE,
     original_tx_id       TEXT NOT NULL,
     tx_id                TEXT NOT NULL,
     web_line_order_tx_id TEXT NOT NULL,
-    app_account_token    TEXT NOT NULL
+    app_account_token    TEXT NOT NULL,
+    -- Per-payment identity (matches the dedup lookup): original_tx_id repeats across the subscription's
+    -- cycles, but tx_id/web_line_order_tx_id differ per cycle. Enforces dedup + atomic insert-if-absent.
+    -- Its index's leading column also serves the original_tx_id lookups (revocation) that the old
+    -- standalone original_tx_idx used to.
+    UNIQUE (original_tx_id, tx_id, web_line_order_tx_id)
 );
--- Auto-redeem matches (tx_id, app_account_token); revocation matches original_tx_id.
-CREATE INDEX IF NOT EXISTS app_store_payment_details_tx_id_idx       ON app_store_payment_details (tx_id);
-CREATE INDEX IF NOT EXISTS app_store_payment_details_original_tx_idx ON app_store_payment_details (original_tx_id);
+-- Auto-redeem matches (tx_id, app_account_token); tx_id is not the UNIQUE's leading column, so it keeps
+-- its own index.
+CREATE INDEX IF NOT EXISTS app_store_payment_details_tx_id_idx ON app_store_payment_details (tx_id);
 
 CREATE TABLE IF NOT EXISTS rangeproof_payment_details (
     payment_id  BIGINT PRIMARY KEY REFERENCES payments(id) ON DELETE CASCADE,
-    order_id    TEXT NOT NULL
+    order_id    TEXT NOT NULL,
+    -- Per-voucher identity; enforces dedup + atomic insert-if-absent. Its index also serves the order_id
+    -- lookups that the old standalone order_id_idx used to.
+    UNIQUE (order_id)
 );
-CREATE INDEX IF NOT EXISTS rangeproof_payment_details_order_id_idx ON rangeproof_payment_details (order_id);
 
 -- A generation is a user's signed-entitlement epoch (the aggregate of their stacked payments), NOT
 -- per-payment and NOT per-proof. `token` is a random 32-byte value embedded verbatim in proofs and the

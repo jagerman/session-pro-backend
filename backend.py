@@ -1202,21 +1202,40 @@ def update_payment_renewal_info(tx:                       db.SQLTransaction,
 
 
 @db.transactional
-def _insert_payment_row(tx: db.SQLTransaction, payment: dict[str, typing.Any], detail_table: str, detail: dict[str, typing.Any]) -> None:
-    """INSERT a payment: the provider-agnostic `payment` columns into `payments` (RETURNING the new id),
-    then the provider-specific `detail` columns into `detail_table`, keyed by that id.
+def _insert_payment_row(tx: db.SQLTransaction, payment: dict[str, typing.Any], detail_table: str,
+                        detail: dict[str, typing.Any], dedup_keys: list[str]) -> bool:
+    """INSERT a payment atomically IFF no row in `detail_table` already matches on `dedup_keys` (a subset of
+    `detail`'s columns, which must be covered by a UNIQUE constraint). Returns whether a row was inserted.
+
+    A single CTE writes the provider-agnostic `payment` columns into `payments` — gated on the dedup key
+    being absent — then the provider-specific `detail` columns keyed by the new id, so a duplicate inserts
+    *neither* row (no orphaned `payments` entry). The `NOT EXISTS` guard is only the fast path: two writers
+    racing on the same key both pass it, but the loser then trips `detail_table`'s UNIQUE constraint and
+    raises — the constraint, not the guard, is what actually guarantees no duplicate.
 
     Each dict is self-aligning — the column name lives with its value, so there is no pair of parallel
     lists to drift out of index-lock; placeholders are generated from the same keys.
     """
-    p_columns      = ', '.join(payment)
-    p_placeholders = ', '.join(f'%({column})s' for column in payment)
-    payment_id     = db.query_scalar(tx.conn, f'INSERT INTO payments ({p_columns}) VALUES ({p_placeholders}) RETURNING id', payment)
+    def columns_and_placeholders(cols: typing.Iterable[str]) -> tuple[str, str]:
+        cols = list(cols)
+        return ', '.join(cols), ', '.join(f'%({column})s' for column in cols)
 
-    detail_row      = {'payment_id': payment_id, **detail}
-    d_columns       = ', '.join(detail_row)
-    d_placeholders  = ', '.join(f'%({column})s' for column in detail_row)
-    _ = db.query(tx.conn, f'INSERT INTO {detail_table} ({d_columns}) VALUES ({d_placeholders})', detail_row)
+    p_columns, p_placeholders = columns_and_placeholders(payment)
+    d_columns, d_placeholders = columns_and_placeholders(detail)
+    dedup_where               = ' AND '.join(f'{key} = %({key})s' for key in dedup_keys)
+
+    inserted = db.query_one(tx.conn, f'''
+        WITH inserted AS (
+            INSERT INTO payments ({p_columns})
+            SELECT {p_placeholders}
+            WHERE NOT EXISTS (SELECT 1 FROM {detail_table} WHERE {dedup_where})
+            RETURNING id
+        )
+        INSERT INTO {detail_table} (payment_id, {d_columns})
+        SELECT inserted.id, {d_placeholders} FROM inserted
+        RETURNING payment_id
+    ''', {**payment, **detail})
+    return inserted is not None
 
 @db.transactional
 def add_unredeemed_payment(tx:                                db.SQLTransaction,
@@ -1240,85 +1259,69 @@ def add_unredeemed_payment(tx:                                db.SQLTransaction,
         assert isinstance(platform_obfuscated_account_id, bytes)
         assert len(platform_obfuscated_account_id) == 32
 
-        # NOTE: Insert IFF this (token, order_id) isn't already recorded.
-        result_set = db.query(tx.conn, '''
-            SELECT 1 FROM google_play_payment_details WHERE payment_token = %s AND order_id = %s
-        ''', payment_tx.google_payment_token, payment_tx.google_order_id)
-
-        record = result_set.fetchone()
-        if not record:
-            _insert_payment_row(tx,
-                payment = {
-                    'plan':                       plan.value,
-                    'payment_provider':           payment_tx.provider.value,
-                    'expires_at':                 expires_at,
-                    'platform_refund_expires_at': platform_refund_expires_at,
-                    'purchased_at':               purchased_at,
-                    'auto_renewing':              True,  # on by default until Google notifies otherwise
-                    'refund_requested_at':        None,
-                },
-                detail_table = 'google_play_payment_details',
-                detail = {
-                    'payment_token':         payment_tx.google_payment_token,
-                    'order_id':              payment_tx.google_order_id,
-                    'obfuscated_account_id': platform_obfuscated_account_id,
-                })
+        # Insert IFF this (token, order_id) isn't already recorded — Google reuses payment_token across
+        # billing cycles, so order_id is what distinguishes them. Dedup + atomicity come from the
+        # UNIQUE(payment_token, order_id) constraint inside _insert_payment_row's CTE.
+        _insert_payment_row(tx,
+            payment = {
+                'plan':                       plan.value,
+                'payment_provider':           payment_tx.provider.value,
+                'expires_at':                 expires_at,
+                'platform_refund_expires_at': platform_refund_expires_at,
+                'purchased_at':               purchased_at,
+                'auto_renewing':              True,  # on by default until Google notifies otherwise
+                'refund_requested_at':        None,
+            },
+            detail_table = 'google_play_payment_details',
+            detail = {
+                'payment_token':         payment_tx.google_payment_token,
+                'order_id':              payment_tx.google_order_id,
+                'obfuscated_account_id': platform_obfuscated_account_id,
+            },
+            dedup_keys = ['payment_token', 'order_id'])
 
     elif payment_tx.provider == base.PaymentProvider.iOSAppStore:
         assert isinstance(platform_obfuscated_account_id, str)
-        # NOTE: Insert IFF this apple payment isn't already recorded.
-        #
-        # For Apple each apple_tx_id is always unique.
-        # apple_web_line_order_tx_id is unique for the payment of the billing
-        # cycle for that subscription and the apple_original_tx_id is reused
-        # across all subscriptions of the same type.
-        result_set = db.query(tx.conn, '''
-                SELECT 1 FROM app_store_payment_details WHERE original_tx_id = %(orig_tx_id)s AND tx_id = %(tx_id)s AND web_line_order_tx_id = %(line_order_tx_id)s
-        ''', orig_tx_id=payment_tx.apple_original_tx_id,
-              tx_id=payment_tx.apple_tx_id,
-              line_order_tx_id=payment_tx.apple_web_line_order_tx_id)
-
-        record = result_set.fetchone()
-        if not record:
-            _insert_payment_row(tx,
-                payment = {
-                    'plan':                       plan.value,
-                    'payment_provider':           payment_tx.provider.value,
-                    'expires_at':                 expires_at,
-                    'platform_refund_expires_at': platform_refund_expires_at,
-                    'purchased_at':               purchased_at,
-                    'auto_renewing':              True,  # on by default until Apple notifies otherwise
-                    'refund_requested_at':        None,
-                },
-                detail_table = 'app_store_payment_details',
-                detail = {
-                    'original_tx_id':       payment_tx.apple_original_tx_id,
-                    'tx_id':                payment_tx.apple_tx_id,
-                    'web_line_order_tx_id': payment_tx.apple_web_line_order_tx_id,
-                    'app_account_token':    platform_obfuscated_account_id,
-                })
+        # Insert IFF this apple payment isn't already recorded. apple_tx_id is always unique;
+        # apple_web_line_order_tx_id is unique per billing cycle of the subscription; apple_original_tx_id is
+        # reused across all subscriptions of the same type. Dedup + atomicity come from the
+        # UNIQUE(original_tx_id, tx_id, web_line_order_tx_id) constraint inside _insert_payment_row's CTE.
+        _insert_payment_row(tx,
+            payment = {
+                'plan':                       plan.value,
+                'payment_provider':           payment_tx.provider.value,
+                'expires_at':                 expires_at,
+                'platform_refund_expires_at': platform_refund_expires_at,
+                'purchased_at':               purchased_at,
+                'auto_renewing':              True,  # on by default until Apple notifies otherwise
+                'refund_requested_at':        None,
+            },
+            detail_table = 'app_store_payment_details',
+            detail = {
+                'original_tx_id':       payment_tx.apple_original_tx_id,
+                'tx_id':                payment_tx.apple_tx_id,
+                'web_line_order_tx_id': payment_tx.apple_web_line_order_tx_id,
+                'app_account_token':    platform_obfuscated_account_id,
+            },
+            dedup_keys = ['original_tx_id', 'tx_id', 'web_line_order_tx_id'])
     elif payment_tx.provider == base.PaymentProvider.Rangeproof:
-        # NOTE: Insert IFF this rangeproof order id isn't already recorded.
-        result_set = db.query(tx.conn, '''
-                SELECT 1 FROM rangeproof_payment_details WHERE order_id = %s
-        ''', payment_tx.rangeproof_order_id)
-
-        record = result_set.fetchone()
-        if not record:
-            _insert_payment_row(tx,
-                payment = {
-                    'plan':                       plan.value,
-                    'payment_provider':           payment_tx.provider.value,
-                    'expires_at':                 expires_at,
-                    'platform_refund_expires_at': platform_refund_expires_at,
-                    'purchased_at':               purchased_at,
-                    'auto_renewing':              False,  # Rangeproof vouchers never auto-renew
-                    'refund_requested_at':        None,
-                },
-                detail_table = 'rangeproof_payment_details',
-                detail = {
-                    'order_id': payment_tx.rangeproof_order_id,
-                })
+        # Insert IFF this rangeproof order id isn't already recorded. Dedup + atomicity come from the
+        # UNIQUE(order_id) constraint inside _insert_payment_row's CTE.
+        _insert_payment_row(tx,
+            payment = {
+                'plan':                       plan.value,
+                'payment_provider':           payment_tx.provider.value,
+                'expires_at':                 expires_at,
+                'platform_refund_expires_at': platform_refund_expires_at,
+                'purchased_at':               purchased_at,
+                'auto_renewing':              False,  # Rangeproof vouchers never auto-renew
+                'refund_requested_at':        None,
+            },
+            detail_table = 'rangeproof_payment_details',
+            detail = {
+                'order_id': payment_tx.rangeproof_order_id,
+            },
+            dedup_keys = ['order_id'])
 
     # NOTE: Find the latest master pkey associated with the common payment identifier (google payment
     # token or apple original tx id). Then find the user if it exists, if the user is still entitled
