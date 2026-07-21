@@ -793,7 +793,7 @@ def handle_notification_tx(decoded_notification: DecodedNotification, sql_tx: db
                 user_payment_tx = backend.UserPaymentTransaction(provider=payment_tx.provider,
                                                                  apple_tx_id=payment_tx.apple_tx_id)
                 log.debug(f'{decoded_notification.body.notificationType.name} for {payment_tx_id_label(payment_tx)}: clearing refund request (refund_requested_at = NULL)')
-                if not backend.set_refund_requested_tx(tx=tx, payment_tx=user_payment_tx, refund_requested_at=None):
+                if not backend.set_refund_requested(tx=tx, payment_tx=user_payment_tx, refund_requested_at=None):
                     log.warning(f"{decoded_notification.body.notificationType.name} for {payment_tx_id_label(payment_tx)} failed to remove refund timestamp")
 
     elif decoded_notification.body.notificationType == AppleNotificationV2.TEST:

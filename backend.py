@@ -1832,16 +1832,10 @@ def has_user_error(conn: psycopg.Connection, payment_provider: base.PaymentProvi
                        payment_provider.value)
     return row is not None
 
-def delete_user_errors_tx(tx: db.SQLTransaction, payment_provider: base.PaymentProvider, payment_id: str) -> bool:
-    row    = db.query(tx.conn, 'DELETE FROM user_errors WHERE payment_provider = %s AND payment_id = %s', payment_provider.value, payment_id)
-    result = row.rowcount > 0
-    return result
-
 def delete_user_errors(conn: psycopg.Connection, payment_provider: base.PaymentProvider, payment_id: str) -> bool:
-    result = False
-    with db.transaction(conn) as tx:
-        result = delete_user_errors_tx(tx, payment_provider, payment_id)
-    return result
+    # Single statement on the given connection (mid-tx callers pass tx.conn); the pool is autocommit.
+    row = db.query(conn, 'DELETE FROM user_errors WHERE payment_provider = %s AND payment_id = %s', payment_provider.value, payment_id)
+    return row.rowcount > 0
 
 def get_payment_tx(tx:          db.SQLTransaction,
                    payment_tx:  base.PaymentProviderTransaction,
@@ -1888,15 +1882,8 @@ def get_payment_tx(tx:          db.SQLTransaction,
 
     return result
 
-def get_payment(conn: psycopg.Connection,
-                payment_tx: base.PaymentProviderTransaction,
-                err:        base.ErrorSink) -> PaymentRow | None:
-    with db.transaction(conn) as tx:
-        return get_payment_tx(tx=tx,
-                              payment_tx=payment_tx,
-                              err=err)
-
-def set_refund_requested_tx(tx: db.SQLTransaction, payment_tx: UserPaymentTransaction, refund_requested_at: datetime.datetime | None) -> bool:
+@db.transactional
+def set_refund_requested(tx: db.SQLTransaction, payment_tx: UserPaymentTransaction, refund_requested_at: datetime.datetime | None) -> bool:
     rows: db.Result | None = None
     if payment_tx.provider == base.PaymentProvider.Rangeproof or payment_tx.provider == base.PaymentProvider.Nil:
         return False
@@ -1949,14 +1936,6 @@ def set_refund_requested_tx(tx: db.SQLTransaction, payment_tx: UserPaymentTransa
             _update_user_expiry_grace_and_renew_flag_from_payment_list_tx(tx, master_pkey)
 
     return success
-
-def set_refund_requested(conn: psycopg.Connection,
-                                    payment_tx: UserPaymentTransaction,
-                                    refund_requested_at: datetime.datetime | None) -> bool:
-    result = False
-    with db.transaction(conn) as tx:
-        result = set_refund_requested_tx(tx, payment_tx, refund_requested_at)
-    return result
 
 def apple_add_notification_uuid_tx(tx: db.SQLTransaction, uuid: str, expires_at: datetime.datetime):
     # uuid is the PRIMARY KEY; DO NOTHING keeps this idempotent (and crash-free) if the caller's

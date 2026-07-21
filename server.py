@@ -897,7 +897,7 @@ def set_payment_refund_requested():
         with db.connection(engine) as conn:
             # Wire `0` means "clear the refund request" → NULL internally (the hash above still used the
             # literal wire value the client signed).
-            updated = backend.set_refund_requested(conn                = conn,
+            updated = backend.set_refund_requested(conn,
                                                    payment_tx          = user_payment,
                                                    refund_requested_at = refund_requested_at if refund_requested_ts else None)
 

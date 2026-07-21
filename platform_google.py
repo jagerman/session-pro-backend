@@ -204,7 +204,7 @@ def _process_notification_message(conn: psycopg.Connection, msg: SortedMessage, 
             if handled:
                 _ = backend.google_set_notification_handled(tx=tx, message_id=msg.message_id, delete=False)
                 if user_is_in_error_state:
-                    _ = backend.delete_user_errors_tx(tx=tx, payment_provider=base.PaymentProvider.GooglePlayStore, payment_id=msg.parse.purchase_token)
+                    _ = backend.delete_user_errors(tx.conn, payment_provider=base.PaymentProvider.GooglePlayStore, payment_id=msg.parse.purchase_token)
             elif not user_is_in_error_state:
                 user_error                      = backend.UserError()
                 user_error.provider             = base.PaymentProvider.GooglePlayStore
