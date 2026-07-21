@@ -30,11 +30,10 @@ def entry_point() -> flask.Flask:
     console_logger = logging.StreamHandler()
     console_logger.setFormatter(log_formatter)
     # NOTE: Setup console logger
-    if 1:
-        log.addHandler(console_logger)
-        backend.log.addHandler(console_logger)
-        platform_google.log.addHandler(console_logger)
-        platform_apple.log.addHandler(console_logger)
+    log.addHandler(console_logger)
+    backend.log.addHandler(console_logger)
+    platform_google.log.addHandler(console_logger)
+    platform_apple.log.addHandler(console_logger)
 
     # NOTE: Parse arguments from .INI if present and environment variables, then setup global variables
     try:
@@ -118,18 +117,17 @@ def entry_point() -> flask.Flask:
                 startup_log += f'    Webhook Logger: Enabled (display name: {it.name})\n'
 
         log.info(startup_log)
-        for it in webhook_loggers:
-            it.emit_text(f'Starting up instance: {startup_log}')
+        for handler in webhook_loggers:
+            handler.emit_text(f'Starting up instance: {startup_log}')
 
 
         # NOTE: Add flask to our global logger
         result: flask.Flask = server.init(testing_mode=False, database_url=parsed_args.db_url, backend_key=backend_key)
-        if 1:
-            _ = result.logger.addHandler(console_logger)
-            if file_logger:
-                _ = result.logger.addHandler(file_logger)
-            for it in webhook_loggers:
-                _ = result.logger.addHandler(it)
+        result.logger.addHandler(console_logger)
+        if file_logger:
+            result.logger.addHandler(file_logger)
+        for handler in webhook_loggers:
+            result.logger.addHandler(handler)
 
         # NOTE: Enable Apple iOS App Store notifications routes on the server if enabled. Apple will
         # contact the endpoint when a notification is generated.
