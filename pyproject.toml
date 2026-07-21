@@ -1,0 +1,19 @@
+# Config for black (the autoformatter). black reads its settings ONLY from pyproject.toml
+# ([tool.black]) — it ignores .flake8 / setup.cfg — so its line length lives here while flake8's
+# lives in .flake8. This file deliberately has NO [build-system] or [project] table, so it does
+# not turn the project into a PEP 517 build; it is purely tool configuration.
+[tool.black]
+line-length = 120
+# Keep the codebase's existing quote style (it is single-quote-heavy); don't rewrite '' -> "".
+skip-string-normalization = true
+# Ignore the "magic trailing comma" — don't force a call/collection to stay exploded just because
+# it carries a trailing comma; reformat purely by line length.
+skip-magic-trailing-comma = true
+target-version = ["py313"]
+# Don't reformat the vendored third-party tree or the venv (matches mypy.ini's exclude).
+extend-exclude = '''
+/(
+    \.venv
+  | vendor
+)/
+'''

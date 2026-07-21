@@ -4,4 +4,5 @@ backend.db
 platform_config.py
 .idea
 /*.ini
+!/mypy.ini
 *.log
