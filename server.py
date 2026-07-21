@@ -574,7 +574,7 @@ def get_json_from_flask_request(request: flask.Request) -> dict[str, typing.Any]
     try:
         json_dict = json.loads(request.data)
     except Exception as e:
-        raise base.FailError(f'JSON failed to be parsed: {e}')
+        raise base.FailError(f'Failed to parse JSON body: {e}')
     if not isinstance(json_dict, dict):
         raise base.FailError('JSON body was not an object')
     return typing.cast(dict[str, typing.Any], json_dict)

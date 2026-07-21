@@ -1370,8 +1370,6 @@ def add_unredeemed_payment(tx:                                db.SQLTransaction,
             master_pkey   = nacl.signing.VerifyKey(bytes(master_pkey_record[0]))
             user: UserRow = get_user(tx.conn, master_pkey)
             if user.found:
-                auto_redeem_deadline_at: int = 0
-
                 # TODO: Handle the situation when a user cancels
                 if payment_tx.provider == base.PaymentProvider.GooglePlayStore:
                     # NOTE: Account hold as described by google

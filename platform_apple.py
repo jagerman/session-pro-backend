@@ -922,27 +922,28 @@ def handle_notification(decoded_notification: DecodedNotification, conn: psycopg
 
 @flask_blueprint.route(FLASK_ROUTE_NOTIFICATIONS_APPLE_APP_CONNECT_SANDBOX, methods=['POST'])
 def notifications_apple_app_connect_sandbox() -> flask.Response:
-    # NOTE: Extract notification from payload
-    get: server.GetJSONFromFlaskRequest = server.get_json_from_flask_request(flask.request)
-    if len(get.err_msg):
-        if base.UNSAFE_LOGGING:
-            log.error(f'Failed to parse notification as JSON: {flask.request.data}')
-        else:
-            log.error(f'Failed to parse notification as JSON')
+    # NOTE: Extract notification from payload. get_json_from_flask_request returns the parsed dict or raises
+    # (base.ApiError) on a malformed body. This is an Apple webhook, so a parse failure must return 500 (so
+    # Apple redelivers) rather than the client fail-envelope — catch the error and abort instead of letting
+    # it propagate to the app error handler.
+    try:
+        body = server.get_json_from_flask_request(flask.request)
+    except base.ApiError as e:
+        # `e` already states what was wrong and why; only append the raw body under unsafe logging.
+        log.error(f'Discarding Apple notification: {e}' + (f' (body: {flask.request.data!r})' if base.UNSAFE_LOGGING else ''))
         flask.abort(500)
 
     if base.UNSAFE_LOGGING:
-        log.debug(f'Received notification: {json.dumps(get.json, indent=1)}\n')
-    assert isinstance(get.json, dict)
+        log.debug(f'Received notification: {json.dumps(body, indent=1)}\n')
     assert FLASK_CONFIG_PLATFORM_APPLE_CORE_KEY in flask.current_app.config
     assert isinstance(flask.current_app.config[FLASK_CONFIG_PLATFORM_APPLE_CORE_KEY], Core)
     core = typing.cast(Core, flask.current_app.config[FLASK_CONFIG_PLATFORM_APPLE_CORE_KEY])
 
-    if 'signedPayload' not in get.json:
-        log.error(f'Failed to parse notification, signedPayload key was missing: {base.safe_dump_dict_keys_or_data(get.json)}')
+    if 'signedPayload' not in body:
+        log.error(f'Failed to parse notification, signedPayload key was missing: {base.safe_dump_dict_keys_or_data(body)}')
         flask.abort(500)
 
-    signed_payload = get.json['signedPayload']
+    signed_payload = body['signedPayload']
     if not isinstance(signed_payload, str):
         log.error(f'Failed to parse notification, signed payload was not a string: {type(signed_payload)}')
         flask.abort(500)
