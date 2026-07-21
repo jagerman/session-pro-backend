@@ -315,9 +315,9 @@ def handle_notification_tx(decoded_notification: DecodedNotification, sql_tx: db
                 if not err.has():
                     # TODO: To be updated when Session iOS figures out how it will generate UUID from the
                     # master pkey, then this can be asserted to have to exist in the payload
-                    platform_obfuscated_account_id: str = tx.appAccountToken if tx.appAccountToken else ''
+                    platform_obfuscated_account_id = tx.appAccountToken if tx.appAccountToken else ''
 
-                    backend.add_unredeemed_payment(tx                                = sql_tx,
+                    backend.add_unredeemed_payment(sql_tx,
                                                       payment_tx                        = payment_tx,
                                                       plan                              = pro_plan,
                                                       purchased_at             = purchased_at,
@@ -327,7 +327,7 @@ def handle_notification_tx(decoded_notification: DecodedNotification, sql_tx: db
                                                       err                               = err)
 
                 if not err.has():
-                    _ = backend.update_payment_renewal_info(tx                       = sql_tx,
+                    backend.update_payment_renewal_info(sql_tx,
                                                                payment_tx               = payment_tx,
                                                                grace_period = base.DEFAULT_APPLE_GRACE_PERIOD,
                                                                auto_renewing            = auto_renewing,
@@ -406,7 +406,7 @@ def handle_notification_tx(decoded_notification: DecodedNotification, sql_tx: db
                         # info that we need to set auto-renewal back on for
                         log.debug(f'{decoded_notification.body.notificationType.name}+DOWNGRADE for {payment_tx_id_label(payment_tx)}: Grace period = {base.DEFAULT_APPLE_GRACE_PERIOD}, auto-renewing = true')
                         sql_tx.cancel = True
-                        _ = backend.update_payment_renewal_info(tx                       = sql_tx,
+                        backend.update_payment_renewal_info(sql_tx,
                                                                    payment_tx               = payment_tx,
                                                                    grace_period = base.DEFAULT_APPLE_GRACE_PERIOD,
                                                                    auto_renewing            = True,
@@ -437,7 +437,7 @@ def handle_notification_tx(decoded_notification: DecodedNotification, sql_tx: db
                             log.debug(f'{decoded_notification.body.notificationType.name}+UPGRADE for {payment_tx_id_label(payment_tx)}: Revoke (orig. TX ID) date = {revoke}, new payment (expiry/unredeemed/refund expiry) ts = {expiry}/{unredeemed}/{refund}, grace period = {base.DEFAULT_APPLE_GRACE_PERIOD}, auto-renewing = {auto_renewing}')
 
                         sql_tx.cancel = True
-                        revoked: bool = backend.add_apple_revocation(tx                   = sql_tx,
+                        revoked: bool = backend.add_apple_revocation(sql_tx,
                                                                         apple_original_tx_id = tx.originalTransactionId,
                                                                         revoke_at    = revoke_at,
                                                                         err                  = err)
@@ -448,9 +448,9 @@ def handle_notification_tx(decoded_notification: DecodedNotification, sql_tx: db
                         if not err.has():
                             # TODO: To be updated when Session iOS figures out how it will generate UUID from the
                             # master pkey, then this can be asserted to have to exist in the payload
-                            platform_obfuscated_account_id: str = tx.appAccountToken if tx.appAccountToken else ''
+                            platform_obfuscated_account_id = tx.appAccountToken if tx.appAccountToken else ''
 
-                            backend.add_unredeemed_payment(tx                                = sql_tx,
+                            backend.add_unredeemed_payment(sql_tx,
                                                               payment_tx                        = payment_tx,
                                                               plan                              = pro_plan,
                                                               expires_at                 = expires_at,
@@ -466,7 +466,7 @@ def handle_notification_tx(decoded_notification: DecodedNotification, sql_tx: db
                         # default behaviour of the backend which is to set that flag on the payment
                         # immediately)
                         if not err.has():
-                            _ = backend.update_payment_renewal_info(tx                       = sql_tx,
+                            backend.update_payment_renewal_info(sql_tx,
                                                                        payment_tx               = payment_tx,
                                                                        grace_period = base.DEFAULT_APPLE_GRACE_PERIOD,
                                                                        auto_renewing            = None,
@@ -521,16 +521,16 @@ def handle_notification_tx(decoded_notification: DecodedNotification, sql_tx: db
                 err.msg_list.append(f'{decoded_notification.body.notificationType.name} TX type ({tx.type}) was not the expected value: {expected_type}. {print_obj(tx)}')
 
             # NOTE: Extract plan
-            pro_plan: base.ProPlan = pro_plan_from_product_id(tx.productId, err)
+            pro_plan = pro_plan_from_product_id(tx.productId, err)
             payment_tx             = payment_tx_from_apple_jws_transaction(tx, err)
 
             # NOTE: Extract components
             if not err.has():
                 if not decoded_notification.body.subtype:
                     # NOTE: User is redeeming an offer to start(?) a sub. Submit the payment
-                    purchased_at:             datetime.datetime = base.datetime_from_unix_ms(tx.purchaseDate)
-                    platform_refund_expires_at: datetime.datetime = get_platform_refund_expires_at(tx)
-                    expires_at:                 datetime.datetime = base.datetime_from_unix_ms(tx.expiresDate)
+                    purchased_at = base.datetime_from_unix_ms(tx.purchaseDate)
+                    platform_refund_expires_at = get_platform_refund_expires_at(tx)
+                    expires_at = base.datetime_from_unix_ms(tx.expiresDate)
 
                     if log.getEffectiveLevel() <= logging.DEBUG:
                         expiry        = base.readable(expires_at)
@@ -540,9 +540,9 @@ def handle_notification_tx(decoded_notification: DecodedNotification, sql_tx: db
 
                     # TODO: To be updated when Session iOS figures out how it will generate UUID from the
                     # master pkey, then this can be asserted to have to exist in the payload
-                    platform_obfuscated_account_id: str = tx.appAccountToken if tx.appAccountToken else ''
+                    platform_obfuscated_account_id = tx.appAccountToken if tx.appAccountToken else ''
 
-                    backend.add_unredeemed_payment(tx                                = sql_tx,
+                    backend.add_unredeemed_payment(sql_tx,
                                                       payment_tx                        = payment_tx,
                                                       plan                              = pro_plan,
                                                       expires_at                 = base.datetime_from_unix_ms(tx.expiresDate),
@@ -578,7 +578,7 @@ def handle_notification_tx(decoded_notification: DecodedNotification, sql_tx: db
                         refund        = base.readable(platform_refund_expires_at)
                         log.debug(f'{decoded_notification.body.notificationType.name}+UPGRADE for {payment_tx_id_label(payment_tx)}: Revoking (orig TX id) at = {revoke}, new payment (expiry/unredeemed/refund ts) = {expiry}/{unredeemed}/{refund}, grace = {base.DEFAULT_APPLE_GRACE_PERIOD}, auto-renewing = {auto_renewing}')
 
-                    revoked = backend.add_apple_revocation(tx                   = sql_tx,
+                    revoked = backend.add_apple_revocation(sql_tx,
                                                               apple_original_tx_id = tx.originalTransactionId,
                                                               revoke_at    = revoke_at,
                                                               err                  = err)
@@ -589,9 +589,9 @@ def handle_notification_tx(decoded_notification: DecodedNotification, sql_tx: db
                     if not err.has():
                         # TODO: To be updated when Session iOS figures out how it will generate UUID from the
                         # master pkey, then this can be asserted to have to exist in the payload
-                        platform_obfuscated_account_id: str = tx.appAccountToken if tx.appAccountToken else ''
+                        platform_obfuscated_account_id = tx.appAccountToken if tx.appAccountToken else ''
 
-                        backend.add_unredeemed_payment(tx                                = sql_tx,
+                        backend.add_unredeemed_payment(sql_tx,
                                                           payment_tx                        = payment_tx,
                                                           plan                              = pro_plan,
                                                           expires_at                 = expires_at,
@@ -601,7 +601,7 @@ def handle_notification_tx(decoded_notification: DecodedNotification, sql_tx: db
                                                           err                               = err)
 
                     if not err.has():
-                        _ = backend.update_payment_renewal_info(tx                       = sql_tx,
+                        backend.update_payment_renewal_info(sql_tx,
                                                                    payment_tx               = payment_tx,
                                                                    grace_period = base.DEFAULT_APPLE_GRACE_PERIOD,
                                                                    auto_renewing            = auto_renewing,
@@ -649,7 +649,7 @@ def handle_notification_tx(decoded_notification: DecodedNotification, sql_tx: db
             payment_tx = payment_tx_from_apple_jws_transaction(tx, err)
             if not err.has():
                 log.debug(f'{decoded_notification.body.notificationType.name} for {payment_tx_id_label(payment_tx)}: Revoke (orig. TX ID) date = {base.readable(base.datetime_from_unix_ms(tx.revocationDate))}')
-                sql_tx.cancel = not backend.add_apple_revocation(tx                   = sql_tx,
+                sql_tx.cancel = not backend.add_apple_revocation(sql_tx,
                                                                     apple_original_tx_id = tx.originalTransactionId,
                                                                     revoke_at    = base.datetime_from_unix_ms(tx.revocationDate),
                                                                     err                  = err)
@@ -711,9 +711,9 @@ def handle_notification_tx(decoded_notification: DecodedNotification, sql_tx: db
             assert tx
             payment_tx = payment_tx_from_apple_jws_transaction(tx, err)
             if not err.has():
-                auto_renewing: bool = decoded_notification.body.subtype == AppleSubtype.AUTO_RENEW_ENABLED
+                auto_renewing = decoded_notification.body.subtype == AppleSubtype.AUTO_RENEW_ENABLED
                 log.debug(f'{decoded_notification.body.notificationType.name} for {payment_tx_id_label(payment_tx)}: Auto-renewing = {auto_renewing}, grace period = {base.DEFAULT_APPLE_GRACE_PERIOD}')
-                _ = backend.update_payment_renewal_info(tx                       = sql_tx,
+                backend.update_payment_renewal_info(sql_tx,
                                                            payment_tx               = payment_tx,
                                                            grace_period = None,
                                                            auto_renewing            = auto_renewing,
@@ -748,7 +748,7 @@ def handle_notification_tx(decoded_notification: DecodedNotification, sql_tx: db
         if not err.has():
             assert renewal
             assert tx
-            payment_tx: base.PaymentProviderTransaction = payment_tx_from_apple_jws_transaction(tx, err)
+            payment_tx = payment_tx_from_apple_jws_transaction(tx, err)
             if not err.has():
                 if not decoded_notification.body.subtype:
                     log.debug(f'{decoded_notification.body.notificationType.name} for {payment_tx_id_label(payment_tx)}: Grace period ended')
@@ -766,7 +766,7 @@ def handle_notification_tx(decoded_notification: DecodedNotification, sql_tx: db
                         assert renewal.gracePeriodExpiresDate is not None and tx.expiresDate is not None
                         grace_period = base.timedelta_from_ms(renewal.gracePeriodExpiresDate - tx.expiresDate)
                         log.debug(f'{decoded_notification.body.notificationType.name} for {payment_tx_id_label(payment_tx)}: Auto-renewing = true, grace period expires = {renewal.gracePeriodExpiresDate}, duration = {grace_period}')
-                        _ = backend.update_payment_renewal_info(tx                       = sql_tx,
+                        backend.update_payment_renewal_info(sql_tx,
                                                                    payment_tx               = payment_tx,
                                                                    grace_period = grace_period,
                                                                    auto_renewing            = True,
@@ -793,7 +793,7 @@ def handle_notification_tx(decoded_notification: DecodedNotification, sql_tx: db
                 user_payment_tx = backend.UserPaymentTransaction(provider=payment_tx.provider,
                                                                  apple_tx_id=payment_tx.apple_tx_id)
                 log.debug(f'{decoded_notification.body.notificationType.name} for {payment_tx_id_label(payment_tx)}: clearing refund request (refund_requested_at = NULL)')
-                if not backend.set_refund_requested(tx=tx, payment_tx=user_payment_tx, refund_requested_at=None):
+                if not backend.set_refund_requested(sql_tx, payment_tx=user_payment_tx, refund_requested_at=None):
                     log.warning(f"{decoded_notification.body.notificationType.name} for {payment_tx_id_label(payment_tx)} failed to remove refund timestamp")
 
     elif decoded_notification.body.notificationType == AppleNotificationV2.TEST:
@@ -892,7 +892,7 @@ def handle_notification_tx(decoded_notification: DecodedNotification, sql_tx: db
          decoded_notification.body.notificationType == AppleNotificationV2.RENEWAL_EXTENSION:
 
         if decoded_notification.tx_info:
-            payment_tx: base.PaymentProviderTransaction = payment_tx_from_apple_jws_transaction(decoded_notification.tx_info, err)
+            payment_tx = payment_tx_from_apple_jws_transaction(decoded_notification.tx_info, err)
             log.debug(f'{decoded_notification.body.notificationType.name} for {payment_tx_id_label(payment_tx)}: No-op')
 
         if decoded_notification.body.notificationType == AppleNotificationV2.EXTERNAL_PURCHASE_TOKEN:
@@ -908,8 +908,8 @@ def handle_notification_tx(decoded_notification: DecodedNotification, sql_tx: db
     # at. But it's close enough-ish
     if result:
         assert decoded_notification.body.signedDate
-        expires_at: datetime.datetime  = base.datetime_from_unix_ms(decoded_notification.body.signedDate) + notification_retry_duration
-        backend.apple_add_notification_uuid(tx                = sql_tx,
+        expires_at = base.datetime_from_unix_ms(decoded_notification.body.signedDate) + notification_retry_duration
+        backend.apple_add_notification_uuid(sql_tx,
                                                uuid              = decoded_notification.body.notificationUUID,
                                                expires_at = expires_at)
     return result
