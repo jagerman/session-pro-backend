@@ -642,32 +642,28 @@ def parse_notification(body: JSONObject, err: base.ErrorSink) -> ParsedNotificat
     if result.package_name != platform_google_api.package_name:
         err.msg_list.append(f'{result.package_name} does not match google_package_name ({platform_google_api.package_name}) from the .INI file!')
 
-    subscription                     = json_dict_optional_obj(body, "subscriptionNotification", err)
-    one_time_product                 = json_dict_optional_obj(body, "oneTimeProductNotification", err)
-    voided_purchase                  = json_dict_optional_obj(body, "voidedPurchaseNotification", err)
-    test_obj                         = json_dict_optional_obj(body, "testNotification", err)
+    subscription     = json_dict_optional_obj(body, "subscriptionNotification", err)
+    one_time_product = json_dict_optional_obj(body, "oneTimeProductNotification", err)
+    voided_purchase  = json_dict_optional_obj(body, "voidedPurchaseNotification", err)
+    test_obj         = json_dict_optional_obj(body, "testNotification", err)
 
-    is_subscription_notification     = subscription     is not None
-    is_one_time_product_notification = one_time_product is not None
-    is_voided_notification           = voided_purchase  is not None
-    is_test_notification             = test_obj         is not None
-
-    unique_notif_keys = is_subscription_notification + is_one_time_product_notification + is_voided_notification + is_test_notification
-    if unique_notif_keys == 0:
+    # Exactly one notification block must be present.
+    notif_count = sum(notif is not None for notif in (subscription, one_time_product, voided_purchase, test_obj))
+    if notif_count == 0:
         err.msg_list.append(f'No subscription notification for {result.package_name} {safe_dump_dict_keys_or_data(body)}')
-    elif unique_notif_keys > 1:
+    elif notif_count > 1:
         err.msg_list.append(f'Multiple subscription notification for {result.package_name} {safe_dump_dict_keys_or_data(body)}')
 
     if err.has():
         return result
 
-    if is_subscription_notification:
+    if subscription is not None:
         result.purchase_token  = json_dict_require_str(subscription, "purchaseToken", err)
         result.payload_version = json_dict_require_str(subscription, "version",  err)
         result.sub_type        = typing.cast(SubscriptionNotificationType, json_dict_require_int_coerce_to_enum(subscription, "notificationType", SubscriptionNotificationType, err))
         result.payload_type    = ParsedNotificationPayloadType.Subscription
 
-    elif is_voided_notification:
+    elif voided_purchase is not None:
         result.purchase_token = json_dict_require_str(voided_purchase, "purchaseToken", err)
         order_id              = json_dict_require_str(voided_purchase, "orderId", err)
         product_type          = json_dict_require_int_coerce_to_enum(voided_purchase, "productType", ProductType, err)
@@ -682,10 +678,10 @@ def parse_notification(body: JSONObject, err: base.ErrorSink) -> ParsedNotificat
                                                        refund_type    = refund_type)
         result.payload_type = ParsedNotificationPayloadType.Test
 
-    elif is_one_time_product_notification:
+    elif one_time_product is not None:
         result.payload_type = ParsedNotificationPayloadType.Nil
 
-    elif is_test_notification:
+    elif test_obj is not None:
         result.payload_type = ParsedNotificationPayloadType.Test
 
     return result

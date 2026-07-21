@@ -271,7 +271,7 @@ def parse_get_subscription_v2_response(response: typing.Any, err: ErrorSink) -> 
             user_initiated_cancellation = None
             user_initiated_cancellation_obj = json_dict_optional_obj(canceled_state_context_obj, "userInitiatedCancellation", err)
             is_user_initiated_cancellation = user_initiated_cancellation_obj is not None
-            if is_user_initiated_cancellation:
+            if user_initiated_cancellation_obj is not None:
                 cancel_survey_result_obj = json_dict_optional_obj(user_initiated_cancellation_obj, "cancelSurveyResult", err)
 
                 cancel_survey_result = None
