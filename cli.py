@@ -743,7 +743,7 @@ def cmd_voucher(args: argparse.Namespace) -> int:
                     print('\nStep 1: Creating unredeemed Rangeproof payment...')
                     err = base.ErrorSink()
                     backend.add_unredeemed_payment(
-                        tx                                = tx,
+                        tx,
                         payment_tx                        = payment_tx,
                         plan                              = plan,
                         expires_at                 = expires_at,
@@ -773,7 +773,7 @@ def cmd_voucher(args: argparse.Namespace) -> int:
                     # Step 2: Redeem the payment via add_pro_payment (raises on failure → caught below).
                     print('\nStep 2: Redeeming payment and generating pro proof...')
                     redeem_result = backend.add_pro_payment(
-                        tx            = tx,
+                        tx,
                         signing_key   = backend_key,
                         request_at    = request_at,
                         redeemed_at   = backend.to_redeemed_at(request_at),
