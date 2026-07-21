@@ -687,11 +687,20 @@ def handle_notification_tx(decoded_notification: DecodedNotification, sql_tx: db
             assert isinstance(tx.transactionId,         str),                    f'{print_obj(tx)}'
             assert isinstance(tx.transactionReason,     AppleTransactionReason), f'{print_obj(tx)}'
             assert isinstance(tx.type,                  AppleType),              f'{print_obj(tx)}'
+            assert decoded_notification.body.signedDate is not None  # part of the verified signed payload
 
-            # NOTE: Process
-            err.msg_list.append(f'Received TX: {tx}, TODO: this needs to be handled but first check what data we got')
-            # TODO: I'm not sure if the notification gives you information about which transaction needs to be reversed.
-            # Need to inspect payload
+            # NOTE: Process — reinstate the entitlement the original REFUND revoked: un-revoke this exact
+            # transaction, restore the user's expiry, and (if the refund had revoked their generation and the
+            # window is still live) roll them onto a fresh one. auto_renewing comes from the notification's
+            # renewal info (the subscription's current state); default on, since a reversal reactivates it.
+            auto_renewing = True
+            if decoded_notification.renewal_info is not None and decoded_notification.renewal_info.autoRenewStatus is not None:
+                auto_renewing = bool(decoded_notification.renewal_info.autoRenewStatus)
+            backend.reinstate_apple_payment(sql_tx,
+                                               apple_original_tx_id = tx.originalTransactionId,
+                                               apple_tx_id          = tx.transactionId,
+                                               auto_renewing        = auto_renewing,
+                                               reinstated_at        = base.datetime_from_unix_ms(decoded_notification.body.signedDate))
 
     elif decoded_notification.body.notificationType == AppleNotificationV2.DID_CHANGE_RENEWAL_STATUS:
         # A notification type that, along with its subtype, indicates that the customer made a

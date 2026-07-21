@@ -994,6 +994,92 @@ def test_revocation_cutting_refund_rolls_generation(monkeypatch, pg_database):
         db_engine.putconn(db_conn)
         db_engine.close()
 
+def test_apple_refund_reversal_reinstates_and_rolls_generation(pg_database):
+    """REFUND_REVERSED: Apple undoes a refund it previously granted, so we must reinstate what the original
+    REFUND revoked. A full refund revokes the only payment -> no entitlement -> the user's generation is
+    revoked (and stays current, nothing to roll onto). A reversal that lands while the paid window is still
+    live must un-revoke the payment, restore the ORIGINAL expiry (never extend), and roll the user onto a
+    FRESH, non-revoked generation (the old broadcast one stays revoked). Redelivery is an idempotent no-op."""
+    err                                           = base.ErrorSink()
+    db_engine: psycopg_pool.ConnectionPool | None = backend.bootstrap_db(database_url=pg_database())
+    assert db_engine
+
+    backend_key  = nacl.signing.SigningKey.generate()
+    master_key   = nacl.signing.SigningKey.generate()
+    rotating_key = nacl.signing.SigningKey.generate()
+    now          = datetime.datetime.now(datetime.timezone.utc)
+    redeemed_at  = base.round_datetime_to_next_day(now)
+    original_tx  = os.urandom(8).hex()
+    tx_id        = os.urandom(8).hex()
+    expires_at   = redeemed_at + datetime.timedelta(days=90)
+
+    db_conn = db_engine.getconn()
+    try:
+        # Seed + redeem a single long (90d) Apple payment.
+        seed_tx                            = base.PaymentProviderTransaction()
+        seed_tx.provider                   = base.PaymentProvider.iOSAppStore
+        seed_tx.apple_original_tx_id       = original_tx
+        seed_tx.apple_tx_id                = tx_id
+        seed_tx.apple_web_line_order_tx_id = os.urandom(8).hex()
+        backend.add_unredeemed_payment(db_conn,
+                                       payment_tx                     = seed_tx,
+                                       plan                           = base.ProPlan.OneMonth,
+                                       purchased_at                   = now,
+                                       expires_at                     = expires_at,
+                                       platform_refund_expires_at     = base.EPOCH,
+                                       platform_obfuscated_account_id = '',
+                                       err                            = err)
+        assert not err.has(), err.msg_list
+
+        user_tx             = backend.UserPaymentTransaction()
+        user_tx.provider    = base.PaymentProvider.iOSAppStore
+        user_tx.apple_tx_id = tx_id
+        msg = backend.make_add_pro_payment_message(master_pkey=master_key.verify_key, rotating_pkey=rotating_key.verify_key, payment_tx=user_tx)
+        redeemed = backend.verify_and_add_pro_payment(conn=db_conn, signing_key=backend_key, request_at=now, redeemed_at=redeemed_at,
+                                                      master_pkey=master_key.verify_key, rotating_pkey=rotating_key.verify_key, payment_tx=user_tx,
+                                                      master_sig=master_key.sign(msg).signature, rotating_sig=rotating_key.sign(msg).signature)
+        assert redeemed.status == backend.RedeemPaymentStatus.Success, f'{err.msg_list}'
+
+        with db.transaction(db_conn) as tx:
+            user_before = backend.get_user_and_payments(tx, master_key.verify_key).user
+        gen_before, token_before, expiry_before = user_before.current_generation_id, user_before.token, user_before.expires_at
+
+        # Full refund: revokes the only payment -> generation revoked, stays current (nothing to roll onto).
+        with db.transaction(db_conn) as tx:
+            assert backend.add_apple_revocation(tx, apple_original_tx_id=original_tx, revoke_at=now, err=err)
+            assert not err.has(), err.msg_list
+        with db.transaction(db_conn) as tx:
+            user_refunded = backend.get_user_and_payments(tx, master_key.verify_key).user
+            assert backend.is_generation_revoked(tx.conn, user_refunded.current_generation_id, now)
+        assert len(backend.get_revocations_list(db_conn)) == 1
+
+        # Reversal WHILE the 90d window is still live -> reinstate: un-revoke, restore expiry, roll onto a
+        # fresh non-revoked generation; the old (revoked) one stays broadcast, no new revocation entry.
+        with db.transaction(db_conn) as tx:
+            assert backend.reinstate_apple_payment(tx, apple_original_tx_id=original_tx, apple_tx_id=tx_id,
+                                                   auto_renewing=True, reinstated_at=now)
+        with db.transaction(db_conn) as tx:
+            reinstated = backend.get_user_and_payments(tx, master_key.verify_key).user
+            assert reinstated.expires_at              == expiry_before          # original window restored, not extended
+            assert reinstated.current_generation_id   != gen_before             # rolled onto a fresh generation
+            assert reinstated.token                   != token_before
+            assert not backend.is_generation_revoked(tx.conn, reinstated.current_generation_id, now)
+            assert backend.is_generation_revoked(tx.conn, gen_before, now)      # old generation stays revoked
+        assert len(backend.get_revocations_list(db_conn)) == 1                  # no new revocation entry
+
+        # Idempotent: a redelivered reversal is a clean no-op (payment already active, no further roll).
+        gen_after = reinstated.current_generation_id
+        with db.transaction(db_conn) as tx:
+            assert backend.reinstate_apple_payment(tx, apple_original_tx_id=original_tx, apple_tx_id=tx_id,
+                                                   auto_renewing=True, reinstated_at=now)
+        with db.transaction(db_conn) as tx:
+            again = backend.get_user_and_payments(tx, master_key.verify_key).user
+            assert again.current_generation_id == gen_after
+            assert again.expires_at            == expiry_before
+    finally:
+        db_engine.putconn(db_conn)
+        db_engine.close()
+
 def test_bump_revocation_ticket(pg_database):
     """Item 7: the manual DR bump (backing the `revoke bump-ticket` CLI command) advances the monotonic
     revocation ticket by the given amount and returns the new value. Used to recover after a DB restore

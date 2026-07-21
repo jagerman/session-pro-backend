@@ -762,6 +762,66 @@ def add_apple_revocation(tx: db.SQLTransaction, apple_original_tx_id: str, revok
     return result
 
 @db.transactional
+def reinstate_apple_payment(tx:                   db.SQLTransaction,
+                            apple_original_tx_id: str,
+                            apple_tx_id:          str,
+                            auto_renewing:        bool,
+                            reinstated_at:        datetime.datetime) -> bool:
+    """Reverse a prior Apple REFUND for a single transaction (a REFUND_REVERSED notification) — the mirror of
+    add_apple_revocation. Un-revoke the payment identified by (original_tx_id, tx_id), restore the affected
+    user's entitlement snapshot, and — only when their current generation is revoked AND the restored window
+    is still live — move them onto a fresh generation (the old, already-broadcast token stays on the
+    revocation list; it can't be un-broadcast). Un-revoking only clears revoked_at (revoke never touched
+    expires_at), so the ORIGINAL paid window is restored, never extended.
+
+    A reversal lands days-to-weeks after the refund, so the window has often already lapsed by the time it
+    arrives — then there is nothing live to serve and no generation work to do (a later renewal settles the
+    generation).
+
+    Returns whether a matching payment was found. Idempotent: a redelivery whose payment is already active is
+    a no-op. An unknown transaction is logged CRITICAL and returns False but never raises/errs — a reversal
+    always follows a refund we processed, so an unknown one is anomalous, yet it must not wedge the Apple
+    notification pipeline / the missed-notification catch-up.
+    """
+    rows = db.query(tx.conn, f'''
+        SELECT p.id, u.master_pkey
+        FROM   {PAYMENTS_FROM}
+        WHERE  ad.original_tx_id = %(orig_tx)s AND ad.tx_id = %(tx_id)s
+    ''', orig_tx=apple_original_tx_id, tx_id=apple_tx_id).fetchall()
+
+    if not rows:
+        log.critical(f'Apple REFUND_REVERSED for an unknown transaction (orig. TX ID='
+                     f'{base.maybe_obfuscate(apple_original_tx_id)}, tx={base.maybe_obfuscate(apple_tx_id)}); '
+                     f'nothing to reinstate')
+        return False
+
+    log.info(f'Reinstating Apple payment (orig. TX ID={base.maybe_obfuscate(apple_original_tx_id)}, '
+             f'tx={base.maybe_obfuscate(apple_tx_id)}, reinstated={base.readable(reinstated_at)})')
+
+    master_pkeys: set[bytes] = set()
+    for payment_id, master_pkey_raw in rows:
+        # Clear the refund's revocation (idempotent) and restore auto-renew from the notification.
+        db.query(tx.conn, '''
+            UPDATE payments SET revoked_at = NULL, auto_renewing = %(auto_renewing)s WHERE id = %(id)s
+        ''', auto_renewing = auto_renewing, id = payment_id)
+        if master_pkey_raw is not None:
+            master_pkeys.add(bytes(master_pkey_raw))
+
+    for master_pkey_bytes in master_pkeys:
+        master_pkey = nacl.signing.VerifyKey(master_pkey_bytes)
+        lookup      = _lookup_user_expiry(tx, master_pkey)
+        if lookup.expiry_from_redeemed is not None and lookup.expiry_from_redeemed > reinstated_at:
+            # Live restored window: ensure the user is on a usable (non-revoked) generation — mints a fresh
+            # one iff the refund had revoked the current one — and refresh their entitlement snapshot.
+            _ensure_active_generation(tx, master_pkey, issued_at = reinstated_at)
+        else:
+            # The paid window has already lapsed: just restore the expiry snapshot; there are no live proofs
+            # to serve, so no generation work (a later renewal will settle the generation).
+            _update_user_expiry_grace_and_renew_flag_from_payment_list(tx, master_pkey)
+
+    return True
+
+@db.transactional
 def add_google_revocation(tx: db.SQLTransaction, google_payment_token: str, revoke_at: datetime.datetime, err: base.ErrorSink) -> bool:
     """Revoke all the payments that aren't revoked that share the same original TX ID. Returns true
     if there were any rows that had the ID"""

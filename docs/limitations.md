@@ -70,7 +70,6 @@ Keep this in sync with the code — it describes real branches, not intentions.
 | Feature / notification | Enabled in App Store Connect by… | Current behaviour if hit | Consequence | Fails |
 |---|---|---|---|---|
 | **Promotional offers / offer codes / win-back offers** — `OFFER_REDEEMED` | configuring any offer for the subscription group | `assert isinstance(expiresDate, str)` — but `expiresDate` is an int → **AssertionError** | offer redemption crashes the handler → paid-but-no-Pro | crash (500) |
-| **Refund reversal** — `REFUND_REVERSED` | a refund being reversed (dispute resolved in your favour — rare) | always appends a TODO error → HTTP 500 + Apple retries, **and wedges the catch-up checkpoint** | customer whose refund was reversed is **not** re-granted Pro; all missed-notification catch-up stalls | loud-ish + wedge |
 | **External purchases / alternative marketplaces** — `EXTERNAL_PURCHASE_TOKEN` | enabling the External Purchase entitlement | appends `we do not support 3rd party stores` → 500 + retries + catch-up wedge | 3rd-party-store purchase not handled | loud-ish + wedge |
 | **Renewal-date extensions** — `RENEWAL_EXTENSION` / `RENEWAL_EXTENDED` | requesting a subscription renewal-date extension (e.g. outage compensation) | appends `we don't handle … extension` → 500 + retries + catch-up wedge | extension not applied; catch-up stalls | loud-ish + wedge |
 | **New / changed subscription SKU** — `pro_plan_from_product_id` | adding any product id beyond the three known SKUs* | `assert False, 'Invalid apple plan_id'` → crash | any purchase of the new SKU crashes the handler (paid-but-no-Pro) | crash (500) |
@@ -85,6 +84,15 @@ Keep this in sync with the code — it describes real branches, not intentions.
   the loud-guard.)
 - The final `else` (any unrecognised `notificationType`) errors → 500 + wedge; it catches future Apple
   notification types, and should route through the loud-guard so a new type doesn't wedge catch-up.
+- `REFUND_REVERSED` is now **handled** (was a wedge; see bugs-fixed #13): `reinstate_apple_payment`
+  un-revokes the reversed transaction, restores the original expiry (never extends), and mints a fresh
+  generation iff the current one was revoked and the window is still live. Idempotent; an unknown tx acks
+  rather than wedging. A reversal that lands after the paid window has lapsed correctly restores nothing live.
+  **Edge:** the `REFUND` path (`add_apple_revocation`) revokes *all* cycles sharing the `original_tx_id`,
+  while reinstate un-revokes only the reversed `(original_tx_id, tx_id)`. Correct in the common case (older
+  cycles are already expired no-ops); the only under-restore is a still-live *other* cycle that the
+  over-broad `REFUND` revoked — a pre-existing consequence of `add_apple_revocation`'s breadth, not of the
+  reinstate.
 
 ---
 
