@@ -149,7 +149,7 @@ def parse_args() -> ParsedArgs:
     result.log_path                       = os.getenv('SESH_PRO_BACKEND_LOG_PATH',                           result.log_path)
     result.with_platform_apple            = base.os_get_boolean_env('SESH_PRO_BACKEND_WITH_PLATFORM_APPLE',  result.with_platform_apple)
     result.with_platform_google           = base.os_get_boolean_env('SESH_PRO_BACKEND_WITH_PLATFORM_GOOGLE', result.with_platform_google)
-    result.with_platform_google           = base.os_get_boolean_env('SESH_PRO_BACKEND_PLATFORM_TESTING_ENV', result.with_platform_google)
+    result.platform_testing_env           = base.os_get_boolean_env('SESH_PRO_BACKEND_PLATFORM_TESTING_ENV', result.platform_testing_env)
     result.provider_dry_run               = base.os_get_boolean_env('SESH_PRO_BACKEND_PROVIDER_DRY_RUN',      result.provider_dry_run)
 
     if result.with_platform_apple:
