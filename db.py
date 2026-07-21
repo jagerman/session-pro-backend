@@ -22,6 +22,7 @@ import atexit
 import collections.abc
 import contextlib
 import dataclasses
+import functools
 import logging
 import os
 import threading
@@ -122,6 +123,29 @@ def transaction(conn: psycopg.Connection) -> collections.abc.Iterator[SQLTransac
         yield result
         if result.cancel:
             raise psycopg.Rollback
+
+
+_TxP = typing.ParamSpec('_TxP')
+_TxR = typing.TypeVar('_TxR')
+
+def transactional(fn: typing.Callable[typing.Concatenate[SQLTransaction, _TxP], _TxR]) -> typing.Callable[typing.Concatenate['psycopg.Connection | SQLTransaction', _TxP], _TxR]:
+    """Write a multi-statement DB function ONCE as `def fn(tx: SQLTransaction, …)` and call it with EITHER a
+    Connection or an existing SQLTransaction as the first argument. A Connection opens a fresh transaction
+    for the call (committed / rolled back here); an existing SQLTransaction passes straight through — no
+    nested transaction, no commit — so the outer owner keeps the lifecycle. This collapses the old
+    foo()/foo_tx() pairs into one function.
+
+    The wrapper's first parameter is named `tx` (though it accepts a Connection too) so callers already
+    written as `foo(tx=…)` keep binding; a Connection can be passed positionally or as `tx=conn`. Reserve
+    this for work that must be atomic when called standalone — a single-statement helper needs none of it
+    and should just take a `Connection` (a mid-transaction caller passes `tx.conn`)."""
+    @functools.wraps(fn)
+    def wrapper(tx: 'psycopg.Connection | SQLTransaction', *args: _TxP.args, **kwargs: _TxP.kwargs) -> _TxR:
+        if isinstance(tx, SQLTransaction):
+            return fn(tx, *args, **kwargs)
+        with transaction(tx) as opened:
+            return fn(opened, *args, **kwargs)
+    return wrapper
 
 
 class Result:

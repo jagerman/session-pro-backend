@@ -283,7 +283,7 @@ def test_provider_dry_run_redeems_google_without_egress(monkeypatch, pg_database
         seed_tx.provider             = base.PaymentProvider.GooglePlayStore
         seed_tx.google_payment_token = os.urandom(backend.BLAKE2B_DIGEST_SIZE).hex()
         seed_tx.google_order_id      = os.urandom(backend.BLAKE2B_DIGEST_SIZE).hex()
-        backend.add_unredeemed_payment(conn                           = db_conn,
+        backend.add_unredeemed_payment(db_conn,
                                        payment_tx                     = seed_tx,
                                        plan                           = base.ProPlan.OneMonth,
                                        purchased_at                   = now,
@@ -382,7 +382,7 @@ def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_d
         payment_tx.google_payment_token = it.google_payment_token
         payment_tx.google_order_id      = it.google_order_id
 
-        backend.add_unredeemed_payment(conn                              = db_conn,
+        backend.add_unredeemed_payment(db_conn,
                                        payment_tx                        = payment_tx,
                                        plan                              = it.plan,
                                        purchased_at             = now,
@@ -513,7 +513,7 @@ def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_d
     payment_tx.google_payment_token                         = scenarios[1].google_payment_token
     payment_tx.google_order_id                              = scenarios[1].google_order_id
     new_grace_period                                   = datetime.timedelta(milliseconds=10000)
-    updated: bool                                           = backend.update_payment_renewal_info(conn                     = db_conn,
+    updated: bool                                           = backend.update_payment_renewal_info(db_conn,
                                                                                                   payment_tx               = payment_tx,
                                                                                                   grace_period = new_grace_period,
                                                                                                   auto_renewing            = False,
@@ -593,7 +593,7 @@ def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_d
         payment_tx.provider             = it.payment_provider
         payment_tx.google_payment_token = it.google_payment_token
         payment_tx.google_order_id      = it.google_order_id
-        backend.add_unredeemed_payment(conn                              = db_conn,
+        backend.add_unredeemed_payment(db_conn,
                                        payment_tx                        = payment_tx,
                                        plan                              = it.plan,
                                        purchased_at             = now,
@@ -706,7 +706,7 @@ def test_revocation_cutting_refund_rolls_generation(monkeypatch, pg_database):
         seed_tx.provider             = base.PaymentProvider.GooglePlayStore
         seed_tx.google_payment_token = os.urandom(backend.BLAKE2B_DIGEST_SIZE).hex()
         seed_tx.google_order_id      = 'DEV.' + os.urandom(backend.BLAKE2B_DIGEST_SIZE).hex()
-        backend.add_unredeemed_payment(conn                           = db_conn,
+        backend.add_unredeemed_payment(db_conn,
                                        payment_tx                     = seed_tx,
                                        plan                           = base.ProPlan.OneMonth,
                                        purchased_at                   = now,
@@ -813,7 +813,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
         payment_tx.provider             = base.PaymentProvider.GooglePlayStore
         payment_tx.google_payment_token = os.urandom(backend.BLAKE2B_DIGEST_SIZE).hex()
         payment_tx.google_order_id      = 'DEV.' + os.urandom(backend.BLAKE2B_DIGEST_SIZE).hex()
-        backend.add_unredeemed_payment(conn                              = db_conn,
+        backend.add_unredeemed_payment(db_conn,
                                        payment_tx                        = payment_tx,
                                        plan                              = base.ProPlan.OneMonth,
                                        purchased_at             = request_at,
@@ -1005,7 +1005,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
             new_payment_tx.provider             = base.PaymentProvider.GooglePlayStore
             new_payment_tx.google_payment_token = os.urandom(int(len(payment_tx.google_payment_token) / 2)).hex()
             new_payment_tx.google_order_id      = 'DEV.' + os.urandom(int(len(payment_tx.google_payment_token) / 2)).hex()
-            backend.add_unredeemed_payment(conn                              = db_conn,
+            backend.add_unredeemed_payment(db_conn,
                                            payment_tx                        = new_payment_tx,
                                            plan                              = base.ProPlan.OneMonth,
                                            purchased_at             = request_at,
@@ -1499,7 +1499,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
             apple_tx.provider    = base.PaymentProvider.iOSAppStore
             apple_tx.apple_tx_id = throwaway_id
             apple_tx.payment_id  = backend.payment_id_from_user_tx(apple_tx)
-            backend.add_unredeemed_payment(conn                              = db_conn,
+            backend.add_unredeemed_payment(db_conn,
                                            payment_tx                        = apple_payment_tx,
                                            plan                              = base.ProPlan.OneMonth,
                                            purchased_at             = base.datetime_from_unix_ms(unix_ts_ms),
@@ -1724,7 +1724,7 @@ def test_apple_grace_period_stores_duration_not_absolute_date(pg_database):
             payment_tx.apple_original_tx_id       = original_tx_id
             payment_tx.apple_tx_id                = tx_id
             payment_tx.apple_web_line_order_tx_id = web_line_id
-            backend.add_unredeemed_payment(conn                              = conn,
+            backend.add_unredeemed_payment(conn,
                                            payment_tx                        = payment_tx,
                                            plan                              = base.ProPlan.OneMonth,
                                            expires_at                 = base.datetime_from_unix_ms(expires_ms),

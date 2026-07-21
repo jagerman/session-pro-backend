@@ -1095,7 +1095,8 @@ def _lookup_user_expiry_tx(tx: db.SQLTransaction, master_pkey: nacl.signing.Veri
             result.best_auto_renewing    = bool(auto_renewing)
     return result
 
-def update_payment_renewal_info_tx(tx:                       db.SQLTransaction,
+@db.transactional
+def update_payment_renewal_info(tx:                       db.SQLTransaction,
                                    payment_tx:               base.PaymentProviderTransaction,
                                    grace_period: datetime.timedelta  | None,
                                    auto_renewing:            bool | None,
@@ -1195,16 +1196,6 @@ def update_payment_renewal_info_tx(tx:                       db.SQLTransaction,
         err.msg_list.append(f'Updating payment TX failed, no matching payment found for {payment_tx.provider.name} {base.maybe_obfuscate(payment_id)}')
     return result
 
-def update_payment_renewal_info(conn:                     psycopg.Connection,
-                                payment_tx:               base.PaymentProviderTransaction,
-                                grace_period: datetime.timedelta  | None,
-                                auto_renewing:            bool | None,
-                                err:                      base.ErrorSink) -> bool:
-
-    result = False
-    with db.transaction(conn) as sql_tx:
-        result = update_payment_renewal_info_tx(sql_tx, payment_tx, grace_period, auto_renewing, err)
-    return result
 
 def _insert_payment_row_tx(tx: db.SQLTransaction, payment: dict[str, typing.Any], detail_table: str, detail: dict[str, typing.Any]) -> None:
     """INSERT a payment: the provider-agnostic `payment` columns into `payments` (RETURNING the new id),
@@ -1223,7 +1214,8 @@ def _insert_payment_row_tx(tx: db.SQLTransaction, payment: dict[str, typing.Any]
     d_placeholders  = ', '.join(f'%({column})s' for column in detail_row)
     _ = db.query(tx.conn, f'INSERT INTO {detail_table} ({d_columns}) VALUES ({d_placeholders})', detail_row)
 
-def add_unredeemed_payment_tx(tx:                                db.SQLTransaction,
+@db.transactional
+def add_unredeemed_payment(tx:                                db.SQLTransaction,
                               payment_tx:                        base.PaymentProviderTransaction,
                               plan:                              base.ProPlan,
                               expires_at:                 datetime.datetime,
@@ -1425,23 +1417,6 @@ def add_unredeemed_payment_tx(tx:                                db.SQLTransacti
                     except base.ApiError as e:
                         log.error(f'Failed to auto-redeem a payment we witnessed from. (auto_redeem_deadline={base.readable(auto_redeem_deadline_at)}) {e}')
 
-def add_unredeemed_payment(conn:                              psycopg.Connection,
-                           payment_tx:                        base.PaymentProviderTransaction,
-                           plan:                              base.ProPlan,
-                           expires_at:                 datetime.datetime,
-                           purchased_at:             datetime.datetime,
-                           platform_refund_expires_at: datetime.datetime,
-                           platform_obfuscated_account_id:    bytes | str,
-                           err:                               base.ErrorSink):
-    with db.transaction(conn) as tx:
-        add_unredeemed_payment_tx(tx                                = tx,
-                                  payment_tx                        = payment_tx,
-                                  plan                              = plan,
-                                  expires_at                 = expires_at,
-                                  purchased_at             = purchased_at,
-                                  platform_refund_expires_at = platform_refund_expires_at,
-                                  platform_obfuscated_account_id    = platform_obfuscated_account_id,
-                                  err                               = err)
 
 def mint_generation(tx: db.SQLTransaction, user_id: int, issued_at: datetime.datetime) -> tuple[int, bytes]:
     '''Insert a fresh generation (new random 32-byte token) for an existing user; returns
@@ -1618,7 +1593,8 @@ def internal_verify_add_payment_and_get_proof_common_arguments(signing_key:   na
     if master_sig == rotating_sig:
         raise base.FailError('Master and rotating signature cannot be the same')
 
-def add_pro_payment_tx(tx:                  db.SQLTransaction,
+@db.transactional
+def add_pro_payment(tx:                  db.SQLTransaction,
                        signing_key:         nacl.signing.SigningKey,
                        request_at:          datetime.datetime,
                        redeemed_at: datetime.datetime,
@@ -1669,23 +1645,6 @@ def add_pro_payment_tx(tx:                  db.SQLTransaction,
     return result
 
 
-def add_pro_payment(conn:                psycopg.Connection,
-                    signing_key:         nacl.signing.SigningKey,
-                    request_at:          datetime.datetime,
-                    redeemed_at: datetime.datetime,
-                    master_pkey:         nacl.signing.VerifyKey,
-                    rotating_pkey:       nacl.signing.VerifyKey,
-                    payment_tx:          UserPaymentTransaction) -> RedeemPayment:
-    result = RedeemPayment()
-    with db.transaction(conn) as tx:
-        result = add_pro_payment_tx(tx,
-                                     signing_key,
-                                     request_at,
-                                     redeemed_at,
-                                     master_pkey,
-                                     rotating_pkey,
-                                     payment_tx)
-    return result
 
 def verify_and_add_pro_payment(conn:                psycopg.Connection,
                                signing_key:         nacl.signing.SigningKey,

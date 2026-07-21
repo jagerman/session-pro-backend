@@ -317,7 +317,7 @@ def handle_notification_tx(decoded_notification: DecodedNotification, sql_tx: db
                     # master pkey, then this can be asserted to have to exist in the payload
                     platform_obfuscated_account_id: str = tx.appAccountToken if tx.appAccountToken else ''
 
-                    backend.add_unredeemed_payment_tx(tx                                = sql_tx,
+                    backend.add_unredeemed_payment(tx                                = sql_tx,
                                                       payment_tx                        = payment_tx,
                                                       plan                              = pro_plan,
                                                       purchased_at             = purchased_at,
@@ -327,7 +327,7 @@ def handle_notification_tx(decoded_notification: DecodedNotification, sql_tx: db
                                                       err                               = err)
 
                 if not err.has():
-                    _ = backend.update_payment_renewal_info_tx(tx                       = sql_tx,
+                    _ = backend.update_payment_renewal_info(tx                       = sql_tx,
                                                                payment_tx               = payment_tx,
                                                                grace_period = base.DEFAULT_APPLE_GRACE_PERIOD,
                                                                auto_renewing            = auto_renewing,
@@ -406,7 +406,7 @@ def handle_notification_tx(decoded_notification: DecodedNotification, sql_tx: db
                         # info that we need to set auto-renewal back on for
                         log.debug(f'{decoded_notification.body.notificationType.name}+DOWNGRADE for {payment_tx_id_label(payment_tx)}: Grace period = {base.DEFAULT_APPLE_GRACE_PERIOD}, auto-renewing = true')
                         sql_tx.cancel = True
-                        _ = backend.update_payment_renewal_info_tx(tx                       = sql_tx,
+                        _ = backend.update_payment_renewal_info(tx                       = sql_tx,
                                                                    payment_tx               = payment_tx,
                                                                    grace_period = base.DEFAULT_APPLE_GRACE_PERIOD,
                                                                    auto_renewing            = True,
@@ -450,7 +450,7 @@ def handle_notification_tx(decoded_notification: DecodedNotification, sql_tx: db
                             # master pkey, then this can be asserted to have to exist in the payload
                             platform_obfuscated_account_id: str = tx.appAccountToken if tx.appAccountToken else ''
 
-                            backend.add_unredeemed_payment_tx(tx                                = sql_tx,
+                            backend.add_unredeemed_payment(tx                                = sql_tx,
                                                               payment_tx                        = payment_tx,
                                                               plan                              = pro_plan,
                                                               expires_at                 = expires_at,
@@ -466,7 +466,7 @@ def handle_notification_tx(decoded_notification: DecodedNotification, sql_tx: db
                         # default behaviour of the backend which is to set that flag on the payment
                         # immediately)
                         if not err.has():
-                            _ = backend.update_payment_renewal_info_tx(tx                       = sql_tx,
+                            _ = backend.update_payment_renewal_info(tx                       = sql_tx,
                                                                        payment_tx               = payment_tx,
                                                                        grace_period = base.DEFAULT_APPLE_GRACE_PERIOD,
                                                                        auto_renewing            = None,
@@ -542,7 +542,7 @@ def handle_notification_tx(decoded_notification: DecodedNotification, sql_tx: db
                     # master pkey, then this can be asserted to have to exist in the payload
                     platform_obfuscated_account_id: str = tx.appAccountToken if tx.appAccountToken else ''
 
-                    backend.add_unredeemed_payment_tx(tx                                = sql_tx,
+                    backend.add_unredeemed_payment(tx                                = sql_tx,
                                                       payment_tx                        = payment_tx,
                                                       plan                              = pro_plan,
                                                       expires_at                 = base.datetime_from_unix_ms(tx.expiresDate),
@@ -591,7 +591,7 @@ def handle_notification_tx(decoded_notification: DecodedNotification, sql_tx: db
                         # master pkey, then this can be asserted to have to exist in the payload
                         platform_obfuscated_account_id: str = tx.appAccountToken if tx.appAccountToken else ''
 
-                        backend.add_unredeemed_payment_tx(tx                                = sql_tx,
+                        backend.add_unredeemed_payment(tx                                = sql_tx,
                                                           payment_tx                        = payment_tx,
                                                           plan                              = pro_plan,
                                                           expires_at                 = expires_at,
@@ -601,7 +601,7 @@ def handle_notification_tx(decoded_notification: DecodedNotification, sql_tx: db
                                                           err                               = err)
 
                     if not err.has():
-                        _ = backend.update_payment_renewal_info_tx(tx                       = sql_tx,
+                        _ = backend.update_payment_renewal_info(tx                       = sql_tx,
                                                                    payment_tx               = payment_tx,
                                                                    grace_period = base.DEFAULT_APPLE_GRACE_PERIOD,
                                                                    auto_renewing            = auto_renewing,
@@ -713,7 +713,7 @@ def handle_notification_tx(decoded_notification: DecodedNotification, sql_tx: db
             if not err.has():
                 auto_renewing: bool = decoded_notification.body.subtype == AppleSubtype.AUTO_RENEW_ENABLED
                 log.debug(f'{decoded_notification.body.notificationType.name} for {payment_tx_id_label(payment_tx)}: Auto-renewing = {auto_renewing}, grace period = {base.DEFAULT_APPLE_GRACE_PERIOD}')
-                _ = backend.update_payment_renewal_info_tx(tx                       = sql_tx,
+                _ = backend.update_payment_renewal_info(tx                       = sql_tx,
                                                            payment_tx               = payment_tx,
                                                            grace_period = None,
                                                            auto_renewing            = auto_renewing,
@@ -766,7 +766,7 @@ def handle_notification_tx(decoded_notification: DecodedNotification, sql_tx: db
                         assert renewal.gracePeriodExpiresDate is not None and tx.expiresDate is not None
                         grace_period = base.timedelta_from_ms(renewal.gracePeriodExpiresDate - tx.expiresDate)
                         log.debug(f'{decoded_notification.body.notificationType.name} for {payment_tx_id_label(payment_tx)}: Auto-renewing = true, grace period expires = {renewal.gracePeriodExpiresDate}, duration = {grace_period}')
-                        _ = backend.update_payment_renewal_info_tx(tx                       = sql_tx,
+                        _ = backend.update_payment_renewal_info(tx                       = sql_tx,
                                                                    payment_tx               = payment_tx,
                                                                    grace_period = grace_period,
                                                                    auto_renewing            = True,

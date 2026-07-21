@@ -397,7 +397,7 @@ def thread_entry_point(context: ThreadContext, app_credentials_path: str, cloud_
 
 def _update_payment_renewal_info(tx_payment: base.PaymentProviderTransaction, auto_renewing: bool | None, grace_period: datetime.timedelta | None, tx: db.SQLTransaction, err: base.ErrorSink)-> bool:
     assert len(tx_payment.google_payment_token) > 0 and len(tx_payment.google_order_id) > 0 and not err.has()
-    return backend.update_payment_renewal_info_tx(
+    return backend.update_payment_renewal_info(
         tx                       = tx,
         payment_tx               = tx_payment,
         grace_period = grace_period,
@@ -479,7 +479,7 @@ def handle_subscription_notification(tx_payment: base.PaymentProviderTransaction
                                                                  revoke_at    = base.datetime_from_unix_ms(tx_event.event_ts_ms),
                                                                  err                  = err)
                         # NOTE: Register the payment
-                        backend.add_unredeemed_payment_tx(
+                        backend.add_unredeemed_payment(
                             tx                                = tx,
                             payment_tx                        = tx_payment,
                             plan                              = tx_event.pro_plan,
@@ -521,7 +521,7 @@ def handle_subscription_notification(tx_payment: base.PaymentProviderTransaction
                 if not err.has():
                     assert tx_event.pro_plan != ProPlan.Nil, "Plan was parsed into a valid enum when extracting data from the notification, should not be nil here"
                     assert len(tx_payment.google_order_id) > 0 and len(tx_payment.google_payment_token) > 0
-                    backend.add_unredeemed_payment_tx(
+                    backend.add_unredeemed_payment(
                         tx                                = tx,
                         payment_tx                        = tx_payment,
                         plan                              = tx_event.pro_plan,
