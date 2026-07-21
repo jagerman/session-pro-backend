@@ -17,7 +17,7 @@ import enum
 import collections.abc
 
 from   google.oauth2 import service_account
-from   google.cloud  import pubsub_v1
+from   google.cloud  import pubsub_v1  # type: ignore[attr-defined]  # google.cloud is a namespace package; mypy can't see the pubsub_v1 submodule (imports fine at runtime)
 import google.pubsub_v1.types
 import googleapiclient.discovery
 import google.api_core.exceptions
