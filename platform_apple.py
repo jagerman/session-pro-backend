@@ -743,10 +743,6 @@ def handle_notification_tx(decoded_notification: DecodedNotification, sql_tx: db
 
         if not err.has():
             assert renewal
-            _ = require_field(renewal.gracePeriodExpiresDate, f'{decoded_notification.body.notificationType.name} is missing renewal grace period expires date. {print_obj(renewal)}', err)
-
-        if not err.has():
-            assert renewal
             assert tx
             payment_tx = payment_tx_from_apple_jws_transaction(tx, err)
             if not err.has():
@@ -762,7 +758,12 @@ def handle_notification_tx(decoded_notification: DecodedNotification, sql_tx: db
                     # the user's entitlement should end during grace). Storing the raw absolute date
                     # here added an epoch (~1.7e12 ms, ~50 years) to the entitlement on every
                     # grace-period renewal failure.
-                    if require_field(tx.expiresDate, f'{decoded_notification.body.notificationType.name} grace period is missing the transaction expiry date. {print_obj(tx)}', err):
+                    # gracePeriodExpiresDate is required ONLY here (the GRACE_PERIOD subtype); a
+                    # subtype-less DID_FAIL_TO_RENEW ("billing failed, no grace, stop service") legitimately
+                    # omits it and must not be rejected — hence it's checked in this branch, not blanket.
+                    have_expiry = require_field(tx.expiresDate, f'{decoded_notification.body.notificationType.name} grace period is missing the transaction expiry date. {print_obj(tx)}', err)
+                    have_grace  = require_field(renewal.gracePeriodExpiresDate, f'{decoded_notification.body.notificationType.name} GRACE_PERIOD subtype is missing the grace period expires date. {print_obj(renewal)}', err)
+                    if have_expiry and have_grace:
                         assert renewal.gracePeriodExpiresDate is not None and tx.expiresDate is not None
                         grace_period = base.timedelta_from_ms(renewal.gracePeriodExpiresDate - tx.expiresDate)
                         log.debug(f'{decoded_notification.body.notificationType.name} for {payment_tx_id_label(payment_tx)}: Auto-renewing = true, grace period expires = {renewal.gracePeriodExpiresDate}, duration = {grace_period}')
