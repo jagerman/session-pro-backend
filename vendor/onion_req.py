@@ -286,24 +286,23 @@ def handle_v4_onionreq_plaintext(body):
         belems = memoryview(body)[1:-1]
 
         # Metadata json; this element is always required:
-        meta, belems = bencode_consume_string(belems)
+        req_meta_bytes, belems = bencode_consume_string(belems)
+        req_meta = json.loads(req_meta_bytes.tobytes())
 
-        meta = json.loads(meta.tobytes())
-
-        # Then we can have a second optional string containing the body:
+        # Then we can have a second optional string containing the body (bencode_consume_string hands back
+        # a memoryview; the no-body case is an empty bytes literal, hence the union):
+        subreq_body: bytes | memoryview = b''
         if len(belems) > 1:
             subreq_body, belems = bencode_consume_string(belems)
             if len(belems):
                 raise RuntimeError("Invalid v4 onion request: found more than 2 parts")
-        else:
-            subreq_body = b''
 
-        method, endpoint = meta['method'], meta['endpoint']
+        method, endpoint = req_meta['method'], req_meta['endpoint']
         if not endpoint.startswith('/'):
             raise RuntimeError("Invalid v4 onion request: endpoint must start with /")
 
         response, headers = make_subrequest(
-            method, endpoint, headers=meta.get('headers', {}), body=subreq_body
+            method, endpoint, headers=req_meta.get('headers', {}), body=subreq_body
         )
 
         data = response.get_data()
@@ -311,16 +310,16 @@ def handle_v4_onionreq_plaintext(body):
             f"Onion sub-request for {endpoint} returned {response.status_code}, {len(data)} bytes"
         )
 
-        meta = {'code': response.status_code, 'headers': headers}
+        resp_meta = {'code': response.status_code, 'headers': headers}
 
     except Exception as e:
         current_app.logger.warning("Invalid v4 onion request: {}".format(e))
-        meta = {'code': HTTP_BAD_REQUEST, 'headers': {'content-type': 'text/plain; charset=utf-8'}}
+        resp_meta = {'code': HTTP_BAD_REQUEST, 'headers': {'content-type': 'text/plain; charset=utf-8'}}
         data = b'Invalid v4 onion request'
 
-    meta = json.dumps(meta).encode()
+    resp_meta_bytes = json.dumps(resp_meta).encode()
     return b''.join(
-        (b'l', str(len(meta)).encode(), b':', meta, str(len(data)).encode(), b':', data, b'e')
+        (b'l', str(len(resp_meta_bytes)).encode(), b':', resp_meta_bytes, str(len(data)).encode(), b':', data, b'e')
     )
 
 
