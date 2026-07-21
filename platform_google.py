@@ -177,7 +177,7 @@ def handle_parsed_notification(tx: db.SQLTransaction, parse: ParsedNotification,
 
     result = not err.has()
     if err.has():
-        assert tx.cancel == True
+        assert tx.cancel
     return result
 
 def _process_notification_message(conn: psycopg.Connection, msg: SortedMessage, err: base.ErrorSink, now_s: float) -> bool:
@@ -205,7 +205,7 @@ def _process_notification_message(conn: psycopg.Connection, msg: SortedMessage, 
                 _ = backend.google_set_notification_handled(tx=tx, message_id=msg.message_id, delete=False)
                 if user_is_in_error_state:
                     _ = backend.delete_user_errors_tx(tx=tx, payment_provider=base.PaymentProvider.GooglePlayStore, payment_id=msg.parse.purchase_token)
-            elif user_is_in_error_state == False:
+            elif not user_is_in_error_state:
                 user_error                      = backend.UserError()
                 user_error.provider             = base.PaymentProvider.GooglePlayStore
                 user_error.google_payment_token = msg.parse.purchase_token
@@ -239,7 +239,7 @@ def thread_entry_point(context: ThreadContext, app_credentials_path: str, cloud_
 
     # NOTE: Then connect to Google and start pulling messages
     log.info(f'Loaded {len(sorted_msg_list)} unhandled messages from the DB')
-    while context.kill_thread == False:
+    while not context.kill_thread:
         with pubsub_v1.SubscriberClient.from_service_account_file(app_credentials_path) as client:
             sub_path = client.subscription_path(project=cloud_project_id, subscription=cloud_subscription_name)
             # NOTE: We have a little bit of a problem here in terms of ordering. Google
@@ -280,7 +280,7 @@ def thread_entry_point(context: ThreadContext, app_credentials_path: str, cloud_
             #       }
             #     }
             #   }, ...]
-            while context.kill_thread == False:
+            while not context.kill_thread:
                 try:
                     # NOTE: Pull messages from Google
                     result: google.pubsub_v1.types.PullResponse = client.pull(subscription       = sub_path,  # pyright: ignore[reportUnknownMemberType]
@@ -312,7 +312,7 @@ def thread_entry_point(context: ThreadContext, app_credentials_path: str, cloud_
                                 with db.open_database(base.DB_URL) as engine:
                                     with db.connection(engine) as conn:
                                         with db.transaction(conn) as tx:
-                                            if backend.google_notification_message_id_is_in_db_tx(tx, message_id).present == False:
+                                            if not backend.google_notification_message_id_is_in_db_tx(tx, message_id).present:
                                                 # NOTE: Our message retention policy for this subscription is 7 days
                                                 # (default). We add a little buffer as we don't know exactly which
                                                 # timestamp Google uses.

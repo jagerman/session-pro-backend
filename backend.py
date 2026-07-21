@@ -753,7 +753,7 @@ def add_apple_revocation_tx(tx: db.SQLTransaction, apple_original_tx_id: str, re
     log.info(f'Revoking Apple payment (orig. TX ID={base.maybe_obfuscate(apple_original_tx_id)}, revoke={base.readable(revoke_at)})')
     rows         = rows_result.fetchall()
     result: bool = revoke_payments_by_id_internal_tx(tx, rows, revoke_at)
-    if result == False:
+    if not result:
         err.msg_list.append(f'Failed to revoke Apple orig. TX ID {base.maybe_obfuscate(apple_original_tx_id)} at {base.readable(revoke_at)}, no matching payments were found')
 
     return result
@@ -781,7 +781,7 @@ def add_google_revocation_tx(tx: db.SQLTransaction, google_payment_token: str, r
     log.info(f'Revoking Google payment (token={base.maybe_obfuscate(google_payment_token)}, revoke={base.readable(revoke_at)})')
     rows         = rows_result.fetchall()
     result: bool = revoke_payments_by_id_internal_tx(tx, rows, revoke_at)
-    if result == False:
+    if not result:
         err.msg_list.append(f'Failed to revoke Google payment {base.maybe_obfuscate(google_payment_token)} at {base.readable(revoke_at)}, no matching payments were found')
 
     return result
@@ -1070,7 +1070,7 @@ def _lookup_user_expiry_tx(tx: db.SQLTransaction, master_pkey: nacl.signing.Veri
         # now-relative concern handled downstream (get_pro_status / proof-expiry clamping) — it must
         # not gate what expiry the user is *entitled* to, so no wall-clock enters here.
         if revoked_at is not None:
-            assert auto_renewing == False
+            assert not auto_renewing
             payment_expires_at = revoked_at
             expires_at         = revoked_at
         else:
@@ -1182,7 +1182,7 @@ def update_payment_renewal_info(tx:                       db.SQLTransaction,
         master_pkey_bytes: bytes = bytes(row[0])
         _update_user_expiry_grace_and_renew_flag_from_payment_list_tx(tx, nacl.signing.VerifyKey(master_pkey_bytes))
 
-    if result == False:
+    if not result:
         payment_id = ''
         if payment_tx.provider == base.PaymentProvider.GooglePlayStore:
             payment_id = payment_tx.google_order_id

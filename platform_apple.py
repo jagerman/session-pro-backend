@@ -86,7 +86,7 @@ def init(key_id: str, issuer_id: str, bundle_id: str, app_id: int | None, key_by
 
     # NOTE: Apple retries 1, 12, 24 ... hours after the previous attempt
     # NOTE: Then add a 30min buffer just in-case
-    if result.sandbox == False:
+    if not result.sandbox:
         # Apple retries at 1, 12, 24, 48, 72 hours after the previous attempt; + a 30-min buffer.
         result.notification_retry_duration = datetime.timedelta(hours=1 + 12 + 24 + 48 + 72, minutes=30)
     return result
@@ -793,7 +793,7 @@ def handle_notification_tx(decoded_notification: DecodedNotification, sql_tx: db
                 user_payment_tx = backend.UserPaymentTransaction(provider=payment_tx.provider,
                                                                  apple_tx_id=payment_tx.apple_tx_id)
                 log.debug(f'{decoded_notification.body.notificationType.name} for {payment_tx_id_label(payment_tx)}: clearing refund request (refund_requested_at = NULL)')
-                if backend.set_refund_requested_tx(tx=tx, payment_tx=user_payment_tx, refund_requested_at=None) == False:
+                if not backend.set_refund_requested_tx(tx=tx, payment_tx=user_payment_tx, refund_requested_at=None):
                     log.warning(f"{decoded_notification.body.notificationType.name} for {payment_tx_id_label(payment_tx)} failed to remove refund timestamp")
 
     elif decoded_notification.body.notificationType == AppleNotificationV2.TEST:
@@ -1037,26 +1037,26 @@ def catchup_on_missed_notifications(core: Core, sql_conn: psycopg.Connection, en
                 history_resp: AppleNotificationHistoryResponse = core.app_store_server_api_client.get_notification_history(history_page_token, notification_history_request=history_req)
                 if history_resp.notificationHistory:
                     total_notifs += len(history_resp.notificationHistory)
-                    if failed == False:
+                    if not failed:
                         for it in history_resp.notificationHistory:
                             # NOTE: Decode and handle
                             assert it.signedPayload
                             resp:                 AppleResponseBodyV2DecodedPayload = core.signed_data_verifier.verify_and_decode_notification(it.signedPayload)
                             decoded_notification: DecodedNotification               = decoded_notification_from_apple_response_body_v2(resp, core.signed_data_verifier, err)
                             handled:              bool                              = handle_notification_tx(decoded_notification, tx, core.notification_retry_duration, err)
-                            if handled == False:
+                            if not handled:
                                 failed            = True
-                                assert tx.cancel == True
+                                assert tx.cancel
                                 err.msg_list.append(f'Failed to handle missed notification {it}')
                                 break
 
                             handled_notifs += 1
-                if history_resp.hasMore == False:
+                if not history_resp.hasMore:
                     break
                 history_page_token = history_resp.paginationToken
 
             if err.has():
-                assert tx.cancel == True
+                assert tx.cancel
                 log.error(f'Processed {handled_notifs}/{total_notifs} missed notifications but encountered errors, rolling back:\n' + '\n  '.join(err.msg_list))
             else:
                 backend.apple_set_notification_checkpoint_at(tx, base.datetime_from_unix_ms(history_req.endDate))

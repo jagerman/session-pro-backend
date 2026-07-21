@@ -173,7 +173,7 @@ def parse_args() -> ParsedArgs:
                 errors.append('Platform Apple was enabled in production mode (e.g. not sandbox mode) but the production_app_id was not specified')
 
         if result.apple_sandbox_env:
-            if result.platform_testing_env == False:
+            if not result.platform_testing_env:
                 log.warning('Platform Apple was enabled in sandbox mode but platform_testing_env was not set to true. You want to set this to true, overriding the flag to true')
                 result.platform_testing_env = True
 
