@@ -13,6 +13,7 @@ import dataclasses
 import pprint
 import logging
 import time
+import traceback
 
 from appstoreserverlibrary.models.SendTestNotificationResponse    import SendTestNotificationResponse    as AppleSendTestNotificationResponse
 from appstoreserverlibrary.models.CheckTestNotificationResponse   import CheckTestNotificationResponse   as AppleCheckTestNotificationResponse
@@ -955,11 +956,17 @@ def notifications_apple_app_connect_sandbox() -> flask.Response:
     # NOTE: Handle the notification
     err                                       = base.ErrorSink()
     decoded_notification: DecodedNotification = decoded_notification_from_apple_response_body_v2(resp, core.signed_data_verifier, err)
-    with server.get_db(flask.current_app) as engine:
-        with db.connection(engine) as conn:
-            db.run_and_log_errors(lambda: handle_notification(decoded_notification, conn, core.notification_retry_duration, err),
-                                        log,
-                                        "Apple notification handling failed")
+    # A raised exception here must NOT be swallowed into a 200: Apple treats a 2xx as "delivered" and will
+    # neither retry the notification nor surface it to the onlyFailures catch-up, so a swallow = a silent
+    # drop. Log it and abort 500 so Apple retries. (Handled/expected problems come back via `err` and 500 in
+    # the err.has() block below; only an actual raise reaches here.)
+    try:
+        with server.get_db(flask.current_app) as engine:
+            with db.connection(engine) as conn:
+                handle_notification(decoded_notification, conn, core.notification_retry_duration, err)
+    except Exception:
+        log.error(f"Apple notification handling failed. Error was: {traceback.format_exc()}")
+        flask.abort(500)
 
     # NOTE: Handle errors
     if err.has():
