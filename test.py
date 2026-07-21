@@ -354,7 +354,7 @@ def test_google_process_notification_message(monkeypatch, pg_database):
 
     def is_handled(conn, message_id):
         # Read-only lookup: wrap conn in a bare SQLTransaction (no BEGIN needed on the autocommit pool).
-        return backend.google_notification_message_id_is_in_db_tx(db.SQLTransaction(conn=conn), message_id).handled
+        return backend.google_notification_message_id_is_in_db(db.SQLTransaction(conn=conn), message_id).handled
 
     with TestingContext(pg_database) as ctx:
         # (A) message not in the DB -> handled=True (skip; someone may have deleted it out-of-band).
@@ -364,7 +364,7 @@ def test_google_process_notification_message(monkeypatch, pg_database):
         # (B) message present + already handled -> handled=True (no reprocessing).
         with ctx.connection() as conn:
             with db.transaction(conn) as tx:
-                backend.google_add_notification_id_tx(tx, 'm-handled', expiry, '')
+                backend.google_add_notification_id(tx, 'm-handled', expiry, '')
                 _ = backend.google_set_notification_handled(tx=tx, message_id='m-handled', delete=False)
             assert platform_google._process_notification_message(conn, make_msg('m-handled', 'tok-b'), base.ErrorSink(), now_s) is True
 
@@ -373,7 +373,7 @@ def test_google_process_notification_message(monkeypatch, pg_database):
         monkeypatch.setattr('platform_google.handle_parsed_notification', lambda tx, parse, err: True)
         with ctx.connection() as conn:
             with db.transaction(conn) as tx:
-                backend.google_add_notification_id_tx(tx, 'm-ok', expiry, '')
+                backend.google_add_notification_id(tx, 'm-ok', expiry, '')
             seed_user_error(conn, 'tok-c')
             assert platform_google._process_notification_message(conn, make_msg('m-ok', 'tok-c'), base.ErrorSink(), now_s) is True
             assert is_handled(conn, 'm-ok') is True
@@ -385,7 +385,7 @@ def test_google_process_notification_message(monkeypatch, pg_database):
         monkeypatch.setattr('platform_google.handle_parsed_notification', lambda tx, parse, err: False)
         with ctx.connection() as conn:
             with db.transaction(conn) as tx:
-                backend.google_add_notification_id_tx(tx, 'm-fail', expiry, '')
+                backend.google_add_notification_id(tx, 'm-fail', expiry, '')
             seed_user_error(conn, 'tok-d')
             assert platform_google._process_notification_message(conn, make_msg('m-fail', 'tok-d'), base.ErrorSink(), now_s) is False
             assert is_handled(conn, 'm-fail') is False
@@ -400,7 +400,7 @@ def test_google_process_notification_message(monkeypatch, pg_database):
         monkeypatch.setattr('platform_google.handle_parsed_notification', lambda tx, parse, err: False)  # self-contained (not relying on (D))
         with ctx.connection() as conn:
             with db.transaction(conn) as tx:
-                backend.google_add_notification_id_tx(tx, 'm-crash', expiry, '')
+                backend.google_add_notification_id(tx, 'm-crash', expiry, '')
             with pytest.raises(TypeError):
                 platform_google._process_notification_message(conn, make_msg('m-crash', 'tok-e'), base.ErrorSink(), now_s)
 
@@ -978,7 +978,7 @@ def test_revocation_cutting_refund_rolls_generation(monkeypatch, pg_database):
         # Refund the long payment. The survivor leaves entitlement well inside the proof-reach window, so
         # an outstanding proof would now over-certify: the generation must roll.
         with db.transaction(db_conn) as tx:
-            revoked = backend.add_google_revocation_tx(tx=tx, google_payment_token=long_token, revoke_at=now, err=err)
+            revoked = backend.add_google_revocation(tx=tx, google_payment_token=long_token, revoke_at=now, err=err)
             assert revoked
             assert not err.has()
 
@@ -1371,7 +1371,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
 
             # We will now manually revoke the shorter payment and check the revocation list again
             with db.transaction(db_conn) as tx:
-                revoked = backend.add_google_revocation_tx(tx                   = tx,
+                revoked = backend.add_google_revocation(tx                   = tx,
                                                            google_payment_token = new_add_pro_payment_tx.google_payment_token,
                                                            revoke_at    = base.datetime_from_unix_ms(unix_ts_ms),
                                                            err                  = err)
@@ -1672,7 +1672,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
         if 1: # Revoke the original payment from the user (so we have ended up revoking everything)
             with db.transaction(db_conn) as tx:
                 gen_before_final_revoke = backend.get_user_and_payments(tx, master_key.verify_key).user.current_generation_id
-                revoked = backend.add_google_revocation_tx(tx                   = tx,
+                revoked = backend.add_google_revocation(tx                   = tx,
                                                            google_payment_token = payment_tx.google_payment_token,
                                                            revoke_at    = base.datetime_from_unix_ms(start_unix_ts_ms),
                                                            err                  = err)

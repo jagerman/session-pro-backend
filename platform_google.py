@@ -192,7 +192,7 @@ def _process_notification_message(conn: psycopg.Connection, msg: SortedMessage, 
         # NOTE: By definition to be in the sorted list, the message must have also been submitted into the
         # DB. So if for some reason the notification doesn't exist anymore (maybe someone deleted it
         # out-of-band, e.g. via the SET_GOOGLE_NOTIFICATION command) then we skip the notification.
-        lookup                 = backend.google_notification_message_id_is_in_db_tx(tx, msg.message_id)
+        lookup                 = backend.google_notification_message_id_is_in_db(tx, msg.message_id)
         user_is_in_error_state = backend.has_user_error(conn=tx.conn, payment_provider=base.PaymentProvider.GooglePlayStore, payment_id=msg.parse.purchase_token)
         if not lookup.present or lookup.present and lookup.handled:
             handled = True
@@ -312,7 +312,7 @@ def thread_entry_point(context: ThreadContext, app_credentials_path: str, cloud_
                                 with db.open_database(base.DB_URL) as engine:
                                     with db.connection(engine) as conn:
                                         with db.transaction(conn) as tx:
-                                            if not backend.google_notification_message_id_is_in_db_tx(tx, message_id).present:
+                                            if not backend.google_notification_message_id_is_in_db(tx, message_id).present:
                                                 # NOTE: Our message retention policy for this subscription is 7 days
                                                 # (default). We add a little buffer as we don't know exactly which
                                                 # timestamp Google uses.
@@ -322,7 +322,7 @@ def thread_entry_point(context: ThreadContext, app_credentials_path: str, cloud_
                                                 # erroneous case there's highly likelihood we need human
                                                 # intervention and having human-readability there will be
                                                 # important.
-                                                backend.google_add_notification_id_tx(tx                = tx,
+                                                backend.google_add_notification_id(tx                = tx,
                                                                                       message_id        = message_id,
                                                                                       expires_at = base.datetime_from_unix_ms(parse.event_time_ms + base.MILLISECONDS_IN_DAY * 8),
                                                                                       payload           = google.pubsub_v1.types.ReceivedMessage.to_json(it))
@@ -476,7 +476,7 @@ def handle_subscription_notification(tx_payment: base.PaymentProviderTransaction
                             # NOTE: For google, the only information we have about the previous order
                             # is the purchase token. So we have to go and find the latest payment
                             # valid for a purchase token and void that.
-                            _ = backend.add_google_revocation_tx(tx                   = tx,
+                            _ = backend.add_google_revocation(tx                   = tx,
                                                                  google_payment_token = tx_event.linked_purchase_token,
                                                                  revoke_at    = base.datetime_from_unix_ms(tx_event.event_ts_ms),
                                                                  err                  = err)
@@ -558,7 +558,7 @@ def handle_subscription_notification(tx_payment: base.PaymentProviderTransaction
             if tx_event.subscription_state == SubscriptionsV2State.EXPIRED:
                 payment_label = backend.payment_provider_tx_log_label_safe(tx_payment)
                 log.info(f'{tx_event.notification.name}+{tx_event.subscription_state.name}; (payment={payment_label}, auto_renew=false)')
-                _ = backend.add_google_revocation_tx(tx                   = tx,
+                _ = backend.add_google_revocation(tx                   = tx,
                                                      google_payment_token = tx_payment.google_payment_token,
                                                      revoke_at    = base.datetime_from_unix_ms(tx_event.event_ts_ms),
                                                      err                  = err)
@@ -580,7 +580,7 @@ def handle_subscription_notification(tx_payment: base.PaymentProviderTransaction
                 not issue a revocation. If a payment is ever in a state where it should self-expire but isn't, we need to revoke it. In
                 this case something has gone wrong and the user was over-entitled.
                 """
-                payment: backend.PaymentRow | None = backend.get_payment_tx(tx=tx, payment_tx=tx_payment, err=err)
+                payment: backend.PaymentRow | None = backend.get_payment(tx=tx, payment_tx=tx_payment, err=err)
                 if payment is None or err.has():
                     err.msg_list.append(f"Failed to get payment details for potential revocation!")
 
@@ -593,7 +593,7 @@ def handle_subscription_notification(tx_payment: base.PaymentProviderTransaction
                     # expiry timestamp rounded to the end of the UTC day. So we only actually want to revoke
                     # proofs that aren't going to self-expire by the end of the day.
                     if rounded_expiry_at > rounded_event_at:
-                        _ = backend.add_google_revocation_tx(tx                   = tx,
+                        _ = backend.add_google_revocation(tx                   = tx,
                                                              google_payment_token = tx_payment.google_payment_token,
                                                              revoke_at    = base.datetime_from_unix_ms(tx_event.event_ts_ms),
                                                              err                  = err)

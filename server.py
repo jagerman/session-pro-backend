@@ -769,7 +769,7 @@ def get_pro_details():
     with get_db(flask.current_app) as engine:
         with db.connection(engine) as conn:
             with db.transaction(conn) as tx:
-                error_report                         = int(backend.has_user_error_from_master_pkey_tx(tx, master_pkey_nacl))
+                error_report                         = int(backend.has_user_error_from_master_pkey(tx, master_pkey_nacl))
                 get_user: backend.GetUserAndPayments = backend.get_user_and_payments(tx=tx, master_pkey=master_pkey_nacl)
                 auto_renewing                        = get_user.user.auto_renewing
                 payments_total                       = get_user.payments_count

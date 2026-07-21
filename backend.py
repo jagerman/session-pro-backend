@@ -151,7 +151,7 @@ class LookupUserExpiry:
     best_auto_renewing:             bool                      = False
 
 class RedeemPaymentStatus(enum.Enum):
-    # redeem_payment_tx now returns Success or raises (FailError(unknown_payment)/revoked/expired), so the
+    # redeem_payment now returns Success or raises (FailError(unknown_payment)/revoked/expired), so the
     # old AlreadyRedeemed/UnknownPayment result codes are gone — a re-redeem is idempotent success and a
     # missing payment is a raised fail. (Error remains only as the pre-success init sentinel.)
     Nil             = 0
@@ -642,11 +642,12 @@ def verify_db(conn: psycopg.Connection, err: base.ErrorSink) -> bool:
     result = len(err.msg_list) == 0
     return result
 
-def _update_user_expiry_grace_and_renew_flag_from_payment_list_tx(tx: db.SQLTransaction, master_pkey: nacl.signing.VerifyKey):
+@db.transactional
+def _update_user_expiry_grace_and_renew_flag_from_payment_list(tx: db.SQLTransaction, master_pkey: nacl.signing.VerifyKey):
     """Update fields for the user that depend on their list of payments, like
     their latest known expiry time"""
     master_pkey_bytes: bytes                    = bytes(master_pkey)
-    lookup:            LookupUserExpiry = _lookup_user_expiry_tx(tx, nacl.signing.VerifyKey(master_pkey_bytes))
+    lookup:            LookupUserExpiry = _lookup_user_expiry(tx, nacl.signing.VerifyKey(master_pkey_bytes))
     # NOTE: We have the latest expiry value, now update the user
     _ = db.query(tx.conn, '''
         UPDATE users
@@ -658,7 +659,8 @@ def _update_user_expiry_grace_and_renew_flag_from_payment_list_tx(tx: db.SQLTran
          refund   = lookup.best_refund_requested,
          pkey     = master_pkey_bytes)
 
-def revoke_payments_by_id_internal_tx(tx: db.SQLTransaction, rows: typing.Any, revoke_at: datetime.datetime) -> bool:
+@db.transactional
+def revoke_payments_by_id_internal(tx: db.SQLTransaction, rows: typing.Any, revoke_at: datetime.datetime) -> bool:
     result                                            = False
     master_pkey_dict: dict[bytes, datetime.datetime]  = {}
     for row in  rows:
@@ -697,7 +699,7 @@ def revoke_payments_by_id_internal_tx(tx: db.SQLTransaction, rows: typing.Any, r
         # expiry time so that the backend knows the new time-frame in which the user is allowed to
         # generate a Session Pro proof (now that one or more of their payments get revoked)
         master_pkey = nacl.signing.VerifyKey(it)
-        _update_user_expiry_grace_and_renew_flag_from_payment_list_tx(tx, master_pkey)
+        _update_user_expiry_grace_and_renew_flag_from_payment_list(tx, master_pkey)
 
         # NOTE: expires_at in the db is not rounded, but the proof's themselves have an
         # expiry timestamp rounded to the end of the UTC day. So we only actually want to revoke
@@ -715,15 +717,16 @@ def revoke_payments_by_id_internal_tx(tx: db.SQLTransaction, rows: typing.Any, r
         # survives the refund (aggregate expiry at or beyond the furthest a live proof can reach) every
         # outstanding proof stays honest, so we skip the revocation entirely. The revocation list is
         # fetched by every client, so keeping it minimal is the point.
-        post_refund_expiry = _lookup_user_expiry_tx(tx, master_pkey).best_expiry
+        post_refund_expiry = _lookup_user_expiry(tx, master_pkey).best_expiry
         if post_refund_expiry is not None and post_refund_expiry >= max_outstanding_proof_expiry:
             continue
 
-        _ = revoke_master_pkey_proofs_and_allocate_new_gen_id_tx(tx, master_pkey, created_at=revoke_at)
+        _ = revoke_master_pkey_proofs_and_allocate_new_gen_id(tx, master_pkey, created_at=revoke_at)
 
     return result
 
-def add_apple_revocation_tx(tx: db.SQLTransaction, apple_original_tx_id: str, revoke_at: datetime.datetime, err: base.ErrorSink) -> bool:
+@db.transactional
+def add_apple_revocation(tx: db.SQLTransaction, apple_original_tx_id: str, revoke_at: datetime.datetime, err: base.ErrorSink) -> bool:
     """Revoke all the payments that aren't revoked that share the same original TX ID. Returns true
     if there were any rows that had the ID"""
     # TODO: Can be cleaned up more, a lot of repeated code between apple and google here, but it
@@ -752,13 +755,14 @@ def add_apple_revocation_tx(tx: db.SQLTransaction, apple_original_tx_id: str, re
 
     log.info(f'Revoking Apple payment (orig. TX ID={base.maybe_obfuscate(apple_original_tx_id)}, revoke={base.readable(revoke_at)})')
     rows         = rows_result.fetchall()
-    result: bool = revoke_payments_by_id_internal_tx(tx, rows, revoke_at)
+    result: bool = revoke_payments_by_id_internal(tx, rows, revoke_at)
     if not result:
         err.msg_list.append(f'Failed to revoke Apple orig. TX ID {base.maybe_obfuscate(apple_original_tx_id)} at {base.readable(revoke_at)}, no matching payments were found')
 
     return result
 
-def add_google_revocation_tx(tx: db.SQLTransaction, google_payment_token: str, revoke_at: datetime.datetime, err: base.ErrorSink) -> bool:
+@db.transactional
+def add_google_revocation(tx: db.SQLTransaction, google_payment_token: str, revoke_at: datetime.datetime, err: base.ErrorSink) -> bool:
     """Revoke all the payments that aren't revoked that share the same original TX ID. Returns true
     if there were any rows that had the ID"""
 
@@ -780,13 +784,14 @@ def add_google_revocation_tx(tx: db.SQLTransaction, google_payment_token: str, r
 
     log.info(f'Revoking Google payment (token={base.maybe_obfuscate(google_payment_token)}, revoke={base.readable(revoke_at)})')
     rows         = rows_result.fetchall()
-    result: bool = revoke_payments_by_id_internal_tx(tx, rows, revoke_at)
+    result: bool = revoke_payments_by_id_internal(tx, rows, revoke_at)
     if not result:
         err.msg_list.append(f'Failed to revoke Google payment {base.maybe_obfuscate(google_payment_token)} at {base.readable(revoke_at)}, no matching payments were found')
 
     return result
 
-def redeem_payment_tx(tx:                  db.SQLTransaction,
+@db.transactional
+def redeem_payment(tx:                  db.SQLTransaction,
                       master_pkey:         nacl.signing.VerifyKey,
                       rotating_pkey:       nacl.signing.VerifyKey | None,
                       signing_key:         nacl.signing.SigningKey | None,
@@ -947,7 +952,7 @@ def redeem_payment_tx(tx:                  db.SQLTransaction,
             log.info(f'Payment already redeemed for this user (idempotent): {user_payment_tx_to_safe_string(payment_tx)}')
             if rotating_pkey:
                 assert signing_key, "Rotating public key and signing key have to be given in tandem"
-                result.proof = build_current_entitlement_proof_tx(tx, master_pkey, rotating_pkey, request_at, signing_key)
+                result.proof = build_current_entitlement_proof(tx, master_pkey, rotating_pkey, request_at, signing_key)
         else:
             raise base.FailError(f'Payment was not redeemed, no payments were found matching the request tx: {user_payment_tx_to_safe_string(payment_tx)}',
                                  code=base.ErrorCode.unknown_payment)
@@ -974,7 +979,8 @@ def verify_payment_provider_tx(payment_tx: base.PaymentProviderTransaction, err:
         case base.PaymentProvider.Nil:
             err.msg_list.append(f'Payment provider was set invalidly to nil')
 
-def _lookup_user_expiry_tx(tx: db.SQLTransaction, master_pkey: nacl.signing.VerifyKey) -> LookupUserExpiry:
+@db.transactional
+def _lookup_user_expiry(tx: db.SQLTransaction, master_pkey: nacl.signing.VerifyKey) -> LookupUserExpiry:
     # NOTE: We grab the expired ones as well because if they have grace that payment's deadline
     # is later than the expiry period which may actually be the latest known expiry period
     #
@@ -1180,7 +1186,7 @@ def update_payment_renewal_info(tx:                       db.SQLTransaction,
     # NOTE: Update the user's expiry to the latest known expiry
     if row and row[0]:
         master_pkey_bytes: bytes = bytes(row[0])
-        _update_user_expiry_grace_and_renew_flag_from_payment_list_tx(tx, nacl.signing.VerifyKey(master_pkey_bytes))
+        _update_user_expiry_grace_and_renew_flag_from_payment_list(tx, nacl.signing.VerifyKey(master_pkey_bytes))
 
     if not result:
         payment_id = ''
@@ -1194,7 +1200,8 @@ def update_payment_renewal_info(tx:                       db.SQLTransaction,
     return result
 
 
-def _insert_payment_row_tx(tx: db.SQLTransaction, payment: dict[str, typing.Any], detail_table: str, detail: dict[str, typing.Any]) -> None:
+@db.transactional
+def _insert_payment_row(tx: db.SQLTransaction, payment: dict[str, typing.Any], detail_table: str, detail: dict[str, typing.Any]) -> None:
     """INSERT a payment: the provider-agnostic `payment` columns into `payments` (RETURNING the new id),
     then the provider-specific `detail` columns into `detail_table`, keyed by that id.
 
@@ -1240,7 +1247,7 @@ def add_unredeemed_payment(tx:                                db.SQLTransaction,
 
         record = result_set.fetchone()
         if not record:
-            _insert_payment_row_tx(tx,
+            _insert_payment_row(tx,
                 payment = {
                     'plan':                       plan.value,
                     'payment_provider':           payment_tx.provider.value,
@@ -1273,7 +1280,7 @@ def add_unredeemed_payment(tx:                                db.SQLTransaction,
 
         record = result_set.fetchone()
         if not record:
-            _insert_payment_row_tx(tx,
+            _insert_payment_row(tx,
                 payment = {
                     'plan':                       plan.value,
                     'payment_provider':           payment_tx.provider.value,
@@ -1298,7 +1305,7 @@ def add_unredeemed_payment(tx:                                db.SQLTransaction,
 
         record = result_set.fetchone()
         if not record:
-            _insert_payment_row_tx(tx,
+            _insert_payment_row(tx,
                 payment = {
                     'plan':                       plan.value,
                     'payment_provider':           payment_tx.provider.value,
@@ -1404,7 +1411,7 @@ def add_unredeemed_payment(tx:                                db.SQLTransaction,
                     # transaction; we log it for internal visibility.
                     try:
                         with tx.conn.transaction():
-                            _ = redeem_payment_tx(tx            = tx,
+                            _ = redeem_payment(tx            = tx,
                                                   master_pkey   = master_pkey,
                                                   rotating_pkey = None,
                                                   signing_key   = None,
@@ -1480,7 +1487,7 @@ def _allocate_new_gen_id_if_master_pkey_has_payments(tx:          db.SQLTransact
     # so it rolls onto a fresh generation. The user row must already exist (redeem creates it via
     # get_or_create_user_and_generation; revoke's user exists).
     result: AllocatedGenID = AllocatedGenID()
-    lookup: LookupUserExpiry = _lookup_user_expiry_tx(tx, master_pkey)
+    lookup: LookupUserExpiry = _lookup_user_expiry(tx, master_pkey)
     result.expires_at = lookup.expiry_from_redeemed
     if lookup.expiry_from_redeemed is None:
         return result  # no usable payment → nothing to allocate
@@ -1608,7 +1615,7 @@ def add_pro_payment(tx:                  db.SQLTransaction,
             "The passed in creation (and or activated) timestamp must lie on a day boundary: {}".format(base.readable(redeemed_at))
 
     # Redeem the payment (raises FailError(unknown_payment)/revoked/expired on failure).
-    result: RedeemPayment = redeem_payment_tx(tx            = tx,
+    result: RedeemPayment = redeem_payment(tx            = tx,
                                               master_pkey   = master_pkey,
                                               rotating_pkey = rotating_pkey,
                                               signing_key   = signing_key,
@@ -1684,7 +1691,8 @@ def verify_and_add_pro_payment(conn:                psycopg.Connection,
                            rotating_pkey,
                            payment_tx)
 
-def revoke_master_pkey_proofs_and_allocate_new_gen_id_tx(tx: db.SQLTransaction, master_pkey: nacl.signing.VerifyKey, created_at: datetime.datetime) -> AllocatedGenID:
+@db.transactional
+def revoke_master_pkey_proofs_and_allocate_new_gen_id(tx: db.SQLTransaction, master_pkey: nacl.signing.VerifyKey, created_at: datetime.datetime) -> AllocatedGenID:
     # Revoke the user's current generation (terminal): sets revoked_at, which blocks every proof issued
     # under that generation and (via the trigger) bumps the revocation ticket. The `revoked_at IS NULL`
     # guard makes a double-revoke a no-op rather than tripping the terminal-immutability trigger.
@@ -1711,7 +1719,8 @@ def round_datetime_to_next_day_with_platform_testing_support(payment_provider: b
         return base.EPOCH + units * google_day
     return base.round_datetime_to_next_day(at)
 
-def build_current_entitlement_proof_tx(tx:            db.SQLTransaction,
+@db.transactional
+def build_current_entitlement_proof(tx:            db.SQLTransaction,
                                        master_pkey:   nacl.signing.VerifyKey,
                                        rotating_pkey: nacl.signing.VerifyKey,
                                        request_at:    datetime.datetime,
@@ -1760,7 +1769,7 @@ def generate_pro_proof(conn: psycopg.Connection,
                                                                rotating_sig  = rotating_sig)
 
     with db.transaction(conn) as tx:
-        return build_current_entitlement_proof_tx(tx, master_pkey, rotating_pkey, request_at, signing_key)
+        return build_current_entitlement_proof(tx, master_pkey, rotating_pkey, request_at, signing_key)
 
 def expire_payments_revocations_and_users(conn: psycopg.Connection, now: datetime.datetime) -> ExpireResult:
     # Pure idempotent housekeeping: prune rows whose expiry has passed (and orphaned users). Nothing
@@ -1807,7 +1816,8 @@ def add_user_error(conn: psycopg.Connection, error: UserError, at: datetime.date
     with db.transaction(conn) as tx:
         add_user_error_tx(tx, error, at)
 
-def has_user_error_from_master_pkey_tx(tx: db.SQLTransaction, master_pkey: nacl.signing.VerifyKey) -> bool:
+@db.transactional
+def has_user_error_from_master_pkey(tx: db.SQLTransaction, master_pkey: nacl.signing.VerifyKey) -> bool:
     # NOTE: Rangeproof payments cannot have user errors
     return bool(db.query_scalar(tx.conn, (f'''
 SELECT EXISTS (
@@ -1837,7 +1847,8 @@ def delete_user_errors(conn: psycopg.Connection, payment_provider: base.PaymentP
     row = db.query(conn, 'DELETE FROM user_errors WHERE payment_provider = %s AND payment_id = %s', payment_provider.value, payment_id)
     return row.rowcount > 0
 
-def get_payment_tx(tx:          db.SQLTransaction,
+@db.transactional
+def get_payment(tx:          db.SQLTransaction,
                    payment_tx:  base.PaymentProviderTransaction,
                    err:         base.ErrorSink) -> PaymentRow | None:
     result = None
@@ -1933,11 +1944,12 @@ def set_refund_requested(tx: db.SQLTransaction, payment_tx: UserPaymentTransacti
 
         if row:
             master_pkey = nacl.signing.VerifyKey(bytes(row[0]))
-            _update_user_expiry_grace_and_renew_flag_from_payment_list_tx(tx, master_pkey)
+            _update_user_expiry_grace_and_renew_flag_from_payment_list(tx, master_pkey)
 
     return success
 
-def apple_add_notification_uuid_tx(tx: db.SQLTransaction, uuid: str, expires_at: datetime.datetime):
+@db.transactional
+def apple_add_notification_uuid(tx: db.SQLTransaction, uuid: str, expires_at: datetime.datetime):
     # uuid is the PRIMARY KEY; DO NOTHING keeps this idempotent (and crash-free) if the caller's
     # prior existence check raced with a concurrent insert of the same notification.
     _ = db.query(tx.conn, ('''
@@ -1946,7 +1958,8 @@ def apple_add_notification_uuid_tx(tx: db.SQLTransaction, uuid: str, expires_at:
         ON CONFLICT (uuid) DO NOTHING
     '''), uuid, expires_at)
 
-def apple_notification_uuid_is_in_db_tx(tx: db.SQLTransaction, uuid: str) -> bool:
+@db.transactional
+def apple_notification_uuid_is_in_db(tx: db.SQLTransaction, uuid: str) -> bool:
     row = db.query_one(tx.conn, ('''
         SELECT 1
         FROM   apple_notification_uuid_history
@@ -1958,7 +1971,8 @@ def apple_notification_uuid_is_in_db_tx(tx: db.SQLTransaction, uuid: str) -> boo
 def apple_set_notification_checkpoint_at(tx: db.SQLTransaction, checkpoint_at: datetime.datetime):
     set_global_datetime(tx.conn, 'apple_notification_checkpoint_at', checkpoint_at)
 
-def google_add_notification_id_tx(tx: db.SQLTransaction, message_id: str, expires_at: datetime.datetime, payload: str):
+@db.transactional
+def google_add_notification_id(tx: db.SQLTransaction, message_id: str, expires_at: datetime.datetime, payload: str):
     maybe_payload: str | None = None
     if len(payload):
         maybe_payload = payload
@@ -1982,7 +1996,8 @@ def google_get_unhandled_notification_iterator(tx: db.SQLTransaction) -> collect
     result_set = db.query(tx.conn, ('SELECT message_id, payload, expires_at FROM google_notification_history WHERE NOT handled'))
     return typing.cast(collections.abc.Iterator[GoogleUnhandledNotificationIterator], result_set)
 
-def google_notification_message_id_is_in_db_tx(tx: db.SQLTransaction, message_id: str) -> GoogleNotificationMessageIDInDB:
+@db.transactional
+def google_notification_message_id_is_in_db(tx: db.SQLTransaction, message_id: str) -> GoogleNotificationMessageIDInDB:
     row    = typing.cast(tuple[int] | None, db.query_one(tx.conn, '''SELECT handled FROM google_notification_history WHERE message_id = %s''', message_id))
     result = GoogleNotificationMessageIDInDB()
     if row is not None:

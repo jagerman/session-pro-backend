@@ -43,7 +43,7 @@ SECONDS_IN_YEAR:       int     = SECONDS_IN_DAY * 365
 # assuming it is. All platforms are designed to interact with the backend using onion requests.
 #
 # It is a protocol constant, not merely a server-side check: the backend's revocation-skip math
-# (revoke_payments_by_id_internal_tx) depends on the same skew bound, so both must read this one value.
+# (revoke_payments_by_id_internal) depends on the same skew bound, so both must read this one value.
 DEFAULT_TIMESTAMP_TOLERANCE: datetime.timedelta = datetime.timedelta(seconds=70)
 
 # Every instant in this codebase is a tz-aware UTC `datetime` and every duration a `timedelta`. Integer

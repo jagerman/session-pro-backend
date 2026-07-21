@@ -144,7 +144,7 @@ def handle_notification_tx(decoded_notification: DecodedNotification, sql_tx: db
         return False
 
     assert decoded_notification.body.notificationUUID
-    if backend.apple_notification_uuid_is_in_db_tx(sql_tx, decoded_notification.body.notificationUUID):
+    if backend.apple_notification_uuid_is_in_db(sql_tx, decoded_notification.body.notificationUUID):
         return True
 
     # NOTE: Exhaustively handle all the notification types defined by Apple:
@@ -437,7 +437,7 @@ def handle_notification_tx(decoded_notification: DecodedNotification, sql_tx: db
                             log.debug(f'{decoded_notification.body.notificationType.name}+UPGRADE for {payment_tx_id_label(payment_tx)}: Revoke (orig. TX ID) date = {revoke}, new payment (expiry/unredeemed/refund expiry) ts = {expiry}/{unredeemed}/{refund}, grace period = {base.DEFAULT_APPLE_GRACE_PERIOD}, auto-renewing = {auto_renewing}')
 
                         sql_tx.cancel = True
-                        revoked: bool = backend.add_apple_revocation_tx(tx                   = sql_tx,
+                        revoked: bool = backend.add_apple_revocation(tx                   = sql_tx,
                                                                         apple_original_tx_id = tx.originalTransactionId,
                                                                         revoke_at    = revoke_at,
                                                                         err                  = err)
@@ -578,7 +578,7 @@ def handle_notification_tx(decoded_notification: DecodedNotification, sql_tx: db
                         refund        = base.readable(platform_refund_expires_at)
                         log.debug(f'{decoded_notification.body.notificationType.name}+UPGRADE for {payment_tx_id_label(payment_tx)}: Revoking (orig TX id) at = {revoke}, new payment (expiry/unredeemed/refund ts) = {expiry}/{unredeemed}/{refund}, grace = {base.DEFAULT_APPLE_GRACE_PERIOD}, auto-renewing = {auto_renewing}')
 
-                    revoked = backend.add_apple_revocation_tx(tx                   = sql_tx,
+                    revoked = backend.add_apple_revocation(tx                   = sql_tx,
                                                               apple_original_tx_id = tx.originalTransactionId,
                                                               revoke_at    = revoke_at,
                                                               err                  = err)
@@ -649,7 +649,7 @@ def handle_notification_tx(decoded_notification: DecodedNotification, sql_tx: db
             payment_tx = payment_tx_from_apple_jws_transaction(tx, err)
             if not err.has():
                 log.debug(f'{decoded_notification.body.notificationType.name} for {payment_tx_id_label(payment_tx)}: Revoke (orig. TX ID) date = {base.readable(base.datetime_from_unix_ms(tx.revocationDate))}')
-                sql_tx.cancel = not backend.add_apple_revocation_tx(tx                   = sql_tx,
+                sql_tx.cancel = not backend.add_apple_revocation(tx                   = sql_tx,
                                                                     apple_original_tx_id = tx.originalTransactionId,
                                                                     revoke_at    = base.datetime_from_unix_ms(tx.revocationDate),
                                                                     err                  = err)
@@ -909,7 +909,7 @@ def handle_notification_tx(decoded_notification: DecodedNotification, sql_tx: db
     if result:
         assert decoded_notification.body.signedDate
         expires_at: datetime.datetime  = base.datetime_from_unix_ms(decoded_notification.body.signedDate) + notification_retry_duration
-        backend.apple_add_notification_uuid_tx(tx                = sql_tx,
+        backend.apple_add_notification_uuid(tx                = sql_tx,
                                                uuid              = decoded_notification.body.notificationUUID,
                                                expires_at = expires_at)
     return result

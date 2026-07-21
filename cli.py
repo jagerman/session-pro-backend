@@ -615,7 +615,7 @@ def cmd_revoke(args: argparse.Namespace, dry_run: bool) -> int:
         with db.open_database(config.db_url) as engine:
             with db.connection(engine) as conn:
                 with db.transaction(conn) as tx:
-                    backend.revoke_master_pkey_proofs_and_allocate_new_gen_id_tx(tx, master_pkey, created_at=revoke_at)
+                    backend.revoke_master_pkey_proofs_and_allocate_new_gen_id(tx, master_pkey, created_at=revoke_at)
                 print(f"Revoked current generation for {args.master_pkey} at {base.readable(revoke_at)}")
                 return 0
 
