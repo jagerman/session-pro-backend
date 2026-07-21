@@ -4227,7 +4227,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
                            pro_status:                        server.UserProStatus,
                            payment_status:                    base.PaymentStatus,
                            auto_renew:                        bool,
-                           grace_duration_ms:                 int,
+                           grace_duration:                    datetime.timedelta,
                            redeemed_ts_ms_rounded:            int,
                            platform_refund_expires_at: int,
                            user_ctx:                          TestUserCtx,
@@ -4273,7 +4273,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
         assert item_expiry_ts                 == to_s(tx.expires_at), res_items
         # Google `payment_id` is the opaque `token|order_id` composite (§3.5).
         assert item_payment_id                == f'{tx.purchase_token}|{tx.order_id}'
-        assert item_grace_duration            == base.seconds_from_timedelta(grace_duration_ms)
+        assert item_grace_duration            == base.seconds_from_timedelta(grace_duration)
         assert item_payment_provider          == base.PaymentProvider.GooglePlayStore
         assert item_platform_refund_expiry_ts == to_s(platform_refund_expires_at)
         assert item_redeemed_ts               == to_s(redeemed_ts_ms_rounded)
@@ -4300,7 +4300,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
         user_ctx.payments += 1
         assert_has_payment(tx=tx, plan=plan, redeemed_ts_ms_rounded=redeemed_ts_ms_rounded, platform_refund_expires_at=platform_refund_expiry_unix_tx_ms, user_ctx=user_ctx, ctx=ctx)
         assert_has_user(tx=tx, user_ctx=user_ctx, ctx=ctx)
-        assert_pro_details(tx=tx, pro_status=server.UserProStatus.Active, payment_status=base.PaymentStatus.Redeemed, auto_renew=True, grace_duration_ms=base.DEFAULT_GOOGLE_GRACE_PERIOD, redeemed_ts_ms_rounded=redeemed_ts_ms_rounded, platform_refund_expires_at=platform_refund_expiry_unix_tx_ms, user_ctx=user_ctx, ctx=ctx)
+        assert_pro_details(tx=tx, pro_status=server.UserProStatus.Active, payment_status=base.PaymentStatus.Redeemed, auto_renew=True, grace_duration=base.DEFAULT_GOOGLE_GRACE_PERIOD, redeemed_ts_ms_rounded=redeemed_ts_ms_rounded, platform_refund_expires_at=platform_refund_expiry_unix_tx_ms, user_ctx=user_ctx, ctx=ctx)
         return tx, platform_refund_expiry_unix_tx_ms, redeemed_ts_ms_rounded
 
     with TestingContext(pg_database, platform_testing_env=True) as ctx:
@@ -4354,7 +4354,7 @@ current_state={'kind': 'androidpublisher#subscriptionPurchaseV2', 'startTime': '
                            pro_status                        = server.UserProStatus.Active,
                            payment_status                    = base.PaymentStatus.Redeemed,
                            auto_renew                        = False,
-                           grace_duration_ms                 = base.DEFAULT_GOOGLE_GRACE_PERIOD,
+                           grace_duration                 = base.DEFAULT_GOOGLE_GRACE_PERIOD,
                            redeemed_ts_ms_rounded            = redeemed_ts_ms_rounded,
                            platform_refund_expires_at = platform_refund_expiry_unix_tx_ms,
                            user_ctx                          = user_ctx, ctx=ctx)
@@ -4365,7 +4365,7 @@ current_state={'kind': 'androidpublisher#subscriptionPurchaseV2', 'startTime': '
                            pro_status                        = server.UserProStatus.Active,
                            payment_status                    = base.PaymentStatus.Redeemed,
                            auto_renew                        = True,
-                           grace_duration_ms                 = base.DEFAULT_GOOGLE_GRACE_PERIOD,
+                           grace_duration                 = base.DEFAULT_GOOGLE_GRACE_PERIOD,
                            redeemed_ts_ms_rounded            = redeemed_ts_ms_rounded,
                            platform_refund_expires_at = platform_refund_expiry_unix_tx_ms,
                            user_ctx                          = user_ctx, ctx = ctx)
@@ -4376,7 +4376,7 @@ current_state={'kind': 'androidpublisher#subscriptionPurchaseV2', 'startTime': '
                            pro_status                        = server.UserProStatus.Expired,
                            payment_status                    = base.PaymentStatus.Revoked,
                            auto_renew                        = False,
-                           grace_duration_ms                 = base.DEFAULT_GOOGLE_GRACE_PERIOD,
+                           grace_duration                 = base.DEFAULT_GOOGLE_GRACE_PERIOD,
                            redeemed_ts_ms_rounded            = redeemed_ts_ms_rounded,
                            platform_refund_expires_at = platform_refund_expiry_unix_tx_ms,
                            user_ctx                          = user_ctx,
@@ -4446,7 +4446,7 @@ current_state={'kind': 'androidpublisher#subscriptionPurchaseV2', 'startTime': '
                            pro_status                        = server.UserProStatus.Active,
                            payment_status                    = base.PaymentStatus.Redeemed,
                            auto_renew                        = True,
-                           grace_duration_ms                 = base.timedelta_from_ms(test_product_details.grace_period.milliseconds),
+                           grace_duration                 = base.timedelta_from_ms(test_product_details.grace_period.milliseconds),
                            redeemed_ts_ms_rounded            = redeemed_ts_ms_rounded,
                            platform_refund_expires_at = platform_refund_expiry_unix_tx_ms,
                            user_ctx                          = user_ctx, ctx=ctx)
@@ -4459,7 +4459,7 @@ current_state={'kind': 'androidpublisher#subscriptionPurchaseV2', 'startTime': '
                            pro_status                        = server.UserProStatus.Expired,
                            payment_status                    = base.PaymentStatus.Expired,
                            auto_renew                        = True,
-                           grace_duration_ms                 = base.timedelta_from_ms(test_product_details.grace_period.milliseconds),
+                           grace_duration                 = base.timedelta_from_ms(test_product_details.grace_period.milliseconds),
                            redeemed_ts_ms_rounded            = redeemed_ts_ms_rounded,
                            platform_refund_expires_at = platform_refund_expiry_unix_tx_ms,
                            user_ctx                          = user_ctx,
@@ -4479,7 +4479,7 @@ current_state={'kind': 'androidpublisher#subscriptionPurchaseV2', 'startTime': '
                            pro_status                        = server.UserProStatus.Active,
                            payment_status                    = base.PaymentStatus.Redeemed,
                            auto_renew                        = False,
-                           grace_duration_ms                 = base.DEFAULT_GOOGLE_GRACE_PERIOD,
+                           grace_duration                 = base.DEFAULT_GOOGLE_GRACE_PERIOD,
                            redeemed_ts_ms_rounded            = base.unix_ms_from_datetime(backend.to_redeemed_at(base.datetime_from_unix_ms(tx_renew.event_ms))),
                            platform_refund_expires_at = platform_refund_expiry_unix_tx_ms,
                            user_ctx                          = user_ctx,
@@ -4493,7 +4493,7 @@ current_state={'kind': 'androidpublisher#subscriptionPurchaseV2', 'startTime': '
                            pro_status                        = server.UserProStatus.Active,
                            payment_status                    = base.PaymentStatus.Redeemed,
                            auto_renew                        = False,
-                           grace_duration_ms                 = base.DEFAULT_GOOGLE_GRACE_PERIOD,
+                           grace_duration                 = base.DEFAULT_GOOGLE_GRACE_PERIOD,
                            redeemed_ts_ms_rounded            = base.unix_ms_from_datetime(backend.to_redeemed_at(base.datetime_from_unix_ms(tx_renew.event_ms))),
                            platform_refund_expires_at = platform_refund_expiry_unix_tx_ms,
                            user_ctx                          = user_ctx,
@@ -4505,7 +4505,7 @@ current_state={'kind': 'androidpublisher#subscriptionPurchaseV2', 'startTime': '
                            pro_status                        = server.UserProStatus.Expired,
                            payment_status                    = base.PaymentStatus.Expired,
                            auto_renew                        = False,
-                           grace_duration_ms                 = base.DEFAULT_GOOGLE_GRACE_PERIOD,
+                           grace_duration                 = base.DEFAULT_GOOGLE_GRACE_PERIOD,
                            redeemed_ts_ms_rounded            = base.unix_ms_from_datetime(backend.to_redeemed_at(base.datetime_from_unix_ms(tx_renew.event_ms))),
                            platform_refund_expires_at = platform_refund_expiry_unix_tx_ms,
                            user_ctx                          = user_ctx,
@@ -4627,7 +4627,7 @@ current_state={'kind': 'androidpublisher#subscriptionPurchaseV2', 'startTime': '
                            pro_status                        = server.UserProStatus.Active,
                            payment_status                    = base.PaymentStatus.Redeemed,
                            auto_renew                        = False,
-                           grace_duration_ms                 = base.DEFAULT_GOOGLE_GRACE_PERIOD,
+                           grace_duration                 = base.DEFAULT_GOOGLE_GRACE_PERIOD,
                            redeemed_ts_ms_rounded            = base.unix_ms_from_datetime(backend.to_redeemed_at(base.datetime_from_unix_ms(tx_renew_2.event_ms))),
                            platform_refund_expires_at = platform_refund_expiry_unix_tx_ms,
                            user_ctx                          = user_ctx,
@@ -4640,7 +4640,7 @@ current_state={'kind': 'androidpublisher#subscriptionPurchaseV2', 'startTime': '
                           pro_status                        = server.UserProStatus.Active,
                           payment_status                    = base.PaymentStatus.Redeemed,
                           auto_renew                        = False,
-                          grace_duration_ms                 = base.DEFAULT_GOOGLE_GRACE_PERIOD,
+                          grace_duration                 = base.DEFAULT_GOOGLE_GRACE_PERIOD,
                           redeemed_ts_ms_rounded            = base.unix_ms_from_datetime(backend.to_redeemed_at(base.datetime_from_unix_ms(tx_renew_2.event_ms))),
                           platform_refund_expires_at = platform_refund_expiry_unix_tx_ms,
                           user_ctx                          = user_ctx,
@@ -4653,7 +4653,7 @@ current_state={'kind': 'androidpublisher#subscriptionPurchaseV2', 'startTime': '
                            pro_status                        = server.UserProStatus.Expired,
                            payment_status                    = base.PaymentStatus.Expired,
                            auto_renew                        = False,
-                           grace_duration_ms                 = base.DEFAULT_GOOGLE_GRACE_PERIOD,
+                           grace_duration                 = base.DEFAULT_GOOGLE_GRACE_PERIOD,
                            redeemed_ts_ms_rounded            = base.unix_ms_from_datetime(backend.to_redeemed_at(base.datetime_from_unix_ms(tx_renew_2.event_ms))),
                            platform_refund_expires_at = platform_refund_expiry_unix_tx_ms,
                            user_ctx                          = user_ctx,
@@ -4672,7 +4672,7 @@ current_state={'kind': 'androidpublisher#subscriptionPurchaseV2', 'startTime': '
                            pro_status                        = server.UserProStatus.Active,
                            payment_status                    = base.PaymentStatus.Redeemed,
                            auto_renew                        = True,
-                           grace_duration_ms                 = base.timedelta_from_ms(test_product_details.grace_period.milliseconds),
+                           grace_duration                 = base.timedelta_from_ms(test_product_details.grace_period.milliseconds),
                            redeemed_ts_ms_rounded            = redeemed_ts_ms_rounded, # TODO: This is not a good design, should not use real-time timestamps
                            platform_refund_expires_at = platform_refund_expiry_unix_tx_ms,
                            user_ctx                          = user_ctx,
@@ -4684,7 +4684,7 @@ current_state={'kind': 'androidpublisher#subscriptionPurchaseV2', 'startTime': '
                            pro_status=server.UserProStatus.Expired,
                            payment_status=base.PaymentStatus.Expired,
                            auto_renew=True,
-                           grace_duration_ms=base.timedelta_from_ms(test_product_details.grace_period.milliseconds),
+                           grace_duration=base.timedelta_from_ms(test_product_details.grace_period.milliseconds),
                            redeemed_ts_ms_rounded=redeemed_ts_ms_rounded,
                            platform_refund_expires_at=platform_refund_expiry_unix_tx_ms,
                            user_ctx=user_ctx,
@@ -4697,7 +4697,7 @@ current_state={'kind': 'androidpublisher#subscriptionPurchaseV2', 'startTime': '
                            pro_status=server.UserProStatus.Expired,
                            payment_status=base.PaymentStatus.Expired,
                            auto_renew=True,
-                           grace_duration_ms=base.timedelta_from_ms(test_product_details.grace_period.milliseconds),
+                           grace_duration=base.timedelta_from_ms(test_product_details.grace_period.milliseconds),
                            redeemed_ts_ms_rounded=redeemed_ts_ms_rounded,
                            platform_refund_expires_at=platform_refund_expiry_unix_tx_ms,
                            user_ctx=user_ctx,
@@ -4711,7 +4711,7 @@ current_state={'kind': 'androidpublisher#subscriptionPurchaseV2', 'startTime': '
                             pro_status=server.UserProStatus.Expired,
                             payment_status=base.PaymentStatus.Expired,
                             auto_renew=False,
-                            grace_duration_ms=base.timedelta_from_ms(test_product_details.grace_period.milliseconds),
+                            grace_duration=base.timedelta_from_ms(test_product_details.grace_period.milliseconds),
                             redeemed_ts_ms_rounded=redeemed_ts_ms_rounded,
                             platform_refund_expires_at=platform_refund_expiry_unix_tx_ms,
                             user_ctx=user_ctx,
@@ -4764,14 +4764,14 @@ current_state={'kind': 'androidpublisher#subscriptionPurchaseV2', 'startTime': '
 
         """2. User fails to renew (enter grace period)"""
         tx_grace = test_notification(grace, ctx)
-        assert_pro_details(tx=tx_subscribe, pro_status=server.UserProStatus.Active, payment_status=base.PaymentStatus.Redeemed, auto_renew=True, grace_duration_ms=base.timedelta_from_ms(test_product_details.grace_period.milliseconds), redeemed_ts_ms_rounded=redeemed_ts_ms_rounded, platform_refund_expires_at=platform_refund_expiry_unix_tx_ms, user_ctx=user_ctx, ctx=ctx)
+        assert_pro_details(tx=tx_subscribe, pro_status=server.UserProStatus.Active, payment_status=base.PaymentStatus.Redeemed, auto_renew=True, grace_duration=base.timedelta_from_ms(test_product_details.grace_period.milliseconds), redeemed_ts_ms_rounded=redeemed_ts_ms_rounded, platform_refund_expires_at=platform_refund_expiry_unix_tx_ms, user_ctx=user_ctx, ctx=ctx)
         backend_expire_payments_at_end_of_day(event_ms=tx_grace.event_ms, assert_success=True)
         # Now that payments up to the expiry time has been expired, this user's status should be expired
         assert_pro_details(tx=tx_subscribe,
                            pro_status=server.UserProStatus.Expired,
                            payment_status=base.PaymentStatus.Expired,
                            auto_renew=True,
-                           grace_duration_ms=base.timedelta_from_ms(test_product_details.grace_period.milliseconds),
+                           grace_duration=base.timedelta_from_ms(test_product_details.grace_period.milliseconds),
                            redeemed_ts_ms_rounded=redeemed_ts_ms_rounded,
                            platform_refund_expires_at=platform_refund_expiry_unix_tx_ms,
                            user_ctx=user_ctx,
@@ -4785,7 +4785,7 @@ current_state={'kind': 'androidpublisher#subscriptionPurchaseV2', 'startTime': '
         pro_status=server.UserProStatus.Expired,
         payment_status=base.PaymentStatus.Expired,
         auto_renew=False,
-        grace_duration_ms=base.timedelta_from_ms(test_product_details.grace_period.milliseconds),
+        grace_duration=base.timedelta_from_ms(test_product_details.grace_period.milliseconds),
         redeemed_ts_ms_rounded=redeemed_ts_ms_rounded,
         platform_refund_expires_at=platform_refund_expiry_unix_tx_ms,
         user_ctx=user_ctx, ctx=ctx,
@@ -4846,7 +4846,7 @@ current_state={'kind': 'androidpublisher#subscriptionPurchaseV2', 'startTime': '
 
         """2. User fails to renew (enter grace period)"""
         tx_grace = test_notification(grace, ctx)
-        assert_pro_details(tx=tx_subscribe, pro_status=server.UserProStatus.Active, payment_status=base.PaymentStatus.Redeemed, auto_renew=True, grace_duration_ms=base.timedelta_from_ms(test_product_details.grace_period.milliseconds), redeemed_ts_ms_rounded=redeemed_ts_ms_rounded, platform_refund_expires_at=platform_refund_expiry_unix_tx_ms, user_ctx=user_ctx, ctx=ctx)
+        assert_pro_details(tx=tx_subscribe, pro_status=server.UserProStatus.Active, payment_status=base.PaymentStatus.Redeemed, auto_renew=True, grace_duration=base.timedelta_from_ms(test_product_details.grace_period.milliseconds), redeemed_ts_ms_rounded=redeemed_ts_ms_rounded, platform_refund_expires_at=platform_refund_expiry_unix_tx_ms, user_ctx=user_ctx, ctx=ctx)
         # Expire payments at the EOD of the resubscribe expiry_ts (not the extend expiry_ts from the grace period tx)
         backend_expire_payments_at_end_of_day(event_ms=tx_grace.event_ms, assert_success=True)
         # Now that payments up to the expiry time has been expired, this user's status should be expired
@@ -4854,7 +4854,7 @@ current_state={'kind': 'androidpublisher#subscriptionPurchaseV2', 'startTime': '
             pro_status=server.UserProStatus.Expired,
             payment_status=base.PaymentStatus.Expired,
             auto_renew=True,
-            grace_duration_ms=base.timedelta_from_ms(test_product_details.grace_period.milliseconds),
+            grace_duration=base.timedelta_from_ms(test_product_details.grace_period.milliseconds),
             redeemed_ts_ms_rounded=redeemed_ts_ms_rounded,
             platform_refund_expires_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
@@ -4867,7 +4867,7 @@ current_state={'kind': 'androidpublisher#subscriptionPurchaseV2', 'startTime': '
             pro_status=server.UserProStatus.Expired,
             payment_status=base.PaymentStatus.Expired,
             auto_renew=True,
-            grace_duration_ms=base.timedelta_from_ms(test_product_details.grace_period.milliseconds),
+            grace_duration=base.timedelta_from_ms(test_product_details.grace_period.milliseconds),
             redeemed_ts_ms_rounded=redeemed_ts_ms_rounded,
             platform_refund_expires_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
@@ -4881,7 +4881,7 @@ current_state={'kind': 'androidpublisher#subscriptionPurchaseV2', 'startTime': '
             pro_status=server.UserProStatus.Expired,
             payment_status=base.PaymentStatus.Expired,
             auto_renew=False,
-            grace_duration_ms=base.timedelta_from_ms(test_product_details.grace_period.milliseconds),
+            grace_duration=base.timedelta_from_ms(test_product_details.grace_period.milliseconds),
             redeemed_ts_ms_rounded=redeemed_ts_ms_rounded,
             platform_refund_expires_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
@@ -4935,14 +4935,14 @@ current_state={'kind': 'androidpublisher#subscriptionPurchaseV2', 'startTime': '
 
         """2. User fails to renew (enter grace period)"""
         tx_grace = test_notification(grace, ctx)
-        assert_pro_details(tx=tx_subscribe, pro_status=server.UserProStatus.Active, payment_status=base.PaymentStatus.Redeemed, auto_renew=True, grace_duration_ms=base.timedelta_from_ms(test_product_details.grace_period.milliseconds), redeemed_ts_ms_rounded=redeemed_ts_ms_rounded, platform_refund_expires_at=platform_refund_expiry_unix_tx_ms, user_ctx=user_ctx, ctx=ctx)
+        assert_pro_details(tx=tx_subscribe, pro_status=server.UserProStatus.Active, payment_status=base.PaymentStatus.Redeemed, auto_renew=True, grace_duration=base.timedelta_from_ms(test_product_details.grace_period.milliseconds), redeemed_ts_ms_rounded=redeemed_ts_ms_rounded, platform_refund_expires_at=platform_refund_expiry_unix_tx_ms, user_ctx=user_ctx, ctx=ctx)
         backend_expire_payments_at_end_of_day(event_ms=tx_grace.event_ms, assert_success=True)
         # Now that payments up to the expiry time has been expired, this user's status should be expired
         assert_pro_details(tx=tx_subscribe,
             pro_status=server.UserProStatus.Expired,
             payment_status=base.PaymentStatus.Expired,
             auto_renew=True,
-            grace_duration_ms=base.timedelta_from_ms(test_product_details.grace_period.milliseconds),
+            grace_duration=base.timedelta_from_ms(test_product_details.grace_period.milliseconds),
             redeemed_ts_ms_rounded=redeemed_ts_ms_rounded,
             platform_refund_expires_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
@@ -4955,7 +4955,7 @@ current_state={'kind': 'androidpublisher#subscriptionPurchaseV2', 'startTime': '
             pro_status=server.UserProStatus.Expired,
             payment_status=base.PaymentStatus.Expired,
             auto_renew=True,
-            grace_duration_ms=base.timedelta_from_ms(test_product_details.grace_period.milliseconds),
+            grace_duration=base.timedelta_from_ms(test_product_details.grace_period.milliseconds),
             redeemed_ts_ms_rounded=redeemed_ts_ms_rounded,
             platform_refund_expires_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
@@ -4984,7 +4984,7 @@ current_state={'kind': 'androidpublisher#subscriptionPurchaseV2', 'startTime': '
                           pro_status                        = server.UserProStatus.Active,
                           payment_status                    = base.PaymentStatus.Redeemed,
                           auto_renew                        = True,
-                          grace_duration_ms                 = base.DEFAULT_GOOGLE_GRACE_PERIOD,
+                          grace_duration                 = base.DEFAULT_GOOGLE_GRACE_PERIOD,
                           redeemed_ts_ms_rounded            = base.unix_ms_from_datetime(backend.to_redeemed_at(base.datetime_from_unix_ms(tx.event_ms))),
                           platform_refund_expires_at = platform_refund_expiry_unix_tx_ms,
                           user_ctx                          = user_ctx,
@@ -5054,7 +5054,7 @@ current_state={'kind': 'androidpublisher#subscriptionPurchaseV2', 'startTime': '
                           pro_status                        = server.UserProStatus.Active,
                           payment_status                    = base.PaymentStatus.Redeemed,
                           auto_renew                        = True,
-                          grace_duration_ms                 = base.DEFAULT_GOOGLE_GRACE_PERIOD,
+                          grace_duration                 = base.DEFAULT_GOOGLE_GRACE_PERIOD,
                           redeemed_ts_ms_rounded            = base.unix_ms_from_datetime(backend.to_redeemed_at(base.datetime_from_unix_ms(tx.event_ms))),
                           platform_refund_expires_at = platform_refund_expiry_unix_tx_ms,
                           user_ctx                          = user_ctx,
@@ -5119,7 +5119,7 @@ current_state={'kind': 'androidpublisher#subscriptionPurchaseV2', 'startTime': '
 
         """3. User fails to renew (enter grace period)"""
         tx_grace = test_notification(grace, ctx)
-        assert_pro_details(tx=tx_change_plan, pro_status=server.UserProStatus.Active, payment_status=base.PaymentStatus.Redeemed, auto_renew=True, grace_duration_ms=base.timedelta_from_ms(test_product_details.grace_period.milliseconds), redeemed_ts_ms_rounded=redeemed_ts_ms_rounded, platform_refund_expires_at=platform_refund_expiry_unix_tx_ms, user_ctx=user_ctx, ctx=ctx)
+        assert_pro_details(tx=tx_change_plan, pro_status=server.UserProStatus.Active, payment_status=base.PaymentStatus.Redeemed, auto_renew=True, grace_duration=base.timedelta_from_ms(test_product_details.grace_period.milliseconds), redeemed_ts_ms_rounded=redeemed_ts_ms_rounded, platform_refund_expires_at=platform_refund_expiry_unix_tx_ms, user_ctx=user_ctx, ctx=ctx)
         backend_expire_payments_at_end_of_day(event_ms=tx_grace.event_ms, assert_success=True)
 
         # Now that payments up to the expiry time has been expired, this user's status should be expired
@@ -5127,7 +5127,7 @@ current_state={'kind': 'androidpublisher#subscriptionPurchaseV2', 'startTime': '
             pro_status=server.UserProStatus.Expired,
             payment_status=base.PaymentStatus.Expired,
             auto_renew=True,
-            grace_duration_ms=base.timedelta_from_ms(test_product_details.grace_period.milliseconds),
+            grace_duration=base.timedelta_from_ms(test_product_details.grace_period.milliseconds),
             redeemed_ts_ms_rounded=redeemed_ts_ms_rounded,
             platform_refund_expires_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
@@ -5150,7 +5150,7 @@ current_state={'kind': 'androidpublisher#subscriptionPurchaseV2', 'startTime': '
                           pro_status                        = server.UserProStatus.Active,
                           payment_status                    = base.PaymentStatus.Redeemed,
                           auto_renew                        = True,
-                          grace_duration_ms                 = base.DEFAULT_GOOGLE_GRACE_PERIOD,
+                          grace_duration                 = base.DEFAULT_GOOGLE_GRACE_PERIOD,
                           redeemed_ts_ms_rounded            = base.unix_ms_from_datetime(backend.to_redeemed_at(base.datetime_from_unix_ms(tx.event_ms))),
                           platform_refund_expires_at = platform_refund_expiry_unix_tx_ms,
                           user_ctx                          = user_ctx,
@@ -5225,14 +5225,14 @@ current_state={'kind': 'androidpublisher#subscriptionPurchaseV2', 'startTime': '
 
         """2. User fails to renew (enter grace period)"""
         tx_grace = test_notification(grace, ctx)
-        assert_pro_details(tx=tx_change_plan, pro_status=server.UserProStatus.Active, payment_status=base.PaymentStatus.Redeemed, auto_renew=True, grace_duration_ms=base.timedelta_from_ms(test_product_details.grace_period.milliseconds), redeemed_ts_ms_rounded=redeemed_ts_ms_rounded, platform_refund_expires_at=platform_refund_expiry_unix_tx_ms, user_ctx=user_ctx, ctx=ctx)
+        assert_pro_details(tx=tx_change_plan, pro_status=server.UserProStatus.Active, payment_status=base.PaymentStatus.Redeemed, auto_renew=True, grace_duration=base.timedelta_from_ms(test_product_details.grace_period.milliseconds), redeemed_ts_ms_rounded=redeemed_ts_ms_rounded, platform_refund_expires_at=platform_refund_expiry_unix_tx_ms, user_ctx=user_ctx, ctx=ctx)
         backend_expire_payments_at_end_of_day(event_ms=tx_grace.event_ms, assert_success=True)
         # Now that payments up to the expiry time has been expired, this user's status should be expired
         assert_pro_details(tx=tx_change_plan,
             pro_status=server.UserProStatus.Expired,
             payment_status=base.PaymentStatus.Expired,
             auto_renew=True,
-            grace_duration_ms=base.timedelta_from_ms(test_product_details.grace_period.milliseconds),
+            grace_duration=base.timedelta_from_ms(test_product_details.grace_period.milliseconds),
             redeemed_ts_ms_rounded=redeemed_ts_ms_rounded,
             platform_refund_expires_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
@@ -5245,7 +5245,7 @@ current_state={'kind': 'androidpublisher#subscriptionPurchaseV2', 'startTime': '
         pro_status=server.UserProStatus.Expired,
         payment_status=base.PaymentStatus.Expired,
         auto_renew=True,
-        grace_duration_ms=base.timedelta_from_ms(test_product_details.grace_period.milliseconds),
+        grace_duration=base.timedelta_from_ms(test_product_details.grace_period.milliseconds),
         redeemed_ts_ms_rounded=redeemed_ts_ms_rounded,
         platform_refund_expires_at=platform_refund_expiry_unix_tx_ms,
         user_ctx=user_ctx,
@@ -5268,7 +5268,7 @@ current_state={'kind': 'androidpublisher#subscriptionPurchaseV2', 'startTime': '
                           pro_status                        = server.UserProStatus.Active,
                           payment_status                    = base.PaymentStatus.Redeemed,
                           auto_renew                        = True,
-                          grace_duration_ms                 = base.DEFAULT_GOOGLE_GRACE_PERIOD,
+                          grace_duration                 = base.DEFAULT_GOOGLE_GRACE_PERIOD,
                           redeemed_ts_ms_rounded            = base.unix_ms_from_datetime(backend.to_redeemed_at(base.datetime_from_unix_ms(tx.event_ms))),
                           platform_refund_expires_at = platform_refund_expiry_unix_tx_ms,
                           user_ctx                          = user_ctx,
@@ -5361,7 +5361,7 @@ current_state={'kind': 'androidpublisher#subscriptionPurchaseV2', 'startTime': '
                           pro_status                        = server.UserProStatus.Active,
                           payment_status                    = base.PaymentStatus.Redeemed,
                           auto_renew                        = True,
-                          grace_duration_ms                 = base.DEFAULT_GOOGLE_GRACE_PERIOD,
+                          grace_duration                 = base.DEFAULT_GOOGLE_GRACE_PERIOD,
                           redeemed_ts_ms_rounded            = base.unix_ms_from_datetime(backend.to_redeemed_at(base.datetime_from_unix_ms(tx.event_ms))),
                           platform_refund_expires_at = platform_refund_expiry_unix_tx_ms,
                           user_ctx                          = user_ctx,
@@ -5443,7 +5443,7 @@ current_state={'kind': 'androidpublisher#subscriptionPurchaseV2', 'startTime': '
             pro_status=server.UserProStatus.Expired,
             payment_status=base.PaymentStatus.Revoked,
             auto_renew=False,
-            grace_duration_ms=base.DEFAULT_GOOGLE_GRACE_PERIOD,
+            grace_duration=base.DEFAULT_GOOGLE_GRACE_PERIOD,
             redeemed_ts_ms_rounded=redeemed_ts_ms_rounded,
             platform_refund_expires_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
