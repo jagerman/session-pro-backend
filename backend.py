@@ -879,13 +879,12 @@ def redeem_payment(tx:                  db.SQLTransaction,
         raise base.FailError('Payment to register specifies an unknown payment provider')
 
     redeemed_ids = [row[0] for row in row_result.fetchall()]
-    rowcount     = len(redeemed_ids)
-    if rowcount >= 1:
-        assert rowcount == 1
+    if redeemed_ids:
+        assert len(redeemed_ids) == 1
 
         # master_pkey lives only in `users`: ensure the identity row (+ its first generation) exists,
         # then link the just-redeemed payment(s) to it.
-        user_id, *_ = get_or_create_user_and_generation(tx, master_pkey, issued_at=redeemed_at)
+        user_id = get_or_create_user_and_generation(tx, master_pkey, issued_at=redeemed_at)[0]
         _ = db.query(tx.conn, '''
             UPDATE payments
             SET    user_id = %(user_id)s
@@ -897,7 +896,9 @@ def redeem_payment(tx:                  db.SQLTransaction,
         # user → the same one they already had), so a redeem never rolls the generation or the client's
         # revocation_tag. (_allocate mints a fresh generation only if the current one is revoked.)
         allocated: AllocatedGenID = _allocate_new_gen_id_if_master_pkey_has_payments(tx, master_pkey, issued_at=redeemed_at)
-        assert allocated.found, "We just added the user's payment we expect to find the latest expiry date for the pkey"
+        # found ⟺ expires_at is not None (the allocator sets found only after the expiry-None early-return);
+        # assert the expiry directly so it's the non-None datetime the proof build needs.
+        assert allocated.expires_at is not None, "We just added the user's payment we expect to find the latest expiry date for the pkey"
 
         # NOTE: Only generate the proof if a rotating public key was given — a payment can be redeemed
         # without automatically creating the corresponding proof.
@@ -1210,8 +1211,7 @@ def _insert_payment_row(tx: db.SQLTransaction, payment: dict[str, typing.Any], d
     """
     p_columns      = ', '.join(payment)
     p_placeholders = ', '.join(f'%({column})s' for column in payment)
-    result         = db.query(tx.conn, f'INSERT INTO payments ({p_columns}) VALUES ({p_placeholders}) RETURNING id', payment)
-    payment_id     = result.fetchone()[0]
+    payment_id     = db.query_scalar(tx.conn, f'INSERT INTO payments ({p_columns}) VALUES ({p_placeholders}) RETURNING id', payment)
 
     detail_row      = {'payment_id': payment_id, **detail}
     d_columns       = ', '.join(detail_row)
@@ -2062,15 +2062,13 @@ def generate_report_rows(conn: psycopg.Connection, period: ReportPeriod, limit: 
             assert isinstance(it, str)
             end_ts = _get_period_end_ts_sql(it, period)
 
-            result_set = db.query(tx_conn, f"""
+            count = db.query_scalar(tx_conn, f"""
                 SELECT COUNT(DISTINCT user_id) AS active
                 FROM payments
                 WHERE {end_ts} >= purchased_at
                   AND {end_ts} <= expires_at
                   AND revoked_at IS NULL
             """)
-
-            count        = result_set.fetchone()[0] or 0
             period_label = _format_period_label(it, period)
             result[period_label] = count
 
