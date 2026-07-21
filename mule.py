@@ -55,15 +55,15 @@ def run() -> None:
     for logger in (log, backend.log, platform_google.log):
         logger.addHandler(handler)
 
-    err                       = base.ErrorSink()
-    parsed                    = config.parse_args(err)
+    try:
+        parsed                = config.parse_args()
+    except config.ConfigError as e:
+        log.error(f'Maintenance mule failed to start, invalid configuration:\n  {e}')
+        sys.exit(1)
     base.UNSAFE_LOGGING       = parsed.unsafe_logging
     base.DB_URL               = parsed.db_url
     base.PLATFORM_TESTING_ENV = parsed.platform_testing_env
     base.PROVIDER_DRY_RUN     = parsed.provider_dry_run
-    if err.has():
-        log.error('Maintenance mule failed to start, invalid configuration:\n  ' + '\n  '.join(err.msg_list))
-        sys.exit(1)
 
     pool = db.get_pool(parsed.db_url)
 

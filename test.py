@@ -11,6 +11,7 @@ sends a request using the test client and we vet the request and response produc
 endpoint.
 '''
 
+import argparse
 import collections.abc
 import contextlib
 import pprint
@@ -40,6 +41,8 @@ from platform_google_types import GoogleDuration, SubscriptionProductDetails
 from vendor import onion_req
 import backend
 import base
+import cli
+import config
 import migrations
 import server
 import platform_apple
@@ -97,9 +100,7 @@ class TestingContext:
         database_url = self.db_url_factory()
 
         # Bootstrap DB
-        err                                     = base.ErrorSink()
-        engine: psycopg_pool.ConnectionPool | None = backend.bootstrap_db(database_url=database_url, err=err)
-        assert len(err.msg_list) == 0
+        engine: psycopg_pool.ConnectionPool | None = backend.bootstrap_db(database_url=database_url)
         assert engine
 
         # Generate the backend signing key for this instance. The app loads its key externally now
@@ -157,6 +158,252 @@ def test_dry_run_backup_rotation():
     }
     assert len(result.to_keep) == 8 and len(result.to_delete) == 3
 
+def test_cli_parse_helpers():
+    # The CLI arg parsers raise ValueError on malformed input (no ErrorSink); command handlers catch it,
+    # print "Failed to parse arguments", and exit 1. Here we pin the parse contract directly.
+
+    # parse_set_user_error_arg: "<provider>:<payment_id>=[true|false]", comma-separated.
+    assert cli.parse_set_user_error_arg('') == []
+    assert cli.parse_set_user_error_arg('google_play:tok1=true, app_store:otx2=false') == [
+        (base.PaymentProvider.GooglePlayStore, 'tok1', True),
+        (base.PaymentProvider.iOSAppStore,     'otx2', False),
+    ]
+    with pytest.raises(ValueError):
+        cli.parse_set_user_error_arg('google_play-tok1-true')  # no ':' / '='
+    with pytest.raises(ValueError):
+        cli.parse_set_user_error_arg('notaprovider:tok=true')  # bad provider (was swallowed into the sink)
+    with pytest.raises(ValueError):
+        cli.parse_set_user_error_arg('google_play:tok=maybe')  # bad flag
+    with pytest.raises(ValueError):
+        cli.parse_set_user_error_arg('nil:tok=true')           # Nil provider rejected
+    with pytest.raises(ValueError):
+        cli.parse_set_user_error_arg('rangeproof:tok=true')    # Rangeproof has no errors
+
+    # parse_payment_id_list: "<provider>:<payment_id>", comma-separated.
+    assert cli.parse_payment_id_list('') == []
+    assert cli.parse_payment_id_list('google_play:tok1, rangeproof:ord2') == [
+        (base.PaymentProvider.GooglePlayStore, 'tok1'),
+        (base.PaymentProvider.Rangeproof,      'ord2'),
+    ]
+    with pytest.raises(ValueError):
+        cli.parse_payment_id_list('missing-colon')
+    with pytest.raises(ValueError):
+        cli.parse_payment_id_list('notaprovider:tok')
+
+    # parse_message_id_list: opaque strings, taken verbatim.
+    assert cli.parse_message_id_list('') == []
+    assert cli.parse_message_id_list('a, b ,c') == ['a', 'b', 'c']
+    with pytest.raises(ValueError):
+        cli.parse_message_id_list('a,,b')  # empty entry
+
+    # parse_master_pkey: 64 hex chars (optionally 0x-prefixed), returns a VerifyKey (never None).
+    good_hex = '00' * 32
+    assert isinstance(cli.parse_master_pkey(good_hex), nacl.signing.VerifyKey)
+    assert isinstance(cli.parse_master_pkey('0x' + good_hex), nacl.signing.VerifyKey)
+    with pytest.raises(ValueError):
+        cli.parse_master_pkey('abcd')          # too short
+    with pytest.raises(ValueError):
+        cli.parse_master_pkey('zz' * 32)       # right length, not hex
+
+def test_cli_require_config(tmp_path, monkeypatch):
+    # require_config resolves the [base] config or exits(1) with a clear message — no ErrorSink, and (the
+    # bug the sink hid) a missing file now exits instead of silently returning an empty config. Env
+    # overrides are cleared so the file alone drives the result.
+    monkeypatch.delenv('SESH_PRO_BACKEND_DB_URL', raising=False)
+    monkeypatch.delenv('SESH_PRO_BACKEND_KEY_PATH', raising=False)
+    ns = lambda config: argparse.Namespace(config=config)
+
+    with pytest.raises(SystemExit):
+        cli.require_config(ns(None))                       # no --config
+
+    with pytest.raises(SystemExit):
+        cli.require_config(ns(str(tmp_path / 'nope.ini')))  # nonexistent file (was a silent empty config)
+
+    no_base = tmp_path / 'no_base.ini'
+    no_base.write_text('[other]\nx = 1\n')
+    with pytest.raises(SystemExit):
+        cli.require_config(ns(str(no_base)))                # missing [base]
+
+    no_url = tmp_path / 'no_url.ini'
+    no_url.write_text('[base]\nlog_path = /var/log/x\n')
+    with pytest.raises(SystemExit):
+        cli.require_config(ns(str(no_url)))                 # [base] but no db_url
+
+    good = tmp_path / 'good.ini'
+    good.write_text('[base]\ndb_url = postgresql:///x\nbackend_key_path = /k\nlog_path = /l\n')
+    cfg = cli.require_config(ns(str(good)))
+    assert cfg.db_url == 'postgresql:///x' and cfg.backend_key_path == '/k' and cfg.log_path == '/l'
+
+def test_config_parse_args(monkeypatch):
+    # parse_args accumulates field problems and raises them together as a ConfigError (an is-a ValueError)
+    # rather than threading an ErrorSink. Clear the ambient SESH_PRO_BACKEND_* so the env alone drives it.
+    for k in list(os.environ):
+        if k.startswith('SESH_PRO_BACKEND_'):
+            monkeypatch.delenv(k, raising=False)
+
+    # Nothing enabled -> clean parse, no raise.
+    parsed = config.parse_args()
+    assert isinstance(parsed, config.ParsedArgs)
+    assert parsed.with_platform_apple is False and parsed.with_platform_google is False
+
+    # Enable Apple with no [apple] config -> every missing field is reported at once in one ConfigError.
+    monkeypatch.setenv('SESH_PRO_BACKEND_WITH_PLATFORM_APPLE', '1')
+    with pytest.raises(config.ConfigError) as excinfo:
+        config.parse_args()
+    assert isinstance(excinfo.value, ValueError)          # ConfigError is-a ValueError
+    assert len(excinfo.value.errors) >= 5                 # accumulates ALL problems, not just the first
+    assert all('Apple' in m for m in excinfo.value.errors)
+
+def test_google_handle_parsed_notification_fetch_failure(monkeypatch, pg_database):
+    # CHARACTERIZATION (pre-ErrorSink-rewrite safety net). Pins the CURRENT control-flow contract of the
+    # Google subscription path so the exception rewrite can't silently change it:
+    #   a failed fetch_subscription_v2_details -> handle_parsed_notification returns handled=False (so the
+    #   pull loop does NOT ack -> Google redelivers), err is populated, and -- the subtle part -- the tx is
+    #   NOT cancelled on this early-return path (nothing was written yet, so it commits). Contrast a failure
+    #   inside handle_subscription_notification, which DOES set tx.cancel. If the rewrite changes either,
+    #   this test must fail loudly and the change be made deliberately.
+    with TestingContext(pg_database) as ctx:
+        def boom_fetch(*args, **kwargs):
+            args[2].msg_list.append('injected fetch failure')  # (package_name, purchase_token, err)
+            return None
+        monkeypatch.setattr('platform_google_api.fetch_subscription_v2_details', boom_fetch)
+
+        parse = platform_google.ParsedNotification(
+            payload_type   = platform_google.ParsedNotificationPayloadType.Subscription,
+            purchase_token = 'tok-xyz',
+            package_name   = 'pkg',
+            event_time_ms  = 1,
+        )
+        err = base.ErrorSink()
+        with ctx.connection() as conn:
+            with db.transaction(conn) as tx:
+                handled = platform_google.handle_parsed_notification(tx, parse, err)
+                assert handled is False
+                assert err.has()
+                assert tx.cancel is False   # fetch-fail early-return does NOT cancel (current behavior)
+
+def _google_subscription_parse(monkeypatch):
+    # Shared setup for the two below: fetch succeeds (returns a non-None sentinel), reaching the parse step.
+    monkeypatch.setattr('platform_google_api.fetch_subscription_v2_details', lambda *a, **k: object())
+    return platform_google.ParsedNotification(
+        payload_type   = platform_google.ParsedNotificationPayloadType.Subscription,
+        purchase_token = 'tok-xyz',
+        package_name   = 'pkg',
+        event_time_ms  = 1,
+    )
+
+def test_google_handle_parsed_notification_parse_failure(monkeypatch, pg_database):
+    # CHARACTERIZATION: a failure while PARSING fetched subscription details is the same early-return
+    # asymmetry as the fetch failure -- handled=False, err populated, tx NOT cancelled.
+    with TestingContext(pg_database) as ctx:
+        parse = _google_subscription_parse(monkeypatch)
+        monkeypatch.setattr('platform_google_api.parse_subscription_purchase_tx',
+                            lambda *a, **k: (k['err'].msg_list.append('injected parse failure'), object())[1])
+        monkeypatch.setattr('platform_google_api.parse_subscription_plan_event_tx', lambda *a, **k: object())
+        err = base.ErrorSink()
+        with ctx.connection() as conn:
+            with db.transaction(conn) as tx:
+                handled = platform_google.handle_parsed_notification(tx, parse, err)
+                assert handled is False
+                assert err.has()
+                assert tx.cancel is False   # parse-fail early-return also does NOT cancel
+
+def test_google_handle_parsed_notification_deep_failure_cancels(monkeypatch, pg_database):
+    # CHARACTERIZATION (the CONTRASTING side of the asymmetry): a failure INSIDE
+    # handle_subscription_notification reaches the function tail, which requires tx.cancel to have been set
+    # -> handled=False, err populated, and tx IS cancelled (so the transaction rolls back). This is the case
+    # the fetch/parse early-returns skip.
+    with TestingContext(pg_database) as ctx:
+        parse = _google_subscription_parse(monkeypatch)
+        monkeypatch.setattr('platform_google_api.parse_subscription_purchase_tx', lambda *a, **k: object())
+        monkeypatch.setattr('platform_google_api.parse_subscription_plan_event_tx', lambda *a, **k: object())
+        def deep_boom(**k):
+            k['err'].msg_list.append('injected deep failure')
+            k['tx'].cancel = True
+        monkeypatch.setattr('platform_google.handle_subscription_notification', deep_boom)
+        err = base.ErrorSink()
+        with ctx.connection() as conn:
+            with db.transaction(conn) as tx:
+                handled = platform_google.handle_parsed_notification(tx, parse, err)
+                assert handled is False
+                assert err.has()
+                assert tx.cancel is True    # deep failure DOES cancel (reaches the tail assert)
+
+def test_google_process_notification_message(monkeypatch, pg_database):
+    # CHARACTERIZATION of _process_notification_message (the per-message tx block extracted from the pull
+    # loop in 91ad5fe). Pins the control flow the ErrorSink rewrite must preserve. DELIBERATELY avoids the
+    # present+unhandled+no-prior-error FAILURE branch: it calls the doubly-broken add_user_error_tx
+    # (unix_ts_ms= kwarg + int(provider.value)), so it currently raises -- that branch is fixed in the
+    # conversion, not pinned here. Seeds user_errors via direct SQL (the writer is broken).
+    now_s  = 1_600_000_000.0
+    expiry = base.datetime_from_unix_ms(int(now_s * 1000) + base.MILLISECONDS_IN_DAY)
+    seeded_at = base.datetime_from_unix_ms(int(now_s * 1000))
+
+    def make_msg(message_id, token):
+        return platform_google.SortedMessage(
+            message_id = message_id,
+            parse      = platform_google.ParsedNotification(
+                payload_type   = platform_google.ParsedNotificationPayloadType.Subscription,
+                purchase_token = token, package_name = 'pkg', event_time_ms = int(now_s * 1000)),
+        )
+
+    def seed_user_error(conn, token):
+        with db.transaction(conn) as tx:
+            _ = db.query(tx.conn, 'INSERT INTO user_errors (payment_provider, payment_id, errored_at) VALUES (%s, %s, %s)',
+                         base.PaymentProvider.GooglePlayStore.value, token, seeded_at)
+
+    def is_handled(conn, message_id):
+        # Read-only lookup: wrap conn in a bare SQLTransaction (no BEGIN needed on the autocommit pool).
+        return backend.google_notification_message_id_is_in_db_tx(db.SQLTransaction(conn=conn), message_id).handled
+
+    with TestingContext(pg_database) as ctx:
+        # (A) message not in the DB -> handled=True (skip; someone may have deleted it out-of-band).
+        with ctx.connection() as conn:
+            assert platform_google._process_notification_message(conn, make_msg('m-absent', 'tok-a'), base.ErrorSink(), now_s) is True
+
+        # (B) message present + already handled -> handled=True (no reprocessing).
+        with ctx.connection() as conn:
+            with db.transaction(conn) as tx:
+                backend.google_add_notification_id_tx(tx, 'm-handled', expiry, '')
+                _ = backend.google_set_notification_handled(tx=tx, message_id='m-handled', delete=False)
+            assert platform_google._process_notification_message(conn, make_msg('m-handled', 'tok-b'), base.ErrorSink(), now_s) is True
+
+        # (C) present + unhandled + SUCCESS -> handled=True, the notification is marked handled, and a prior
+        #     user_error for the token is cleared -- all committed in the one transaction.
+        monkeypatch.setattr('platform_google.handle_parsed_notification', lambda tx, parse, err: True)
+        with ctx.connection() as conn:
+            with db.transaction(conn) as tx:
+                backend.google_add_notification_id_tx(tx, 'm-ok', expiry, '')
+            seed_user_error(conn, 'tok-c')
+            assert platform_google._process_notification_message(conn, make_msg('m-ok', 'tok-c'), base.ErrorSink(), now_s) is True
+            assert is_handled(conn, 'm-ok') is True
+            assert backend.has_user_error(conn, base.PaymentProvider.GooglePlayStore, 'tok-c') is False
+
+        # (D) present + unhandled + FAILURE (no tx.cancel) WITH a prior user_error -> handled=False, the
+        #     notification stays unhandled, and the prior error is left intact (the failure branch neither
+        #     clears nor re-adds while already in error state -- so it never reaches the broken add path).
+        monkeypatch.setattr('platform_google.handle_parsed_notification', lambda tx, parse, err: False)
+        with ctx.connection() as conn:
+            with db.transaction(conn) as tx:
+                backend.google_add_notification_id_tx(tx, 'm-fail', expiry, '')
+            seed_user_error(conn, 'tok-d')
+            assert platform_google._process_notification_message(conn, make_msg('m-fail', 'tok-d'), base.ErrorSink(), now_s) is False
+            assert is_handled(conn, 'm-fail') is False
+            assert backend.has_user_error(conn, base.PaymentProvider.GooglePlayStore, 'tok-d') is True
+
+        # (E) TRIPWIRE for the known-broken branch: present + unhandled + failure + NO prior error reaches
+        #     add_user_error_tx(unix_ts_ms=…) which is doubly broken (bad kwarg + int('google_play')) and
+        #     raises. The `user_is_in_error_state == False` guard is exactly what shields (C)/(D) from this,
+        #     so pin the crash here: if a refactor moves the guard, this fails instead of C/D passing green
+        #     over a relocated crash. When the conversion fixes add_user_error_tx, THIS test must be flipped
+        #     to assert the correct write (poison recorded) rather than a raise.
+        monkeypatch.setattr('platform_google.handle_parsed_notification', lambda tx, parse, err: False)  # self-contained (not relying on (D))
+        with ctx.connection() as conn:
+            with db.transaction(conn) as tx:
+                backend.google_add_notification_id_tx(tx, 'm-crash', expiry, '')
+            with pytest.raises(TypeError):
+                platform_google._process_notification_message(conn, make_msg('m-crash', 'tok-e'), base.ErrorSink(), now_s)
+
 def test_migrations_bootstrap_and_idempotency(pg_database):
     # bootstrap_db runs the schema/ migrations; every migration file should be recorded, the globals
     # rows seeded exactly once, and a second pass must be a clean no-op (nothing re-run or duplicated).
@@ -164,9 +411,7 @@ def test_migrations_bootstrap_and_idempotency(pg_database):
     expected   = {p.name for p in schema_dir.iterdir() if re.match(r'^\d+_.*\.(sql|py)$', p.name)}
     assert expected, 'expected some migration files to exist'
 
-    err  = base.ErrorSink()
-    pool = backend.bootstrap_db(database_url=pg_database(), err=err)
-    assert not err.msg_list, err.msg_list
+    pool = backend.bootstrap_db(database_url=pg_database())
     assert pool
 
     with db.connection(pool) as conn:
@@ -227,9 +472,7 @@ def test_stale_revocation_is_not_served(pg_database):
     # ago than RETAIN_FOR drops out of the served list, independent of whether the prune sweep has run.
     # Filtering by the window (rather than depending on a prune) keeps the served answer independent of
     # housekeeping timing. This mirrors the guard in server.get_pro_revocations.
-    err  = base.ErrorSink()
-    pool = backend.bootstrap_db(database_url=pg_database(), err=err)
-    assert not err.msg_list, err.msg_list
+    pool = backend.bootstrap_db(database_url=pg_database())
     assert pool
 
     RETAIN_FOR  = base.SECONDS_IN_MONTH
@@ -266,8 +509,7 @@ def test_provider_dry_run_redeems_google_without_egress(monkeypatch, pg_database
     monkeypatch.setattr(base, 'PROVIDER_DRY_RUN', True)
 
     err                                            = base.ErrorSink()
-    db_engine: psycopg_pool.ConnectionPool | None  = backend.bootstrap_db(database_url=pg_database(), err=err)
-    assert len(err.msg_list) == 0, f'{err.msg_list}'
+    db_engine: psycopg_pool.ConnectionPool | None  = backend.bootstrap_db(database_url=pg_database())
     assert db_engine
 
     backend_key  = nacl.signing.SigningKey.generate()
@@ -335,8 +577,7 @@ def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_d
 
     # Setup DB
     err                                        = base.ErrorSink()
-    db_engine: psycopg_pool.ConnectionPool | None = backend.bootstrap_db(database_url=pg_database(), err=err)
-    assert len(err.msg_list) == 0, f'{err.msg_list}'
+    db_engine: psycopg_pool.ConnectionPool | None = backend.bootstrap_db(database_url=pg_database())
     assert db_engine
 
     # Setup scenarios, single user who stacks a subscription
@@ -689,8 +930,7 @@ def test_revocation_cutting_refund_rolls_generation(monkeypatch, pg_database):
     monkeypatch.setattr("platform_google_api.fetch_subscription_v2_details", lambda *a, **k: platform_google_types.SubscriptionV2Data())
 
     err                                           = base.ErrorSink()
-    db_engine: psycopg_pool.ConnectionPool | None = backend.bootstrap_db(database_url=pg_database(), err=err)
-    assert not err.has(), f'{err.msg_list}'
+    db_engine: psycopg_pool.ConnectionPool | None = backend.bootstrap_db(database_url=pg_database())
     assert db_engine
 
     backend_key  = nacl.signing.SigningKey.generate()
@@ -757,9 +997,7 @@ def test_bump_revocation_ticket(pg_database):
     """Item 7: the manual DR bump (backing the `revoke bump-ticket` CLI command) advances the monotonic
     revocation ticket by the given amount and returns the new value. Used to recover after a DB restore
     from an older backup rolls the counter backward (see docs/deploy.md)."""
-    err                                           = base.ErrorSink()
-    db_engine: psycopg_pool.ConnectionPool | None = backend.bootstrap_db(database_url=pg_database(), err=err)
-    assert not err.has(), f'{err.msg_list}'
+    db_engine: psycopg_pool.ConnectionPool | None = backend.bootstrap_db(database_url=pg_database())
     assert db_engine
 
     conn = db_engine.getconn()
@@ -787,8 +1025,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
     with contextlib.nullcontext():
         db_url                                     = pg_database()
         err                                        = base.ErrorSink()
-        db_engine: psycopg_pool.ConnectionPool | None = backend.bootstrap_db(database_url=db_url, err=err)
-        assert not err.has(), f'{err.msg_list}'
+        db_engine: psycopg_pool.ConnectionPool | None = backend.bootstrap_db(database_url=db_url)
         assert db_engine
         # Setup local flask instance. The signing key is external now (not in the DB), so generate
         # one for this test and hand it to the server; use it directly to verify signatures below.

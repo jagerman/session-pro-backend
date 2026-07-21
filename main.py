@@ -37,15 +37,15 @@ def entry_point() -> flask.Flask:
         platform_apple.log.addHandler(console_logger)
 
     # NOTE: Parse arguments from .INI if present and environment variables, then setup global variables
-    err = base.ErrorSink()
-    parsed_args: config.ParsedArgs = config.parse_args(err)
+    try:
+        parsed_args: config.ParsedArgs = config.parse_args()
+    except config.ConfigError as e:
+        log.error(f'Failed to startup, invalid configuration options:\n  {e}')
+        sys.exit(1)
     base.UNSAFE_LOGGING       = parsed_args.unsafe_logging
     base.DB_URL               = parsed_args.db_url
     base.PLATFORM_TESTING_ENV = parsed_args.platform_testing_env
     base.PROVIDER_DRY_RUN     = parsed_args.provider_dry_run
-    if err.has():
-        log.error(f'Failed to startup, invalid configuration options:\n  ' + '\n  '.join(err.msg_list))
-        sys.exit(1)
 
     # NOTE: Setup file logger
     file_logger: logging.handlers.RotatingFileHandler | None = None
@@ -85,11 +85,11 @@ def entry_point() -> flask.Flask:
         sys.exit(1)
 
     # NOTE: Open the DB (create tables if necessary)
-    engine: psycopg_pool.ConnectionPool | None = backend.bootstrap_db(database_url=parsed_args.db_url, err=err)
-    if err.has():
-        log.error(err.build())
+    try:
+        engine: psycopg_pool.ConnectionPool = backend.bootstrap_db(database_url=parsed_args.db_url)
+    except Exception as e:
+        log.error(f'{e}', exc_info=True)
         sys.exit(1)
-    assert engine
 
     with db.connection(engine) as conn:
         startup_log = '\n'

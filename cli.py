@@ -12,6 +12,7 @@ import os
 import pathlib
 import sys
 import time
+import typing
 import uuid
 
 import nacl.signing
@@ -265,8 +266,9 @@ COMMAND FORMATS DETAILED:
 """
 
 
-def parse_set_user_error_arg(arg: str, err: base.ErrorSink) -> list[tuple[base.PaymentProvider, str, bool]]:
-    """Parse a comma-separated string of errors into a list of (payment_provider, payment_id, set_flag) tuples."""
+def parse_set_user_error_arg(arg: str) -> list[tuple[base.PaymentProvider, str, bool]]:
+    """Parse a comma-separated string of errors into a list of (payment_provider, payment_id, set_flag)
+    tuples. Raises ValueError on malformed input."""
     result: list[tuple[base.PaymentProvider, str, bool]] = []
     if len(arg) == 0:
         return result
@@ -274,21 +276,20 @@ def parse_set_user_error_arg(arg: str, err: base.ErrorSink) -> list[tuple[base.P
     for item in arg.split(','):
         item = item.strip()
         if ':' not in item or '=' not in item:
-            err.msg_list.append(f"Invalid format for user error: '{item}'. Expected '<payment_provider>:<payment_id>=[true|false]'.")
-            return result
+            raise ValueError(f"Invalid format for user error: '{item}'. Expected '<payment_provider>:<payment_id>=[true|false]'.")
         payment_provider_str, remainder = item.split(':', 1)
         payment_id, set_flag_str = remainder.split('=', 1)
         payment_provider_str = payment_provider_str.strip()
-        payment_provider = base.PaymentProvider.Nil
 
         try:
             payment_provider = base.PaymentProvider(payment_provider_str)
         except Exception:
-            err.msg_list.append(f'Failed to parse payment provider ({payment_provider_str}) for item {item}')
-            return result
+            raise ValueError(f'Failed to parse payment provider ({payment_provider_str}) for item {item}')
 
-        assert payment_provider != base.PaymentProvider.Nil,        "Nil payment provider cannot be used for errors"
-        assert payment_provider != base.PaymentProvider.Rangeproof, "Rangeproof payment provider does not support errors"
+        if payment_provider == base.PaymentProvider.Nil:
+            raise ValueError(f'Nil payment provider cannot be used for errors (item {item})')
+        if payment_provider == base.PaymentProvider.Rangeproof:
+            raise ValueError(f'Rangeproof payment provider does not support errors (item {item})')
 
         set_flag = False
         if set_flag_str.lower() == 'true':
@@ -296,15 +297,14 @@ def parse_set_user_error_arg(arg: str, err: base.ErrorSink) -> list[tuple[base.P
         elif set_flag_str.lower() == 'false':
             set_flag = False
         else:
-            err.msg_list.append(f'Failed to parse set flag ({set_flag_str}) for item {item}')
-            return result
+            raise ValueError(f'Failed to parse set flag ({set_flag_str}) for item {item}')
 
         result.append((payment_provider, payment_id, set_flag))
     return result
 
 
-def parse_payment_id_list(arg: str, err: base.ErrorSink) -> list[tuple[base.PaymentProvider, str]]:
-    """Parse a comma-separated string of payment IDs for deletion."""
+def parse_payment_id_list(arg: str) -> list[tuple[base.PaymentProvider, str]]:
+    """Parse a comma-separated string of payment IDs for deletion. Raises ValueError on malformed input."""
     result: list[tuple[base.PaymentProvider, str]] = []
     if len(arg) == 0:
         return result
@@ -312,24 +312,22 @@ def parse_payment_id_list(arg: str, err: base.ErrorSink) -> list[tuple[base.Paym
     for item in arg.split(','):
         item = item.strip()
         if ':' not in item:
-            err.msg_list.append(f"Invalid format for payment ID: '{item}'. Expected '<payment_provider>:<payment_id>'.")
-            return result
+            raise ValueError(f"Invalid format for payment ID: '{item}'. Expected '<payment_provider>:<payment_id>'.")
         payment_provider_str, payment_id = item.split(':', 1)
         payment_provider_str = payment_provider_str.strip()
 
         try:
             payment_provider = base.PaymentProvider(payment_provider_str)
         except Exception:
-            err.msg_list.append(f'Failed to parse payment provider ({payment_provider_str}) for item {item}')
-            return result
+            raise ValueError(f'Failed to parse payment provider ({payment_provider_str}) for item {item}')
 
         result.append((payment_provider, payment_id))
     return result
 
 
-def parse_message_id_list(arg: str, err: base.ErrorSink) -> list[str]:
+def parse_message_id_list(arg: str) -> list[str]:
     """Parse a comma-separated string of message IDs. Pub/Sub message ids are opaque strings, so entries
-    are taken verbatim (no numeric parsing)."""
+    are taken verbatim (no numeric parsing). Raises ValueError on malformed input."""
     result: list[str] = []
     if len(arg) == 0:
         return result
@@ -337,27 +335,24 @@ def parse_message_id_list(arg: str, err: base.ErrorSink) -> list[str]:
     for item in arg.split(','):
         item = item.strip()
         if len(item) == 0:
-            err.msg_list.append('Empty message_id in list')
-            return result
+            raise ValueError('Empty message_id in list')
         result.append(item)
     return result
 
 
-def parse_master_pkey(hex_str: str, err: base.ErrorSink) -> nacl.signing.VerifyKey | None:
-    """Parse a hex string into a VerifyKey."""
+def parse_master_pkey(hex_str: str) -> nacl.signing.VerifyKey:
+    """Parse a hex string into a VerifyKey. Raises ValueError on malformed input."""
     if hex_str.startswith("0x"):
         hex_str = hex_str[2:]
 
     if len(hex_str) != 64:
-        err.msg_list.append(f"Expected 64 hex chars for master public key, received {len(hex_str)}")
-        return None
+        raise ValueError(f"Expected 64 hex chars for master public key, received {len(hex_str)}")
 
     try:
         hex_bytes = bytes.fromhex(hex_str)
         return nacl.signing.VerifyKey(hex_bytes)
     except Exception as e:
-        err.msg_list.append(f"Failed to parse hex as master public key: {e}")
-        return None
+        raise ValueError(f"Failed to parse hex as master public key: {e}")
 
 
 @dataclasses.dataclass
@@ -367,43 +362,38 @@ class CLIConfig:
     log_path:         str = ''
 
 
+def _fail_config(reason: str) -> typing.NoReturn:
+    print(f"ERROR: Failed to load config:\n  {reason}", file=sys.stderr)
+    sys.exit(1)
+
+
 def require_config(args: argparse.Namespace) -> CLIConfig:
     if not args.config:
         print("ERROR: --config is required for this command", file=sys.stderr)
         sys.exit(1)
 
-    # NOTE: Parse the config
-    err              = base.ErrorSink()
-    result           = CLIConfig()
-    if 1:
-        config_path: str = args.config
-        if not pathlib.Path(config_path).exists():
-            err.msg_list.append(f'Config file "{config_path}" does not exist or is not readable')
-            return result
+    config_path: str = args.config
+    if not pathlib.Path(config_path).exists():
+        _fail_config(f'Config file "{config_path}" does not exist or is not readable')
 
-        try:
-            parser = configparser.ConfigParser()
-            _ = parser.read(config_path)
+    result = CLIConfig()
+    try:
+        parser = configparser.ConfigParser()
+        parser.read(config_path)
+    except Exception as e:
+        _fail_config(f'Failed to parse config file: {e}')
 
-            if 'base' not in parser:
-                err.msg_list.append(f'Config file "{config_path}" is missing [base] section')
-            else:
-                base_section            = parser['base']
-                result.db_url           = base_section.get('db_url', '')
-                result.backend_key_path = base_section.get('backend_key_path', '')
-                result.log_path         = base_section.get('log_path', '')
+    if 'base' not in parser:
+        _fail_config(f'Config file "{config_path}" is missing [base] section')
 
-                # Allow environment variable override
-                result.db_url           = os.getenv('SESH_PRO_BACKEND_DB_URL', result.db_url)
-                result.backend_key_path = os.getenv('SESH_PRO_BACKEND_KEY_PATH', result.backend_key_path)
-        except Exception as e:
-            err.msg_list.append(f'Failed to parse config file: {e}')
+    base_section            = parser['base']
+    result.db_url           = base_section.get('db_url', '')
+    result.backend_key_path = base_section.get('backend_key_path', '')
+    result.log_path         = base_section.get('log_path', '')
 
-    # NOTE: Log errors
-    if err.has():
-        msg = "ERROR: Failed to load config:\n  " + "\n  ".join(err.msg_list)
-        print(msg, file=sys.stderr)
-        sys.exit(1)
+    # Allow environment variable override
+    result.db_url           = os.getenv('SESH_PRO_BACKEND_DB_URL', result.db_url)
+    result.backend_key_path = os.getenv('SESH_PRO_BACKEND_KEY_PATH', result.backend_key_path)
 
     if not result.db_url:
         print("ERROR: No database URL configured in config file", file=sys.stderr)
@@ -412,19 +402,12 @@ def require_config(args: argparse.Namespace) -> CLIConfig:
     return result
 
 
-def load_config(config_path: str, err: base.ErrorSink) -> CLIConfig:
-    result = CLIConfig()
-
-    return result
-
-
 def cmd_user_error_set(args: argparse.Namespace, dry_run: bool) -> int:
     config = require_config(args)
-    err = base.ErrorSink()
-    items = parse_set_user_error_arg(args.items, err)
-
-    if err.has():
-        print(f"ERROR: Failed to parse arguments:\n  " + "\n  ".join(err.msg_list), file=sys.stderr)
+    try:
+        items = parse_set_user_error_arg(args.items)
+    except ValueError as e:
+        print(f"ERROR: Failed to parse arguments:\n  {e}", file=sys.stderr)
         return 1
 
     if len(items) == 0:
@@ -478,11 +461,10 @@ def cmd_user_error_set(args: argparse.Namespace, dry_run: bool) -> int:
 
 def cmd_user_error_delete(args: argparse.Namespace, dry_run: bool) -> int:
     config = require_config(args)
-    err = base.ErrorSink()
-    items = parse_payment_id_list(args.items, err)
-
-    if err.has():
-        print(f"ERROR: Failed to parse arguments:\n  " + "\n  ".join(err.msg_list), file=sys.stderr)
+    try:
+        items = parse_payment_id_list(args.items)
+    except ValueError as e:
+        print(f"ERROR: Failed to parse arguments:\n  {e}", file=sys.stderr)
         return 1
 
     if len(items) == 0:
@@ -521,11 +503,10 @@ def cmd_user_error_delete(args: argparse.Namespace, dry_run: bool) -> int:
 
 def cmd_google_notification_handle(args: argparse.Namespace, dry_run: bool) -> int:
     config = require_config(args)
-    err = base.ErrorSink()
-    message_ids = parse_message_id_list(args.items, err)
-
-    if err.has():
-        print(f"ERROR: Failed to parse arguments:\n  " + "\n  ".join(err.msg_list), file=sys.stderr)
+    try:
+        message_ids = parse_message_id_list(args.items)
+    except ValueError as e:
+        print(f"ERROR: Failed to parse arguments:\n  {e}", file=sys.stderr)
         return 1
 
     if len(message_ids) == 0:
@@ -565,11 +546,10 @@ def cmd_google_notification_handle(args: argparse.Namespace, dry_run: bool) -> i
 
 def cmd_google_notification_delete(args: argparse.Namespace, dry_run: bool) -> int:
     config = require_config(args)
-    err = base.ErrorSink()
-    message_ids = parse_message_id_list(args.items, err)
-
-    if err.has():
-        print(f"ERROR: Failed to parse arguments:\n  " + "\n  ".join(err.msg_list), file=sys.stderr)
+    try:
+        message_ids = parse_message_id_list(args.items)
+    except ValueError as e:
+        print(f"ERROR: Failed to parse arguments:\n  {e}", file=sys.stderr)
         return 1
 
     if len(message_ids) == 0:
@@ -635,15 +615,10 @@ def cmd_google_notification_list(args: argparse.Namespace) -> int:
 
 def cmd_revoke_list(args: argparse.Namespace) -> int:
     config = require_config(args)
-    err = base.ErrorSink()
-    master_pkey = parse_master_pkey(args.master_pkey, err)
-
-    if err.has():
-        print(f"ERROR: Failed to parse arguments:\n  " + "\n  ".join(err.msg_list), file=sys.stderr)
-        return 1
-
-    if master_pkey is None:
-        print("ERROR: Master public key is required", file=sys.stderr)
+    try:
+        master_pkey = parse_master_pkey(args.master_pkey)
+    except ValueError as e:
+        print(f"ERROR: Failed to parse arguments:\n  {e}", file=sys.stderr)
         return 1
 
     try:
@@ -689,15 +664,10 @@ def cmd_revoke_list(args: argparse.Namespace) -> int:
 
 def cmd_revoke(args: argparse.Namespace, dry_run: bool) -> int:
     config = require_config(args)
-    err = base.ErrorSink()
-    master_pkey = parse_master_pkey(args.master_pkey, err)
-
-    if err.has():
-        print(f"ERROR: Failed to parse arguments:\n  " + "\n  ".join(err.msg_list), file=sys.stderr)
-        return 1
-
-    if master_pkey is None:
-        print("ERROR: Master public key is required", file=sys.stderr)
+    try:
+        master_pkey = parse_master_pkey(args.master_pkey)
+    except ValueError as e:
+        print(f"ERROR: Failed to parse arguments:\n  {e}", file=sys.stderr)
         return 1
 
     # Revocation is terminal, so there is no un-revoke; the manual revoke uses the one real revoke path

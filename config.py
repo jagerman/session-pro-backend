@@ -15,6 +15,14 @@ import base
 
 log = logging.getLogger('PRO')
 
+class ConfigError(ValueError):
+    '''Startup configuration is invalid. Carries every problem found: parse_args accumulates them so the
+    operator sees all the bad/missing fields at once rather than one per rerun. `str(e)` is the joined,
+    indented list ready to log.'''
+    def __init__(self, errors: list[str]):
+        self.errors: list[str] = errors
+        super().__init__('\n  '.join(errors))
+
 @dataclasses.dataclass
 class SessionWebhook:
     enabled: bool = False
@@ -55,8 +63,12 @@ class ParsedArgs:
     google_cloud_subscription_name:            str                             = ''
     google_subscription_product_id:            str                             = ''
 
-def parse_args(err: base.ErrorSink) -> ParsedArgs:
-    # NOTE: Parse .INI file if present and get arguments for it
+def parse_args() -> ParsedArgs:
+    # NOTE: Parse .INI file if present and get arguments for it. Field-validation problems are
+    # accumulated (so the operator sees every bad/missing field at once) and raised together as a
+    # ConfigError at the end; unrecoverable structural problems (missing .INI, malformed webhook
+    # section) still log + sys.exit immediately.
+    errors: list[str] = []
     result          = ParsedArgs()
     result.ini_path = os.getenv('SESH_PRO_BACKEND_INI_PATH', '')
     if len(result.ini_path) > 0:
@@ -118,7 +130,7 @@ def parse_args(err: base.ErrorSink) -> ParsedArgs:
                 result.apple_root_cert_path                = apple_section.get(option='root_cert_path',                fallback='')
                 result.apple_sandbox_env                   = apple_section.getboolean(option='sandbox_env',            fallback=False)
             else:
-                err.msg_list.append('Platform Apple was enabled but [apple] section is missing')
+                errors.append('Platform Apple was enabled but [apple] section is missing')
 
         if result.with_platform_google:
             if 'google' in ini_parser:
@@ -129,7 +141,7 @@ def parse_args(err: base.ErrorSink) -> ParsedArgs:
                 result.google_package_name                = google_section.get(option='package_name',                       fallback='')
                 result.google_subscription_product_id     = google_section.get(option='subscription_product_id',            fallback='')
             else:
-                err.msg_list.append('Platform Google was enabled but [google] section is missing')
+                errors.append('Platform Google was enabled but [google] section is missing')
 
     # NOTE: Get arguments from environment, they override .INI values if specified
     result.db_url                         = os.getenv('SESH_PRO_BACKEND_DB_URL',                             result.db_url)
@@ -142,30 +154,30 @@ def parse_args(err: base.ErrorSink) -> ParsedArgs:
 
     if result.with_platform_apple:
         if len(result.apple_key_id) == 0:
-            err.msg_list.append('Platform Apple was enabled but key_id was not specified')
+            errors.append('Platform Apple was enabled but key_id was not specified')
         if len(result.apple_issuer_id) == 0:
-            err.msg_list.append('Platform Apple was enabled but issuer_id was not specified')
+            errors.append('Platform Apple was enabled but issuer_id was not specified')
         if len(result.apple_bundle_id) == 0:
-            err.msg_list.append('Platform Apple was enabled but bundle_id was not specified')
+            errors.append('Platform Apple was enabled but bundle_id was not specified')
         if len(result.apple_key_path) == 0:
-            err.msg_list.append('Platform Apple was enabled but key_path was not specified')
+            errors.append('Platform Apple was enabled but key_path was not specified')
         if len(result.apple_root_cert_path) == 0:
-            err.msg_list.append('Platform Apple was enabled but root_cert_path was not specified')
+            errors.append('Platform Apple was enabled but root_cert_path was not specified')
         if len(result.apple_root_cert_ca_g2_path) == 0:
-            err.msg_list.append('Platform Apple was enabled but root_cert_ca_g2_path was not specified')
+            errors.append('Platform Apple was enabled but root_cert_ca_g2_path was not specified')
         if len(result.apple_root_cert_ca_g3_path) == 0:
-            err.msg_list.append('Platform Apple was enabled but root_cert_ca_g3_path was not specified')
+            errors.append('Platform Apple was enabled but root_cert_ca_g3_path was not specified')
 
         if not result.apple_sandbox_env:
             if result.apple_app_id is None:
-                err.msg_list.append('Platform Apple was enabled in production mode (e.g. not sandbox mode) but the production_app_id was not specified')
+                errors.append('Platform Apple was enabled in production mode (e.g. not sandbox mode) but the production_app_id was not specified')
 
         if result.apple_sandbox_env:
             if result.platform_testing_env == False:
                 log.warning('Platform Apple was enabled in sandbox mode but platform_testing_env was not set to true. You want to set this to true, overriding the flag to true')
                 result.platform_testing_env = True
 
-        if not err.has():
+        if not errors:
             try:
                 result.apple_key = pathlib.Path(result.apple_key_path).read_bytes()
                 result.apple_root_certs = [
@@ -174,18 +186,21 @@ def parse_args(err: base.ErrorSink) -> ParsedArgs:
                     pathlib.Path(result.apple_root_cert_ca_g3_path).read_bytes(),
                 ]
             except Exception as e:
-                err.msg_list.append(f'Platform Apple was enabled but we are unable to read the path: {e}');
+                errors.append(f'Platform Apple was enabled but we are unable to read the path: {e}');
 
     if result.with_platform_google:
         if len(result.google_package_name) == 0:
-            err.msg_list.append('Platform Google was enabled but package_name was not specified')
+            errors.append('Platform Google was enabled but package_name was not specified')
         if len(result.google_cloud_project_id) == 0:
-            err.msg_list.append('Platform Google was enabled but cloud_project_id was not specified')
+            errors.append('Platform Google was enabled but cloud_project_id was not specified')
         if len(result.google_cloud_subscription_name) == 0:
-            err.msg_list.append('Platform Google was enabled but cloud_subscription_name was not specified')
+            errors.append('Platform Google was enabled but cloud_subscription_name was not specified')
         if len(result.google_cloud_app_credentials_path) == 0:
-            err.msg_list.append('Platform Google was enabled but cloud_application_credentials_path was not specified')
+            errors.append('Platform Google was enabled but cloud_application_credentials_path was not specified')
         if len(result.google_subscription_product_id) == 0:
-            err.msg_list.append('Platform Google was enabled but subscription_product_id was not specified')
+            errors.append('Platform Google was enabled but subscription_product_id was not specified')
+
+    if errors:
+        raise ConfigError(errors)
 
     return result

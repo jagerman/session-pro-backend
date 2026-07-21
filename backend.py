@@ -1,4 +1,3 @@
-import traceback
 import nacl.signing
 import nacl.utils
 import hashlib
@@ -560,22 +559,20 @@ def bump_revocation_ticket(conn: psycopg.Connection, amount: int) -> int:
     assert row is not None, 'missing revocation_ticket global'
     return row[0]
 
-def bootstrap_db(database_url: str, err: base.ErrorSink) -> psycopg_pool.ConnectionPool | None:
-    """ Opens the database pool and bootstraps/migrates the schema if needed. """
-    result: psycopg_pool.ConnectionPool | None = None
+def bootstrap_db(database_url: str) -> psycopg_pool.ConnectionPool:
+    """ Opens the database pool and bootstraps/migrates the schema if needed. Raises on failure. """
     try:
-        result = db.get_pool(database_url)
+        pool = db.get_pool(database_url)
     except Exception as e:
-        err.msg_list.append(f'Failed to open/connect to DB at {database_url}: {e}')
-        return result
+        raise RuntimeError(f'Failed to open/connect to DB at {database_url}: {e}') from e
 
     try:
-        with db.connection(result) as conn:
+        with db.connection(pool) as conn:
             migrations.apply_migrations(conn)
-    except Exception:
-        err.msg_list.append(f"Failed to bootstrap DB tables: {traceback.format_exc()}")
+    except Exception as e:
+        raise RuntimeError('Failed to bootstrap DB tables') from e
 
-    return result
+    return pool
 
 def verify_db(conn: psycopg.Connection, err: base.ErrorSink) -> bool:
     unredeemed_payments: list[PaymentRow] = get_unredeemed_payments_list(conn)
