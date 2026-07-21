@@ -895,7 +895,7 @@ def redeem_payment(tx:                  db.SQLTransaction,
         # (item 3): this REUSES the user's current generation (brand-new user → its initial one; existing
         # user → the same one they already had), so a redeem never rolls the generation or the client's
         # revocation_tag. (_allocate mints a fresh generation only if the current one is revoked.)
-        allocated: AllocatedGenID = _allocate_new_gen_id_if_master_pkey_has_payments(tx, master_pkey, issued_at=redeemed_at)
+        allocated = _ensure_active_generation(tx, master_pkey, issued_at=redeemed_at)
         # found ⟺ expires_at is not None (the allocator sets found only after the expiry-None early-return);
         # assert the expiry directly so it's the non-None datetime the proof build needs.
         assert allocated.expires_at is not None, "We just added the user's payment we expect to find the latest expiry date for the pkey"
@@ -1476,7 +1476,7 @@ def get_or_create_user_and_generation(tx: db.SQLTransaction, master_pkey: nacl.s
              gen_id, user_id, token, issued_at)
     return (user_id, gen_id, token, True)
 
-def _allocate_new_gen_id_if_master_pkey_has_payments(tx:          db.SQLTransaction,
+def _ensure_active_generation(tx:          db.SQLTransaction,
                                                      master_pkey: nacl.signing.VerifyKey,
                                                      issued_at:   datetime.datetime) -> AllocatedGenID:
     # Refresh the user's top-level entitlement fields from their current best payment, and settle which
@@ -1487,7 +1487,7 @@ def _allocate_new_gen_id_if_master_pkey_has_payments(tx:          db.SQLTransact
     # already-revoked). The revoke path depends on exactly this: it sets revoked_at first, then calls here,
     # so it rolls onto a fresh generation. The user row must already exist (redeem creates it via
     # get_or_create_user_and_generation; revoke's user exists).
-    result: AllocatedGenID = AllocatedGenID()
+    result = AllocatedGenID()
     lookup: LookupUserExpiry = _lookup_user_expiry(tx, master_pkey)
     result.expires_at = lookup.expiry_from_redeemed
     if lookup.expiry_from_redeemed is None:
@@ -1707,7 +1707,7 @@ def revoke_master_pkey_proofs_and_allocate_new_gen_id(tx: db.SQLTransaction, mas
 
     # If the user still has usable payments, roll them onto a fresh generation for subsequent proofs.
     # Clients see the old generation revoked (via the revocation list) and re-query for a new proof.
-    result = _allocate_new_gen_id_if_master_pkey_has_payments(tx, master_pkey, issued_at=created_at)
+    result = _ensure_active_generation(tx, master_pkey, issued_at=created_at)
     return result
 
 def round_datetime_to_next_day_with_platform_testing_support(payment_provider: base.PaymentProvider, at: datetime.datetime) -> datetime.datetime:
