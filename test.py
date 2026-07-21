@@ -746,8 +746,8 @@ def test_revocation_cutting_refund_rolls_generation(monkeypatch, pg_database):
             user_after = backend.get_user_and_payments(tx, master_key.verify_key)
             assert user_after.user.current_generation_id != gen_before
             assert user_after.user.token                 != token_before
-            assert not backend.is_generation_revoked_tx(tx, user_after.user.current_generation_id, now)
-            assert backend.is_generation_revoked_tx(tx, gen_before, now)
+            assert not backend.is_generation_revoked(tx.conn, user_after.user.current_generation_id, now)
+            assert backend.is_generation_revoked(tx.conn, gen_before, now)
         assert len(backend.get_revocations_list(db_conn)) == 1
     finally:
         db_engine.putconn(db_conn)
@@ -1185,7 +1185,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
                     now_dt = base.datetime_from_unix_ms(unix_ts_ms)
                     assert get_user.user.current_generation_id == kept_generation_id
                     assert get_user.user.token                 == kept_generation_token
-                    assert not backend.is_generation_revoked_tx(tx, get_user.user.current_generation_id, now_dt)
+                    assert not backend.is_generation_revoked(tx.conn, get_user.user.current_generation_id, now_dt)
 
             assert not err.has()
 
@@ -1448,7 +1448,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
             with db.transaction(db_conn) as tx:
                 get_user_after = backend.get_user_and_payments(tx, master_key.verify_key)
                 assert get_user_after.user.current_generation_id == gen_before_final_revoke
-                assert backend.is_generation_revoked_tx(tx, get_user_after.user.current_generation_id, base.datetime_from_unix_ms(start_unix_ts_ms))
+                assert backend.is_generation_revoked(tx.conn, get_user_after.user.current_generation_id, base.datetime_from_unix_ms(start_unix_ts_ms))
 
             # Try requesting a proof normally which should now fail as everything has been revoked
             generate_pro_proof_hash_version = 0

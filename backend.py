@@ -471,7 +471,7 @@ def get_user_and_payments(tx: db.SQLTransaction, master_pkey: nacl.signing.Verif
     ''', bytes(master_pkey), row_factory=db.dict_row)
 
     result      = GetUserAndPayments(payments_it=payments_it)
-    result.user = get_user_from_sql_tx(tx, master_pkey)
+    result.user = get_user(tx.conn, master_pkey)
 
     result.payments_count = db.query_scalar(tx.conn, '''
         SELECT COUNT(*)
@@ -498,18 +498,14 @@ def get_users_list(conn: psycopg.Connection) -> list[UserRow]:
             result.append(user_row_from_dict(row))
     return result
 
-def get_user_from_sql_tx(tx: db.SQLTransaction, master_pkey: nacl.signing.VerifyKey) -> UserRow:
+def get_user(conn: psycopg.Connection, master_pkey: nacl.signing.VerifyKey) -> UserRow:
+    # Single SELECT: runs on the given connection, so a mid-transaction caller passes `tx.conn` (joins the
+    # open transaction) and a standalone caller autocommits.
     result: UserRow = UserRow()
-    row = db.query_one(tx.conn, f"SELECT {USERS_COLUMNS} FROM {USERS_FROM} WHERE u.master_pkey = %s",
+    row = db.query_one(conn, f"SELECT {USERS_COLUMNS} FROM {USERS_FROM} WHERE u.master_pkey = %s",
                        bytes(master_pkey), row_factory=db.dict_row)
     if row:
         result = user_row_from_dict(row)
-    return result
-
-def get_user(conn: psycopg.Connection, master_pkey: nacl.signing.VerifyKey) -> UserRow:
-    result: UserRow = UserRow()
-    with db.transaction(conn) as tx:
-        result = get_user_from_sql_tx(tx, master_pkey)
     return result
 
 def get_revocations_list(conn: psycopg.Connection) -> list[RevocationRow]:
@@ -520,17 +516,13 @@ def get_revocations_list(conn: psycopg.Connection) -> list[RevocationRow]:
             result.append(RevocationRow(generation_id=generation_id, token=bytes(token), revoked_at=revoked_at))
     return result
 
-def is_generation_revoked_tx(tx: db.SQLTransaction, generation_id: int, now: datetime.datetime) -> bool:
+def is_generation_revoked(conn: psycopg.Connection, generation_id: int, now: datetime.datetime) -> bool:
     # A generation is revoked iff revoked_at is set (revocation is terminal). `now` is accepted for a
     # uniform signature; a set revoked_at is always in effect (there is no per-entry expiry now — the
-    # served-list retention window is list-level and memory-only on the client).
-    return bool(db.query_scalar(tx.conn, "SELECT EXISTS (SELECT 1 FROM generations WHERE id = %s AND revoked_at IS NOT NULL)", generation_id))
-
-def is_generation_revoked(conn: psycopg.Connection, generation_id: int, now: datetime.datetime) -> bool:
-    result: bool = False
-    with db.transaction(conn) as tx:
-        result = is_generation_revoked_tx(tx, generation_id, now)
-    return result
+    # served-list retention window is list-level and memory-only on the client). Single statement, so it
+    # runs directly on the given connection: a mid-transaction caller passes `tx.conn` and the read joins
+    # that open transaction (sees an uncommitted revoke); a standalone caller autocommits.
+    return bool(db.query_scalar(conn, "SELECT EXISTS (SELECT 1 FROM generations WHERE id = %s AND revoked_at IS NOT NULL)", generation_id))
 
 # Typed accessors for the `globals` key/value store (one row per app-global; see schema/000). Each
 # global's type is known at the call site, so we read/write the matching value slot directly.
@@ -1380,7 +1372,7 @@ def add_unredeemed_payment_tx(tx:                                db.SQLTransacti
         master_pkey_record = typing.cast(tuple[bytes] | None, result_set.fetchone())
         if master_pkey_record and master_pkey_record[0]:
             master_pkey   = nacl.signing.VerifyKey(bytes(master_pkey_record[0]))
-            user: UserRow = get_user_from_sql_tx(tx, master_pkey)
+            user: UserRow = get_user(tx.conn, master_pkey)
             if user.found:
                 auto_redeem_deadline_at: int = 0
 
@@ -1476,7 +1468,7 @@ def get_or_create_user_and_generation(tx: db.SQLTransaction, master_pkey: nacl.s
     master_pkey_bytes = bytes(master_pkey)
 
     # Common path: the user already exists — a plain read, no id/generation allocation burned.
-    existing = get_user_from_sql_tx(tx, master_pkey)
+    existing = get_user(tx.conn, master_pkey)
     if existing.found:
         return (existing.id, existing.current_generation_id, existing.token, False)
 
@@ -1498,7 +1490,7 @@ def get_or_create_user_and_generation(tx: db.SQLTransaction, master_pkey: nacl.s
          gen_id      = gen_id)
     if won is None:
         # Lost a concurrent create — re-read the winner (our pre-allocated ids simply go unused).
-        winner = get_user_from_sql_tx(tx, master_pkey)
+        winner = get_user(tx.conn, master_pkey)
         return (winner.id, winner.current_generation_id, winner.token, False)
     db.query(tx.conn, "INSERT INTO generations (id, user_id, token, issued_at) VALUES (%s, %s, %s, %s)",
              gen_id, user_id, token, issued_at)
@@ -1522,10 +1514,10 @@ def _allocate_new_gen_id_if_master_pkey_has_payments(tx:          db.SQLTransact
         return result  # no usable payment → nothing to allocate
 
     result.found = True
-    user = get_user_from_sql_tx(tx, master_pkey)
+    user = get_user(tx.conn, master_pkey)
     assert user.found, "user must exist before allocating a generation"
 
-    if is_generation_revoked_tx(tx, user.current_generation_id, issued_at):
+    if is_generation_revoked(tx.conn, user.current_generation_id, issued_at):
         result.generation_id, result.token = mint_generation(tx, user.id, issued_at)
     else:
         result.generation_id, result.token = user.current_generation_id, user.token
@@ -1777,7 +1769,7 @@ def build_current_entitlement_proof_tx(tx:            db.SQLTransaction,
         raise base.FailError(f'User {bytes(master_pkey).hex()} does not have an active payment registered for it',
                              code=base.ErrorCode.not_subscribed)
 
-    if is_generation_revoked_tx(tx, get_user.user.current_generation_id, request_at):
+    if is_generation_revoked(tx.conn, get_user.user.current_generation_id, request_at):
         raise base.FailError(f'User {bytes(master_pkey).hex()} payment has been revoked', code=base.ErrorCode.revoked)
 
     proof_expires_at = _build_proof_clamped_expiry_time(request_at=request_at, proposed_expires_at=get_user.user.expires_at)
@@ -1859,14 +1851,6 @@ def add_user_error(conn: psycopg.Connection, error: UserError, at: datetime.date
     with db.transaction(conn) as tx:
         add_user_error_tx(tx, error, at)
 
-def has_user_error_tx(tx: db.SQLTransaction, payment_provider: base.PaymentProvider, payment_id: str) -> bool:
-    row = db.query_one(tx.conn,
-                       'SELECT 1 FROM user_errors WHERE payment_id = %s AND payment_provider = %s',
-                       payment_id,
-                       int(payment_provider.value))
-    result = row is not None
-    return result
-
 def has_user_error_from_master_pkey_tx(tx: db.SQLTransaction, master_pkey: nacl.signing.VerifyKey) -> bool:
     # NOTE: Rangeproof payments cannot have user errors
     return bool(db.query_scalar(tx.conn, (f'''
@@ -1884,10 +1868,13 @@ SELECT EXISTS (
 '''), bytes(master_pkey)))
 
 def has_user_error(conn: psycopg.Connection, payment_provider: base.PaymentProvider, payment_id: str) -> bool:
-    result = False
-    with db.transaction(conn) as tx:
-        result = has_user_error_tx(tx, payment_provider, payment_id)
-    return result;
+    # Single SELECT on the given connection (mid-tx callers pass tx.conn). payment_provider is a string
+    # code (item 9) — compared directly, NOT int()-cast (that was a latent crash on the CLI path).
+    row = db.query_one(conn,
+                       'SELECT 1 FROM user_errors WHERE payment_id = %s AND payment_provider = %s',
+                       payment_id,
+                       payment_provider.value)
+    return row is not None
 
 def delete_user_errors_tx(tx: db.SQLTransaction, payment_provider: base.PaymentProvider, payment_id: str) -> bool:
     row    = db.query(tx.conn, 'DELETE FROM user_errors WHERE payment_provider = %s AND payment_id = %s', payment_provider.value, payment_id)

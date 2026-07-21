@@ -828,7 +828,7 @@ def get_pro_details():
                     else:
                         user_pro_status = UserProStatus.Expired
 
-                    if backend.is_generation_revoked_tx(tx, get_user.user.current_generation_id, request_at):
+                    if backend.is_generation_revoked(tx.conn, get_user.user.current_generation_id, request_at):
                         user_pro_status = UserProStatus.Expired
 
             dict_result = {
