@@ -45,7 +45,7 @@
   ~238 ns, so this preserves milliseconds exactly.) A value that enters a **signed message is always a
   whole-second integer** (encoded as canonical decimal ASCII per §1.1), never a float — the signed
   timestamps (`ts`, `refund_requested_ts`, proof `expiry_ts`) are whole-second by nature; the float
-  `purchased_ts`/`revoked_ts` are get-details *response* fields, never signed. The DB stores every instant at full
+  `purchased_ts`/`revoked_ts` are read-response fields, never signed. The DB stores every instant at full
   `timestamptz` (µs) precision regardless of wire type, so an integer wire field is a *display* choice,
   not data loss — a field can widen to a float later with no storage change.
 - **Field-name markers (no unit suffix, ever).** Seconds is the universal unit, so **no** field carries a
@@ -68,16 +68,27 @@
   the DB keeps a surrogate int `id`, but the wire *and the signed messages* use the `code`, so no magic
   number ever crosses the wire and new values are additive `INSERT`s):
   - `payment_provider`: `"google_play"`, `"app_store"`, `"rangeproof"`
-  - `status`: TWO distinct fields share this name at different nesting levels. Each get-details **item**
-    carries a *payment* `status`: `"unredeemed"`, `"redeemed"`, `"expired"`, `"revoked"` — **`"revoked"`**
-    is the terminal revoked state (refund/chargeback/protocol kill); distinct from the separate
-    `refund_requested_ts` field (refund-*requested* ≠ *revoked*). There is no `"refunded"` status. The
-    **top-level** get-details `status` is the account's overall *Pro* status: `"never"` (never been Pro),
-    `"active"`, `"expired"`.
-  - `plan`: a compact **billing-period code** — `"1m"`, `"3m"`, `"1y"` (`N` + unit `d`/`w`/`m`/`y`),
-    free-form for non-period plans (`"lifetime"`). Canonical per period (a 12-month product is `"1y"`,
-    not `"12m"`). **Display/accounting only** (never computed with); recurrence is the separate
-    `auto_renewing` field, *not* part of this code. Client maps/parses it for display; backend groups by it.
+  - `status`: the per-**item** *payment* status — `"unredeemed"`, `"redeemed"`, `"expired"`, `"revoked"` —
+    where **`"revoked"`** is the terminal revoked state (refund/chargeback/protocol kill), distinct from the
+    separate `refund_requested_ts` field (refund-*requested* ≠ *revoked*). There is no `"refunded"` status.
+    (The account-level *Pro* status is a **separate** field, `user_status` — values `"never"`/`"active"`/
+    `"expired"` — not this per-item `status`; see §5.2.)
+  - `plan`: a compact **billing-period code** with a **backend-owned, closed grammar** (Delta #14): a fixed
+    `<N><unit>` pattern over a fixed unit set, or the literal `"lifetime"`. The backend emits only conforming
+    values, so a client MAY treat a non-conforming value as a protocol error (fail-closed) and need not keep
+    a raw-string pass-through.
+    - **`<N><unit>`** — `N` a positive integer, no leading zeros (`[1-9][0-9]*`); `unit` one of
+      `s`/`d`/`w`/`m`/`y` (second/day/week/month/year). Single-unit (`"1y6m"` is invalid). Parses to
+      `(count ≥ 1, unit)`. **The unit is preserved, never converted:** `"12m"` and `"1y"` are the same
+      duration but distinct values — the unit is the product's intended presentation. `s` is mainly for
+      testing; no production plan uses it.
+    - **`"lifetime"`** — perpetual, non-recurring; parses to `(count = 0, unit = lifetime)`. `count` is
+      defined only for periodic units; for `lifetime` it is not meaningful (invariant:
+      `count == 0 ⟺ lifetime`). Consumers switch on `unit` and never render `lifetime` as `"{count} {unit}"`.
+
+    **Display/accounting only** (never computed with); recurrence is the separate `auto_renewing` field. A
+    parser reads it **once** to `(count, unit)` — unit enum `second`/`day`/`week`/`month`/`year`/`lifetime`;
+    clients own localized display. Backend groups by the raw code.
   - A `nil`/unset value is never valid on the wire — every stored row has a real code.
 - **No version byte in any signed message; no `version` field on requests/responses** (Delta #11).
   Requests are domain-separated by their **domain prefix** (§1.1) and their **endpoint**; a new *request*
@@ -145,28 +156,36 @@ field or prefix (§1, Delta #11) — the domain prefix + the endpoint already do
 new request shape gets a new endpoint. Below, `dec(x)` = the canonical decimal-ASCII integer of §1.1, raw
 32-byte fields are self-delimiting, and `\0` separates adjacent variable-length fields.
 
-**3.1 generate-proof** — domain `ProGenerateProof`
+**3.1 generate_pro_proof** — domain `ProGenerateProof`
 ```
 master_pkey(32) ‖ rotating_pkey(32) ‖ dec(ts)
 ```
 
-**3.2 add-payment** — domain `ProAddPayment___`  (note: **no timestamp**)
+**3.2 add_pro_payment** — domain `ProAddPayment___`  (note: **no timestamp**)
 ```
 master_pkey(32) ‖ rotating_pkey(32) ‖ provider_code ‖ \0 ‖ payment_id (§3.5)
 ```
 
-**3.3 set-refund-requested** — domain `ProSetRefundReq_`  (note: **no rotating_pkey**, two timestamps)
+**3.3 set_payment_refund_requested** — domain `ProSetRefundReq_`  (note: **no rotating_pkey**, two timestamps)
 ```
 master_pkey(32) ‖ dec(ts) ‖ \0 ‖ dec(refund_requested_ts) ‖ \0 ‖ provider_code ‖ \0 ‖ payment_id (§3.5)
 ```
 
-**3.4 get-pro-details** — domain `ProGetProDetReq_`
-```
-master_pkey(32) ‖ dec(ts) ‖ \0 ‖ dec(count)
-```
+**3.4 read requests** — two authorised read endpoints (the split of the old combined `get_pro_details`, Delta #15):
 
-**3.5 payment_id** — one **opaque UTF-8 string** identifying the payment, appended verbatim for add-payment
-& set-refund. The client treats it as a single opaque token (received from the provider's purchase flow,
+  **get_pro_status** — domain `ProGetProStatus_`  (the hot path: account status + the single latest payment)
+  ```
+  master_pkey(32) ‖ dec(ts)
+  ```
+
+  **get_payment_details** — domain `ProGetPayDetails`  (paginated payment history; rarely hit)
+  ```
+  master_pkey(32) ‖ dec(ts) ‖ \0 ‖ dec(limit) ‖ \0 ‖ before
+  ```
+  `before` is the opaque pagination cursor (§5.3) — the empty string requests the newest page.
+
+**3.5 payment_id** — one **opaque UTF-8 string** identifying the payment, appended verbatim for add_pro_payment
+& set_payment_refund_requested. The client treats it as a single opaque token (received from the provider's purchase flow,
 passed through unread); the backend, which alone acts on it, owns its encoding.
 
 **Each provider owns its `payment_id` encoding.** The one cross-cutting invariant is that `payment_id` is
@@ -176,7 +195,7 @@ Beyond that, structure is a private contract between the provider's client flow 
   today because the token is base64url (`[A-Za-z0-9._-]`) and the order id is `GPA.####-…` — neither
   contains `|`.
 - `app_store`   → `apple_tx_id`
-- `rangeproof`  → `rangeproof_order_id`  *(add-payment only)*
+- `rangeproof`  → `rangeproof_order_id`  *(add_pro_payment only)*
 
 > This collapses the old per-provider wire fields to one opaque value: the wire/signed message no longer needs to
 > know a payment identifier has sub-fields. If a future provider's identifier can itself contain the
@@ -263,17 +282,40 @@ Non-`ok` responses carry two fields:
 
 ### 5.2 Result payloads
 
-`get-pro-details` and payment/refund `result` bodies are unsigned JSON data. They carry the same
-conventions: timestamps are `_ts` seconds — **integer** everywhere except the two upstream provider event
-instants `purchased_ts` and `revoked_ts`, which are **floats** to keep provider sub-second precision (§1) —
-enums are their string `code`s (§1), byte strings are hex, and no key name leaks an internal implementation
-detail (see §6). (Their per-field shapes track `server.py`; only the naming/units rules here are normative
-for them.) Note some non-error outcomes live *in* `result`, not as a `fail`: get-details reports account
-state as `user_status` (`never`/`active`/`expired`; `user_` disambiguates it from the envelope `status`
-and the per-item payment `status`), and set-refund returns `{ "updated": <bool> }`. `user_status` is a
-distinct axis from the `error_code` slugs (§5.1) and their vocabularies are deliberately **disjoint** — the
-"lapsed" `error_code` is `subscription_expired`, not `expired`, so a value never belongs to two fields;
-`user_status: never` is the state behind an `error_code: not_subscribed` rejection.
+The read endpoints (`get_pro_status`, `get_payment_details`) and payment/refund `result` bodies are unsigned
+JSON data. They carry the same conventions: timestamps are `_ts` seconds — **integer** everywhere except the
+two upstream provider event instants `purchased_ts` and `revoked_ts`, which are **floats** to keep provider
+sub-second precision (§1) — enums are their string `code`s (§1), byte strings are hex, and no key name leaks
+an internal implementation detail (see §6). (Their per-field shapes track `server.py`; only the naming/units
+rules here are normative for them.) Note some non-error outcomes live *in* `result`, not as a `fail`:
+`get_pro_status` reports account state as `user_status` (`never`/`active`/`expired`; `user_` disambiguates it
+from the envelope `status` and the per-item payment `status`), and set_payment_refund_requested returns `{ "updated": <bool> }`.
+`user_status` is a distinct axis from the `error_code` slugs (§5.1) and their vocabularies are deliberately
+**disjoint** — the "lapsed" `error_code` is `subscription_expired`, not `expired`, so a value never belongs to
+two fields; `user_status: never` is the state behind an `error_code: not_subscribed` rejection.
+
+The two read endpoints split the old combined `get_pro_details` `result` (Delta #15):
+- **`get_pro_status`** (cheap, hot path) — `{ user_status, auto_renewing, expiry_ts, refund_requested_ts,
+  grace_period_duration, error_report, latest_payment }`. `latest_payment` is a single payment item (shape
+  below) or `null` when the account has no payments. No list, no pagination.
+- **`get_payment_details`** (paginated history) — `{ payments_total, items, next_cursor }`. `items` is one
+  keyset page of payment items, newest-first, and carries **no** `user_status`; `payments_total` is the
+  account's total payment count; `next_cursor` (§5.3) is the pagination token, or `null` at end-of-data.
+
+Each **payment item** carries: `status` (payment `code`), `plan`, `payment_provider`, `auto_renewing`,
+`purchased_ts` (float), `redeemed_ts`, `expiry_ts`, `grace_period_duration`, `platform_refund_expiry_ts`,
+`revoked_ts` (float), `refund_requested_ts`, and the opaque `payment_id` (§3.5).
+
+### 5.3 Pagination cursor (`get_payment_details`)
+
+`get_payment_details` uses **keyset** (seek) pagination, never numeric offsets. The client sends
+`{ limit, before }` — `limit` caps the page (server-clamped), `before` is a cursor (empty string = newest
+page). The response returns up to `limit` items newest-first plus `next_cursor`; the client re-requests with
+`before = next_cursor` to walk older pages, stopping when `next_cursor` is `null` (or fewer than `limit`
+items return). The cursor is **opaque** — an **encrypted** token, not a readable id: the client stores and
+echoes it verbatim and MUST NOT parse it. (It seals the boundary row's internal id, a global identity
+sequence whose raw value would leak system-wide payment volume/ordering — the same enumeration concern that
+made `payment_id` opaque. A tampered or foreign cursor is rejected as `invalid_request`.)
 
 ## 6. Field-naming rule
 Wire (JSON) field names describe **purpose to the consumer**, never server implementation, and carry
@@ -287,7 +329,7 @@ a `_ts` marker, durations `…_duration`. Audit every response key against both 
 1. **Timestamps ms → seconds** everywhere (proof `expiry`, all request timestamps, all wire
    `…_unix_ts_ms` → `…_ts`). (Their in-signature encoding is now canonical decimal ASCII, not 8-byte LE —
    superseded by #13.) Integer seconds
-   everywhere **except** the two upstream provider event instants in the get-details response,
+   everywhere **except** the two upstream provider event instants in the read responses,
    `purchased_ts` and `revoked_ts`, which are JSON **floats** carrying the provider's sub-second
    precision (§1). No `…_ts_ms`/`_ms` field survives — the unit is always seconds; precision that
    exceeds a whole second rides in the float.
@@ -304,8 +346,8 @@ a `_ts` marker, durations `…_duration`. Audit every response key against both 
    input.]**
 5. **Payment identifier → single opaque `payment_id` (§3.5)** — *both-sides-flip*. The per-provider wire
    fields (`google_payment_token`/`google_order_id`/`apple_tx_id`/`rangeproof_order_id`/`order_id`) collapse
-   to one opaque UTF-8 `payment_id` in `payment_tx`, get-details items, **and** the signed add-payment /
-   set-refund signed-message tail (`… ‖ provider_code ‖ payment_id`). Each provider owns its encoding; the only
+   to one opaque UTF-8 `payment_id` in `payment_tx`, read-response items, **and** the signed add_pro_payment /
+   set_payment_refund_requested signed-message tail (`… ‖ provider_code ‖ payment_id`). Each provider owns its encoding; the only
    invariant is exact bytes (it's signed). Google's is `token ‖ "|" ‖ order_id`, split once on the first
    `|`; the backend still stores the split-out fields in its own typed columns. Length-prefixing considered
    and dropped (collision unreachable: master-sig + onion + backend looks up by split fields, never the raw
@@ -326,11 +368,11 @@ a `_ts` marker, durations `…_duration`. Audit every response key against both 
    provider, split payment fields) and a "reference" that verifies nothing the backend signs is a trap. The
    authoritative references are now this byte-level spec and libsession-util's proof-verification test
    apparatus. (Supersedes the earlier plan to fix `verify_pro_proof.py` in place.)
-9. Minor: generate-proof signing hardcodes `version = 0` despite a version field — thread the real value.
+9. Minor: generate_pro_proof signing hardcodes `version = 0` despite a version field — thread the real value.
 10. **Enums → string `code`s** (§1): `payment_provider`, `status`, `plan` are transmitted as string codes,
     not integers — backed by lookup tables (backend item 9; DB keeps an int `id`, wire/signed-message use the
     `code`). `status`/`plan` are wire-only (unsigned responses) → easy. **`provider` is also in the
-    add-payment / set-refund signed messages** (was a 1-byte int, now the UTF-8 `provider_code`), so that's
+    add_pro_payment / set_payment_refund_requested signed messages** (was a 1-byte int, now the UTF-8 `provider_code`), so that's
     a **both-sides-flip**. `plan` is `"1m"/"3m"/"1y"` (period code, not a lookup of tiers-with-attributes).
 11. **Drop the in-digest version byte everywhere; version requests via the endpoint, the proof via a
     plaintext field that selects its domain prefix** (Q11 + Q12) — *both-sides-flip*. The leading
@@ -389,6 +431,26 @@ a `_ts` marker, durations `…_duration`. Audit every response key against both 
       verify/sign sites unchanged since they already `verify(msg,sig)`/`sign(msg)`). libsession must
       rebuild all five signed inputs to §1.1 in lockstep. (The `examples/` scripts that showed the old
       scheme have been deleted — see #8; the spec + libsession's test apparatus are the reference.)
+
+14. **Formalize the `plan` grammar (§1) as a closed grammar** — *spec-only; response-parse, no wire/signing
+    change, no both-sides flip.* `plan` was passed through opaquely; it now has a fixed grammar: `<N><unit>`
+    (`N` = `[1-9][0-9]*`, `unit` ∈ `s`/`d`/`w`/`m`/`y`, single-unit) or `"lifetime"`. The backend emits only
+    conforming values, so a client MAY fail-closed on a non-conforming one (no raw-string pass-through). The
+    unit is preserved, not canonicalised (`"12m"` ≠ `"1y"`). Parse once to `(count, unit)`.
+
+15. **Split the old combined `get_pro_details` into `get_pro_status` + `get_payment_details`** (§3.4, §5.2–5.3) — *both-sides-flip,
+    new endpoint + new signing domain + reshaped request/response.* The old combined endpoint conflated a
+    cheap entitlement check with a heavy payment ledger, and no client used the ledger beyond `items[0]`.
+    Now two endpoints:
+    - **`/get_pro_status`** (domain `ProGetProStatus_`; signed `master_pkey ‖ ts`) — the hot path. Result
+      `{ user_status, auto_renewing, expiry_ts, refund_requested_ts, grace_period_duration, error_report,
+      latest_payment }`, where `latest_payment` is a single item (or `null`). No list, no pagination.
+    - **`/get_payment_details`** (domain `ProGetPayDetails`; signed `master_pkey ‖ ts ‖ limit ‖ before`) —
+      paginated history. Request `{ limit, before }`, result `{ payments_total, items, next_cursor }`, **no**
+      `user_status`. Keyset pagination via an opaque encrypted `next_cursor` (§5.3), never numeric offsets.
+    Supersedes the earlier bare `get_pro_details` → `get_payment_details` rename (that rename stands for the
+    history endpoint; the status half is new). Clients call `get_pro_status` for the "am I Pro?" render and
+    `get_payment_details` only for a (future) history/receipts view.
 
 ## Open (coordination)
 - **Spec home:** this file, in the backend repo (`docs/pro-wire-protocol.md`), is proposed as the

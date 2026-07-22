@@ -1,5 +1,7 @@
 import nacl.signing
 import nacl.utils
+import nacl.bindings
+import functools
 import hashlib
 import os
 import typing
@@ -30,9 +32,11 @@ GENERATE_PROOF_DOMAIN               = b'ProGenerateProof'
 BUILD_PROOF_DOMAIN                  = b'ProProof_v0_____'  # version lives IN the domain prefix (Q12), not a byte/field
 ADD_PRO_PAYMENT_DOMAIN              = b'ProAddPayment___'
 SET_PAYMENT_REFUND_REQUESTED_DOMAIN = b'ProSetRefundReq_'
-GET_PRO_DETAILS_DOMAIN              = b'ProGetProDetReq_'
+GET_PAYMENT_DETAILS_DOMAIN          = b'ProGetPayDetails'
+GET_PRO_STATUS_DOMAIN               = b'ProGetProStatus_'
 assert all(len(p) == DOMAIN_SIZE for p in (GENERATE_PROOF_DOMAIN, BUILD_PROOF_DOMAIN,
-           ADD_PRO_PAYMENT_DOMAIN, SET_PAYMENT_REFUND_REQUESTED_DOMAIN, GET_PRO_DETAILS_DOMAIN))
+           ADD_PRO_PAYMENT_DOMAIN, SET_PAYMENT_REFUND_REQUESTED_DOMAIN, GET_PAYMENT_DETAILS_DOMAIN,
+           GET_PRO_STATUS_DOMAIN))
 
 # Explicit column list for payments table queries. Rows are read with `db.dict_row` and unpacked by
 # name in `payment_row_from_dict`, so order here is cosmetic (no positional coupling).
@@ -400,8 +404,45 @@ def make_set_payment_refund_requested_message(master_pkey: nacl.signing.VerifyKe
                           request_at, refund_requested_at,
                           payment_tx.provider.value, payment_tx.payment_id)
 
-def make_get_pro_details_message(master_pkey: nacl.signing.VerifyKey, request_at: datetime.datetime, count: int) -> bytes:
-    return signed_message(GET_PRO_DETAILS_DOMAIN, master_pkey, request_at, count)
+def make_get_pro_status_message(master_pkey: nacl.signing.VerifyKey, request_at: datetime.datetime) -> bytes:
+    return signed_message(GET_PRO_STATUS_DOMAIN, master_pkey, request_at)
+
+def make_get_payment_details_message(master_pkey: nacl.signing.VerifyKey, request_at: datetime.datetime,
+                                     limit: int, before: str) -> bytes:
+    return signed_message(GET_PAYMENT_DETAILS_DOMAIN, master_pkey, request_at, limit, before)
+
+# --- get-payment-details keyset pagination cursor ------------------------------------------------
+# Seek pagination keys on the payment's surrogate id, but that id is a global identity sequence, so
+# handing the raw value to the client would leak system-wide payment volume/ordering (the same reason
+# `payment_id` is opaque, §3.5). So we hand back the boundary id sealed in an XChaCha20-Poly1305 token
+# the client echoes verbatim. The key is derived from the backend signing key via a domain-separated
+# BLAKE2b — no separate secret to provision; rotating the signing key just invalidates outstanding
+# cursors (harmless — the client re-fetches from the newest page). The master_pkey is the AEAD
+# associated data, binding a cursor to the user it was issued to.
+_CURSOR_KEY_DOMAIN = b'SeshProCursorKey'  # 16-byte BLAKE2b personalisation
+
+@functools.lru_cache(maxsize=None)
+def _derive_cursor_key(seed: bytes) -> bytes:
+    return hashlib.blake2b(seed, digest_size=32, person=_CURSOR_KEY_DOMAIN).digest()
+
+def payment_cursor_key(signing_key: nacl.signing.SigningKey) -> bytes:
+    '''The 32-byte XChaCha20-Poly1305 cursor key derived from the signing seed. The derivation is constant
+    for a given key and memoized, so calling this per request just returns the cached bytes.'''
+    return _derive_cursor_key(bytes(signing_key))
+
+def encrypt_payment_cursor(cursor_key: bytes, master_pkey: nacl.signing.VerifyKey, payment_id: int) -> str:
+    nonce = nacl.utils.random(nacl.bindings.crypto_aead_xchacha20poly1305_ietf_NPUBBYTES)
+    ct    = nacl.bindings.crypto_aead_xchacha20poly1305_ietf_encrypt(
+        payment_id.to_bytes(8, 'big'), bytes(master_pkey), nonce, cursor_key)
+    return (nonce + ct).hex()
+
+def decrypt_payment_cursor(cursor_key: bytes, master_pkey: nacl.signing.VerifyKey, cursor: str) -> int:
+    '''Decrypt a pagination cursor to its boundary payment id. Raises on tamper / wrong user / garbage.'''
+    raw       = bytes.fromhex(cursor)
+    npub      = nacl.bindings.crypto_aead_xchacha20poly1305_ietf_NPUBBYTES
+    nonce, ct = raw[:npub], raw[npub:]
+    pt = nacl.bindings.crypto_aead_xchacha20poly1305_ietf_decrypt(ct, bytes(master_pkey), nonce, cursor_key)
+    return int.from_bytes(pt, 'big')
 
 def payment_row_from_dict(row: dict[str, typing.Any]) -> PaymentRow:
     # Rows come from a dict row factory (SELECT PAYMENTS_COLUMNS FROM PAYMENTS_FROM, row_factory=
@@ -478,6 +519,25 @@ def get_user_and_payments(tx: db.SQLTransaction, master_pkey: nacl.signing.Verif
         WHERE  user_id = (SELECT id FROM users WHERE master_pkey = %s)
     ''', bytes(master_pkey))
     return result
+
+def get_user_payments_page(tx: db.SQLTransaction, master_pkey: nacl.signing.VerifyKey,
+                           limit: int, before_id: int | None) -> list[PaymentRow]:
+    '''One keyset page of a user's (redeemed) payments, newest-first (id DESC — the registration order).
+    `before_id` is the exclusive upper bound: return rows with id < before_id; None starts at the newest.
+    A user_id is only ever set on a redeemed payment, so this returns only redeemed rows.'''
+    sql = (f'SELECT {PAYMENTS_COLUMNS} FROM {PAYMENTS_FROM} '
+           'WHERE p.user_id = (SELECT id FROM users WHERE master_pkey = %(mk)s)')
+    params: dict[str, typing.Any] = {'mk': bytes(master_pkey), 'lim': limit}
+    if before_id is not None:
+        sql += ' AND p.id < %(before)s'
+        params['before'] = before_id
+    sql += ' ORDER BY p.id DESC LIMIT %(lim)s'
+    return [payment_row_from_dict(r) for r in db.query(tx.conn, sql, row_factory=db.dict_row, **params)]
+
+def get_user_payments_count(tx: db.SQLTransaction, master_pkey: nacl.signing.VerifyKey) -> int:
+    return db.query_scalar(tx.conn,
+        'SELECT COUNT(*) FROM payments WHERE user_id = (SELECT id FROM users WHERE master_pkey = %s)',
+        bytes(master_pkey))
 
 def user_row_from_dict(row: dict[str, typing.Any]) -> UserRow:
     return UserRow(found                        = True,
@@ -1977,7 +2037,7 @@ def set_refund_requested(tx: db.SQLTransaction, payment_tx: UserPaymentTransacti
 
     # If the refund timestamp has been set, immediately refresh the user's row.
     #
-    # When a client hits /get_pro_details, that endpoint uses the user's row which caches the
+    # When a client hits /get_payment_details, that endpoint uses the user's row which caches the
     # "best" payment that should be used to entitle a user to pro. Hence if their refund
     # timestamp changes for that best payment, that metadata that is cached in the user details
     # must be updated.

@@ -242,7 +242,7 @@ API
         "status": "ok"
       }
 
-  /get_pro_details
+  /get_payment_details
     Description
       Retrieve the list of current and historical payments associated with the Session Pro master
       public key. The returned list is in descending order from the date that the payment was
@@ -255,7 +255,7 @@ API
       The embedded `master_sig` signature must sign over the 32 byte hash of the requests contents
       (in little endian):
 
-        hash = blake2b32(person='ProGetProDetReq_', master_pkey || ts || count)
+        hash = blake2b32(person='ProGetPayDetails', master_pkey || ts || count)
 
       TODO: In future we plan to prune payment history after some legally required threshold such as
       a year.
@@ -540,7 +540,8 @@ FLASK_CONFIG_BACKEND_SKEY_KEY                      = 'session_pro_backend_signin
 FLASK_ROUTE_ADD_PRO_PAYMENT                         = '/add_pro_payment'
 FLASK_ROUTE_GENERATE_PRO_PROOF                      = '/generate_pro_proof'
 FLASK_ROUTE_GET_PRO_REVOCATIONS                     = '/get_pro_revocations'
-FLASK_ROUTE_GET_PRO_DETAILS                         = '/get_pro_details'
+FLASK_ROUTE_GET_PRO_STATUS                          = '/get_pro_status'
+FLASK_ROUTE_GET_PAYMENT_DETAILS                     = '/get_payment_details'
 FLASK_ROUTE_SET_PAYMENT_REFUND_REQUESTED            = '/set_payment_refund_requested'
 FLASK_ROUTE_STATUS                                  = '/status'
 
@@ -725,128 +726,158 @@ def get_pro_revocations():
                 'retain_for': RETAIN_FOR,
             })
 
-@flask_blueprint.route(FLASK_ROUTE_GET_PRO_DETAILS, methods=['POST'])
-def get_pro_details():
+MAX_PAYMENT_DETAILS_PAGE = 100  # server-side cap on a get-payment-details page (client `limit` is clamped)
+
+def _check_read_replay_window(request_at: datetime.datetime) -> None:
+    # Timestamp anti-replay window (wire nonce is integer seconds). Out of window → stale_request. (We
+    # _could_ track recent nonces to reject replays outright, but the onion transport already masks replay
+    # ability for a read-only query.)
+    now = base.datetime_from_unix_ms(int(time_now() * 1000))
+    if abs(now - request_at) >= base.DEFAULT_TIMESTAMP_TOLERANCE:
+        raise base.FailError(f'Timestamp is outside the tolerance window, delta was {abs(now - request_at)}',
+                             code=base.ErrorCode.stale_request)
+
+def _verify_master_sig(master_pkey_nacl: nacl.signing.VerifyKey, master_sig_bytes: bytes, message: bytes) -> None:
+    try:
+        master_pkey_nacl.verify(smessage=message, signature=master_sig_bytes)
+    except Exception:
+        raise base.FailError('Signature failed to be verified', code=base.ErrorCode.bad_signature)
+
+def _payment_item_wire(payment: backend.PaymentRow, request_at: datetime.datetime) -> dict[str, str | int | float | bool]:
+    # Wire seconds (wire spec §1/§5): integer everywhere the backend computes/rounds the value; the two
+    # upstream provider event instants — `purchased_ts` and `revoked_ts` — are floats carrying the
+    # provider's sub-second precision. `payment_id` is the single opaque value (§3.5, Q10).
+    return {
+        'status':                    backend.derive_payment_status(payment, request_at).value,
+        'plan':                      payment.plan.value,
+        'payment_provider':          payment.payment_provider.value,
+        'auto_renewing':             payment.auto_renewing,
+        'purchased_ts':              base.unix_seconds_float_from_datetime(payment.purchased_at),
+        'redeemed_ts':               base.unix_seconds_from_datetime(payment.redeemed_at) if payment.redeemed_at else 0,
+        'expiry_ts':                 base.unix_seconds_from_datetime(payment.expires_at),
+        'grace_period_duration':     base.seconds_from_timedelta(payment.grace_period) if payment.grace_period is not None else 0,
+        'platform_refund_expiry_ts': base.unix_seconds_from_datetime(payment.platform_refund_expires_at),
+        'revoked_ts':                base.unix_seconds_float_from_datetime(payment.revoked_at) if payment.revoked_at else 0.0,
+        'refund_requested_ts':       base.unix_seconds_from_datetime(payment.refund_requested_at) if payment.refund_requested_at else 0,
+        'payment_id':                backend.payment_id_from_payment_row(payment),
+    }
+
+@flask_blueprint.route(FLASK_ROUTE_GET_PRO_STATUS, methods=['POST'])
+def get_pro_status():
+    # Cheap, hot-path entitlement check: the account's Pro status + the single latest payment item. No
+    # history, no pagination — this is what clients hit to render "am I Pro?" / the Pro-settings screen.
+    get_json    = get_json_from_flask_request(flask.request)
+    master_pkey = base.json_dict_require_str(get_json, 'master_pkey')
+    master_sig  = base.json_dict_require_str(get_json, 'master_sig')
+    ts          = base.json_dict_require_int(get_json, 'ts')
+
+    master_pkey_bytes = base.hex_to_bytes(hex=master_pkey, label='Master public key',    hex_len=nacl.bindings.crypto_sign_PUBLICKEYBYTES * 2)
+    master_sig_bytes  = base.hex_to_bytes(hex=master_sig,  label='Master key signature', hex_len=nacl.bindings.crypto_sign_BYTES * 2)
+    request_at        = base.datetime_from_unix_seconds(ts)
+    _check_read_replay_window(request_at)
+
+    master_pkey_nacl = nacl.signing.VerifyKey(master_pkey_bytes)
+    _verify_master_sig(master_pkey_nacl, master_sig_bytes,
+                       backend.make_get_pro_status_message(master_pkey=master_pkey_nacl, request_at=request_at))
+
+    user_pro_status                                            = UserProStatus.Never
+    auto_renewing                                              = False
+    expiry_ts                                                  = 0
+    grace_period_duration                                      = 0
+    refund_requested_ts                                        = 0
+    error_report                                               = 0
+    latest_payment: dict[str, str | int | float | bool] | None = None
+
+    with get_db(flask.current_app) as engine:
+        with db.connection(engine) as conn:
+            with db.transaction(conn) as tx:
+                error_report = int(backend.has_user_error_from_master_pkey(tx, master_pkey_nacl))
+                user         = backend.get_user(tx.conn, master_pkey_nacl)
+                if user.found:
+                    auto_renewing = user.auto_renewing
+                    # Egress: user datetimes/timedelta → integer-seconds wire values (day-aligned, exact).
+                    expiry_ts             = base.unix_seconds_from_datetime(user.expires_at)
+                    grace_period_duration = base.seconds_from_timedelta(user.grace_period)
+                    refund_requested_ts   = base.unix_seconds_from_datetime(user.refund_requested_at) if user.refund_requested_at else 0
+
+                    # Status decided against the *request* clock (signed, anti-replay-bounded to ≈now) —
+                    # the same clock the latest item's derived status uses, never a second time.time().
+                    user_pro_status = UserProStatus.Active if request_at <= user.expires_at else UserProStatus.Expired
+                    if backend.is_generation_revoked(tx.conn, user.current_generation_id, request_at):
+                        user_pro_status = UserProStatus.Expired
+
+                    page = backend.get_user_payments_page(tx, master_pkey_nacl, limit=1, before_id=None)
+                    if page:
+                        latest_payment = _payment_item_wire(page[0], request_at)
+
+    return make_success_response({
+        'user_status':           user_pro_status.value,
+        'auto_renewing':         auto_renewing,
+        'expiry_ts':             expiry_ts,
+        'refund_requested_ts':   refund_requested_ts,
+        'grace_period_duration': grace_period_duration if auto_renewing else 0,
+        'error_report':          error_report,
+        'latest_payment':        latest_payment,
+    })
+
+@flask_blueprint.route(FLASK_ROUTE_GET_PAYMENT_DETAILS, methods=['POST'])
+def get_payment_details():
     # Extract + validate request fields (each raises FailError(invalid_request) on the first bad field).
     get_json    = get_json_from_flask_request(flask.request)
     master_pkey = base.json_dict_require_str(get_json, 'master_pkey')
     master_sig  = base.json_dict_require_str(get_json, 'master_sig')
     ts          = base.json_dict_require_int(get_json, 'ts')
-    count       = base.json_dict_require_int(get_json, 'count')
+    limit       = base.json_dict_require_int(get_json, 'limit')
+    before      = get_json.get('before', '')                      # opaque cursor; '' / absent = newest page
+    if not isinstance(before, str):
+        raise base.FailError("'before' cursor must be a string", code=base.ErrorCode.invalid_request)
 
     master_pkey_bytes = base.hex_to_bytes(hex=master_pkey, label='Master public key',    hex_len=nacl.bindings.crypto_sign_PUBLICKEYBYTES * 2)
     master_sig_bytes  = base.hex_to_bytes(hex=master_sig,  label='Master key signature', hex_len=nacl.bindings.crypto_sign_BYTES * 2)
+    request_at        = base.datetime_from_unix_seconds(ts)
+    _check_read_replay_window(request_at)
 
-    # Timestamp anti-replay window (wire nonce is integer seconds, §3.4). Out of window → stale_request.
-    # (We _could_ track recent nonces to reject replays outright, but the onion transport already masks
-    # replay ability for a read-only query.)
-    request_at = base.datetime_from_unix_seconds(ts)
-    now        = base.datetime_from_unix_ms(int(time_now() * 1000))
-    if abs(now - request_at) >= base.DEFAULT_TIMESTAMP_TOLERANCE:
-        raise base.FailError(f'Timestamp is outside the tolerance window, delta was {abs(now - request_at)}',
-                             code=base.ErrorCode.stale_request)
+    master_pkey_nacl = nacl.signing.VerifyKey(master_pkey_bytes)
+    _verify_master_sig(master_pkey_nacl, master_sig_bytes,
+                       backend.make_get_payment_details_message(master_pkey=master_pkey_nacl, request_at=request_at, limit=limit, before=before))
 
-    # Validate the signature.
-    master_pkey_nacl      = nacl.signing.VerifyKey(master_pkey_bytes)
-    hash_to_verify: bytes = backend.make_get_pro_details_message(master_pkey=master_pkey_nacl, request_at=request_at, count=count)
-    try:
-        _ = master_pkey_nacl.verify(smessage=hash_to_verify, signature=master_sig_bytes)
-    except Exception:
-        raise base.FailError('Signature failed to be verified', code=base.ErrorCode.bad_signature)
+    # Clamp the (signed) client limit to the server page cap, and decode the opaque cursor to its boundary
+    # id. A bad / forged / foreign cursor fails to decrypt → invalid_request.
+    if limit <= 0:
+        raise base.FailError("'limit' must be positive", code=base.ErrorCode.invalid_request)
+    limit      = min(limit, MAX_PAYMENT_DETAILS_PAGE)
+    cursor_key = backend.payment_cursor_key(flask.current_app.config[FLASK_CONFIG_BACKEND_SKEY_KEY])
+    before_id: int | None = None
+    if before:
+        try:
+            before_id = backend.decrypt_payment_cursor(cursor_key, master_pkey_nacl, before)
+        except Exception:
+            raise base.FailError('Invalid pagination cursor', code=base.ErrorCode.invalid_request)
 
-    items:           list[dict[str, str | int | float | bool]] = []
-    user_pro_status: UserProStatus                           = UserProStatus.Never
-    auto_renewing                                            = False
-    expiry_ts                                                = 0
-    grace_period_duration                                    = 0
-    payments_total                                           = 0
-    refund_requested_ts                                      = 0
-
-    # NOTE: Eventually we might migrate this to be a fully-featured enum to provide some more
-    # descriptive messaging
-    error_report: int                                  = False
-
+    items:          list[dict[str, str | int | float | bool]] = []
+    payments_total                                            = 0
     with get_db(flask.current_app) as engine:
         with db.connection(engine) as conn:
             with db.transaction(conn) as tx:
-                error_report                         = int(backend.has_user_error_from_master_pkey(tx, master_pkey_nacl))
-                get_user: backend.GetUserAndPayments = backend.get_user_and_payments(tx=tx, master_pkey=master_pkey_nacl)
-                auto_renewing                        = get_user.user.auto_renewing
-                payments_total                       = get_user.payments_count
-                # Egress: convert the user's datetimes/timedelta to integer-seconds wire values. These
-                # are all backend-computed/day-aligned, so integer seconds is exact (wire spec §1).
-                grace_period_duration                = base.seconds_from_timedelta(get_user.user.grace_period)
-                expiry_ts                            = base.unix_seconds_from_datetime(get_user.user.expires_at)
-                refund_requested_ts                  = base.unix_seconds_from_datetime(get_user.user.refund_requested_at) if get_user.user.refund_requested_at else 0
+                # One keyset page, newest-first. Each item's status is derived against the *request*
+                # clock `ts` (signed, anti-replay-bounded to ≈now), never a second time.time() read.
+                # The query is user-scoped and only redeemed payments carry a user_id, so unredeemed
+                # rows (whose tokens are confidential until the user registers them) never appear.
+                page           = backend.get_user_payments_page(tx, master_pkey_nacl, limit=limit, before_id=before_id)
+                payments_total = backend.get_user_payments_count(tx, master_pkey_nacl)
+                items          = [_payment_item_wire(payment, request_at) for payment in page]
 
-                # NOTE: Collect payment history. Each item's status is derived against the *request*
-                # timestamp `ts` (client's signed clock, anti-replay-bounded to ≈now) — the same
-                # clock the user-level active/expired decision below uses. Deliberately NOT a second
-                # `time.time()` read: two clocks in one response could disagree by the request's
-                # in-flight time and report user-level "Active" alongside an "expired" item.
-                # count == 0 → summary only (no items); count < 0 → unlimited ("give me everything");
-                # count > 0 → cap. So gate on non-zero and break only once a non-negative cap is reached.
-                if count != 0:
-                    for row in get_user.payments_it:
-                        if count >= 0 and len(items) >= count:
-                            break
+    # A full page means there may be more: seal the oldest id on this page into a cursor so the next
+    # request continues at id < that. A short (or empty) page is the end → no cursor.
+    next_cursor: str | None = None
+    if page and len(page) == limit:
+        next_cursor = backend.encrypt_payment_cursor(cursor_key, master_pkey_nacl, page[-1].id)
 
-                        payment: backend.PaymentRow = backend.payment_row_from_dict(row)
-
-                        # NOTE: We do not return unredeemed payments. Their token/tx IDs are
-                        # confidential until the user registers them from their own receipt. (payments_it
-                        # filters by user_id, which only redeemed payments have, so this is defensive.)
-                        if payment.redeemed_at is None:
-                            continue
-
-                        # Wire seconds (wire spec §1/§5): integer everywhere the backend computes or
-                        # rounds the value; the two upstream provider event instants — `purchased_ts`
-                        # and `revoked_ts` — are floats carrying the provider's sub-second precision.
-                        # (The three near-identical branches are a Phase-5 dedup target — folds with Q10.)
-                        item: dict[str, str | int | float | bool] = {
-                            'status':                     backend.derive_payment_status(payment, request_at).value,
-                            'plan':                       payment.plan.value,
-                            'payment_provider':           payment.payment_provider.value,
-                            'auto_renewing':              payment.auto_renewing,
-                            'purchased_ts':               base.unix_seconds_float_from_datetime(payment.purchased_at),
-                            'redeemed_ts':                base.unix_seconds_from_datetime(payment.redeemed_at) if payment.redeemed_at else 0,
-                            'expiry_ts':                  base.unix_seconds_from_datetime(payment.expires_at),
-                            'grace_period_duration':      base.seconds_from_timedelta(payment.grace_period) if payment.grace_period is not None else 0,
-                            'platform_refund_expiry_ts':  base.unix_seconds_from_datetime(payment.platform_refund_expires_at),
-                            'revoked_ts':                 base.unix_seconds_float_from_datetime(payment.revoked_at) if payment.revoked_at else 0.0,
-                            'refund_requested_ts':        base.unix_seconds_from_datetime(payment.refund_requested_at) if payment.refund_requested_at else 0,
-                        }
-                        # One opaque `payment_id` (§3.5, Q10) instead of the provider-specific fields —
-                        # the backend's typed columns folded back into a single wire value.
-                        item['payment_id'] = backend.payment_id_from_payment_row(payment)
-                        items.append(item)
-
-                # NOTE: Determine pro status of user
-                if get_user.payments_count > 0:
-                    if request_at <= get_user.user.expires_at:
-                        user_pro_status = UserProStatus.Active
-                    else:
-                        user_pro_status = UserProStatus.Expired
-
-                    if backend.is_generation_revoked(tx.conn, get_user.user.current_generation_id, request_at):
-                        user_pro_status = UserProStatus.Expired
-
-            dict_result = {
-                'user_status':           user_pro_status.value,
-                'auto_renewing':         auto_renewing,
-                'expiry_ts':             expiry_ts,
-                'refund_requested_ts':   refund_requested_ts,
-                'grace_period_duration': grace_period_duration if auto_renewing else 0,
-                'payments_total':        payments_total,
-                'error_report':          error_report,
-                'items':                 items
-            }
-
-            result = make_success_response(dict_result)
-            if 1:
-                flask.current_app.logger.setLevel(logging.DEBUG)
-                flask.current_app.logger.debug(f"Request (their_clock={base.readable(request_at)}, master_pkey={master_pkey}) => ({json.dumps(dict_result)})")
-            return result
+    return make_success_response({
+        'payments_total': payments_total,
+        'items':          items,
+        'next_cursor':    next_cursor,
+    })
 
 @flask_blueprint.route(FLASK_ROUTE_SET_PAYMENT_REFUND_REQUESTED, methods=['POST'])
 def set_payment_refund_requested():

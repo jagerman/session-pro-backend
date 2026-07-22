@@ -21,7 +21,7 @@ server {
         return 404;
     }
 
-    location ~ ^/(add_pro_payment|get_pro_revocations|get_pro_details|generate_pro_proof|set_payment_refund_requested|apple_notifications_v2|oxen/v4/lsrpc)$ {
+    location ~ ^/(add_pro_payment|generate_pro_proof|get_pro_revocations|get_pro_status|get_payment_details|set_payment_refund_requested|status|apple_notifications_v2|oxen/v4/lsrpc)$ {
         include uwsgi_params;
         uwsgi_pass unix:/run/pro-backend/pro-backend.sock;
     }
