@@ -7,6 +7,7 @@ own transaction, and its filename is recorded in the ``migrations_applied`` ledg
 (rather than a single integer version) means migrations are identified by what they are, and adding
 one is just dropping a new file in the directory.
 """
+
 import importlib.util
 import logging
 import pathlib
@@ -26,8 +27,7 @@ _MIGRATION_RE = re.compile(r'^\d+_.*\.(sql|py)$')
 
 
 def _migration_files() -> list[pathlib.Path]:
-    files = sorted((p for p in SCHEMA_DIR.iterdir() if _MIGRATION_RE.match(p.name)),
-                   key=lambda p: p.name)
+    files = sorted((p for p in SCHEMA_DIR.iterdir() if _MIGRATION_RE.match(p.name)), key=lambda p: p.name)
     # The same base name must not be both a .sql and a .py migration (ambiguous ordering/identity).
     by_stem: dict[str, list[str]] = {}
     for p in files:
@@ -53,12 +53,15 @@ def _apply_py_migration(path: pathlib.Path, conn: psycopg.Connection) -> None:
 def apply_migrations(conn: psycopg.Connection) -> None:
     """Apply every not-yet-recorded migration in ``schema/``, in ascii order."""
     with db.transaction(conn) as tx:
-        _ = db.query(tx.conn, '''
+        db.query(
+            tx.conn,
+            '''
             CREATE TABLE IF NOT EXISTS migrations_applied (
                 name       TEXT        PRIMARY KEY NOT NULL,
                 applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
             )
-        ''')
+        ''',
+        )
 
     applied = {row[0] for row in db.query(conn, 'SELECT name FROM migrations_applied')}
 
@@ -67,8 +70,8 @@ def apply_migrations(conn: psycopg.Connection) -> None:
             continue
         with db.transaction(conn) as tx:
             if path.suffix == '.sql':
-                _ = db.query(tx.conn, path.read_text())
+                db.query(tx.conn, path.read_text())
             else:
                 _apply_py_migration(path, tx.conn)
-            _ = db.query(tx.conn, 'INSERT INTO migrations_applied (name) VALUES (%s)', path.name)
+            db.query(tx.conn, 'INSERT INTO migrations_applied (name) VALUES (%s)', path.name)
         log.info(f'Applied migration {path.name}')

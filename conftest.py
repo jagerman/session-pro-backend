@@ -45,13 +45,7 @@ def pg_database(postgresql_proc):
 
     def make() -> str:
         dbname = f"test_{uuid.uuid4().hex}"
-        janitor = DatabaseJanitor(
-            user=proc.user,
-            host=proc.host,
-            port=proc.port,
-            version=proc.version,
-            dbname=dbname,
-        )
+        janitor = DatabaseJanitor(user=proc.user, host=proc.host, port=proc.port, version=proc.version, dbname=dbname)
         janitor.init()
         janitors.append(janitor)
         return f"postgresql://{proc.user}@/{dbname}?host={proc.host}&port={proc.port}"

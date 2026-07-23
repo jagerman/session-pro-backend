@@ -21,7 +21,6 @@ Overview
 import collections.abc
 import contextlib
 import datetime
-import dataclasses
 import enum
 import flask
 import json
@@ -31,42 +30,44 @@ import nacl.signing
 import psycopg_pool
 import time
 import typing
-import logging
 import db
 
 import base
 import backend
 from vendor import onion_req
 
+
 class UserProStatus(enum.StrEnum):
     # Overall Pro status of the account, emitted as the top-level `user_status` code in the get-details
     # response. A string code (not an integer) so an unknown future value passes through opaquely and
     # old clients degrade gracefully instead of hard-failing the whole parse — see the wire spec §1.
-    Never        = 'never'
-    Active       = 'active'
-    Expired      = 'expired'
+    Never = 'never'
+    Active = 'active'
+    Expired = 'expired'
+
 
 # Keys stored in the flask app config dictionary that can be retrieved within
 # a request to get the path to the SQLite DB to load and use for that request.
 
-FLASK_CONFIG_DB_URL_KEY                            = 'session_pro_backend_db_url'
+FLASK_CONFIG_DB_URL_KEY = 'session_pro_backend_db_url'
 
 # The backend Ed25519 signing key (nacl.signing.SigningKey), loaded from disk at startup. Kept in
 # the flask config rather than the DB so it never touches the database (or its backups).
-FLASK_CONFIG_BACKEND_SKEY_KEY                      = 'session_pro_backend_signing_key'
+FLASK_CONFIG_BACKEND_SKEY_KEY = 'session_pro_backend_signing_key'
 
 # Name of the endpoints exposed on the server
-FLASK_ROUTE_ADD_PRO_PAYMENT                         = '/add_pro_payment'
-FLASK_ROUTE_GENERATE_PRO_PROOF                      = '/generate_pro_proof'
-FLASK_ROUTE_GET_PRO_REVOCATIONS                     = '/get_pro_revocations'
-FLASK_ROUTE_GET_PRO_STATUS                          = '/get_pro_status'
-FLASK_ROUTE_GET_PAYMENT_DETAILS                     = '/get_payment_details'
-FLASK_ROUTE_SET_PAYMENT_REFUND_REQUESTED            = '/set_payment_refund_requested'
-FLASK_ROUTE_STATUS                                  = '/status'
+FLASK_ROUTE_ADD_PRO_PAYMENT = '/add_pro_payment'
+FLASK_ROUTE_GENERATE_PRO_PROOF = '/generate_pro_proof'
+FLASK_ROUTE_GET_PRO_REVOCATIONS = '/get_pro_revocations'
+FLASK_ROUTE_GET_PRO_STATUS = '/get_pro_status'
+FLASK_ROUTE_GET_PAYMENT_DETAILS = '/get_payment_details'
+FLASK_ROUTE_SET_PAYMENT_REFUND_REQUESTED = '/set_payment_refund_requested'
+FLASK_ROUTE_STATUS = '/status'
 
 # The object containing routes that you register onto a Flask app to turn it
 # into an app that accepts Session Pro Backend client requests.
 flask_blueprint = flask.Blueprint('session-pro-backend-blueprint', __name__)
+
 
 # All calls to time.time() in the server layer are now routed through the function pointer
 # 'time_now'. This is primarily for unit tests which recorded real-time payment data on test
@@ -76,10 +77,13 @@ flask_blueprint = flask.Blueprint('session-pro-backend-blueprint', __name__)
 # validation) to prevent stale signatures that would break in those contexts. In the tests then
 # the code changes the 'time_now()' implementation to "mock" the time of the server back to when the
 # real-time data was being captured and tested.
-time_now = lambda: time.time()
+def time_now():
+    return time.time()
+
 
 def make_success_response(dict_result: typing.Any) -> flask.Response:
     return flask.jsonify({'status': 'ok', 'result': dict_result})
+
 
 @flask_blueprint.app_errorhandler(base.ApiError)
 def handle_api_error(e: base.ApiError) -> flask.Response:
@@ -88,6 +92,7 @@ def handle_api_error(e: base.ApiError) -> flask.Response:
     # subrequest's full_dispatch_request — so the envelope is produced in-band and onion-wrapped normally.
     # HTTP stays 200 (the envelope `status` is authoritative; make_subrequest warns on any non-200).
     return flask.jsonify({'status': e.wire_status, 'error_code': e.code.value, 'error': str(e)})
+
 
 def get_json_from_flask_request(request: flask.Request) -> dict[str, typing.Any]:
     # Parse the request body as a JSON object, or raise FailError(invalid_request).
@@ -99,21 +104,24 @@ def get_json_from_flask_request(request: flask.Request) -> dict[str, typing.Any]
         raise base.FailError('JSON body was not an object')
     return typing.cast(dict[str, typing.Any], json_dict)
 
+
 @contextlib.contextmanager
 def get_db(flask_app: flask.Flask) -> collections.abc.Iterator[psycopg_pool.ConnectionPool]:
     database_url = typing.cast(str, flask_app.config[FLASK_CONFIG_DB_URL_KEY])
     with db.open_database(database_url) as engine:
         yield engine
 
+
 def init(testing_mode: bool, database_url: str, backend_key: nacl.signing.SigningKey) -> flask.Flask:
-    result                                                      = flask.Flask(__name__)
-    result.config['TESTING']                                    = testing_mode
-    result.config[FLASK_CONFIG_DB_URL_KEY]                      = database_url
-    result.config[FLASK_CONFIG_BACKEND_SKEY_KEY]                = backend_key
+    result = flask.Flask(__name__)
+    result.config['TESTING'] = testing_mode
+    result.config[FLASK_CONFIG_DB_URL_KEY] = database_url
+    result.config[FLASK_CONFIG_BACKEND_SKEY_KEY] = backend_key
     result.config[onion_req.FLASK_CONFIG_ONION_REQ_X25519_SKEY] = backend_key.to_curve25519_private_key()
     result.register_blueprint(flask_blueprint)
     result.register_blueprint(onion_req.flask_blueprint_v4)
     return result
+
 
 @flask_blueprint.route(FLASK_ROUTE_STATUS, methods=['GET', 'POST'])
 def status():
@@ -122,26 +130,29 @@ def status():
     # version, the current server time, and the Ed25519 signing public key so a caller can fetch the key
     # to verify issued proofs against instead of hard-coding it.
     backend_key: nacl.signing.SigningKey = flask.current_app.config[FLASK_CONFIG_BACKEND_SKEY_KEY]
-    return make_success_response(dict_result={
-        'version':        base.BACKEND_VERSION,
-        'timestamp':      int(time_now()),  # integer UNIX seconds (wire spec §1)
-        'signing_pubkey': bytes(backend_key.verify_key).hex(),
-    })
+    return make_success_response(
+        dict_result={
+            'version': base.BACKEND_VERSION,
+            'timestamp': int(time_now()),  # integer UNIX seconds (wire spec §1)
+            'signing_pubkey': bytes(backend_key.verify_key).hex(),
+        }
+    )
+
 
 @flask_blueprint.route(FLASK_ROUTE_ADD_PRO_PAYMENT, methods=['POST'])
 def add_pro_payment():
     # Extract + validate request fields (each raises FailError(invalid_request) on the first bad field).
-    get_json         = get_json_from_flask_request(flask.request)
-    master_pkey      = base.json_dict_require_str(get_json,   'master_pkey')
-    rotating_pkey    = base.json_dict_require_str(get_json,   'rotating_pkey')
-    master_sig       = base.json_dict_require_str(get_json,   'master_sig')
-    rotating_sig     = base.json_dict_require_str(get_json,   'rotating_sig')
-    payment_tx       = base.json_dict_require_obj(get_json,   'payment_tx')
+    get_json = get_json_from_flask_request(flask.request)
+    master_pkey = base.json_dict_require_str(get_json, 'master_pkey')
+    rotating_pkey = base.json_dict_require_str(get_json, 'rotating_pkey')
+    master_sig = base.json_dict_require_str(get_json, 'master_sig')
+    rotating_sig = base.json_dict_require_str(get_json, 'rotating_sig')
+    payment_tx = base.json_dict_require_obj(get_json, 'payment_tx')
     payment_provider = base.json_dict_require_str(payment_tx, 'provider')
     base.verify_payment_provider(payment_provider=payment_provider)
 
-    user_payment            = backend.UserPaymentTransaction()
-    user_payment.provider   = base.PaymentProvider(payment_provider)
+    user_payment = backend.UserPaymentTransaction()
+    user_payment.provider = base.PaymentProvider(payment_provider)
     # One opaque `payment_id` (§3.5): hashed verbatim, then split into the backend's typed fields for DB
     # lookup. The wire/hash never sees the provider-specific sub-fields.
     user_payment.payment_id = base.json_dict_require_str(payment_tx, 'payment_id')
@@ -150,64 +161,88 @@ def add_pro_payment():
         raise base.FailError('Bad payment provider given')
     backend.apply_payment_id_to_tx(user_payment)
 
-    master_pkey_bytes   = base.hex_to_bytes(hex=master_pkey,   label='Master public key',      hex_len=nacl.bindings.crypto_sign_PUBLICKEYBYTES * 2)
-    rotating_pkey_bytes = base.hex_to_bytes(hex=rotating_pkey, label='Rotating public key',    hex_len=nacl.bindings.crypto_sign_PUBLICKEYBYTES * 2)
-    master_sig_bytes    = base.hex_to_bytes(hex=master_sig,    label='Master key signature',   hex_len=nacl.bindings.crypto_sign_BYTES * 2)
-    rotating_sig_bytes  = base.hex_to_bytes(hex=rotating_sig,  label='Rotating key signature', hex_len=nacl.bindings.crypto_sign_BYTES * 2)
+    master_pkey_bytes = base.hex_to_bytes(
+        hex=master_pkey, label='Master public key', hex_len=nacl.bindings.crypto_sign_PUBLICKEYBYTES * 2
+    )
+    rotating_pkey_bytes = base.hex_to_bytes(
+        hex=rotating_pkey, label='Rotating public key', hex_len=nacl.bindings.crypto_sign_PUBLICKEYBYTES * 2
+    )
+    master_sig_bytes = base.hex_to_bytes(
+        hex=master_sig, label='Master key signature', hex_len=nacl.bindings.crypto_sign_BYTES * 2
+    )
+    rotating_sig_bytes = base.hex_to_bytes(
+        hex=rotating_sig, label='Rotating key signature', hex_len=nacl.bindings.crypto_sign_BYTES * 2
+    )
 
     # Submit the payment to the DB (raises FailError(bad_signature/unknown_payment/…) or ServerError).
     with get_db(flask.current_app) as engine:
         with db.connection(engine) as conn:
-            request_at       = base.datetime_from_unix_ms(int(time_now() * 1000))
-            redeemed_payment = backend.verify_and_add_pro_payment(conn          = conn,
-                                                                  signing_key   = flask.current_app.config[FLASK_CONFIG_BACKEND_SKEY_KEY],
-                                                                  request_at    = request_at,
-                                                                  redeemed_at   = backend.to_redeemed_at(request_at),
-                                                                  master_pkey   = nacl.signing.VerifyKey(master_pkey_bytes),
-                                                                  rotating_pkey = nacl.signing.VerifyKey(rotating_pkey_bytes),
-                                                                  payment_tx    = user_payment,
-                                                                  master_sig    = master_sig_bytes,
-                                                                  rotating_sig  = rotating_sig_bytes)
+            request_at = base.datetime_from_unix_ms(int(time_now() * 1000))
+            redeemed_payment = backend.verify_and_add_pro_payment(
+                conn=conn,
+                signing_key=flask.current_app.config[FLASK_CONFIG_BACKEND_SKEY_KEY],
+                request_at=request_at,
+                redeemed_at=backend.to_redeemed_at(request_at),
+                master_pkey=nacl.signing.VerifyKey(master_pkey_bytes),
+                rotating_pkey=nacl.signing.VerifyKey(rotating_pkey_bytes),
+                payment_tx=user_payment,
+                master_sig=master_sig_bytes,
+                rotating_sig=rotating_sig_bytes,
+            )
             return make_success_response(dict_result=redeemed_payment.proof.to_dict())
+
 
 @flask_blueprint.route(FLASK_ROUTE_GENERATE_PRO_PROOF, methods=['POST'])
 def generate_pro_proof() -> flask.Response:
     # Extract + validate request fields (each raises FailError(invalid_request) on the first bad field).
-    get_json      = get_json_from_flask_request(flask.request)
-    master_pkey   = base.json_dict_require_str(get_json, 'master_pkey')
+    get_json = get_json_from_flask_request(flask.request)
+    master_pkey = base.json_dict_require_str(get_json, 'master_pkey')
     rotating_pkey = base.json_dict_require_str(get_json, 'rotating_pkey')
-    ts            = base.json_dict_require_int(get_json, 'ts')
-    master_sig    = base.json_dict_require_str(get_json, 'master_sig')
-    rotating_sig  = base.json_dict_require_str(get_json, 'rotating_sig')
+    ts = base.json_dict_require_int(get_json, 'ts')
+    master_sig = base.json_dict_require_str(get_json, 'master_sig')
+    rotating_sig = base.json_dict_require_str(get_json, 'rotating_sig')
 
-    master_pkey_bytes   = base.hex_to_bytes(hex=master_pkey,   label='Master public key',      hex_len=nacl.bindings.crypto_sign_PUBLICKEYBYTES * 2)
-    rotating_pkey_bytes = base.hex_to_bytes(hex=rotating_pkey, label='Rotating public key',    hex_len=nacl.bindings.crypto_sign_PUBLICKEYBYTES * 2)
-    master_sig_bytes    = base.hex_to_bytes(hex=master_sig,    label='Master key signature',   hex_len=nacl.bindings.crypto_sign_BYTES * 2)
-    rotating_sig_bytes  = base.hex_to_bytes(hex=rotating_sig,  label='Rotating key signature', hex_len=nacl.bindings.crypto_sign_BYTES * 2)
+    master_pkey_bytes = base.hex_to_bytes(
+        hex=master_pkey, label='Master public key', hex_len=nacl.bindings.crypto_sign_PUBLICKEYBYTES * 2
+    )
+    rotating_pkey_bytes = base.hex_to_bytes(
+        hex=rotating_pkey, label='Rotating public key', hex_len=nacl.bindings.crypto_sign_PUBLICKEYBYTES * 2
+    )
+    master_sig_bytes = base.hex_to_bytes(
+        hex=master_sig, label='Master key signature', hex_len=nacl.bindings.crypto_sign_BYTES * 2
+    )
+    rotating_sig_bytes = base.hex_to_bytes(
+        hex=rotating_sig, label='Rotating key signature', hex_len=nacl.bindings.crypto_sign_BYTES * 2
+    )
 
     # Timestamp must be within tolerance of now (replay mitigation). The wire nonce is integer seconds
     # (§3); the comparison is datetime-native. Out of window → stale_request (client can re-sync + retry).
     request_at = base.datetime_from_unix_seconds(ts)
-    now        = base.datetime_from_unix_ms(int(time_now() * 1000))
+    now = base.datetime_from_unix_ms(int(time_now() * 1000))
     if abs(now - request_at) > base.DEFAULT_TIMESTAMP_TOLERANCE:
-        raise base.FailError(f'Nonce timestamp is outside the tolerance window: {base.readable(request_at)} (now {base.readable(now)})',
-                             code=base.ErrorCode.stale_request)
+        raise base.FailError(
+            f'Nonce timestamp is outside the tolerance window: {base.readable(request_at)} (now {base.readable(now)})',
+            code=base.ErrorCode.stale_request,
+        )
 
     # Request proof from the backend (raises FailError(bad_signature/revoked/expired/not_subscribed)).
     with get_db(flask.current_app) as engine:
         with db.connection(engine) as conn:
-            proof = backend.generate_pro_proof(conn          = conn,
-                                               signing_key   = flask.current_app.config[FLASK_CONFIG_BACKEND_SKEY_KEY],
-                                               master_pkey   = nacl.signing.VerifyKey(master_pkey_bytes),
-                                               rotating_pkey = nacl.signing.VerifyKey(rotating_pkey_bytes),
-                                               request_at    = request_at,
-                                               master_sig    = master_sig_bytes,
-                                               rotating_sig  = rotating_sig_bytes)
+            proof = backend.generate_pro_proof(
+                conn=conn,
+                signing_key=flask.current_app.config[FLASK_CONFIG_BACKEND_SKEY_KEY],
+                master_pkey=nacl.signing.VerifyKey(master_pkey_bytes),
+                rotating_pkey=nacl.signing.VerifyKey(rotating_pkey_bytes),
+                request_at=request_at,
+                master_sig=master_sig_bytes,
+                rotating_sig=rotating_sig_bytes,
+            )
             return make_success_response(dict_result=proof.to_dict())
+
 
 @flask_blueprint.route(FLASK_ROUTE_GET_PRO_REVOCATIONS, methods=['POST'])
 def get_pro_revocations():
-    get_json    = get_json_from_flask_request(flask.request)
+    get_json = get_json_from_flask_request(flask.request)
     ticket: int = base.json_dict_require_int(get_json, 'ticket')
 
     RETRY_IN = base.SECONDS_IN_DAY
@@ -215,9 +250,9 @@ def get_pro_revocations():
     # in-memory revocation list (wire spec §4 / Delta #6). Memory-only aging: a dropped entry can't
     # reactivate anything, so this has no correctness dependence.
     RETAIN_FOR = base.SECONDS_IN_MONTH
-    now                = base.datetime_from_unix_ms(int(time_now() * 1000))
-    revocation_items:  list[dict[str, str | int]] = []
-    revocation_ticket: int                        = 0
+    now = base.datetime_from_unix_ms(int(time_now() * 1000))
+    revocation_items: list[dict[str, str | int]] = []
+    revocation_ticket: int = 0
     with get_db(flask.current_app) as engine:
         with db.connection(engine) as conn:
             with db.transaction(conn) as tx:
@@ -227,25 +262,35 @@ def get_pro_revocations():
                     # now - retain_for`). Filtering by the window (rather than depending on a prune) keeps
                     # the answer independent of whether housekeeping has run; the token IS the wire tag.
                     retain_cutoff = now - datetime.timedelta(seconds=RETAIN_FOR)
-                    for row in db.query(tx.conn, "SELECT token, revoked_at FROM generations WHERE revoked_at IS NOT NULL AND revoked_at > %s", retain_cutoff):
+                    for row in db.query(
+                        tx.conn,
+                        "SELECT token, revoked_at FROM generations WHERE revoked_at IS NOT NULL AND revoked_at > %s",
+                        retain_cutoff,
+                    ):
                         token, revoked_at = row
                         effective_at = revoked_at + datetime.timedelta(seconds=RETRY_IN)
                         # Per-entry wire shape (spec §4 / Delta #6): revocation_tag + effective_ts only.
                         # Clients age entries out via the list-level retain_for below, not a per-entry expiry.
-                        revocation_items.append({
-                            'revocation_tag': bytes(token).hex(),
-                            # Integer seconds: a computed instant (wire spec §1/§4).
-                            'effective_ts':   base.unix_seconds_from_datetime(effective_at),
-                        })
+                        revocation_items.append(
+                            {
+                                'revocation_tag': bytes(token).hex(),
+                                # Integer seconds: a computed instant (wire spec §1/§4).
+                                'effective_ts': base.unix_seconds_from_datetime(effective_at),
+                            }
+                        )
 
-            return make_success_response(dict_result={
-                'ticket':     revocation_ticket,
-                'items':      revocation_items,
-                'retry_in':   RETRY_IN,
-                'retain_for': RETAIN_FOR,
-            })
+            return make_success_response(
+                dict_result={
+                    'ticket': revocation_ticket,
+                    'items': revocation_items,
+                    'retry_in': RETRY_IN,
+                    'retain_for': RETAIN_FOR,
+                }
+            )
+
 
 MAX_PAYMENT_DETAILS_PAGE = 100  # server-side cap on a get-payment-details page (client `limit` is clamped)
+
 
 def _check_read_replay_window(request_at: datetime.datetime) -> None:
     # Timestamp anti-replay window (wire nonce is integer seconds). Out of window → stale_request. (We
@@ -253,8 +298,11 @@ def _check_read_replay_window(request_at: datetime.datetime) -> None:
     # ability for a read-only query.)
     now = base.datetime_from_unix_ms(int(time_now() * 1000))
     if abs(now - request_at) >= base.DEFAULT_TIMESTAMP_TOLERANCE:
-        raise base.FailError(f'Timestamp is outside the tolerance window, delta was {abs(now - request_at)}',
-                             code=base.ErrorCode.stale_request)
+        raise base.FailError(
+            f'Timestamp is outside the tolerance window, delta was {abs(now - request_at)}',
+            code=base.ErrorCode.stale_request,
+        )
+
 
 def _verify_master_sig(master_pkey_nacl: nacl.signing.VerifyKey, master_sig_bytes: bytes, message: bytes) -> None:
     try:
@@ -262,62 +310,79 @@ def _verify_master_sig(master_pkey_nacl: nacl.signing.VerifyKey, master_sig_byte
     except Exception:
         raise base.FailError('Signature failed to be verified', code=base.ErrorCode.bad_signature)
 
-def _payment_item_wire(payment: backend.PaymentRow, request_at: datetime.datetime) -> dict[str, str | int | float | bool]:
+
+def _payment_item_wire(
+    payment: backend.PaymentRow, request_at: datetime.datetime
+) -> dict[str, str | int | float | bool]:
     # Wire seconds (wire spec §1/§5): integer everywhere the backend computes/rounds the value; the two
     # upstream provider event instants — `purchased_ts` and `revoked_ts` — are floats carrying the
     # provider's sub-second precision. `payment_id` is the single opaque value (§3.5, Q10).
     return {
-        'status':                    backend.derive_payment_status(payment, request_at).value,
-        'plan':                      payment.plan.value,
-        'payment_provider':          payment.payment_provider.value,
-        'auto_renewing':             payment.auto_renewing,
-        'purchased_ts':              base.unix_seconds_float_from_datetime(payment.purchased_at),
-        'redeemed_ts':               base.unix_seconds_from_datetime(payment.redeemed_at) if payment.redeemed_at else 0,
-        'expiry_ts':                 base.unix_seconds_from_datetime(payment.expires_at),
-        'grace_period_duration':     base.seconds_from_timedelta(payment.grace_period) if payment.grace_period is not None else 0,
+        'status': backend.derive_payment_status(payment, request_at).value,
+        'plan': payment.plan.value,
+        'payment_provider': payment.payment_provider.value,
+        'auto_renewing': payment.auto_renewing,
+        'purchased_ts': base.unix_seconds_float_from_datetime(payment.purchased_at),
+        'redeemed_ts': base.unix_seconds_from_datetime(payment.redeemed_at) if payment.redeemed_at else 0,
+        'expiry_ts': base.unix_seconds_from_datetime(payment.expires_at),
+        'grace_period_duration': (
+            base.seconds_from_timedelta(payment.grace_period) if payment.grace_period is not None else 0
+        ),
         'platform_refund_expiry_ts': base.unix_seconds_from_datetime(payment.platform_refund_expires_at),
-        'revoked_ts':                base.unix_seconds_float_from_datetime(payment.revoked_at) if payment.revoked_at else 0.0,
-        'refund_requested_ts':       base.unix_seconds_from_datetime(payment.refund_requested_at) if payment.refund_requested_at else 0,
-        'payment_id':                backend.payment_id_from_payment_row(payment),
+        'revoked_ts': base.unix_seconds_float_from_datetime(payment.revoked_at) if payment.revoked_at else 0.0,
+        'refund_requested_ts': (
+            base.unix_seconds_from_datetime(payment.refund_requested_at) if payment.refund_requested_at else 0
+        ),
+        'payment_id': backend.payment_id_from_payment_row(payment),
     }
+
 
 @flask_blueprint.route(FLASK_ROUTE_GET_PRO_STATUS, methods=['POST'])
 def get_pro_status():
     # Cheap, hot-path entitlement check: the account's Pro status + the single latest payment item. No
     # history, no pagination — this is what clients hit to render "am I Pro?" / the Pro-settings screen.
-    get_json    = get_json_from_flask_request(flask.request)
+    get_json = get_json_from_flask_request(flask.request)
     master_pkey = base.json_dict_require_str(get_json, 'master_pkey')
-    master_sig  = base.json_dict_require_str(get_json, 'master_sig')
-    ts          = base.json_dict_require_int(get_json, 'ts')
+    master_sig = base.json_dict_require_str(get_json, 'master_sig')
+    ts = base.json_dict_require_int(get_json, 'ts')
 
-    master_pkey_bytes = base.hex_to_bytes(hex=master_pkey, label='Master public key',    hex_len=nacl.bindings.crypto_sign_PUBLICKEYBYTES * 2)
-    master_sig_bytes  = base.hex_to_bytes(hex=master_sig,  label='Master key signature', hex_len=nacl.bindings.crypto_sign_BYTES * 2)
-    request_at        = base.datetime_from_unix_seconds(ts)
+    master_pkey_bytes = base.hex_to_bytes(
+        hex=master_pkey, label='Master public key', hex_len=nacl.bindings.crypto_sign_PUBLICKEYBYTES * 2
+    )
+    master_sig_bytes = base.hex_to_bytes(
+        hex=master_sig, label='Master key signature', hex_len=nacl.bindings.crypto_sign_BYTES * 2
+    )
+    request_at = base.datetime_from_unix_seconds(ts)
     _check_read_replay_window(request_at)
 
     master_pkey_nacl = nacl.signing.VerifyKey(master_pkey_bytes)
-    _verify_master_sig(master_pkey_nacl, master_sig_bytes,
-                       backend.make_get_pro_status_message(master_pkey=master_pkey_nacl, request_at=request_at))
+    _verify_master_sig(
+        master_pkey_nacl,
+        master_sig_bytes,
+        backend.make_get_pro_status_message(master_pkey=master_pkey_nacl, request_at=request_at),
+    )
 
-    user_pro_status                                            = UserProStatus.Never
-    auto_renewing                                              = False
-    expiry_ts                                                  = 0
-    grace_period_duration                                      = 0
-    refund_requested_ts                                        = 0
-    error_report                                               = 0
+    user_pro_status = UserProStatus.Never
+    auto_renewing = False
+    expiry_ts = 0
+    grace_period_duration = 0
+    refund_requested_ts = 0
+    error_report = 0
     latest_payment: dict[str, str | int | float | bool] | None = None
 
     with get_db(flask.current_app) as engine:
         with db.connection(engine) as conn:
             with db.transaction(conn) as tx:
                 error_report = int(backend.has_user_error_from_master_pkey(tx, master_pkey_nacl))
-                user         = backend.get_user(tx.conn, master_pkey_nacl)
+                user = backend.get_user(tx.conn, master_pkey_nacl)
                 if user.found:
                     auto_renewing = user.auto_renewing
                     # Egress: user datetimes/timedelta → integer-seconds wire values (day-aligned, exact).
-                    expiry_ts             = base.unix_seconds_from_datetime(user.expires_at)
+                    expiry_ts = base.unix_seconds_from_datetime(user.expires_at)
                     grace_period_duration = base.seconds_from_timedelta(user.grace_period)
-                    refund_requested_ts   = base.unix_seconds_from_datetime(user.refund_requested_at) if user.refund_requested_at else 0
+                    refund_requested_ts = (
+                        base.unix_seconds_from_datetime(user.refund_requested_at) if user.refund_requested_at else 0
+                    )
 
                     # Status decided against the *request* clock (signed, anti-replay-bounded to ≈now) —
                     # the same clock the latest item's derived status uses, never a second time.time().
@@ -329,42 +394,54 @@ def get_pro_status():
                     if page:
                         latest_payment = _payment_item_wire(page[0], request_at)
 
-    return make_success_response({
-        'user_status':           user_pro_status.value,
-        'auto_renewing':         auto_renewing,
-        'expiry_ts':             expiry_ts,
-        'refund_requested_ts':   refund_requested_ts,
-        'grace_period_duration': grace_period_duration if auto_renewing else 0,
-        'error_report':          error_report,
-        'latest_payment':        latest_payment,
-    })
+    return make_success_response(
+        {
+            'user_status': user_pro_status.value,
+            'auto_renewing': auto_renewing,
+            'expiry_ts': expiry_ts,
+            'refund_requested_ts': refund_requested_ts,
+            'grace_period_duration': grace_period_duration if auto_renewing else 0,
+            'error_report': error_report,
+            'latest_payment': latest_payment,
+        }
+    )
+
 
 @flask_blueprint.route(FLASK_ROUTE_GET_PAYMENT_DETAILS, methods=['POST'])
 def get_payment_details():
     # Extract + validate request fields (each raises FailError(invalid_request) on the first bad field).
-    get_json    = get_json_from_flask_request(flask.request)
+    get_json = get_json_from_flask_request(flask.request)
     master_pkey = base.json_dict_require_str(get_json, 'master_pkey')
-    master_sig  = base.json_dict_require_str(get_json, 'master_sig')
-    ts          = base.json_dict_require_int(get_json, 'ts')
-    limit       = base.json_dict_require_int(get_json, 'limit')
-    before      = get_json.get('before', '')                      # opaque cursor; '' / absent = newest page
+    master_sig = base.json_dict_require_str(get_json, 'master_sig')
+    ts = base.json_dict_require_int(get_json, 'ts')
+    limit = base.json_dict_require_int(get_json, 'limit')
+    before = get_json.get('before', '')  # opaque cursor; '' / absent = newest page
     if not isinstance(before, str):
         raise base.FailError("'before' cursor must be a string", code=base.ErrorCode.invalid_request)
 
-    master_pkey_bytes = base.hex_to_bytes(hex=master_pkey, label='Master public key',    hex_len=nacl.bindings.crypto_sign_PUBLICKEYBYTES * 2)
-    master_sig_bytes  = base.hex_to_bytes(hex=master_sig,  label='Master key signature', hex_len=nacl.bindings.crypto_sign_BYTES * 2)
-    request_at        = base.datetime_from_unix_seconds(ts)
+    master_pkey_bytes = base.hex_to_bytes(
+        hex=master_pkey, label='Master public key', hex_len=nacl.bindings.crypto_sign_PUBLICKEYBYTES * 2
+    )
+    master_sig_bytes = base.hex_to_bytes(
+        hex=master_sig, label='Master key signature', hex_len=nacl.bindings.crypto_sign_BYTES * 2
+    )
+    request_at = base.datetime_from_unix_seconds(ts)
     _check_read_replay_window(request_at)
 
     master_pkey_nacl = nacl.signing.VerifyKey(master_pkey_bytes)
-    _verify_master_sig(master_pkey_nacl, master_sig_bytes,
-                       backend.make_get_payment_details_message(master_pkey=master_pkey_nacl, request_at=request_at, limit=limit, before=before))
+    _verify_master_sig(
+        master_pkey_nacl,
+        master_sig_bytes,
+        backend.make_get_payment_details_message(
+            master_pkey=master_pkey_nacl, request_at=request_at, limit=limit, before=before
+        ),
+    )
 
     # Clamp the (signed) client limit to the server page cap, and decode the opaque cursor to its boundary
     # id. A bad / forged / foreign cursor fails to decrypt → invalid_request.
     if limit <= 0:
         raise base.FailError("'limit' must be positive", code=base.ErrorCode.invalid_request)
-    limit      = min(limit, MAX_PAYMENT_DETAILS_PAGE)
+    limit = min(limit, MAX_PAYMENT_DETAILS_PAGE)
     cursor_key = backend.payment_cursor_key(flask.current_app.config[FLASK_CONFIG_BACKEND_SKEY_KEY])
     before_id: int | None = None
     if before:
@@ -373,8 +450,8 @@ def get_payment_details():
         except Exception:
             raise base.FailError('Invalid pagination cursor', code=base.ErrorCode.invalid_request)
 
-    items:          list[dict[str, str | int | float | bool]] = []
-    payments_total                                            = 0
+    items: list[dict[str, str | int | float | bool]] = []
+    payments_total = 0
     with get_db(flask.current_app) as engine:
         with db.connection(engine) as conn:
             with db.transaction(conn) as tx:
@@ -382,9 +459,9 @@ def get_payment_details():
                 # clock `ts` (signed, anti-replay-bounded to ≈now), never a second time.time() read.
                 # The query is user-scoped and only redeemed payments carry a user_id, so unredeemed
                 # rows (whose tokens are confidential until the user registers them) never appear.
-                page           = backend.get_user_payments_page(tx, master_pkey_nacl, limit=limit, before_id=before_id)
+                page = backend.get_user_payments_page(tx, master_pkey_nacl, limit=limit, before_id=before_id)
                 payments_total = backend.get_user_payments_count(tx, master_pkey_nacl)
-                items          = [_payment_item_wire(payment, request_at) for payment in page]
+                items = [_payment_item_wire(payment, request_at) for payment in page]
 
     # A full page means there may be more: seal the oldest id on this page into a cursor so the next
     # request continues at id < that. A short (or empty) page is the end → no cursor.
@@ -392,28 +469,29 @@ def get_payment_details():
     if page and len(page) == limit:
         next_cursor = backend.encrypt_payment_cursor(cursor_key, master_pkey_nacl, page[-1].id)
 
-    return make_success_response({
-        'payments_total': payments_total,
-        'items':          items,
-        'next_cursor':    next_cursor,
-    })
+    return make_success_response({'payments_total': payments_total, 'items': items, 'next_cursor': next_cursor})
+
 
 @flask_blueprint.route(FLASK_ROUTE_SET_PAYMENT_REFUND_REQUESTED, methods=['POST'])
 def set_payment_refund_requested():
     # Extract + validate request fields (each raises FailError(invalid_request) on the first bad field).
-    get_json            = get_json_from_flask_request(flask.request)
-    master_pkey         = base.json_dict_require_str(get_json,   'master_pkey')
-    master_sig          = base.json_dict_require_str(get_json,   'master_sig')
-    payment_tx          = base.json_dict_require_obj(get_json,   'payment_tx')
-    ts                  = base.json_dict_require_int(get_json,   'ts')
-    refund_requested_ts = base.json_dict_require_int(get_json,   'refund_requested_ts')
-    payment_provider    = base.json_dict_require_str(payment_tx, 'provider')
+    get_json = get_json_from_flask_request(flask.request)
+    master_pkey = base.json_dict_require_str(get_json, 'master_pkey')
+    master_sig = base.json_dict_require_str(get_json, 'master_sig')
+    payment_tx = base.json_dict_require_obj(get_json, 'payment_tx')
+    ts = base.json_dict_require_int(get_json, 'ts')
+    refund_requested_ts = base.json_dict_require_int(get_json, 'refund_requested_ts')
+    payment_provider = base.json_dict_require_str(payment_tx, 'provider')
 
-    master_pkey_bytes = base.hex_to_bytes(hex=master_pkey, label='Master public key',    hex_len=nacl.bindings.crypto_sign_PUBLICKEYBYTES * 2)
-    master_sig_bytes  = base.hex_to_bytes(hex=master_sig,  label='Master key signature', hex_len=nacl.bindings.crypto_sign_BYTES * 2)
+    master_pkey_bytes = base.hex_to_bytes(
+        hex=master_pkey, label='Master public key', hex_len=nacl.bindings.crypto_sign_PUBLICKEYBYTES * 2
+    )
+    master_sig_bytes = base.hex_to_bytes(
+        hex=master_sig, label='Master key signature', hex_len=nacl.bindings.crypto_sign_BYTES * 2
+    )
 
-    user_payment            = backend.UserPaymentTransaction()
-    user_payment.provider   = base.PaymentProvider(payment_provider)
+    user_payment = backend.UserPaymentTransaction()
+    user_payment.provider = base.PaymentProvider(payment_provider)
     # One opaque `payment_id` (§3.5), hashed verbatim then split into the typed fields for DB lookup.
     user_payment.payment_id = base.json_dict_require_str(payment_tx, 'payment_id')
     if user_payment.provider == base.PaymentProvider.iOSAppStore:
@@ -424,21 +502,25 @@ def set_payment_refund_requested():
         raise base.FailError('Bad payment provider given')
 
     # Timestamp anti-replay window (wire nonce is integer seconds, §3.3). Out of window → stale_request.
-    request_at          = base.datetime_from_unix_seconds(ts)
+    request_at = base.datetime_from_unix_seconds(ts)
     refund_requested_at = base.datetime_from_unix_seconds(refund_requested_ts)
-    now                 = base.datetime_from_unix_ms(int(time_now() * 1000))
+    now = base.datetime_from_unix_ms(int(time_now() * 1000))
     if abs(now - request_at) >= base.DEFAULT_TIMESTAMP_TOLERANCE:
-        raise base.FailError(f'Timestamp is outside the tolerance window, delta was {abs(now - request_at)}',
-                             code=base.ErrorCode.stale_request)
+        raise base.FailError(
+            f'Timestamp is outside the tolerance window, delta was {abs(now - request_at)}',
+            code=base.ErrorCode.stale_request,
+        )
 
     # Validate the signature.
-    master_pkey_nacl      = nacl.signing.VerifyKey(master_pkey_bytes)
-    hash_to_verify: bytes = backend.make_set_payment_refund_requested_message(master_pkey         = master_pkey_nacl,
-                                                                           request_at          = request_at,
-                                                                           refund_requested_at = refund_requested_at,
-                                                                           payment_tx          = user_payment)
+    master_pkey_nacl = nacl.signing.VerifyKey(master_pkey_bytes)
+    hash_to_verify: bytes = backend.make_set_payment_refund_requested_message(
+        master_pkey=master_pkey_nacl,
+        request_at=request_at,
+        refund_requested_at=refund_requested_at,
+        payment_tx=user_payment,
+    )
     try:
-        _ = master_pkey_nacl.verify(smessage=hash_to_verify, signature=master_sig_bytes)
+        master_pkey_nacl.verify(smessage=hash_to_verify, signature=master_sig_bytes)
     except Exception:
         raise base.FailError('Signature failed to be verified', code=base.ErrorCode.bad_signature)
 
@@ -447,9 +529,9 @@ def set_payment_refund_requested():
         with db.connection(engine) as conn:
             # Wire `0` means "clear the refund request" → NULL internally (the hash above still used the
             # literal wire value the client signed).
-            updated = backend.set_refund_requested(conn,
-                                                   payment_tx          = user_payment,
-                                                   refund_requested_at = refund_requested_at if refund_requested_ts else None)
+            updated = backend.set_refund_requested(
+                conn, payment_tx=user_payment, refund_requested_at=refund_requested_at if refund_requested_ts else None
+            )
 
             result = make_success_response(dict_result={'updated': updated})
             return result

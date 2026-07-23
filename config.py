@@ -15,53 +15,58 @@ import base
 
 log = logging.getLogger('PRO')
 
+
 class ConfigError(ValueError):
     '''Startup configuration is invalid. Carries every problem found: parse_args accumulates them so the
     operator sees all the bad/missing fields at once rather than one per rerun. `str(e)` is the joined,
     indented list ready to log.'''
+
     def __init__(self, errors: list[str]):
         self.errors: list[str] = errors
         super().__init__('\n  '.join(errors))
 
+
 @dataclasses.dataclass
 class SessionWebhook:
     enabled: bool = False
-    url:     str  = ''
-    name:    str  = ''
+    url: str = ''
+    name: str = ''
+
 
 @dataclasses.dataclass
 class ParsedArgs:
-    ini_path:                                  str                             = ''
-    db_url:                                    str                             = ''
-    backend_key_path:                          str                             = ''
-    log_path:                                  str                             = ''
-    unsafe_logging:                            bool                            = False
+    ini_path: str = ''
+    db_url: str = ''
+    backend_key_path: str = ''
+    log_path: str = ''
+    unsafe_logging: bool = False
 
-    with_platform_apple:                       bool                            = False
-    with_platform_google:                      bool                            = False
+    with_platform_apple: bool = False
+    with_platform_google: bool = False
 
-    platform_testing_env:                      bool                            = False
-    provider_dry_run:                          bool                            = False
+    platform_testing_env: bool = False
+    provider_dry_run: bool = False
 
-    session_webhooks:                          list[SessionWebhook]            = dataclasses.field(default_factory=list)
+    session_webhooks: list[SessionWebhook] = dataclasses.field(default_factory=list)
 
-    apple_key_id:                              str                             = ''
-    apple_issuer_id:                           str                             = ''
-    apple_bundle_id:                           str                             = ''
-    apple_key_path:                            str                             = ''
-    apple_root_cert_path:                      str                             = ''
-    apple_root_cert_ca_g2_path:                str                             = ''
-    apple_root_cert_ca_g3_path:                str                             = ''
-    apple_key:                                 bytes                           = b''
-    apple_root_certs:                          list[bytes]                     = dataclasses.field(default_factory=list)
-    apple_sandbox_env:                         bool                            = False
-    apple_app_id:                   int | None                      = None
+    apple_key_id: str = ''
+    apple_issuer_id: str = ''
+    apple_bundle_id: str = ''
+    apple_key_path: str = ''
+    apple_root_cert_path: str = ''
+    apple_root_cert_ca_g2_path: str = ''
+    apple_root_cert_ca_g3_path: str = ''
+    apple_key: bytes = b''
+    apple_root_certs: list[bytes] = dataclasses.field(default_factory=list)
+    apple_sandbox_env: bool = False
+    apple_app_id: int | None = None
 
-    google_package_name:                       str                             = ''
-    google_cloud_app_credentials_path: str                             = ''
-    google_cloud_project_id:                   str                             = ''
-    google_cloud_subscription_name:            str                             = ''
-    google_subscription_product_id:            str                             = ''
+    google_package_name: str = ''
+    google_cloud_app_credentials_path: str = ''
+    google_cloud_project_id: str = ''
+    google_cloud_subscription_name: str = ''
+    google_subscription_product_id: str = ''
+
 
 def parse_args() -> ParsedArgs:
     # NOTE: Parse .INI file if present and get arguments for it. Field-validation problems are
@@ -69,27 +74,27 @@ def parse_args() -> ParsedArgs:
     # ConfigError at the end; unrecoverable structural problems (missing .INI, malformed webhook
     # section) still log + sys.exit immediately.
     errors: list[str] = []
-    result          = ParsedArgs()
+    result = ParsedArgs()
     result.ini_path = os.getenv('SESH_PRO_BACKEND_INI_PATH', '')
     if len(result.ini_path) > 0:
         if not pathlib.Path(result.ini_path).exists():
             log.error(f'.INI config file "{result.ini_path}", was specified but does not exist/is not readable')
             sys.exit(1)
 
-        ini_parser                                 = configparser.ConfigParser()
-        _                                          = ini_parser.read(filenames=result.ini_path)
+        ini_parser = configparser.ConfigParser()
+        ini_parser.read(filenames=result.ini_path)
 
-        base_section: configparser.SectionProxy    = ini_parser['base']
-        result.db_url                              = base_section.get(option='db_url',                      fallback='')
-        result.backend_key_path                    = base_section.get(option='backend_key_path',            fallback='')
-        result.log_path                            = base_section.get(option='log_path',                    fallback='')
-        result.unsafe_logging                      = base_section.getboolean(option='unsafe_logging',       fallback=False)
+        base_section: configparser.SectionProxy = ini_parser['base']
+        result.db_url = base_section.get(option='db_url', fallback='')
+        result.backend_key_path = base_section.get(option='backend_key_path', fallback='')
+        result.log_path = base_section.get(option='log_path', fallback='')
+        result.unsafe_logging = base_section.getboolean(option='unsafe_logging', fallback=False)
 
-        result.with_platform_apple                 = base_section.getboolean(option='with_platform_apple',  fallback=False)
-        result.with_platform_google                = base_section.getboolean(option='with_platform_google', fallback=False)
+        result.with_platform_apple = base_section.getboolean(option='with_platform_apple', fallback=False)
+        result.with_platform_google = base_section.getboolean(option='with_platform_google', fallback=False)
 
-        result.platform_testing_env                = base_section.getboolean(option='platform_testing_env', fallback=False)
-        result.provider_dry_run                    = base_section.getboolean(option='provider_dry_run',     fallback=False)
+        result.platform_testing_env = base_section.getboolean(option='platform_testing_env', fallback=False)
+        result.provider_dry_run = base_section.getboolean(option='provider_dry_run', fallback=False)
 
         webhook_index = 0
         while True:
@@ -98,19 +103,19 @@ def parse_args() -> ParsedArgs:
                 break
 
             webhook_section: configparser.SectionProxy = ini_parser[webhook_label]
-            webhook_enabled: bool | None               = webhook_section.getboolean('enabled')
-            webhook_url:     str | None                = webhook_section.get('url')
-            webhook_name:    str | None                = webhook_section.get('name')
+            webhook_enabled: bool | None = webhook_section.getboolean('enabled')
+            webhook_url: str | None = webhook_section.get('url')
+            webhook_name: str | None = webhook_section.get('name')
 
-            if webhook_name == None:
+            if webhook_name is None:
                 log.error(f"Failed to parse webhook section {webhook_label}, missing \'name\'")
                 sys.exit(1)
 
-            if webhook_url == None:
+            if webhook_url is None:
                 log.error(f"Failed to parse webhook section {webhook_label}, missing \'url\'")
                 sys.exit(1)
 
-            if webhook_enabled == None:
+            if webhook_enabled is None:
                 log.error(f"Failed to parse webhook section {webhook_label}, missing \'enabled\'")
                 sys.exit(1)
 
@@ -119,38 +124,50 @@ def parse_args() -> ParsedArgs:
 
         if result.with_platform_apple:
             if 'apple' in ini_parser:
-                apple_section: configparser.SectionProxy   = ini_parser['apple']
-                result.apple_app_id                        = apple_section.getint(option='app_id')
-                result.apple_bundle_id                     = apple_section.get(option='bundle_id',                     fallback='')
-                result.apple_issuer_id                     = apple_section.get(option='issuer_id',                     fallback='')
-                result.apple_key_id                        = apple_section.get(option='key_id',                        fallback='')
-                result.apple_key_path                      = apple_section.get(option='key_path',                      fallback='')
-                result.apple_root_cert_ca_g2_path          = apple_section.get(option='root_cert_ca_g2_path',          fallback='')
-                result.apple_root_cert_ca_g3_path          = apple_section.get(option='root_cert_ca_g3_path',          fallback='')
-                result.apple_root_cert_path                = apple_section.get(option='root_cert_path',                fallback='')
-                result.apple_sandbox_env                   = apple_section.getboolean(option='sandbox_env',            fallback=False)
+                apple_section: configparser.SectionProxy = ini_parser['apple']
+                result.apple_app_id = apple_section.getint(option='app_id')
+                result.apple_bundle_id = apple_section.get(option='bundle_id', fallback='')
+                result.apple_issuer_id = apple_section.get(option='issuer_id', fallback='')
+                result.apple_key_id = apple_section.get(option='key_id', fallback='')
+                result.apple_key_path = apple_section.get(option='key_path', fallback='')
+                result.apple_root_cert_ca_g2_path = apple_section.get(option='root_cert_ca_g2_path', fallback='')
+                result.apple_root_cert_ca_g3_path = apple_section.get(option='root_cert_ca_g3_path', fallback='')
+                result.apple_root_cert_path = apple_section.get(option='root_cert_path', fallback='')
+                result.apple_sandbox_env = apple_section.getboolean(option='sandbox_env', fallback=False)
             else:
                 errors.append('Platform Apple was enabled but [apple] section is missing')
 
         if result.with_platform_google:
             if 'google' in ini_parser:
                 google_section: configparser.SectionProxy = ini_parser['google']
-                result.google_cloud_app_credentials_path  = google_section.get(option='cloud_app_credentials_path', fallback='')
-                result.google_cloud_project_id            = google_section.get(option='cloud_project_id',                   fallback='')
-                result.google_cloud_subscription_name     = google_section.get(option='cloud_subscription_name',            fallback='')
-                result.google_package_name                = google_section.get(option='package_name',                       fallback='')
-                result.google_subscription_product_id     = google_section.get(option='subscription_product_id',            fallback='')
+                result.google_cloud_app_credentials_path = google_section.get(
+                    option='cloud_app_credentials_path', fallback=''
+                )
+                result.google_cloud_project_id = google_section.get(option='cloud_project_id', fallback='')
+                result.google_cloud_subscription_name = google_section.get(
+                    option='cloud_subscription_name', fallback=''
+                )
+                result.google_package_name = google_section.get(option='package_name', fallback='')
+                result.google_subscription_product_id = google_section.get(
+                    option='subscription_product_id', fallback=''
+                )
             else:
                 errors.append('Platform Google was enabled but [google] section is missing')
 
     # NOTE: Get arguments from environment, they override .INI values if specified
-    result.db_url                         = os.getenv('SESH_PRO_BACKEND_DB_URL',                             result.db_url)
-    result.backend_key_path               = os.getenv('SESH_PRO_BACKEND_KEY_PATH',                           result.backend_key_path)
-    result.log_path                       = os.getenv('SESH_PRO_BACKEND_LOG_PATH',                           result.log_path)
-    result.with_platform_apple            = base.os_get_boolean_env('SESH_PRO_BACKEND_WITH_PLATFORM_APPLE',  result.with_platform_apple)
-    result.with_platform_google           = base.os_get_boolean_env('SESH_PRO_BACKEND_WITH_PLATFORM_GOOGLE', result.with_platform_google)
-    result.platform_testing_env           = base.os_get_boolean_env('SESH_PRO_BACKEND_PLATFORM_TESTING_ENV', result.platform_testing_env)
-    result.provider_dry_run               = base.os_get_boolean_env('SESH_PRO_BACKEND_PROVIDER_DRY_RUN',      result.provider_dry_run)
+    result.db_url = os.getenv('SESH_PRO_BACKEND_DB_URL', result.db_url)
+    result.backend_key_path = os.getenv('SESH_PRO_BACKEND_KEY_PATH', result.backend_key_path)
+    result.log_path = os.getenv('SESH_PRO_BACKEND_LOG_PATH', result.log_path)
+    result.with_platform_apple = base.os_get_boolean_env(
+        'SESH_PRO_BACKEND_WITH_PLATFORM_APPLE', result.with_platform_apple
+    )
+    result.with_platform_google = base.os_get_boolean_env(
+        'SESH_PRO_BACKEND_WITH_PLATFORM_GOOGLE', result.with_platform_google
+    )
+    result.platform_testing_env = base.os_get_boolean_env(
+        'SESH_PRO_BACKEND_PLATFORM_TESTING_ENV', result.platform_testing_env
+    )
+    result.provider_dry_run = base.os_get_boolean_env('SESH_PRO_BACKEND_PROVIDER_DRY_RUN', result.provider_dry_run)
 
     if result.with_platform_apple:
         if len(result.apple_key_id) == 0:
@@ -170,11 +187,17 @@ def parse_args() -> ParsedArgs:
 
         if not result.apple_sandbox_env:
             if result.apple_app_id is None:
-                errors.append('Platform Apple was enabled in production mode (e.g. not sandbox mode) but the production_app_id was not specified')
+                errors.append(
+                    'Platform Apple was enabled in production mode (e.g. not sandbox mode)'
+                    ' but the production_app_id was not specified'
+                )
 
         if result.apple_sandbox_env:
             if not result.platform_testing_env:
-                log.warning('Platform Apple was enabled in sandbox mode but platform_testing_env was not set to true. You want to set this to true, overriding the flag to true')
+                log.warning(
+                    'Platform Apple was enabled in sandbox mode but platform_testing_env was not set to true.'
+                    ' You want to set this to true, overriding the flag to true'
+                )
                 result.platform_testing_env = True
 
         if not errors:
@@ -186,7 +209,7 @@ def parse_args() -> ParsedArgs:
                     pathlib.Path(result.apple_root_cert_ca_g3_path).read_bytes(),
                 ]
             except Exception as e:
-                errors.append(f'Platform Apple was enabled but we are unable to read the path: {e}');
+                errors.append(f'Platform Apple was enabled but we are unable to read the path: {e}')
 
     if result.with_platform_google:
         if len(result.google_package_name) == 0:

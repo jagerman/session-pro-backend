@@ -21,24 +21,21 @@ import base
 import backend
 import db
 
-
 # Epilog definitions
 BRIEF_EPILOG = """
-QUICK START EXAMPLES:
-  voucher                                           --master-pkey <hex> --plan <1M|3M|12M> [--rotating-pkey <hex>] [--duration <s>] (requires --config)
+QUICK START EXAMPLES (all commands require --config):
+  voucher                     --master-pkey <hex> --plan <1M|3M|12M> [--rotating-pkey <hex>] [--duration <s>]
+  user-error set              <provider>:<payment-id>=<true|false>[,...]
+  user-error delete           <provider>:<payment-id>[,...]
+  google-notification handle  <msgid>[,...]
+  google-notification delete  <msgid>[,...]
+  google-notification list
+  revoke list                 <master_pkey_hex>
+  revoke user                 [--creation-unix-ts-s <ts>] <master_pkey_hex>
+  revoke bump-ticket          <amount>
+  report generate             <daily|weekly|monthly> [--format <human|csv>] [--count <n>]
 
-  user-error          set                          <provider>:<payment-id>=<true|false>[,...]                                               (requires --config)
-  user-error          delete                       <provider>:<payment-id>[,...]                                                            (requires --config)
-
-  google-notification handle                       <msgid>[,...]                                                                            (requires --config)
-  google-notification delete                       <msgid>[,...]                                                                            (requires --config)
-  google-notification list                                                                                                                  (requires --config)
-
-  revoke              list                         <master_pkey_hex>                                                                        (requires --config)
-  revoke              user                         [--creation-unix-ts-s <ts>] <master_pkey_hex>                                            (requires --config)
-  revoke              bump-ticket                  <amount>                                                                                 (requires --config)
-
-  report              generate                     <daily|weekly|monthly> [--format <human|csv>] [--count <n>]                              (requires --config)
+Run with --help-full for detailed command formats.
 """
 
 DETAILED_EPILOG = """
@@ -101,7 +98,7 @@ COMMAND FORMATS DETAILED:
       python cli.py --config config.ini user-error delete "1:abc123token"
       python cli.py --config config.ini user-error delete "1:token1,1:token2,2:apple1"
 
-  voucher --config <ini> --master-pkey <hex> --plan <1M|3M|12M> [--rotating-pkey <hex>] [--duration <s>] (requires --config)
+  voucher --config <ini> --master-pkey <hex> --plan <1M|3M|12M> [--rotating-pkey <hex>] [--duration <s>]
     Create a Rangeproof voucher payment and auto-redeem it. This is an admin command for granting
     promotional or complimentary Session Pro subscriptions directly in the database.
 
@@ -209,7 +206,9 @@ def parse_set_user_error_arg(arg: str) -> list[tuple[base.PaymentProvider, str, 
     for item in arg.split(','):
         item = item.strip()
         if ':' not in item or '=' not in item:
-            raise ValueError(f"Invalid format for user error: '{item}'. Expected '<payment_provider>:<payment_id>=[true|false]'.")
+            raise ValueError(
+                f"Invalid format for user error: '{item}'. Expected '<payment_provider>:<payment_id>=[true|false]'."
+            )
         payment_provider_str, remainder = item.split(':', 1)
         payment_id, set_flag_str = remainder.split('=', 1)
         payment_provider_str = payment_provider_str.strip()
@@ -290,9 +289,9 @@ def parse_master_pkey(hex_str: str) -> nacl.signing.VerifyKey:
 
 @dataclasses.dataclass
 class CLIConfig:
-    db_url:           str = ''
+    db_url: str = ''
     backend_key_path: str = ''
-    log_path:         str = ''
+    log_path: str = ''
 
 
 def _fail_config(reason: str) -> typing.NoReturn:
@@ -319,13 +318,13 @@ def require_config(args: argparse.Namespace) -> CLIConfig:
     if 'base' not in parser:
         _fail_config(f'Config file "{config_path}" is missing [base] section')
 
-    base_section            = parser['base']
-    result.db_url           = base_section.get('db_url', '')
+    base_section = parser['base']
+    result.db_url = base_section.get('db_url', '')
     result.backend_key_path = base_section.get('backend_key_path', '')
-    result.log_path         = base_section.get('log_path', '')
+    result.log_path = base_section.get('log_path', '')
 
     # Allow environment variable override
-    result.db_url           = os.getenv('SESH_PRO_BACKEND_DB_URL', result.db_url)
+    result.db_url = os.getenv('SESH_PRO_BACKEND_DB_URL', result.db_url)
     result.backend_key_path = os.getenv('SESH_PRO_BACKEND_KEY_PATH', result.backend_key_path)
 
     if not result.db_url:
@@ -374,11 +373,15 @@ def cmd_user_error_set(args: argparse.Namespace, dry_run: bool) -> int:
                         if backend.has_user_error(conn=conn, payment_provider=payment_provider, payment_id=payment_id):
                             label += ' (skipped - already exists)'
                         else:
-                            backend.add_user_error(conn, error=error, at=base.datetime_from_unix_ms(int(time.time() * 1000)))
+                            backend.add_user_error(
+                                conn, error=error, at=base.datetime_from_unix_ms(int(time.time() * 1000))
+                            )
                             count += 1
                             label += ' (added)'
                     else:
-                        if backend.delete_user_errors(conn=conn, payment_provider=payment_provider, payment_id=payment_id):
+                        if backend.delete_user_errors(
+                            conn=conn, payment_provider=payment_provider, payment_id=payment_id
+                        ):
                             count += 1
                             label += ' (deleted)'
                         else:
@@ -569,23 +572,37 @@ def cmd_revoke_list(args: argparse.Namespace) -> int:
 
                         plan_label = ''
                         match payment.plan:
-                            case base.ProPlan.Nil:         plan_label = '??'
-                            case base.ProPlan.OneMonth:    plan_label = '1M'
-                            case base.ProPlan.ThreeMonth:  plan_label = '3M'
-                            case base.ProPlan.TwelveMonth: plan_label = '12M'
+                            case base.ProPlan.Nil:
+                                plan_label = '??'
+                            case base.ProPlan.OneMonth:
+                                plan_label = '1M'
+                            case base.ProPlan.ThreeMonth:
+                                plan_label = '3M'
+                            case base.ProPlan.TwelveMonth:
+                                plan_label = '12M'
 
                         payment_id = ''
                         match payment.payment_provider:
-                            case base.PaymentProvider.Nil:             pass
-                            case base.PaymentProvider.GooglePlayStore: payment_id = f'{payment.google_payment_token}-{payment.google_order_id}'
-                            case base.PaymentProvider.iOSAppStore:     payment_id = f'{payment.apple.original_tx_id}'
-                            case base.PaymentProvider.Rangeproof:      payment_id = f'{payment.rangeproof_order_id}'
+                            case base.PaymentProvider.Nil:
+                                pass
+                            case base.PaymentProvider.GooglePlayStore:
+                                payment_id = f'{payment.google_payment_token}-{payment.google_order_id}'
+                            case base.PaymentProvider.iOSAppStore:
+                                payment_id = f'{payment.apple.original_tx_id}'
+                            case base.PaymentProvider.Rangeproof:
+                                payment_id = f'{payment.rangeproof_order_id}'
 
                         if now >= payment.expires_at:
                             continue
 
                         status_label = backend.derive_payment_status(payment, now).name
-                        list_label += f'\n    {eligible_count:02d} RevokeID={payment.payment_provider.name}-{payment_id}; Status={status_label}; Plan={plan_label}; Unredeemed={base.readable(payment.purchased_at)}; Expiry={base.readable(payment.expires_at)};'
+                        list_label += (
+                            f'\n    {eligible_count:02d} RevokeID={payment.payment_provider.name}-{payment_id}; '
+                            f'Status={status_label}; '
+                            f'Plan={plan_label}; '
+                            f'Unredeemed={base.readable(payment.purchased_at)}; '
+                            f'Expiry={base.readable(payment.expires_at)};'
+                        )
                         eligible_count += 1
 
                     print(f"User {args.master_pkey} has {eligible_count} revocable payments{list_label}")
@@ -594,6 +611,7 @@ def cmd_revoke_list(args: argparse.Namespace) -> int:
     except Exception as e:
         print(f"ERROR: Database error: {e}", file=sys.stderr)
         return 1
+
 
 def cmd_revoke(args: argparse.Namespace, dry_run: bool) -> int:
     config = require_config(args)
@@ -605,7 +623,11 @@ def cmd_revoke(args: argparse.Namespace, dry_run: bool) -> int:
 
     # Revocation is terminal, so there is no un-revoke; the manual revoke uses the one real revoke path
     # (revoke the user's current generation + roll them onto a fresh one if they still have valid payments).
-    revoke_at = base.datetime_from_unix_ms(args.creation_unix_ts_s * 1000) if args.creation_unix_ts_s else datetime.datetime.now(datetime.timezone.utc)
+    revoke_at = (
+        base.datetime_from_unix_ms(args.creation_unix_ts_s * 1000)
+        if args.creation_unix_ts_s
+        else datetime.datetime.now(datetime.timezone.utc)
+    )
 
     if dry_run:
         print(f"(DRY RUN) Would revoke {args.master_pkey} at {base.readable(revoke_at)}")
@@ -622,6 +644,7 @@ def cmd_revoke(args: argparse.Namespace, dry_run: bool) -> int:
     except Exception as e:
         print(f"ERROR: Database error: {e}", file=sys.stderr)
         return 1
+
 
 def cmd_revoke_bump_ticket(args: argparse.Namespace, dry_run: bool) -> int:
     config = require_config(args)
@@ -645,6 +668,7 @@ def cmd_revoke_bump_ticket(args: argparse.Namespace, dry_run: bool) -> int:
     except Exception as e:
         print(f"ERROR: Database error: {e}", file=sys.stderr)
         return 1
+
 
 def cmd_report_generate(args: argparse.Namespace) -> int:
     config = require_config(args)
@@ -711,7 +735,7 @@ def cmd_voucher(args: argparse.Namespace) -> int:
 
     # Map plan to enum and calculate duration
     plan_map = {'1M': base.ProPlan.OneMonth, '3M': base.ProPlan.ThreeMonth, '12M': base.ProPlan.TwelveMonth}
-    plan     = plan_map[args.plan]
+    plan = plan_map[args.plan]
 
     # Calculate plan duration in milliseconds
     if args.duration:
@@ -726,17 +750,16 @@ def cmd_voucher(args: argparse.Namespace) -> int:
 
     # Create payment transaction
     payment_tx = base.PaymentProviderTransaction(
-        provider=base.PaymentProvider.Rangeproof,
-        rangeproof_order_id=rangeproof_order_id
+        provider=base.PaymentProvider.Rangeproof, rangeproof_order_id=rangeproof_order_id
     )
 
     try:
         with db.open_database(config.db_url) as engine:
             with db.connection(engine) as conn:
                 with db.transaction(conn) as tx:
-                    unix_ts_ms   = int(time.time() * 1000)
-                    request_at   = base.datetime_from_unix_ms(unix_ts_ms)
-                    expires_at   = base.datetime_from_unix_ms(unix_ts_ms + duration_ms)
+                    unix_ts_ms = int(time.time() * 1000)
+                    request_at = base.datetime_from_unix_ms(unix_ts_ms)
+                    expires_at = base.datetime_from_unix_ms(unix_ts_ms + duration_ms)
                     purchased_at = request_at
 
                     # Step 1: Add unredeemed payment
@@ -744,17 +767,20 @@ def cmd_voucher(args: argparse.Namespace) -> int:
                     err = base.ErrorSink()
                     backend.add_unredeemed_payment(
                         tx,
-                        payment_tx                        = payment_tx,
-                        plan                              = plan,
-                        expires_at                 = expires_at,
-                        purchased_at             = purchased_at,
-                        platform_refund_expires_at = base.EPOCH,
-                        platform_obfuscated_account_id    = b'',
-                        err                               = err
+                        payment_tx=payment_tx,
+                        plan=plan,
+                        expires_at=expires_at,
+                        purchased_at=purchased_at,
+                        platform_refund_expires_at=base.EPOCH,
+                        platform_obfuscated_account_id=b'',
+                        err=err,
                     )
 
                     if err.has():
-                        print(f"ERROR: Failed to create unredeemed payment:\n  " + "\n  ".join(err.msg_list), file=sys.stderr)
+                        print(
+                            "ERROR: Failed to create unredeemed payment:\n  " + "\n  ".join(err.msg_list),
+                            file=sys.stderr,
+                        )
                         return 1
 
                     print("Success: Unredeemed payment created")
@@ -774,19 +800,18 @@ def cmd_voucher(args: argparse.Namespace) -> int:
                     print('\nStep 2: Redeeming payment and generating pro proof...')
                     redeem_result = backend.add_pro_payment(
                         tx,
-                        signing_key   = backend_key,
-                        request_at    = request_at,
-                        redeemed_at   = backend.to_redeemed_at(request_at),
-                        master_pkey   = master_pkey,
-                        rotating_pkey = rotating_pkey,
-                        payment_tx    = backend.UserPaymentTransaction(
-                            provider            = base.PaymentProvider.Rangeproof,
-                            rangeproof_order_id = rangeproof_order_id
+                        signing_key=backend_key,
+                        request_at=request_at,
+                        redeemed_at=backend.to_redeemed_at(request_at),
+                        master_pkey=master_pkey,
+                        rotating_pkey=rotating_pkey,
+                        payment_tx=backend.UserPaymentTransaction(
+                            provider=base.PaymentProvider.Rangeproof, rangeproof_order_id=rangeproof_order_id
                         ),
                     )
 
                     print("Success: Payment redeemed and pro proof generated")
-                    print(f'\nProof Details:')
+                    print('\nProof Details:')
                     print(f'  Expiry: {base.readable(redeem_result.proof.expires_at)}')
                     print(f'  Revocation Tag: {redeem_result.proof.revocation_tag.hex()}')
 
@@ -795,76 +820,99 @@ def cmd_voucher(args: argparse.Namespace) -> int:
     except Exception as e:
         print(f"ERROR: Database error: {e}", file=sys.stderr)
         import traceback
+
         traceback.print_exc()
         return 1
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description     = 'Session Pro Backend CLI',
-        formatter_class = argparse.RawDescriptionHelpFormatter,
-        epilog          = DETAILED_EPILOG if '--help-full' in sys.argv else BRIEF_EPILOG,
-        add_help        = False
+        description='Session Pro Backend CLI',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=DETAILED_EPILOG if '--help-full' in sys.argv else BRIEF_EPILOG,
+        add_help=False,
     )
 
     # Global options
-    _                       = parser.add_argument('--help',      action='help',       default=argparse.SUPPRESS, help='Show brief help message and exit')
-    _                       = parser.add_argument('--help-full', action='help',       default=argparse.SUPPRESS, help='Show detailed help with full documentation')
-    _                       = parser.add_argument('--config',                         required=False,            help='Path to config.ini file (required for DB operations)')
-    _                       = parser.add_argument('--dry-run',   action='store_true',                            help='Show what would be done without executing')
+    parser.add_argument('--help', action='help', default=argparse.SUPPRESS, help='Show brief help message and exit')
+    parser.add_argument(
+        '--help-full', action='help', default=argparse.SUPPRESS, help='Show detailed help with full documentation'
+    )
+    parser.add_argument('--config', required=False, help='Path to config.ini file (required for DB operations)')
+    parser.add_argument('--dry-run', action='store_true', help='Show what would be done without executing')
 
-    subparsers              = parser.add_subparsers(dest='command', help='Available commands')
+    subparsers = parser.add_subparsers(dest='command', help='Available commands')
 
     # Voucher command (creates Rangeproof voucher and auto-redeems it)
-    voucher_parser          = subparsers.add_parser('voucher',                                                             help='Create a Rangeproof voucher payment (requires --config)')
-    _                       = voucher_parser.add_argument('--master-pkey',     required=True,                              help='64-char hex master public key of the recipient')
-    _                       = voucher_parser.add_argument('--plan',            required=True, choices=['1M', '3M', '12M'], help='Subscription plan (1M/3M/12M)')
-    _                       = voucher_parser.add_argument('--rotating-pkey',                                               help='64-char hex rotating public key (generates new if omitted)')
-    _                       = voucher_parser.add_argument('--duration',        type=int,                                   help='Override duration in seconds')
+    voucher_parser = subparsers.add_parser('voucher', help='Create a Rangeproof voucher payment (requires --config)')
+    voucher_parser.add_argument('--master-pkey', required=True, help='64-char hex master public key of the recipient')
+    voucher_parser.add_argument(
+        '--plan', required=True, choices=['1M', '3M', '12M'], help='Subscription plan (1M/3M/12M)'
+    )
+    voucher_parser.add_argument('--rotating-pkey', help='64-char hex rotating public key (generates new if omitted)')
+    voucher_parser.add_argument('--duration', type=int, help='Override duration in seconds')
 
     # User error commands
-    user_error_parser       = subparsers.add_parser('user-error',                         help='Manage user errors')
-    user_error_subparsers   = user_error_parser.add_subparsers(dest='user_error_command', help='User error subcommands')
+    user_error_parser = subparsers.add_parser('user-error', help='Manage user errors')
+    user_error_subparsers = user_error_parser.add_subparsers(dest='user_error_command', help='User error subcommands')
 
-    user_error_set          = user_error_subparsers.add_parser('set',                     help='Set user errors (format: <provider>:<payment-id>=true|false,...)')
-    _                       = user_error_set.add_argument('items',                        help='Comma-separated list of errors')
+    user_error_set = user_error_subparsers.add_parser(
+        'set', help='Set user errors (format: <provider>:<payment-id>=true|false,...)'
+    )
+    user_error_set.add_argument('items', help='Comma-separated list of errors')
 
-    user_error_delete       = user_error_subparsers.add_parser('delete',                  help='Delete user errors (format: <provider>:<payment-id>,...)')
-    _                       = user_error_delete.add_argument('items',                     help='Comma-separated list of payment IDs')
+    user_error_delete = user_error_subparsers.add_parser(
+        'delete', help='Delete user errors (format: <provider>:<payment-id>,...)'
+    )
+    user_error_delete.add_argument('items', help='Comma-separated list of payment IDs')
 
     # Google notification commands
-    google_notif_parser     = subparsers.add_parser('google-notification',                    help='Manage the list of Google notifications received in the database')
-    google_notif_subparsers = google_notif_parser.add_subparsers(dest='google_notif_command', help='Google notification subcommands')
+    google_notif_parser = subparsers.add_parser(
+        'google-notification', help='Manage the list of Google notifications received in the database'
+    )
+    google_notif_subparsers = google_notif_parser.add_subparsers(
+        dest='google_notif_command', help='Google notification subcommands'
+    )
 
-    google_notif_handle     = google_notif_subparsers.add_parser('handle',                    help='Mark notifications as handled')
-    _                       = google_notif_handle.add_argument('items',                       help='Comma-separated list of message IDs')
+    google_notif_handle = google_notif_subparsers.add_parser('handle', help='Mark notifications as handled')
+    google_notif_handle.add_argument('items', help='Comma-separated list of message IDs')
 
-    google_notif_delete     = google_notif_subparsers.add_parser('delete',                    help='Delete notifications')
-    _                       = google_notif_delete.add_argument('items',                       help='Comma-separated list of message IDs')
-    _                       = google_notif_subparsers.add_parser('list',                      help='List unhandled notifications')
+    google_notif_delete = google_notif_subparsers.add_parser('delete', help='Delete notifications')
+    google_notif_delete.add_argument('items', help='Comma-separated list of message IDs')
+    google_notif_subparsers.add_parser('list', help='List unhandled notifications')
 
     # Revoke commands
-    revoke_parser           = subparsers.add_parser('revoke',                     help='Manage revocations')
-    revoke_subparsers       = revoke_parser.add_subparsers(dest='revoke_command', help='Revocation subcommands')
+    revoke_parser = subparsers.add_parser('revoke', help='Manage revocations')
+    revoke_subparsers = revoke_parser.add_subparsers(dest='revoke_command', help='Revocation subcommands')
 
-    revoke_list             = revoke_subparsers.add_parser('list',                help='List revocable payments for a user')
-    _                       = revoke_list.add_argument('master_pkey',             help='Master public key (64 hex chars)')
+    revoke_list = revoke_subparsers.add_parser('list', help='List revocable payments for a user')
+    revoke_list.add_argument('master_pkey', help='Master public key (64 hex chars)')
 
-    revoke_now              = revoke_subparsers.add_parser('user',                help="Revoke a user's current generation (terminal — no un-revoke)")
-    _                       = revoke_now.add_argument('master_pkey',              help='Master public key (64 hex chars)')
-    _                       = revoke_now.add_argument('--creation-unix-ts-s', type=int, default=int(time.time()), help='Revocation instant in unix seconds (default: now)')
+    revoke_now = revoke_subparsers.add_parser(
+        'user', help="Revoke a user's current generation (terminal — no un-revoke)"
+    )
+    revoke_now.add_argument('master_pkey', help='Master public key (64 hex chars)')
+    revoke_now.add_argument(
+        '--creation-unix-ts-s',
+        type=int,
+        default=int(time.time()),
+        help='Revocation instant in unix seconds (default: now)',
+    )
 
-    revoke_bump_ticket      = revoke_subparsers.add_parser('bump-ticket',         help='Advance the revocation ticket forward (DR: run after restoring the DB from an older backup)')
-    _                       = revoke_bump_ticket.add_argument('amount', type=int, help='Positive integer to add to the current revocation ticket')
+    revoke_bump_ticket = revoke_subparsers.add_parser(
+        'bump-ticket',
+        help='Advance the revocation ticket forward (DR: run after restoring the DB from an older backup)',
+    )
+    revoke_bump_ticket.add_argument('amount', type=int, help='Positive integer to add to the current revocation ticket')
 
     # Report commands
-    report_parser           = subparsers.add_parser('report',                     help='Generate reports')
-    report_subparsers       = report_parser.add_subparsers(dest='report_command', help='Report subcommands')
+    report_parser = subparsers.add_parser('report', help='Generate reports')
+    report_subparsers = report_parser.add_subparsers(dest='report_command', help='Report subcommands')
 
-    report_generate         = report_subparsers.add_parser('generate',                                                            help='Generate a report')
-    _                       = report_generate.add_argument('period',   choices=['daily', 'weekly',  'monthly'],                   help='Report period')
-    _                       = report_generate.add_argument('--format', choices=['human', 'csv'],                 default='human', help='Report format')
-    _                       = report_generate.add_argument('--count',  type=int,                                 default=7,       help='Number of periods to report')
+    report_generate = report_subparsers.add_parser('generate', help='Generate a report')
+    report_generate.add_argument('period', choices=['daily', 'weekly', 'monthly'], help='Report period')
+    report_generate.add_argument('--format', choices=['human', 'csv'], default='human', help='Report format')
+    report_generate.add_argument('--count', type=int, default=7, help='Number of periods to report')
 
     args = parser.parse_args()
 
@@ -919,5 +967,7 @@ def main() -> int:
     else:
         parser.print_help()
         return 1
+
+
 if __name__ == '__main__':
     sys.exit(main())

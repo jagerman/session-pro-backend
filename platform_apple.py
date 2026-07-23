@@ -4,6 +4,9 @@ notifications to this server which is achieved by exposing a flask route that tr
 flows to receive, parse and process payment information into the database layer (backend.py).
 '''
 
+# Apple documentation about life-cycle triggers as implemented in this file:
+# https://developer.apple.com/documentation/appstoreservernotifications/notificationtype#Handle-use-cases-for-in-app-purchase-life-cycle-events  # noqa: E501
+
 import datetime
 import flask
 import json
@@ -15,28 +18,42 @@ import logging
 import time
 import traceback
 
-from appstoreserverlibrary.models.SendTestNotificationResponse    import SendTestNotificationResponse    as AppleSendTestNotificationResponse
-from appstoreserverlibrary.models.CheckTestNotificationResponse   import CheckTestNotificationResponse   as AppleCheckTestNotificationResponse
-from appstoreserverlibrary.models.Environment                     import Environment                     as AppleEnvironment
-from appstoreserverlibrary.models.Type                            import Type                            as AppleType
-from appstoreserverlibrary.models.TransactionReason               import TransactionReason               as AppleTransactionReason
-from appstoreserverlibrary.models.JWSTransactionDecodedPayload    import JWSTransactionDecodedPayload    as AppleJWSTransactionDecodedPayload
-from appstoreserverlibrary.models.JWSRenewalInfoDecodedPayload    import JWSRenewalInfoDecodedPayload    as AppleJWSRenewalInfoDecodedPayload
-from appstoreserverlibrary.models.Data                            import Data                            as AppleData
-from appstoreserverlibrary.models.ResponseBodyV2DecodedPayload    import ResponseBodyV2DecodedPayload    as AppleResponseBodyV2DecodedPayload
-from appstoreserverlibrary.models.Subtype                         import Subtype                         as AppleSubtype
-from appstoreserverlibrary.models.NotificationTypeV2              import NotificationTypeV2              as AppleNotificationV2
-from appstoreserverlibrary.models.NotificationHistoryRequest      import NotificationHistoryRequest      as AppleNotificationHistoryRequest
-from appstoreserverlibrary.models.NotificationHistoryResponse     import NotificationHistoryResponse     as AppleNotificationHistoryResponse
+from appstoreserverlibrary.models.SendTestNotificationResponse import (
+    SendTestNotificationResponse as AppleSendTestNotificationResponse,
+)
+from appstoreserverlibrary.models.CheckTestNotificationResponse import (
+    CheckTestNotificationResponse as AppleCheckTestNotificationResponse,
+)
+from appstoreserverlibrary.models.Environment import Environment as AppleEnvironment
+from appstoreserverlibrary.models.Type import Type as AppleType
+from appstoreserverlibrary.models.TransactionReason import TransactionReason as AppleTransactionReason
+from appstoreserverlibrary.models.JWSTransactionDecodedPayload import (
+    JWSTransactionDecodedPayload as AppleJWSTransactionDecodedPayload,
+)
+from appstoreserverlibrary.models.JWSRenewalInfoDecodedPayload import (
+    JWSRenewalInfoDecodedPayload as AppleJWSRenewalInfoDecodedPayload,
+)
+from appstoreserverlibrary.models.Data import Data as AppleData
+from appstoreserverlibrary.models.ResponseBodyV2DecodedPayload import (
+    ResponseBodyV2DecodedPayload as AppleResponseBodyV2DecodedPayload,
+)
+from appstoreserverlibrary.models.Subtype import Subtype as AppleSubtype
+from appstoreserverlibrary.models.NotificationTypeV2 import NotificationTypeV2 as AppleNotificationV2
+from appstoreserverlibrary.models.NotificationHistoryRequest import (
+    NotificationHistoryRequest as AppleNotificationHistoryRequest,
+)
+from appstoreserverlibrary.models.NotificationHistoryResponse import (
+    NotificationHistoryResponse as AppleNotificationHistoryResponse,
+)
 
 from appstoreserverlibrary.api_client import (
     AppStoreServerAPIClient as AppleAppStoreServerAPIClient,
-    APIException            as AppleAPIException,
+    APIException as AppleAPIException,
 )
 
 from appstoreserverlibrary.signed_data_verifier import (
-    VerificationException   as AppleVerificationException,
-    SignedDataVerifier      as AppleSignedDataVerifier,
+    VerificationException as AppleVerificationException,
+    SignedDataVerifier as AppleSignedDataVerifier,
 )
 
 import base
@@ -46,43 +63,55 @@ import server
 
 log = logging.Logger('APPLE')
 
+
 @dataclasses.dataclass
 class Core:
-    app_store_server_api_client:    AppleAppStoreServerAPIClient
-    signed_data_verifier:           AppleSignedDataVerifier
-    sandbox:                        bool = False
+    app_store_server_api_client: AppleAppStoreServerAPIClient
+    signed_data_verifier: AppleSignedDataVerifier
+    sandbox: bool = False
     notification_retry_duration: datetime.timedelta = datetime.timedelta(0)
-    max_history_lookup_in_days:     int = 0
+    max_history_lookup_in_days: int = 0
+
 
 @dataclasses.dataclass
 class DecodedNotification:
-    body:         AppleResponseBodyV2DecodedPayload
-    tx_info:      AppleJWSTransactionDecodedPayload | None = None
+    body: AppleResponseBodyV2DecodedPayload
+    tx_info: AppleJWSTransactionDecodedPayload | None = None
     renewal_info: AppleJWSRenewalInfoDecodedPayload | None = None
 
+
 FLASK_ROUTE_NOTIFICATIONS_APPLE_APP_CONNECT_SANDBOX: str = '/apple_notifications_v2'
-FLASK_CONFIG_PLATFORM_APPLE_CORE_KEY:                str = 'session_pro_backend_platform_apple_core'
+FLASK_CONFIG_PLATFORM_APPLE_CORE_KEY: str = 'session_pro_backend_platform_apple_core'
 
 # The object containing routes that you register onto a Flask app to turn it
 # into an app that accepts Apple iOS App Store subscription notifications
-flask_blueprint                                     = flask.Blueprint('session-pro-backend-apple', __name__)
+flask_blueprint = flask.Blueprint('session-pro-backend-apple', __name__)
 
-def init(key_id: str, issuer_id: str, bundle_id: str, app_id: int | None, key_bytes: bytes, root_certs: list[bytes], sandbox_env: bool) -> Core:
-    apple_env                   = AppleEnvironment.SANDBOX if sandbox_env else AppleEnvironment.PRODUCTION
-    app_store_server_api_client = AppleAppStoreServerAPIClient(signing_key = key_bytes,
-                                                               key_id      = key_id,
-                                                               issuer_id   = issuer_id,
-                                                               bundle_id   = bundle_id,
-                                                               environment = apple_env)
 
-    signed_data_verifier        = AppleSignedDataVerifier(root_certificates    = root_certs,
-                                                          enable_online_checks = True,
-                                                          environment          = apple_env,
-                                                          bundle_id            = bundle_id,
-                                                          app_apple_id         = app_id)
+def init(
+    key_id: str,
+    issuer_id: str,
+    bundle_id: str,
+    app_id: int | None,
+    key_bytes: bytes,
+    root_certs: list[bytes],
+    sandbox_env: bool,
+) -> Core:
+    apple_env = AppleEnvironment.SANDBOX if sandbox_env else AppleEnvironment.PRODUCTION
+    app_store_server_api_client = AppleAppStoreServerAPIClient(
+        signing_key=key_bytes, key_id=key_id, issuer_id=issuer_id, bundle_id=bundle_id, environment=apple_env
+    )
 
-    result                            = Core(app_store_server_api_client, signed_data_verifier)
-    result.sandbox                    = sandbox_env
+    signed_data_verifier = AppleSignedDataVerifier(
+        root_certificates=root_certs,
+        enable_online_checks=True,
+        environment=apple_env,
+        bundle_id=bundle_id,
+        app_apple_id=app_id,
+    )
+
+    result = Core(app_store_server_api_client, signed_data_verifier)
+    result.sandbox = sandbox_env
     result.max_history_lookup_in_days = 30 if sandbox_env else 180
 
     # NOTE: Apple retries 1, 12, 24 ... hours after the previous attempt
@@ -92,9 +121,11 @@ def init(key_id: str, issuer_id: str, bundle_id: str, app_id: int | None, key_by
         result.notification_retry_duration = datetime.timedelta(hours=1 + 12 + 24 + 48 + 72, minutes=30)
     return result
 
+
 def payment_tx_id_label(tx: base.PaymentProviderTransaction) -> str:
     result = f'TX ID (orig/tx/web) {tx.apple_original_tx_id}/{tx.apple_tx_id}/{tx.apple_web_line_order_tx_id}'
     return result
+
 
 def pro_plan_from_product_id(product_id: str, err: base.ErrorSink) -> base.ProPlan:
     result = base.ProPlan.Nil
@@ -111,15 +142,21 @@ def pro_plan_from_product_id(product_id: str, err: base.ErrorSink) -> base.ProPl
 
     return result
 
-def print_obj(obj: typing.Any) -> str:  # pyright: ignore[reportAny]
+
+def print_obj(obj: typing.Any) -> str:
     # NOTE: For some reason pprint is unable to pretty print Apple classes. We do it manually ourselves
     result = ''
     if base.UNSAFE_LOGGING:
-        attrs  = {attr: getattr(obj, attr) for attr in dir(obj) if not attr.startswith('_') and not callable(getattr(obj, attr))}
+        attrs = {
+            attr: getattr(obj, attr)
+            for attr in dir(obj)
+            if not attr.startswith('_') and not callable(getattr(obj, attr))
+        }
         result = f'{pprint.pformat(attrs)}'
     else:
         result = '(obfuscated obj dump)'
     return result
+
 
 def require_field(field: typing.Any, msg: str, err: base.ErrorSink | None) -> bool:
     result = True
@@ -128,6 +165,7 @@ def require_field(field: typing.Any, msg: str, err: base.ErrorSink | None) -> bo
         if err:
             err.msg_list.append(msg)
     return result
+
 
 def get_platform_refund_expires_at(tx: AppleJWSTransactionDecodedPayload) -> datetime.datetime:
     # TODO: It's unclear from the Apple documentation whether or not there is a deadline that a user
@@ -140,13 +178,22 @@ def get_platform_refund_expires_at(tx: AppleJWSTransactionDecodedPayload) -> dat
     assert tx.expiresDate
     return base.datetime_from_unix_ms(tx.expiresDate)
 
-def handle_notification_tx(decoded_notification: DecodedNotification, sql_tx: db.SQLTransaction, notification_retry_duration: datetime.timedelta, err: base.ErrorSink) -> bool:
+
+def handle_notification_tx(
+    decoded_notification: DecodedNotification,
+    sql_tx: db.SQLTransaction,
+    notification_retry_duration: datetime.timedelta,
+    err: base.ErrorSink,
+) -> bool:
     if err.has():
         return False
 
     assert decoded_notification.body.notificationUUID
     if backend.apple_notification_uuid_is_in_db(sql_tx, decoded_notification.body.notificationUUID):
         return True
+
+    assert decoded_notification.body.notificationType is not None
+    notif_type = decoded_notification.body.notificationType.name
 
     # NOTE: Exhaustively handle all the notification types defined by Apple:
     #
@@ -208,9 +255,11 @@ def handle_notification_tx(decoded_notification: DecodedNotification, sql_tx: db
     #   https://developer.apple.com/forums/thread/719657?answerId=735817022#735817022
     #   https://developer.apple.com/forums/thread/735297?answerId=761269022#761269022
 
-    if decoded_notification.body.notificationType == AppleNotificationV2.SUBSCRIBED       or \
-       decoded_notification.body.notificationType == AppleNotificationV2.DID_RENEW        or \
-       decoded_notification.body.notificationType == AppleNotificationV2.ONE_TIME_CHARGE:
+    if (
+        decoded_notification.body.notificationType == AppleNotificationV2.SUBSCRIBED
+        or decoded_notification.body.notificationType == AppleNotificationV2.DID_RENEW
+        or decoded_notification.body.notificationType == AppleNotificationV2.ONE_TIME_CHARGE
+    ):
         # AppleNotificationV2.ONE_TIME_CHARGE
         #   A notification type that indicates the customer purchased a consumable, non-consumable,
         #   or non-renewing subscription. The App Store also sends this notification when the
@@ -222,9 +271,9 @@ def handle_notification_tx(decoded_notification: DecodedNotification, sql_tx: db
         #   User bought a subscription, but, didn't set it to auto-renew. Note we should never get a
         #   consumable here as we don't support those.
         #
-        #   Triggers (https://developer.apple.com/documentation/appstoreservernotifications/notificationtype#Handle-use-cases-for-in-app-purchase-life-cycle-events)
-        #     Customer purchases a consumable, non-consumable, or non-renewing subscription.
-        #     Customer receives access to a non-consumable in-app purchase through Family Sharing.
+        #   Triggers
+        #     - Customer purchases a consumable, non-consumable, or non-renewing subscription.
+        #     - Customer receives access to a non-consumable in-app purchase through Family Sharing.
         #
         # AppleNotificationV2.SUBSCRIBED
         #   A notification type that, along with its subtype, indicates that the customer subscribed
@@ -237,13 +286,19 @@ def handle_notification_tx(decoded_notification: DecodedNotification, sql_tx: db
         #   For notifications about other product type purchases, see the ONE_TIME_CHARGE
         #   notification type.
         #
-        #   Triggers (https://developer.apple.com/documentation/appstoreservernotifications/notificationtype#Handle-use-cases-for-in-app-purchase-life-cycle-events)
-        #     Customer subscribes for the first time to any subscription within a subscription group. (subtype INITIAL_BUY)
-        #     Customer resubscribes to any subscription from the same subscription group as their expired subscription. (subtype RESUBSCRIBE)
-        #     A family member gains access to the subscription through Family Sharing after the purchaser subscribes for the first time. (subtype INITIAL_BUY)
-        #     A family member gains access to the subscription through Family Sharing after the purchaser resubscribes. (subtype RESUBSCRIBE)
-        #     Customer redeems an offer code to subscribe for the first time. (subtype INITIAL_BUY)
-        #     Customer redeems a promotional offer, offer code, or win-back offer after their subscription expired. (subtype RESUBSCRIBE)
+        #   Triggers
+        #     - Customer subscribes for the first time to any subscription within a subscription
+        #       group. (subtype INITIAL_BUY)
+        #     - Customer resubscribes to any subscription from the same subscription group as their
+        #       expired subscription. (subtype RESUBSCRIBE)
+        #     - A family member gains access to the subscription through Family Sharing after the
+        #       purchaser subscribes for the first time. (subtype INITIAL_BUY)
+        #     - A family member gains access to the subscription through Family Sharing after the
+        #       purchaser resubscribes. (subtype RESUBSCRIBE)
+        #     - Customer redeems an offer code to subscribe for the first time. (subtype
+        #       INITIAL_BUY)
+        #     - Customer redeems a promotional offer, offer code, or win-back offer after their
+        #       subscription expired. (subtype RESUBSCRIBE)
         #
         # AppleNotifiationV2.DID_RENEW
         #   A notification type that, along with its subtype, indicates that the subscription
@@ -253,63 +308,84 @@ def handle_notification_tx(decoded_notification: DecodedNotification, sql_tx: db
         #   customer with access to the subscription’s content or service.
         #
         #   Triggers
-        #     The subscription successfully auto-renews.
-        #     The billing retry successfully recovers the subscription. (subtype BILLING_RECOVERY)
+        #     - The subscription successfully auto-renews.
+        #     - The billing retry successfully recovers the subscription. (subtype BILLING_RECOVERY)
         tx: AppleJWSTransactionDecodedPayload | None = decoded_notification.tx_info
         if not tx:
-            err.msg_list.append(f'{decoded_notification.body.notificationType.name} is missing TX info. {print_obj(tx)}')
+            err.msg_list.append(f'{notif_type} is missing TX info. {print_obj(tx)}')
 
         if len(err.msg_list) == 0:
             assert tx
-            if require_field(tx.expiresDate,           f'{decoded_notification.body.notificationType.name} is missing TX expires date. {print_obj(tx)}',            err) and \
-               require_field(tx.originalTransactionId, f'{decoded_notification.body.notificationType.name} is missing TX original transaction ID. {print_obj(tx)}', err) and \
-               require_field(tx.purchaseDate,          f'{decoded_notification.body.notificationType.name} is missing TX purchase date. {print_obj(tx)}',           err) and \
-               require_field(tx.transactionId,         f'{decoded_notification.body.notificationType.name} is missing TX transaction ID. {print_obj(tx)}',          err) and \
-               require_field(tx.transactionReason,     f'{decoded_notification.body.notificationType.name} is missing TX reason. {print_obj(tx)}',                  err) and \
-               require_field(tx.type,                  f'{decoded_notification.body.notificationType.name} is missing TX type. {print_obj(tx)}',                    err) and \
-               require_field(tx.productId,             f'{decoded_notification.body.notificationType.name} is missing TX product ID. {print_obj(tx)}',              err) and \
-               require_field(tx.webOrderLineItemId,    f'{decoded_notification.body.notificationType.name} is missing TX web order line item ID. {print_obj(tx)}',  err):
+            if (
+                require_field(tx.expiresDate, f'{notif_type} is missing TX expires date. {print_obj(tx)}', err)
+                and require_field(
+                    tx.originalTransactionId,
+                    f'{notif_type} is missing TX original transaction ID. {print_obj(tx)}',
+                    err,
+                )
+                and require_field(tx.purchaseDate, f'{notif_type} is missing TX purchase date. {print_obj(tx)}', err)
+                and require_field(tx.transactionId, f'{notif_type} is missing TX transaction ID. {print_obj(tx)}', err)
+                and require_field(tx.transactionReason, f'{notif_type} is missing TX reason. {print_obj(tx)}', err)
+                and require_field(tx.type, f'{notif_type} is missing TX type. {print_obj(tx)}', err)
+                and require_field(tx.productId, f'{notif_type} is missing TX product ID. {print_obj(tx)}', err)
+                and require_field(
+                    tx.webOrderLineItemId, f'{notif_type} is missing TX web order line item ID. {print_obj(tx)}', err
+                )
+            ):
 
                 # NOTE: Assert the types for LSP now that we have checked that they exist
-                assert isinstance(tx.purchaseDate,          int),                    f'{print_obj(tx)}'
-                assert isinstance(tx.originalTransactionId, str),                    f'{print_obj(tx)}'
-                assert isinstance(tx.transactionId,         str),                    f'{print_obj(tx)}'
-                assert isinstance(tx.expiresDate,           int),                    f'{print_obj(tx)}'
-                assert isinstance(tx.transactionReason,     AppleTransactionReason), f'{print_obj(tx)}'
-                assert isinstance(tx.type,                  AppleType),              f'{print_obj(tx)}'
-                assert isinstance(tx.productId,             str),                    f'{print_obj(tx)}'
-                assert isinstance(tx.webOrderLineItemId,    str),                    f'{print_obj(tx)}'
+                assert isinstance(tx.purchaseDate, int), f'{print_obj(tx)}'
+                assert isinstance(tx.originalTransactionId, str), f'{print_obj(tx)}'
+                assert isinstance(tx.transactionId, str), f'{print_obj(tx)}'
+                assert isinstance(tx.expiresDate, int), f'{print_obj(tx)}'
+                assert isinstance(tx.transactionReason, AppleTransactionReason), f'{print_obj(tx)}'
+                assert isinstance(tx.type, AppleType), f'{print_obj(tx)}'
+                assert isinstance(tx.productId, str), f'{print_obj(tx)}'
+                assert isinstance(tx.webOrderLineItemId, str), f'{print_obj(tx)}'
 
                 if decoded_notification.body.notificationType == AppleNotificationV2.ONE_TIME_CHARGE:
                     # NOTE: Verify that the TX type is what we expect it to be
                     expected_type = AppleType.NON_RENEWING_SUBSCRIPTION
                     if tx.type != expected_type:
-                        err.msg_list.append(f'{decoded_notification.body.notificationType.name} TX type ({tx.type}) was not the expected value: {expected_type}. {print_obj(tx)}')
+                        err.msg_list.append(
+                            f'{notif_type} TX type ({tx.type}) was not the expected value: {expected_type}. '
+                            f'{print_obj(tx)}'
+                        )
 
                     # NOTE: Verify purchase type is what we expect it to be
                     expected_reason = AppleTransactionReason.PURCHASE
                     if tx.transactionReason != expected_reason:
-                        err.msg_list.append(f'{decoded_notification.body.notificationType.name} TX type ({tx.transactionReason}) was not the expected value for a one-time payment: {expected_reason.name}. {print_obj(tx)}')
+                        err.msg_list.append(
+                            f'{notif_type} TX type ({tx.transactionReason}) was not the expected value '
+                            f'for a one-time payment: {expected_reason.name}. {print_obj(tx)}'
+                        )
                 else:
                     # NOTE: Verify that the TX type is what we expect it to be
                     expected_type = AppleType.AUTO_RENEWABLE_SUBSCRIPTION
                     if tx.type != expected_type:
-                        err.msg_list.append(f'{decoded_notification.body.notificationType.name} TX type ({tx.type}) was not the expected value: {expected_type}. {print_obj(tx)}')
+                        err.msg_list.append(
+                            f'{notif_type} TX type ({tx.type}) was not the expected value: {expected_type}. '
+                            f'{print_obj(tx)}'
+                        )
 
                 # NOTE: Extract plan
                 payment_tx = payment_tx_from_apple_jws_transaction(tx, err)
-                pro_plan   = pro_plan_from_product_id(tx.productId, err)
+                pro_plan = pro_plan_from_product_id(tx.productId, err)
 
-                expires_at                 = base.datetime_from_unix_ms(tx.expiresDate)
-                purchased_at             = base.datetime_from_unix_ms(tx.purchaseDate)
+                expires_at = base.datetime_from_unix_ms(tx.expiresDate)
+                purchased_at = base.datetime_from_unix_ms(tx.purchaseDate)
                 platform_refund_expires_at = get_platform_refund_expires_at(tx)
-                auto_renewing                     = True
+                auto_renewing = True
 
                 if log.getEffectiveLevel() <= logging.DEBUG:
-                    expiry        = base.readable(expires_at)
-                    unredeemed    = base.readable(purchased_at)
-                    refund        = base.readable(platform_refund_expires_at)
-                    log.debug(f'{decoded_notification.body.notificationType.name} for {payment_tx_id_label(payment_tx)}: New payment (expiry/unredeemed/refund expiry) ts = {expiry}/{unredeemed}/{refund}, grace period = {base.DEFAULT_APPLE_GRACE_PERIOD}, auto-renewing = {auto_renewing}')
+                    expiry = base.readable(expires_at)
+                    unredeemed = base.readable(purchased_at)
+                    refund = base.readable(platform_refund_expires_at)
+                    log.debug(
+                        f'{notif_type} for {payment_tx_id_label(payment_tx)}: '
+                        f'New payment (expiry/unredeemed/refund expiry) ts = {expiry}/{unredeemed}/{refund}, '
+                        f'grace period = {base.DEFAULT_APPLE_GRACE_PERIOD}, auto-renewing = {auto_renewing}'
+                    )
 
                 # NOTE: Process notification
                 sql_tx.cancel = True
@@ -318,21 +394,25 @@ def handle_notification_tx(decoded_notification: DecodedNotification, sql_tx: db
                     # master pkey, then this can be asserted to have to exist in the payload
                     platform_obfuscated_account_id = tx.appAccountToken if tx.appAccountToken else ''
 
-                    backend.add_unredeemed_payment(sql_tx,
-                                                      payment_tx                        = payment_tx,
-                                                      plan                              = pro_plan,
-                                                      purchased_at             = purchased_at,
-                                                      platform_refund_expires_at = platform_refund_expires_at,
-                                                      expires_at                 = expires_at,
-                                                      platform_obfuscated_account_id    = platform_obfuscated_account_id,
-                                                      err                               = err)
+                    backend.add_unredeemed_payment(
+                        sql_tx,
+                        payment_tx=payment_tx,
+                        plan=pro_plan,
+                        purchased_at=purchased_at,
+                        platform_refund_expires_at=platform_refund_expires_at,
+                        expires_at=expires_at,
+                        platform_obfuscated_account_id=platform_obfuscated_account_id,
+                        err=err,
+                    )
 
                 if not err.has():
-                    backend.update_payment_renewal_info(sql_tx,
-                                                               payment_tx               = payment_tx,
-                                                               grace_period = base.DEFAULT_APPLE_GRACE_PERIOD,
-                                                               auto_renewing            = auto_renewing,
-                                                               err                      = err)
+                    backend.update_payment_renewal_info(
+                        sql_tx,
+                        payment_tx=payment_tx,
+                        grace_period=base.DEFAULT_APPLE_GRACE_PERIOD,
+                        auto_renewing=auto_renewing,
+                        err=err,
+                    )
                 sql_tx.cancel = err.has()
 
     elif decoded_notification.body.notificationType == AppleNotificationV2.DID_CHANGE_RENEWAL_PREF:
@@ -346,42 +426,53 @@ def handle_notification_tx(decoded_notification: DecodedNotification, sql_tx: db
         # If the subtype is empty, the user changed their renewal preference back to the current
         # subscription, effectively canceling a downgrade.
         #
-        # Triggers (https://developer.apple.com/documentation/appstoreservernotifications/notificationtype#Handle-use-cases-for-in-app-purchase-life-cycle-events)
-        #   Customer downgrades a subscription within the same subscription group. (subtype DOWNGRADE)
-        #   Customer reverts to the previous subscription, effectively canceling their downgrade.
-        #   Customer upgrades a subscription within the same subscription group. (subtype UPGRADE)
+        # Triggers
+        #   - Customer downgrades a subscription within the same subscription group. (subtype
+        #     DOWNGRADE)
+        #   - Customer reverts to the previous subscription, effectively canceling their downgrade.
+        #   - Customer upgrades a subscription within the same subscription group. (subtype UPGRADE)
         tx = decoded_notification.tx_info
         if not tx:
-            err.msg_list.append(f'{decoded_notification.body.notificationType.name} is missing TX info {print_obj(tx)}')
+            err.msg_list.append(f'{notif_type} is missing TX info {print_obj(tx)}')
 
         if len(err.msg_list) == 0:
             assert tx
-            if require_field(tx.expiresDate,           f'{decoded_notification.body.notificationType.name} is missing TX expires date. {print_obj(tx)}',            err) and \
-               require_field(tx.originalTransactionId, f'{decoded_notification.body.notificationType.name} is missing TX original transaction ID. {print_obj(tx)}', err) and \
-               require_field(tx.purchaseDate,          f'{decoded_notification.body.notificationType.name} is missing TX purchase date. {print_obj(tx)}',           err) and \
-               require_field(tx.transactionId,         f'{decoded_notification.body.notificationType.name} is missing TX transaction ID. {print_obj(tx)}',          err) and \
-               require_field(tx.transactionReason,     f'{decoded_notification.body.notificationType.name} is missing TX reason. {print_obj(tx)}',                  err) and \
-               require_field(tx.type,                  f'{decoded_notification.body.notificationType.name} is missing TX type. {print_obj(tx)}',                    err) and \
-               require_field(tx.productId,             f'{decoded_notification.body.notificationType.name} is missing TX product ID. {print_obj(tx)}',              err) and \
-               require_field(tx.webOrderLineItemId,    f'{decoded_notification.body.notificationType.name} is missing TX web order line item ID. {print_obj(tx)}',  err):
+            if (
+                require_field(tx.expiresDate, f'{notif_type} is missing TX expires date. {print_obj(tx)}', err)
+                and require_field(
+                    tx.originalTransactionId,
+                    f'{notif_type} is missing TX original transaction ID. {print_obj(tx)}',
+                    err,
+                )
+                and require_field(tx.purchaseDate, f'{notif_type} is missing TX purchase date. {print_obj(tx)}', err)
+                and require_field(tx.transactionId, f'{notif_type} is missing TX transaction ID. {print_obj(tx)}', err)
+                and require_field(tx.transactionReason, f'{notif_type} is missing TX reason. {print_obj(tx)}', err)
+                and require_field(tx.type, f'{notif_type} is missing TX type. {print_obj(tx)}', err)
+                and require_field(tx.productId, f'{notif_type} is missing TX product ID. {print_obj(tx)}', err)
+                and require_field(
+                    tx.webOrderLineItemId, f'{notif_type} is missing TX web order line item ID. {print_obj(tx)}', err
+                )
+            ):
 
                 # NOTE: Assert the types for LSP now that we have checked that they exist
-                assert isinstance(tx.purchaseDate,          int),                    f'{print_obj(tx)}'
-                assert isinstance(tx.originalTransactionId, str),                    f'{print_obj(tx)}'
-                assert isinstance(tx.transactionId,         str),                    f'{print_obj(tx)}'
-                assert isinstance(tx.expiresDate,           int),                    f'{print_obj(tx)}'
-                assert isinstance(tx.transactionReason,     AppleTransactionReason), f'{print_obj(tx)}'
-                assert isinstance(tx.type,                  AppleType),              f'{print_obj(tx)}'
-                assert isinstance(tx.productId,             str),                    f'{print_obj(tx)}'
-                assert isinstance(tx.webOrderLineItemId,    str),                    f'{print_obj(tx)}'
+                assert isinstance(tx.purchaseDate, int), f'{print_obj(tx)}'
+                assert isinstance(tx.originalTransactionId, str), f'{print_obj(tx)}'
+                assert isinstance(tx.transactionId, str), f'{print_obj(tx)}'
+                assert isinstance(tx.expiresDate, int), f'{print_obj(tx)}'
+                assert isinstance(tx.transactionReason, AppleTransactionReason), f'{print_obj(tx)}'
+                assert isinstance(tx.type, AppleType), f'{print_obj(tx)}'
+                assert isinstance(tx.productId, str), f'{print_obj(tx)}'
+                assert isinstance(tx.webOrderLineItemId, str), f'{print_obj(tx)}'
 
                 # NOTE: Verify that the TX type is what we expect it to be
                 expected_type = AppleType.AUTO_RENEWABLE_SUBSCRIPTION
                 if tx.type != expected_type:
-                    err.msg_list.append(f'{decoded_notification.body.notificationType.name} TX type ({tx.type}) was not the expected value: {expected_type}. {print_obj(tx)}')
+                    err.msg_list.append(
+                        f'{notif_type} TX type ({tx.type}) was not the expected value: {expected_type}. {print_obj(tx)}'
+                    )
 
                 # NOTE: Extract plan
-                pro_plan   = pro_plan_from_product_id(tx.productId, err)
+                pro_plan = pro_plan_from_product_id(tx.productId, err)
                 payment_tx = payment_tx_from_apple_jws_transaction(tx, err)
 
                 # NOTE: Extract components
@@ -390,7 +481,7 @@ def handle_notification_tx(decoded_notification: DecodedNotification, sql_tx: db
                         # NOTE: User is cancelling their downgrade, the downgrade was meant to be
                         # queued for the end of the month. No-op the current payment for the user is
                         # still valid
-                        log.debug(f'{decoded_notification.body.notificationType.name} for {payment_tx_id_label(payment_tx)}: No-op')
+                        log.debug(f'{notif_type} for {payment_tx_id_label(payment_tx)}: No-op')
 
                     elif decoded_notification.body.subtype == AppleSubtype.DOWNGRADE:
                         # NOTE: User is downgrading to a lesser subscription. Downgrade happens at
@@ -405,17 +496,23 @@ def handle_notification_tx(decoded_notification: DecodedNotification, sql_tx: db
                         # transaction that the user made. In this case the TX info has the current
                         # subscription before the downgrade is to take effect, e.g. it has the TX
                         # info that we need to set auto-renewal back on for
-                        log.debug(f'{decoded_notification.body.notificationType.name}+DOWNGRADE for {payment_tx_id_label(payment_tx)}: Grace period = {base.DEFAULT_APPLE_GRACE_PERIOD}, auto-renewing = true')
+                        log.debug(
+                            f'{notif_type}+DOWNGRADE for {payment_tx_id_label(payment_tx)}: '
+                            f'Grace period = {base.DEFAULT_APPLE_GRACE_PERIOD}, auto-renewing = true'
+                        )
                         sql_tx.cancel = True
-                        backend.update_payment_renewal_info(sql_tx,
-                                                                   payment_tx               = payment_tx,
-                                                                   grace_period = base.DEFAULT_APPLE_GRACE_PERIOD,
-                                                                   auto_renewing            = True,
-                                                                   err                      = err)
+                        backend.update_payment_renewal_info(
+                            sql_tx,
+                            payment_tx=payment_tx,
+                            grace_period=base.DEFAULT_APPLE_GRACE_PERIOD,
+                            auto_renewing=True,
+                            err=err,
+                        )
                         sql_tx.cancel = err.has()
 
                     elif decoded_notification.body.subtype == AppleSubtype.UPGRADE:
-                        # User is upgrading to a better subscription. Upgrade happens immediately, current plan is ended.
+                        # User is upgrading to a better subscription. Upgrade happens immediately,
+                        # current plan is ended.
 
                         # NOTE: The only link we have to the current plan is the original
                         # transaction ID. It doesn't seem guaranteed that the web order line item ID
@@ -425,25 +522,31 @@ def handle_notification_tx(decoded_notification: DecodedNotification, sql_tx: db
                         # We lookup the latest payment for the original transaction ID and cancel
                         # that
 
-                        expires_at                 = base.datetime_from_unix_ms(tx.expiresDate)
-                        purchased_at             = base.datetime_from_unix_ms(tx.purchaseDate)
+                        expires_at = base.datetime_from_unix_ms(tx.expiresDate)
+                        purchased_at = base.datetime_from_unix_ms(tx.purchaseDate)
                         platform_refund_expires_at = get_platform_refund_expires_at(tx)
-                        auto_renewing                     = True
-                        revoke_at                 = base.datetime_from_unix_ms(tx.purchaseDate)
+                        auto_renewing = True
+                        revoke_at = base.datetime_from_unix_ms(tx.purchaseDate)
                         if log.getEffectiveLevel() <= logging.DEBUG:
-                            expiry        = base.readable(expires_at)
-                            unredeemed    = base.readable(purchased_at)
-                            refund        = base.readable(platform_refund_expires_at)
-                            revoke        = base.readable(base.datetime_from_unix_ms(tx.purchaseDate))
-                            log.debug(f'{decoded_notification.body.notificationType.name}+UPGRADE for {payment_tx_id_label(payment_tx)}: Revoke (orig. TX ID) date = {revoke}, new payment (expiry/unredeemed/refund expiry) ts = {expiry}/{unredeemed}/{refund}, grace period = {base.DEFAULT_APPLE_GRACE_PERIOD}, auto-renewing = {auto_renewing}')
+                            expiry = base.readable(expires_at)
+                            unredeemed = base.readable(purchased_at)
+                            refund = base.readable(platform_refund_expires_at)
+                            revoke = base.readable(base.datetime_from_unix_ms(tx.purchaseDate))
+                            log.debug(
+                                f'{notif_type}+UPGRADE for {payment_tx_id_label(payment_tx)}: '
+                                f'Revoke (orig. TX ID) date = {revoke}, '
+                                f'new payment (expiry/unredeemed/refund expiry) ts = {expiry}/{unredeemed}/{refund}, '
+                                f'grace period = {base.DEFAULT_APPLE_GRACE_PERIOD}, auto-renewing = {auto_renewing}'
+                            )
 
                         sql_tx.cancel = True
-                        revoked: bool = backend.add_apple_revocation(sql_tx,
-                                                                        apple_original_tx_id = tx.originalTransactionId,
-                                                                        revoke_at    = revoke_at,
-                                                                        err                  = err)
+                        revoked: bool = backend.add_apple_revocation(
+                            sql_tx, apple_original_tx_id=tx.originalTransactionId, revoke_at=revoke_at, err=err
+                        )
                         if not revoked:
-                            err.msg_list.append(f'No matching active payment was available to be revoked. {print_obj(tx)}')
+                            err.msg_list.append(
+                                f'No matching active payment was available to be revoked. {print_obj(tx)}'
+                            )
 
                         # NOTE: Submit the upgraded payment (e.g. the new payment)
                         if not err.has():
@@ -451,14 +554,16 @@ def handle_notification_tx(decoded_notification: DecodedNotification, sql_tx: db
                             # master pkey, then this can be asserted to have to exist in the payload
                             platform_obfuscated_account_id = tx.appAccountToken if tx.appAccountToken else ''
 
-                            backend.add_unredeemed_payment(sql_tx,
-                                                              payment_tx                        = payment_tx,
-                                                              plan                              = pro_plan,
-                                                              expires_at                 = expires_at,
-                                                              purchased_at             = purchased_at,
-                                                              platform_refund_expires_at = platform_refund_expires_at,
-                                                              platform_obfuscated_account_id    = platform_obfuscated_account_id,
-                                                              err                               = err)
+                            backend.add_unredeemed_payment(
+                                sql_tx,
+                                payment_tx=payment_tx,
+                                plan=pro_plan,
+                                expires_at=expires_at,
+                                purchased_at=purchased_at,
+                                platform_refund_expires_at=platform_refund_expires_at,
+                                platform_obfuscated_account_id=platform_obfuscated_account_id,
+                                err=err,
+                            )
 
                         # NOTE: Update grace period, note we do not update the auto-renewing flag
                         # because it is set on by default for new subscription payments (by
@@ -467,11 +572,13 @@ def handle_notification_tx(decoded_notification: DecodedNotification, sql_tx: db
                         # default behaviour of the backend which is to set that flag on the payment
                         # immediately)
                         if not err.has():
-                            backend.update_payment_renewal_info(sql_tx,
-                                                                       payment_tx               = payment_tx,
-                                                                       grace_period = base.DEFAULT_APPLE_GRACE_PERIOD,
-                                                                       auto_renewing            = None,
-                                                                       err                      = err)
+                            backend.update_payment_renewal_info(
+                                sql_tx,
+                                payment_tx=payment_tx,
+                                grace_period=base.DEFAULT_APPLE_GRACE_PERIOD,
+                                auto_renewing=None,
+                                err=err,
+                            )
                         sql_tx.cancel = err.has()
 
     elif decoded_notification.body.notificationType == AppleNotificationV2.OFFER_REDEEMED:
@@ -484,46 +591,54 @@ def handle_notification_tx(decoded_notification: DecodedNotification, sql_tx: db
         # at the next renewal date. If the customer redeemed an offer for their active subscription,
         # you receive an OFFER_REDEEMED notification type without a subtype.
         #
-        # Triggers (https://developer.apple.com/documentation/appstoreservernotifications/notificationtype#Handle-use-cases-for-in-app-purchase-life-cycle-events)
-        #   Customer redeems a promotional offer or offer code for an active subscription.
-        #   Customer redeems a promotional offer or offer code to upgrade their subscription. (subtype UPGRADE)
-        #   Customer redeems a promotional offer and downgrades their subscription. (subtype DOWNGRADE)
+        # Triggers
+        #   - Customer redeems a promotional offer or offer code for an active subscription.
+        #   - Customer redeems a promotional offer or offer code to upgrade their subscription.
+        #     (subtype UPGRADE)
+        #   - Customer redeems a promotional offer and downgrades their subscription. (subtype
+        #     DOWNGRADE)
 
         tx = decoded_notification.tx_info
 
         # NOTE: Check the required fields exist
         if tx:
-            _ = require_field(tx.expiresDate,           f'{decoded_notification.body.notificationType.name} is missing TX expires date. {print_obj(tx)}',            err)
-            _ = require_field(tx.originalTransactionId, f'{decoded_notification.body.notificationType.name} is missing TX original transaction ID. {print_obj(tx)}', err)
-            _ = require_field(tx.purchaseDate,          f'{decoded_notification.body.notificationType.name} is missing TX purchase date. {print_obj(tx)}',           err)
-            _ = require_field(tx.transactionId,         f'{decoded_notification.body.notificationType.name} is missing TX transaction ID. {print_obj(tx)}',          err)
-            _ = require_field(tx.transactionReason,     f'{decoded_notification.body.notificationType.name} is missing TX reason. {print_obj(tx)}',                  err)
-            _ = require_field(tx.type,                  f'{decoded_notification.body.notificationType.name} is missing TX type. {print_obj(tx)}',                    err)
-            _ = require_field(tx.productId,             f'{decoded_notification.body.notificationType.name} is missing TX product ID. {print_obj(tx)}',              err)
-            _ = require_field(tx.webOrderLineItemId,    f'{decoded_notification.body.notificationType.name} is missing TX web order line item ID. {print_obj(tx)}',  err)
+            require_field(tx.expiresDate, f'{notif_type} is missing TX expires date. {print_obj(tx)}', err)
+            require_field(
+                tx.originalTransactionId, f'{notif_type} is missing TX original transaction ID. {print_obj(tx)}', err
+            )
+            require_field(tx.purchaseDate, f'{notif_type} is missing TX purchase date. {print_obj(tx)}', err)
+            require_field(tx.transactionId, f'{notif_type} is missing TX transaction ID. {print_obj(tx)}', err)
+            require_field(tx.transactionReason, f'{notif_type} is missing TX reason. {print_obj(tx)}', err)
+            require_field(tx.type, f'{notif_type} is missing TX type. {print_obj(tx)}', err)
+            require_field(tx.productId, f'{notif_type} is missing TX product ID. {print_obj(tx)}', err)
+            require_field(
+                tx.webOrderLineItemId, f'{notif_type} is missing TX web order line item ID. {print_obj(tx)}', err
+            )
         else:
-            err.msg_list.append(f'{decoded_notification.body.notificationType.name} is missing TX info {print_obj(tx)}')
+            err.msg_list.append(f'{notif_type} is missing TX info {print_obj(tx)}')
 
         # NOTE: Use the required fields
         if not err.has():
-            assert tx # NOTE: Assert the types for LSP now that we have checked that they exist
-            assert isinstance(tx.purchaseDate,          int),                    f'{print_obj(tx)}'
-            assert isinstance(tx.originalTransactionId, str),                    f'{print_obj(tx)}'
-            assert isinstance(tx.transactionId,         str),                    f'{print_obj(tx)}'
-            assert isinstance(tx.expiresDate,           str),                    f'{print_obj(tx)}'
-            assert isinstance(tx.transactionReason,     AppleTransactionReason), f'{print_obj(tx)}'
-            assert isinstance(tx.type,                  AppleType),              f'{print_obj(tx)}'
-            assert isinstance(tx.productId,             str),                    f'{print_obj(tx)}'
-            assert isinstance(tx.webOrderLineItemId,    str),                    f'{print_obj(tx)}'
+            assert tx  # NOTE: Assert the types for LSP now that we have checked that they exist
+            assert isinstance(tx.purchaseDate, int), f'{print_obj(tx)}'
+            assert isinstance(tx.originalTransactionId, str), f'{print_obj(tx)}'
+            assert isinstance(tx.transactionId, str), f'{print_obj(tx)}'
+            assert isinstance(tx.expiresDate, str), f'{print_obj(tx)}'
+            assert isinstance(tx.transactionReason, AppleTransactionReason), f'{print_obj(tx)}'
+            assert isinstance(tx.type, AppleType), f'{print_obj(tx)}'
+            assert isinstance(tx.productId, str), f'{print_obj(tx)}'
+            assert isinstance(tx.webOrderLineItemId, str), f'{print_obj(tx)}'
 
             # NOTE: Verify that the TX type is what we expect it to be
             expected_type = AppleType.AUTO_RENEWABLE_SUBSCRIPTION
             if tx.type != expected_type:
-                err.msg_list.append(f'{decoded_notification.body.notificationType.name} TX type ({tx.type}) was not the expected value: {expected_type}. {print_obj(tx)}')
+                err.msg_list.append(
+                    f'{notif_type} TX type ({tx.type}) was not the expected value: {expected_type}. {print_obj(tx)}'
+                )
 
             # NOTE: Extract plan
             pro_plan = pro_plan_from_product_id(tx.productId, err)
-            payment_tx             = payment_tx_from_apple_jws_transaction(tx, err)
+            payment_tx = payment_tx_from_apple_jws_transaction(tx, err)
 
             # NOTE: Extract components
             if not err.has():
@@ -534,30 +649,38 @@ def handle_notification_tx(decoded_notification: DecodedNotification, sql_tx: db
                     expires_at = base.datetime_from_unix_ms(tx.expiresDate)
 
                     if log.getEffectiveLevel() <= logging.DEBUG:
-                        expiry        = base.readable(expires_at)
-                        unredeemed    = base.readable(purchased_at)
-                        refund        = base.readable(platform_refund_expires_at)
-                        log.debug(f'{decoded_notification.body.notificationType.name} for {payment_tx_id_label(payment_tx)}: New payment (unredeemed/refund expiry/expiry) ts = ({unredeemed}/{refund}/{expiry})')
+                        expiry = base.readable(expires_at)
+                        unredeemed = base.readable(purchased_at)
+                        refund = base.readable(platform_refund_expires_at)
+                        log.debug(
+                            f'{notif_type} for {payment_tx_id_label(payment_tx)}: '
+                            f'New payment (unredeemed/refund expiry/expiry) ts = ({unredeemed}/{refund}/{expiry})'
+                        )
 
                     # TODO: To be updated when Session iOS figures out how it will generate UUID from the
                     # master pkey, then this can be asserted to have to exist in the payload
                     platform_obfuscated_account_id = tx.appAccountToken if tx.appAccountToken else ''
 
-                    backend.add_unredeemed_payment(sql_tx,
-                                                      payment_tx                        = payment_tx,
-                                                      plan                              = pro_plan,
-                                                      expires_at                 = base.datetime_from_unix_ms(tx.expiresDate),
-                                                      purchased_at             = base.datetime_from_unix_ms(tx.purchaseDate),
-                                                      platform_refund_expires_at = platform_refund_expires_at,
-                                                      platform_obfuscated_account_id    = platform_obfuscated_account_id,
-                                                      err                               = err)
+                    backend.add_unredeemed_payment(
+                        sql_tx,
+                        payment_tx=payment_tx,
+                        plan=pro_plan,
+                        expires_at=base.datetime_from_unix_ms(tx.expiresDate),
+                        purchased_at=base.datetime_from_unix_ms(tx.purchaseDate),
+                        platform_refund_expires_at=platform_refund_expires_at,
+                        platform_obfuscated_account_id=platform_obfuscated_account_id,
+                        err=err,
+                    )
 
                 elif decoded_notification.body.subtype == AppleSubtype.DOWNGRADE:
                     # NOTE: User is downgrading to a lesser subscription. Downgrade happens at
                     # end of billing cycle. This is a no-op, we _should_ get a DID_RENEW
                     # notification which handles this for us at the end of the billing cycle
                     # when they renew.
-                    log.debug(f'{decoded_notification.body.notificationType.name}+DOWNGRADE for {payment_tx_id_label(payment_tx)}: No-op, downgrade at next billing cycle')
+                    log.debug(
+                        f'{notif_type}+DOWNGRADE for {payment_tx_id_label(payment_tx)}: '
+                        f'No-op, downgrade at next billing cycle'
+                    )
                     pass
 
                 elif decoded_notification.body.subtype == AppleSubtype.UPGRADE:
@@ -565,24 +688,28 @@ def handle_notification_tx(decoded_notification: DecodedNotification, sql_tx: db
                     # immediately, current plan is ended. The only link we have to the current
                     # plan is the original transaction ID, so we use that to cancel the old
                     # payment and issue a new one.
-                    sql_tx.cancel                     = True
-                    auto_renewing                     = True
-                    expires_at                 = base.datetime_from_unix_ms(tx.expiresDate)
-                    purchased_at             = base.datetime_from_unix_ms(tx.purchaseDate)
+                    sql_tx.cancel = True
+                    auto_renewing = True
+                    expires_at = base.datetime_from_unix_ms(tx.expiresDate)
+                    purchased_at = base.datetime_from_unix_ms(tx.purchaseDate)
                     platform_refund_expires_at = get_platform_refund_expires_at(tx)
-                    revoke_at                 = base.datetime_from_unix_ms(tx.purchaseDate)
+                    revoke_at = base.datetime_from_unix_ms(tx.purchaseDate)
 
                     if log.getEffectiveLevel() <= logging.DEBUG:
-                        expiry        = base.readable(expires_at)
-                        unredeemed    = base.readable(purchased_at)
-                        revoke        = base.readable(base.datetime_from_unix_ms(tx.purchaseDate))
-                        refund        = base.readable(platform_refund_expires_at)
-                        log.debug(f'{decoded_notification.body.notificationType.name}+UPGRADE for {payment_tx_id_label(payment_tx)}: Revoking (orig TX id) at = {revoke}, new payment (expiry/unredeemed/refund ts) = {expiry}/{unredeemed}/{refund}, grace = {base.DEFAULT_APPLE_GRACE_PERIOD}, auto-renewing = {auto_renewing}')
+                        expiry = base.readable(expires_at)
+                        unredeemed = base.readable(purchased_at)
+                        revoke = base.readable(base.datetime_from_unix_ms(tx.purchaseDate))
+                        refund = base.readable(platform_refund_expires_at)
+                        log.debug(
+                            f'{notif_type}+UPGRADE for {payment_tx_id_label(payment_tx)}: '
+                            f'Revoking (orig TX id) at = {revoke}, '
+                            f'new payment (expiry/unredeemed/refund ts) = {expiry}/{unredeemed}/{refund}, '
+                            f'grace = {base.DEFAULT_APPLE_GRACE_PERIOD}, auto-renewing = {auto_renewing}'
+                        )
 
-                    revoked = backend.add_apple_revocation(sql_tx,
-                                                              apple_original_tx_id = tx.originalTransactionId,
-                                                              revoke_at    = revoke_at,
-                                                              err                  = err)
+                    revoked = backend.add_apple_revocation(
+                        sql_tx, apple_original_tx_id=tx.originalTransactionId, revoke_at=revoke_at, err=err
+                    )
                     if not revoked:
                         err.msg_list.append(f'No matching active payment was available to be revoked. {print_obj(tx)}')
 
@@ -592,25 +719,32 @@ def handle_notification_tx(decoded_notification: DecodedNotification, sql_tx: db
                         # master pkey, then this can be asserted to have to exist in the payload
                         platform_obfuscated_account_id = tx.appAccountToken if tx.appAccountToken else ''
 
-                        backend.add_unredeemed_payment(sql_tx,
-                                                          payment_tx                        = payment_tx,
-                                                          plan                              = pro_plan,
-                                                          expires_at                 = expires_at,
-                                                          purchased_at             = purchased_at,
-                                                          platform_refund_expires_at = platform_refund_expires_at,
-                                                          platform_obfuscated_account_id    = platform_obfuscated_account_id,
-                                                          err                               = err)
+                        backend.add_unredeemed_payment(
+                            sql_tx,
+                            payment_tx=payment_tx,
+                            plan=pro_plan,
+                            expires_at=expires_at,
+                            purchased_at=purchased_at,
+                            platform_refund_expires_at=platform_refund_expires_at,
+                            platform_obfuscated_account_id=platform_obfuscated_account_id,
+                            err=err,
+                        )
 
                     if not err.has():
-                        backend.update_payment_renewal_info(sql_tx,
-                                                                   payment_tx               = payment_tx,
-                                                                   grace_period = base.DEFAULT_APPLE_GRACE_PERIOD,
-                                                                   auto_renewing            = auto_renewing,
-                                                                   err                      = err)
+                        backend.update_payment_renewal_info(
+                            sql_tx,
+                            payment_tx=payment_tx,
+                            grace_period=base.DEFAULT_APPLE_GRACE_PERIOD,
+                            auto_renewing=auto_renewing,
+                            err=err,
+                        )
 
                     sql_tx.cancel = err.has()
 
-    elif decoded_notification.body.notificationType == AppleNotificationV2.REFUND or decoded_notification.body.notificationType == AppleNotificationV2.REVOKE:
+    elif (
+        decoded_notification.body.notificationType == AppleNotificationV2.REFUND
+        or decoded_notification.body.notificationType == AppleNotificationV2.REVOKE
+    ):
         # AppleNotificationV2.REFUND
         #   A notification type that indicates that the App Store successfully refunded a transaction
         #   for a consumable in-app purchase, a non-consumable in-app purchase, an auto-renewable
@@ -620,8 +754,9 @@ def handle_notification_tx(decoded_notification: DecodedNotification, sql_tx: db
         #   originalTransactionId and productId identify the original transaction and product. The
         #   revocationReason contains the reason.
         #
-        #   Triggers (https://developer.apple.com/documentation/appstoreservernotifications/notificationtype#Handle-use-cases-for-in-app-purchase-life-cycle-events)
-        #     Apple refunds the transaction for a consumable or non-consumable in-app purchase, a non-renewing subscription, or an auto-renewable subscription.
+        #   Triggers
+        #     - Apple refunds the transaction for a consumable or non-consumable in-app purchase, a
+        #       non-renewing subscription, or an auto-renewable subscription.
         #
         # AppleNotificationV2.REVOKE
         #   A notification type that indicates that an in-app purchase the customer was entitled to
@@ -632,28 +767,35 @@ def handle_notification_tx(decoded_notification: DecodedNotification, sql_tx: db
         #   Sharing applies to non-consumable in-app purchases and auto-renewable subscriptions. For
         #   more information about Family Sharing, see Supporting Family Sharing in your app.
         #
-        #   Triggers (https://developer.apple.com/documentation/appstoreservernotifications/notificationtype#Handle-use-cases-for-in-app-purchase-life-cycle-events)
-        #     A family member loses access to the subscription through Family Sharing.
+        #   Triggers
+        #     - A family member loses access to the subscription through Family Sharing.
         tx = decoded_notification.tx_info
         if tx:
-            _ = require_field(tx.revocationDate,        f'{decoded_notification.body.notificationType.name} is missing TX revocation date. {print_obj(tx)}',           err)
-            _ = require_field(tx.originalTransactionId, f'{decoded_notification.body.notificationType.name} is missing TX original transaction ID. {print_obj(tx)}', err)
+            require_field(tx.revocationDate, f'{notif_type} is missing TX revocation date. {print_obj(tx)}', err)
+            require_field(
+                tx.originalTransactionId, f'{notif_type} is missing TX original transaction ID. {print_obj(tx)}', err
+            )
         else:
-            err.msg_list.append(f'{decoded_notification.body.notificationType.name} is missing TX info {print_obj(tx)}')
+            err.msg_list.append(f'{notif_type} is missing TX info {print_obj(tx)}')
 
         if len(err.msg_list) == 0:
-            assert tx # NOTE: Assert the types for LSP now that we have checked that they exist
-            assert isinstance(tx.revocationDate,        int), f'{print_obj(tx)}'
+            assert tx  # NOTE: Assert the types for LSP now that we have checked that they exist
+            assert isinstance(tx.revocationDate, int), f'{print_obj(tx)}'
             assert isinstance(tx.originalTransactionId, str), f'{print_obj(tx)}'
 
             # NOTE: Process
             payment_tx = payment_tx_from_apple_jws_transaction(tx, err)
             if not err.has():
-                log.debug(f'{decoded_notification.body.notificationType.name} for {payment_tx_id_label(payment_tx)}: Revoke (orig. TX ID) date = {base.readable(base.datetime_from_unix_ms(tx.revocationDate))}')
-                sql_tx.cancel = not backend.add_apple_revocation(sql_tx,
-                                                                    apple_original_tx_id = tx.originalTransactionId,
-                                                                    revoke_at    = base.datetime_from_unix_ms(tx.revocationDate),
-                                                                    err                  = err)
+                log.debug(
+                    f'{notif_type} for {payment_tx_id_label(payment_tx)}: '
+                    f'Revoke (orig. TX ID) date = {base.readable(base.datetime_from_unix_ms(tx.revocationDate))}'
+                )
+                sql_tx.cancel = not backend.add_apple_revocation(
+                    sql_tx,
+                    apple_original_tx_id=tx.originalTransactionId,
+                    revoke_at=base.datetime_from_unix_ms(tx.revocationDate),
+                    err=err,
+                )
                 if sql_tx.cancel:
                     err.msg_list.append(f'No matching active payment was available to be refunded. {print_obj(tx)}')
 
@@ -666,27 +808,29 @@ def handle_notification_tx(decoded_notification: DecodedNotification, sql_tx: db
         # non-renewing subscription, and auto-renewable subscription. For auto-renewable
         # subscriptions, the renewal date remains unchanged when the App Store reverses a refund.
         #
-        # Triggers (https://developer.apple.com/documentation/appstoreservernotifications/notificationtype#Handle-use-cases-for-in-app-purchase-life-cycle-events)
-        #   Apple reverses a previously granted refund due to a dispute that the customer raised.
+        # Triggers
+        #   - Apple reverses a previously granted refund due to a dispute that the customer raised.
 
         # NOTE: Check for required fields
         tx = decoded_notification.tx_info
         if tx:
-            _ = require_field(tx.expiresDate,           f'{decoded_notification.body.notificationType.name} is missing TX expires date. {print_obj(tx)}',            err)
-            _ = require_field(tx.originalTransactionId, f'{decoded_notification.body.notificationType.name} is missing TX original transaction ID. {print_obj(tx)}', err)
-            _ = require_field(tx.transactionId,         f'{decoded_notification.body.notificationType.name} is missing TX transaction ID. {print_obj(tx)}',          err)
-            _ = require_field(tx.transactionReason,     f'{decoded_notification.body.notificationType.name} is missing TX reason. {print_obj(tx)}',                  err)
-            _ = require_field(tx.type,                  f'{decoded_notification.body.notificationType.name} is missing TX type. {print_obj(tx)}',                    err)
+            require_field(tx.expiresDate, f'{notif_type} is missing TX expires date. {print_obj(tx)}', err)
+            require_field(
+                tx.originalTransactionId, f'{notif_type} is missing TX original transaction ID. {print_obj(tx)}', err
+            )
+            require_field(tx.transactionId, f'{notif_type} is missing TX transaction ID. {print_obj(tx)}', err)
+            require_field(tx.transactionReason, f'{notif_type} is missing TX reason. {print_obj(tx)}', err)
+            require_field(tx.type, f'{notif_type} is missing TX type. {print_obj(tx)}', err)
         else:
-            err.msg_list.append(f'{decoded_notification.body.notificationType.name} is missing TX info {print_obj(tx)}')
+            err.msg_list.append(f'{notif_type} is missing TX info {print_obj(tx)}')
 
         if not err.has():
-            assert tx # NOTE: Assert the types for LSP now that we have checked that they exist
-            assert isinstance(tx.expiresDate,           int),                    f'{print_obj(tx)}'
-            assert isinstance(tx.originalTransactionId, str),                    f'{print_obj(tx)}'
-            assert isinstance(tx.transactionId,         str),                    f'{print_obj(tx)}'
-            assert isinstance(tx.transactionReason,     AppleTransactionReason), f'{print_obj(tx)}'
-            assert isinstance(tx.type,                  AppleType),              f'{print_obj(tx)}'
+            assert tx  # NOTE: Assert the types for LSP now that we have checked that they exist
+            assert isinstance(tx.expiresDate, int), f'{print_obj(tx)}'
+            assert isinstance(tx.originalTransactionId, str), f'{print_obj(tx)}'
+            assert isinstance(tx.transactionId, str), f'{print_obj(tx)}'
+            assert isinstance(tx.transactionReason, AppleTransactionReason), f'{print_obj(tx)}'
+            assert isinstance(tx.type, AppleType), f'{print_obj(tx)}'
             assert decoded_notification.body.signedDate is not None  # part of the verified signed payload
 
             # NOTE: Process — reinstate the entitlement the original REFUND revoked: un-revoke this exact
@@ -694,13 +838,18 @@ def handle_notification_tx(decoded_notification: DecodedNotification, sql_tx: db
             # window is still live) roll them onto a fresh one. auto_renewing comes from the notification's
             # renewal info (the subscription's current state); default on, since a reversal reactivates it.
             auto_renewing = True
-            if decoded_notification.renewal_info is not None and decoded_notification.renewal_info.autoRenewStatus is not None:
+            if (
+                decoded_notification.renewal_info is not None
+                and decoded_notification.renewal_info.autoRenewStatus is not None
+            ):
                 auto_renewing = bool(decoded_notification.renewal_info.autoRenewStatus)
-            backend.reinstate_apple_payment(sql_tx,
-                                               apple_original_tx_id = tx.originalTransactionId,
-                                               apple_tx_id          = tx.transactionId,
-                                               auto_renewing        = auto_renewing,
-                                               reinstated_at        = base.datetime_from_unix_ms(decoded_notification.body.signedDate))
+            backend.reinstate_apple_payment(
+                sql_tx,
+                apple_original_tx_id=tx.originalTransactionId,
+                apple_tx_id=tx.transactionId,
+                auto_renewing=auto_renewing,
+                reinstated_at=base.datetime_from_unix_ms(decoded_notification.body.signedDate),
+            )
 
     elif decoded_notification.body.notificationType == AppleNotificationV2.DID_CHANGE_RENEWAL_STATUS:
         # A notification type that, along with its subtype, indicates that the customer made a
@@ -708,26 +857,31 @@ def handle_notification_tx(decoded_notification: DecodedNotification, sql_tx: db
         # customer reenabled subscription auto-renewal. If the subtype is AUTO_RENEW_DISABLED, the
         # customer turned off subscription auto-renewal, or the App Store turned off subscription
         # auto-renewal after the customer requested a refund.
-        #
-        # Triggers (https://developer.apple.com/documentation/appstoreservernotifications/notificationtype#Handle-use-cases-for-in-app-purchase-life-cycle-events)
+
         tx = decoded_notification.tx_info
         if not tx:
-            err.msg_list.append(f'{decoded_notification.body.notificationType.name} is missing TX info {print_obj(tx)}')
+            err.msg_list.append(f'{notif_type} is missing TX info {print_obj(tx)}')
 
-        if not decoded_notification.body.subtype == AppleSubtype.AUTO_RENEW_DISABLED and not decoded_notification.body.subtype == AppleSubtype.AUTO_RENEW_ENABLED:
-            err.msg_list.append(f'Received TX: {print_obj(tx)}, with unrecognised subtype for a DID_CHANGE_RENEWAL_STATUS notification')
+        if (
+            not decoded_notification.body.subtype == AppleSubtype.AUTO_RENEW_DISABLED
+            and not decoded_notification.body.subtype == AppleSubtype.AUTO_RENEW_ENABLED
+        ):
+            err.msg_list.append(
+                f'Received TX: {print_obj(tx)}, with unrecognised subtype for a DID_CHANGE_RENEWAL_STATUS notification'
+            )
 
         if not err.has():
             assert tx
             payment_tx = payment_tx_from_apple_jws_transaction(tx, err)
             if not err.has():
                 auto_renewing = decoded_notification.body.subtype == AppleSubtype.AUTO_RENEW_ENABLED
-                log.debug(f'{decoded_notification.body.notificationType.name} for {payment_tx_id_label(payment_tx)}: Auto-renewing = {auto_renewing}, grace period = {base.DEFAULT_APPLE_GRACE_PERIOD}')
-                backend.update_payment_renewal_info(sql_tx,
-                                                           payment_tx               = payment_tx,
-                                                           grace_period = None,
-                                                           auto_renewing            = auto_renewing,
-                                                           err                      = err)
+                log.debug(
+                    f'{notif_type} for {payment_tx_id_label(payment_tx)}: '
+                    f'Auto-renewing = {auto_renewing}, grace period = {base.DEFAULT_APPLE_GRACE_PERIOD}'
+                )
+                backend.update_payment_renewal_info(
+                    sql_tx, payment_tx=payment_tx, grace_period=None, auto_renewing=auto_renewing, err=err
+                )
 
     elif decoded_notification.body.notificationType == AppleNotificationV2.DID_FAIL_TO_RENEW:
         # A notification type that, along with its subtype, indicates that the subscription failed
@@ -740,16 +894,14 @@ def handle_notification_tx(decoded_notification: DecodedNotification, sql_tx: db
         # Store continues to retry billing for 60 days, or until the customer resolves their billing
         # issue or cancels their subscription, whichever comes first.
         #
-        # Triggers (https://developer.apple.com/documentation/appstoreservernotifications/notificationtype#Handle-use-cases-for-in-app-purchase-life-cycle-events)
-        #
         # TODO: Potentially have to pass on information to the backend so cross-platform devices can
         # identify that there's a renewing issue.
         renewal = decoded_notification.renewal_info
-        tx      = decoded_notification.tx_info
+        tx = decoded_notification.tx_info
         if not renewal:
-            err.msg_list.append(f'{decoded_notification.body.notificationType.name} is missing renewal info {print_obj(renewal)}')
+            err.msg_list.append(f'{notif_type} is missing renewal info {print_obj(renewal)}')
         if not tx:
-            err.msg_list.append(f'{decoded_notification.body.notificationType.name} is missing TX info {print_obj(tx)}')
+            err.msg_list.append(f'{notif_type} is missing TX info {print_obj(tx)}')
 
         if not err.has():
             assert renewal
@@ -757,7 +909,7 @@ def handle_notification_tx(decoded_notification: DecodedNotification, sql_tx: db
             payment_tx = payment_tx_from_apple_jws_transaction(tx, err)
             if not err.has():
                 if not decoded_notification.body.subtype:
-                    log.debug(f'{decoded_notification.body.notificationType.name} for {payment_tx_id_label(payment_tx)}: Grace period ended')
+                    log.debug(f'{notif_type} for {payment_tx_id_label(payment_tx)}: Grace period ended')
 
                 elif decoded_notification.body.subtype == AppleSubtype.GRACE_PERIOD:
                     # `gracePeriodExpiresDate` is an ABSOLUTE ms-epoch timestamp per the App Store
@@ -771,19 +923,32 @@ def handle_notification_tx(decoded_notification: DecodedNotification, sql_tx: db
                     # gracePeriodExpiresDate is required ONLY here (the GRACE_PERIOD subtype); a
                     # subtype-less DID_FAIL_TO_RENEW ("billing failed, no grace, stop service") legitimately
                     # omits it and must not be rejected — hence it's checked in this branch, not blanket.
-                    have_expiry = require_field(tx.expiresDate, f'{decoded_notification.body.notificationType.name} grace period is missing the transaction expiry date. {print_obj(tx)}', err)
-                    have_grace  = require_field(renewal.gracePeriodExpiresDate, f'{decoded_notification.body.notificationType.name} GRACE_PERIOD subtype is missing the grace period expires date. {print_obj(renewal)}', err)
+                    have_expiry = require_field(
+                        tx.expiresDate,
+                        f'{notif_type} grace period is missing the transaction expiry date. {print_obj(tx)}',
+                        err,
+                    )
+                    have_grace = require_field(
+                        renewal.gracePeriodExpiresDate,
+                        f'{notif_type} GRACE_PERIOD subtype is missing the grace period expires date. '
+                        f'{print_obj(renewal)}',
+                        err,
+                    )
                     if have_expiry and have_grace:
                         assert renewal.gracePeriodExpiresDate is not None and tx.expiresDate is not None
                         grace_period = base.timedelta_from_ms(renewal.gracePeriodExpiresDate - tx.expiresDate)
-                        log.debug(f'{decoded_notification.body.notificationType.name} for {payment_tx_id_label(payment_tx)}: Auto-renewing = true, grace period expires = {renewal.gracePeriodExpiresDate}, duration = {grace_period}')
-                        backend.update_payment_renewal_info(sql_tx,
-                                                                   payment_tx               = payment_tx,
-                                                                   grace_period = grace_period,
-                                                                   auto_renewing            = True,
-                                                                   err                      = err)
+                        log.debug(
+                            f'{notif_type} for {payment_tx_id_label(payment_tx)}: '
+                            f'Auto-renewing = true, grace period expires = {renewal.gracePeriodExpiresDate}, '
+                            f'duration = {grace_period}'
+                        )
+                        backend.update_payment_renewal_info(
+                            sql_tx, payment_tx=payment_tx, grace_period=grace_period, auto_renewing=True, err=err
+                        )
                 else:
-                    err.msg_list.append(f'Received TX: {print_obj(tx)}, with unrecognised subtype for a DID_FAIL_TO_RENEW notification')
+                    err.msg_list.append(
+                        f'Received TX: {print_obj(tx)}, with unrecognised subtype for a DID_FAIL_TO_RENEW notification'
+                    )
 
     elif decoded_notification.body.notificationType == AppleNotificationV2.REFUND_DECLINED:
         # A notification type that indicates the App Store declined a refund request.
@@ -795,38 +960,44 @@ def handle_notification_tx(decoded_notification: DecodedNotification, sql_tx: db
         # TODO: Needs some more testing
         tx = decoded_notification.tx_info
         if not tx:
-            err.msg_list.append(f'{decoded_notification.body.notificationType.name} is missing TX info {print_obj(tx)}')
+            err.msg_list.append(f'{notif_type} is missing TX info {print_obj(tx)}')
 
         if not err.has():
             assert tx
             payment_tx = payment_tx_from_apple_jws_transaction(tx, err)
             if not err.has():
-                user_payment_tx = backend.UserPaymentTransaction(provider=payment_tx.provider,
-                                                                 apple_tx_id=payment_tx.apple_tx_id)
-                log.debug(f'{decoded_notification.body.notificationType.name} for {payment_tx_id_label(payment_tx)}: clearing refund request (refund_requested_at = NULL)')
+                user_payment_tx = backend.UserPaymentTransaction(
+                    provider=payment_tx.provider, apple_tx_id=payment_tx.apple_tx_id
+                )
+                log.debug(
+                    f'{notif_type} for {payment_tx_id_label(payment_tx)}: '
+                    f'clearing refund request (refund_requested_at = NULL)'
+                )
                 if not backend.set_refund_requested(sql_tx, payment_tx=user_payment_tx, refund_requested_at=None):
-                    log.warning(f"{decoded_notification.body.notificationType.name} for {payment_tx_id_label(payment_tx)} failed to remove refund timestamp")
+                    log.warning(f"{notif_type} for {payment_tx_id_label(payment_tx)} failed to remove refund timestamp")
 
     elif decoded_notification.body.notificationType == AppleNotificationV2.TEST:
         # NOTE: Test notification that we can invoke for testing. No-op
         pass
 
     # NOTE: Notifications that we do not care about handling
-    elif decoded_notification.body.notificationType == AppleNotificationV2.EXPIRED              or \
-         decoded_notification.body.notificationType == AppleNotificationV2.REFUND_DECLINED      or \
-         decoded_notification.body.notificationType == AppleNotificationV2.GRACE_PERIOD_EXPIRED or \
-         decoded_notification.body.notificationType == AppleNotificationV2.CONSUMPTION_REQUEST  or \
-         decoded_notification.body.notificationType == AppleNotificationV2.PRICE_INCREASE:
+    elif (
+        decoded_notification.body.notificationType == AppleNotificationV2.EXPIRED
+        or decoded_notification.body.notificationType == AppleNotificationV2.REFUND_DECLINED
+        or decoded_notification.body.notificationType == AppleNotificationV2.GRACE_PERIOD_EXPIRED
+        or decoded_notification.body.notificationType == AppleNotificationV2.CONSUMPTION_REQUEST
+        or decoded_notification.body.notificationType == AppleNotificationV2.PRICE_INCREASE
+    ):
 
-        tx         = decoded_notification.tx_info
+        tx = decoded_notification.tx_info
         payment_tx = base.PaymentProviderTransaction()
         if tx:
             payment_tx = payment_tx_from_apple_jws_transaction(tx, err)
         else:
-            err.msg_list.append(f'{decoded_notification.body.notificationType.name} is missing TX info {print_obj(tx)}')
+            err.msg_list.append(f'{notif_type} is missing TX info {print_obj(tx)}')
 
         if not err.has():
-            log.debug(f'{decoded_notification.body.notificationType.name} for {payment_tx_id_label(payment_tx)}: No-op')
+            log.debug(f'{notif_type} for {payment_tx_id_label(payment_tx)}: No-op')
 
             if decoded_notification.body.notificationType == AppleNotificationV2.EXPIRED:
                 # A notification type that, along with its subtype, indicates that a subscription
@@ -841,8 +1012,6 @@ def handle_notification_tx(decoded_notification: DecodedNotification, sql_tx: db
                 # A notification without a subtype indicates that the subscription expired for some
                 # other reason.
                 #
-                # Triggers (https://developer.apple.com/documentation/appstoreservernotifications/notificationtype#Handle-use-cases-for-in-app-purchase-life-cycle-events)
-                #
                 # NOTE: No-op, the Session Pro proof already has a baked in expiry date and will
                 # self-expire itself.
                 pass
@@ -854,8 +1023,6 @@ def handle_notification_tx(decoded_notification: DecodedNotification, sql_tx: db
                 # continues to retry billing for 60 days, or until the customer resolves their billing issue
                 # or cancels their subscription, whichever comes first.
                 #
-                # Triggers (https://developer.apple.com/documentation/appstoreservernotifications/notificationtype#Handle-use-cases-for-in-app-purchase-life-cycle-events)
-                #
                 # NOTE: No-op, the Session Pro proofs have an expiry date embedded into them and that is
                 # handled by the backend itself.
                 pass
@@ -866,21 +1033,22 @@ def handle_notification_tx(decoded_notification: DecodedNotification, sql_tx: db
                 # requesting that you provide consumption data. For more information, see Send Consumption
                 # Information.
                 #
-                # Triggers (https://developer.apple.com/documentation/appstoreservernotifications/notificationtype#Handle-use-cases-for-in-app-purchase-life-cycle-events)
-                #   Apple requests consumption information for a refund request that a customer initiates.
+                # Triggers
+                #   - Apple requests consumption information for a refund request that a customer initiates.
                 #
                 # NOTE: We do not provide consumption data because we don't have some sort of credit system
                 # that a user can expend whilst on the subscription. Furthermore, sending a consumption
                 # request-response requires getting consent from the user:
                 #
                 #   type customerConsented
-                #     A Boolean value that indicates whether the customer consented to provide consumption data to the App Store.
+                #     - A Boolean value that indicates whether the customer consented to provide
+                #       consumption data to the App Store.
                 #
                 # We avoid all this because all we need to do when a user refunds is cancel their membership
                 # by issueing a revocation by the backend.
                 pass
 
-            else: # Price increase
+            else:  # Price increase
                 assert decoded_notification.body.notificationType == AppleNotificationV2.PRICE_INCREASE
                 # A notification type that, along with its subtype, indicates that the system has
                 # informed the customer of an auto-renewable subscription price increase.
@@ -891,27 +1059,36 @@ def handle_notification_tx(decoded_notification: DecodedNotification, sql_tx: db
                 #
                 # If the price increase doesn’t require customer consent, the subtype is ACCEPTED.
                 #
-                # Triggers (https://developer.apple.com/documentation/appstoreservernotifications/notificationtype#Handle-use-cases-for-in-app-purchase-life-cycle-events)
-                #
                 # NOTE: No-op, the apps do not respond to price increases
                 pass
 
-
     # NOTE: Erroneous cases, scenarios we don't support/should never receive a notification for
-    elif decoded_notification.body.notificationType == AppleNotificationV2.EXTERNAL_PURCHASE_TOKEN or \
-         decoded_notification.body.notificationType == AppleNotificationV2.RENEWAL_EXTENDED        or \
-         decoded_notification.body.notificationType == AppleNotificationV2.RENEWAL_EXTENSION:
+    elif (
+        decoded_notification.body.notificationType == AppleNotificationV2.EXTERNAL_PURCHASE_TOKEN
+        or decoded_notification.body.notificationType == AppleNotificationV2.RENEWAL_EXTENDED
+        or decoded_notification.body.notificationType == AppleNotificationV2.RENEWAL_EXTENSION
+    ):
 
         if decoded_notification.tx_info:
             payment_tx = payment_tx_from_apple_jws_transaction(decoded_notification.tx_info, err)
-            log.debug(f'{decoded_notification.body.notificationType.name} for {payment_tx_id_label(payment_tx)}: No-op')
+            log.debug(f'{notif_type} for {payment_tx_id_label(payment_tx)}: No-op')
 
         if decoded_notification.body.notificationType == AppleNotificationV2.EXTERNAL_PURCHASE_TOKEN:
-           err.msg_list.append(f'Received notification "{decoded_notification.body.notificationType.name}", but we do not support 3rd party stores through Apple')
-        elif decoded_notification.body.notificationType == AppleNotificationV2.RENEWAL_EXTENSION or decoded_notification.body.notificationType == AppleNotificationV2.RENEWAL_EXTENDED:
-           err.msg_list.append(f'Received notification "{decoded_notification.body.notificationType.name}", but we don\'t handle issuing the extension of a subscription renewal (e.g.: to compensate for service outages)')
+            err.msg_list.append(
+                f'Received notification "{notif_type}", but we do not support 3rd party stores through Apple'
+            )
+        elif (
+            decoded_notification.body.notificationType == AppleNotificationV2.RENEWAL_EXTENSION
+            or decoded_notification.body.notificationType == AppleNotificationV2.RENEWAL_EXTENDED
+        ):
+            err.msg_list.append(
+                f'Received notification "{notif_type}", but we don\'t handle issuing '
+                f'the extension of a subscription renewal (e.g.: to compensate for service outages)'
+            )
     else:
-        err.msg_list.append(f'Received notification {decoded_notification.body.notificationType} that wasn\'t explicitly handled')
+        err.msg_list.append(
+            f'Received notification {decoded_notification.body.notificationType} that wasn\'t explicitly handled'
+        )
 
     result = len(err.msg_list) == 0
 
@@ -920,16 +1097,23 @@ def handle_notification_tx(decoded_notification: DecodedNotification, sql_tx: db
     if result:
         assert decoded_notification.body.signedDate
         expires_at = base.datetime_from_unix_ms(decoded_notification.body.signedDate) + notification_retry_duration
-        backend.apple_add_notification_uuid(sql_tx,
-                                               uuid              = decoded_notification.body.notificationUUID,
-                                               expires_at = expires_at)
+        backend.apple_add_notification_uuid(
+            sql_tx, uuid=decoded_notification.body.notificationUUID, expires_at=expires_at
+        )
     return result
 
-def handle_notification(decoded_notification: DecodedNotification, conn: psycopg.Connection, notification_retry_duration: datetime.timedelta, err: base.ErrorSink) -> bool:
+
+def handle_notification(
+    decoded_notification: DecodedNotification,
+    conn: psycopg.Connection,
+    notification_retry_duration: datetime.timedelta,
+    err: base.ErrorSink,
+) -> bool:
     result = False
     with db.transaction(conn) as tx:
         result = handle_notification_tx(decoded_notification, tx, notification_retry_duration, err)
     return result
+
 
 @flask_blueprint.route(FLASK_ROUTE_NOTIFICATIONS_APPLE_APP_CONNECT_SANDBOX, methods=['POST'])
 def notifications_apple_app_connect_sandbox() -> flask.Response:
@@ -941,7 +1125,9 @@ def notifications_apple_app_connect_sandbox() -> flask.Response:
         body = server.get_json_from_flask_request(flask.request)
     except base.ApiError as e:
         # `e` already states what was wrong and why; only append the raw body under unsafe logging.
-        log.error(f'Discarding Apple notification: {e}' + (f' (body: {flask.request.data!r})' if base.UNSAFE_LOGGING else ''))
+        log.error(
+            f'Discarding Apple notification: {e}' + (f' (body: {flask.request.data!r})' if base.UNSAFE_LOGGING else '')
+        )
         flask.abort(500)
 
     if base.UNSAFE_LOGGING:
@@ -951,7 +1137,9 @@ def notifications_apple_app_connect_sandbox() -> flask.Response:
     core = typing.cast(Core, flask.current_app.config[FLASK_CONFIG_PLATFORM_APPLE_CORE_KEY])
 
     if 'signedPayload' not in body:
-        log.error(f'Failed to parse notification, signedPayload key was missing: {base.safe_dump_dict_keys_or_data(body)}')
+        log.error(
+            f'Failed to parse notification, signedPayload key was missing: {base.safe_dump_dict_keys_or_data(body)}'
+        )
         flask.abort(500)
 
     signed_payload = body['signedPayload']
@@ -960,11 +1148,13 @@ def notifications_apple_app_connect_sandbox() -> flask.Response:
         flask.abort(500)
 
     # NOTE: Decode the notification
-    resp: AppleResponseBodyV2DecodedPayload   = core.signed_data_verifier.verify_and_decode_notification(signed_payload)
+    resp: AppleResponseBodyV2DecodedPayload = core.signed_data_verifier.verify_and_decode_notification(signed_payload)
 
     # NOTE: Handle the notification
-    err                                       = base.ErrorSink()
-    decoded_notification: DecodedNotification = decoded_notification_from_apple_response_body_v2(resp, core.signed_data_verifier, err)
+    err = base.ErrorSink()
+    decoded_notification: DecodedNotification = decoded_notification_from_apple_response_body_v2(
+        resp, core.signed_data_verifier, err
+    )
     # A raised exception here must NOT be swallowed into a 200: Apple treats a 2xx as "delivered" and will
     # neither retry the notification nor surface it to the onlyFailures catch-up, so a swallow = a silent
     # drop. Log it and abort 500 so Apple retries. (Handled/expected problems come back via `err` and 500 in
@@ -982,19 +1172,26 @@ def notifications_apple_app_connect_sandbox() -> flask.Response:
         # NOTE: Record the error under the payment token if possible to propagate to clients
         if decoded_notification.tx_info and decoded_notification.tx_info.originalTransactionId:
             user_error = backend.UserError(
-                provider             = base.PaymentProvider.iOSAppStore,
-                apple_original_tx_id = decoded_notification.tx_info.originalTransactionId,
+                provider=base.PaymentProvider.iOSAppStore,
+                apple_original_tx_id=decoded_notification.tx_info.originalTransactionId,
             )
 
             with server.get_db(flask.current_app) as engine:
                 with db.connection(engine) as conn:
-                    backend.add_user_error(conn, error=user_error, at=base.datetime_from_unix_ms(int(time.time() * 1000)))
+                    backend.add_user_error(
+                        conn, error=user_error, at=base.datetime_from_unix_ms(int(time.time() * 1000))
+                    )
 
         # NOTE: Log and abort request
-        log.error(f'Failed to parse notification ({resp.signedDate}) signed payload was:\n{base.maybe_obfuscate(signed_payload)}\nErrors:' + '\n  '.join(err.msg_list))
+        log.error(
+            f'Failed to parse notification ({resp.signedDate}) signed payload was:\n'
+            f'{base.maybe_obfuscate(signed_payload)}\n'
+            f'Errors:' + '\n  '.join(err.msg_list)
+        )
         flask.abort(500)
 
     return flask.Response(status=200)
+
 
 def trigger_test_notification(client: AppleAppStoreServerAPIClient, verifier: AppleSignedDataVerifier):
     if base.PROVIDER_DRY_RUN:
@@ -1006,14 +1203,19 @@ def trigger_test_notification(client: AppleAppStoreServerAPIClient, verifier: Ap
 
         notification_token = response_test_notif.testNotificationToken
         if notification_token:
-            response_check_test_notif: AppleCheckTestNotificationResponse = client.get_test_notification_status(test_notification_token=notification_token)
+            response_check_test_notif: AppleCheckTestNotificationResponse = client.get_test_notification_status(
+                test_notification_token=notification_token
+            )
             log.debug('Check test notif: ', response_check_test_notif)
             if response_check_test_notif.signedPayload:
-                decoded_response: AppleResponseBodyV2DecodedPayload = verifier.verify_and_decode_notification(signed_payload=response_check_test_notif.signedPayload)
+                decoded_response: AppleResponseBodyV2DecodedPayload = verifier.verify_and_decode_notification(
+                    signed_payload=response_check_test_notif.signedPayload
+                )
                 if base.UNSAFE_LOGGING:
                     log.info('Decoded test response: ', decoded_response)
     except AppleAPIException as e:
         log.error(f'Failed to decode test notification: {e}')
+
 
 def catchup_on_missed_notifications(core: Core, sql_conn: psycopg.Connection, end_unix_ts_ms: int):
     if base.PROVIDER_DRY_RUN:
@@ -1026,44 +1228,62 @@ def catchup_on_missed_notifications(core: Core, sql_conn: psycopg.Connection, en
         # processes racing to try and execute this
         # The checkpoint is stored as a timestamptz global; Apple's history API speaks ms, so convert at
         # this boundary (an epoch checkpoint means "never checkpointed").
-        checkpoint_at:         datetime.datetime = backend.get_global_datetime(tx.conn, 'apple_notification_checkpoint_at')
-        checkpoint_ms:         int               = base.unix_ms_from_datetime(checkpoint_at)
-        ms_since_last_catchup: int               = end_unix_ts_ms - checkpoint_ms
-        ms_between_catchup:    int               = (60 * 30) * 1000 # 30 minutes
-        do_catchup:            bool              = ms_since_last_catchup >= ms_between_catchup
+        checkpoint_at: datetime.datetime = backend.get_global_datetime(tx.conn, 'apple_notification_checkpoint_at')
+        checkpoint_ms: int = base.unix_ms_from_datetime(checkpoint_at)
+        ms_since_last_catchup: int = end_unix_ts_ms - checkpoint_ms
+        ms_between_catchup: int = (60 * 30) * 1000  # 30 minutes
+        do_catchup: bool = ms_since_last_catchup >= ms_between_catchup
 
         if do_catchup:
             # NOTE: Setup request
-            min_start_date:      int = end_unix_ts_ms - (core.max_history_lookup_in_days * base.MILLISECONDS_IN_DAY)
-            history_req              = AppleNotificationHistoryRequest()
+            min_start_date: int = end_unix_ts_ms - (core.max_history_lookup_in_days * base.MILLISECONDS_IN_DAY)
+            history_req = AppleNotificationHistoryRequest()
             history_req.onlyFailures = True
-            history_req.startDate    = max(min_start_date, checkpoint_ms)
-            history_req.endDate      = end_unix_ts_ms
-            log.info(f'Checking for missed notifications from {base.readable(base.datetime_from_unix_ms(history_req.startDate))} => {base.readable(base.datetime_from_unix_ms(history_req.endDate))}')
+            history_req.startDate = max(min_start_date, checkpoint_ms)
+            history_req.endDate = end_unix_ts_ms
+            log.info(
+                f'Checking for missed notifications from '
+                f'{base.readable(base.datetime_from_unix_ms(history_req.startDate))} => '
+                f'{base.readable(base.datetime_from_unix_ms(history_req.endDate))}'
+            )
 
             if checkpoint_at != base.EPOCH and checkpoint_ms < min_start_date:
-                log.warning(f'Apple only allows retrieving 180 days worth of notifications (i.e. {base.readable(base.datetime_from_unix_ms(min_start_date))}). ' +
-                            f'Last notification checkpoint was at {base.readable(checkpoint_at)} which is older than the history that can be recalled')
+                log.warning(
+                    f'Apple only allows retrieving 180 days worth of notifications '
+                    f'(i.e. {base.readable(base.datetime_from_unix_ms(min_start_date))}). '
+                    f'Last notification checkpoint was at {base.readable(checkpoint_at)} '
+                    f'which is older than the history that can be recalled'
+                )
 
             # NOTE: Iterate the paginated API
-            failed             = False
+            failed = False
             history_page_token = None
-            handled_notifs     = 0
-            total_notifs       = 0
-            err                = base.ErrorSink()
+            handled_notifs = 0
+            total_notifs = 0
+            err = base.ErrorSink()
             while True:
-                history_resp: AppleNotificationHistoryResponse = core.app_store_server_api_client.get_notification_history(history_page_token, notification_history_request=history_req)
+                history_resp: AppleNotificationHistoryResponse = (
+                    core.app_store_server_api_client.get_notification_history(
+                        history_page_token, notification_history_request=history_req
+                    )
+                )
                 if history_resp.notificationHistory:
                     total_notifs += len(history_resp.notificationHistory)
                     if not failed:
                         for it in history_resp.notificationHistory:
                             # NOTE: Decode and handle
                             assert it.signedPayload
-                            resp:                 AppleResponseBodyV2DecodedPayload = core.signed_data_verifier.verify_and_decode_notification(it.signedPayload)
-                            decoded_notification: DecodedNotification               = decoded_notification_from_apple_response_body_v2(resp, core.signed_data_verifier, err)
-                            handled:              bool                              = handle_notification_tx(decoded_notification, tx, core.notification_retry_duration, err)
+                            resp: AppleResponseBodyV2DecodedPayload = (
+                                core.signed_data_verifier.verify_and_decode_notification(it.signedPayload)
+                            )
+                            decoded_notification: DecodedNotification = (
+                                decoded_notification_from_apple_response_body_v2(resp, core.signed_data_verifier, err)
+                            )
+                            handled: bool = handle_notification_tx(
+                                decoded_notification, tx, core.notification_retry_duration, err
+                            )
                             if not handled:
-                                failed            = True
+                                failed = True
                                 assert tx.cancel
                                 err.msg_list.append(f'Failed to handle missed notification {it}')
                                 break
@@ -1075,14 +1295,25 @@ def catchup_on_missed_notifications(core: Core, sql_conn: psycopg.Connection, en
 
             if err.has():
                 assert tx.cancel
-                log.error(f'Processed {handled_notifs}/{total_notifs} missed notifications but encountered errors, rolling back:\n' + '\n  '.join(err.msg_list))
+                log.error(
+                    f'Processed {handled_notifs}/{total_notifs} missed notifications '
+                    f'but encountered errors, rolling back:\n' + '\n  '.join(err.msg_list)
+                )
             else:
                 backend.apple_set_notification_checkpoint_at(tx, base.datetime_from_unix_ms(history_req.endDate))
-                log.info(f'Processed {handled_notifs}/{total_notifs} missed notifications, checkpointed from {base.readable(base.datetime_from_unix_ms(history_req.startDate))} => {base.readable(base.datetime_from_unix_ms(history_req.endDate))}')
+                log.info(
+                    f'Processed {handled_notifs}/{total_notifs} missed notifications, checkpointed from '
+                    f'{base.readable(base.datetime_from_unix_ms(history_req.startDate))} => '
+                    f'{base.readable(base.datetime_from_unix_ms(history_req.endDate))}'
+                )
         else:
-            mins_between_catchup    = (ms_between_catchup / 1000) / 60
+            mins_between_catchup = (ms_between_catchup / 1000) / 60
             mins_since_last_catchup = (ms_since_last_catchup / 1000) / 60
-            log.debug(f'Skipping catchup of missed notifications last checked {mins_since_last_catchup:.1f} mins ago (catchup occurs every {mins_between_catchup} mins)')
+            log.debug(
+                f'Skipping catchup of missed notifications last checked {mins_since_last_catchup:.1f} mins ago '
+                f'(catchup occurs every {mins_between_catchup} mins)'
+            )
+
 
 def equip_flask_routes(core: Core, flask: flask.Flask):
     flask.register_blueprint(flask_blueprint)
@@ -1091,17 +1322,28 @@ def equip_flask_routes(core: Core, flask: flask.Flask):
     # accessible in routes across concurrent connections.
     flask.config[FLASK_CONFIG_PLATFORM_APPLE_CORE_KEY] = core
 
-def decoded_notification_from_apple_response_body_v2(body: AppleResponseBodyV2DecodedPayload, verifier: AppleSignedDataVerifier, err: base.ErrorSink | None) -> DecodedNotification:
+
+def decoded_notification_from_apple_response_body_v2(
+    body: AppleResponseBodyV2DecodedPayload, verifier: AppleSignedDataVerifier, err: base.ErrorSink | None
+) -> DecodedNotification:
     result = DecodedNotification(body=body)
 
-    raw_signed_tx_info:      str | None = None
+    raw_signed_tx_info: str | None = None
     raw_signed_renewal_info: str | None = None
     if require_field(body.data, f'{body.notificationType} notification is missing body\'s data', err):
         assert isinstance(body.data, AppleData)
-        if require_field(body.data.signedTransactionInfo, f'{body.notificationType} notification is missing body data\'s signedTransactionInfo', err):
+        if require_field(
+            body.data.signedTransactionInfo,
+            f'{body.notificationType} notification is missing body data\'s signedTransactionInfo',
+            err,
+        ):
             assert isinstance(body.data.signedTransactionInfo, str)
             raw_signed_tx_info = body.data.signedTransactionInfo
-        if require_field(body.data.signedRenewalInfo, f'{body.notificationType} notification is missing body data\'s signedRenewalInfo', err):
+        if require_field(
+            body.data.signedRenewalInfo,
+            f'{body.notificationType} notification is missing body data\'s signedRenewalInfo',
+            err,
+        ):
             assert isinstance(body.data.signedRenewalInfo, str)
             raw_signed_renewal_info = body.data.signedRenewalInfo
 
@@ -1118,11 +1360,16 @@ def decoded_notification_from_apple_response_body_v2(body: AppleResponseBodyV2De
             result.renewal_info = verifier.verify_and_decode_renewal_info(raw_signed_renewal_info)
         except AppleVerificationException as e:
             if err:
-                err.msg_list.append(f'{body.notificationType} notification signed TX renewal info failed to be verified, {e}')
+                err.msg_list.append(
+                    f'{body.notificationType} notification signed TX renewal info failed to be verified, {e}'
+                )
 
     return result
 
-def payment_tx_from_apple_jws_transaction(tx: AppleJWSTransactionDecodedPayload, err: base.ErrorSink) -> base.PaymentProviderTransaction:
+
+def payment_tx_from_apple_jws_transaction(
+    tx: AppleJWSTransactionDecodedPayload, err: base.ErrorSink
+) -> base.PaymentProviderTransaction:
     result = base.PaymentProviderTransaction()
     if not tx.transactionId:
         err.msg_list.append('Failed to convert Apple TX to payment TX, transaction ID is missing')
@@ -1131,10 +1378,10 @@ def payment_tx_from_apple_jws_transaction(tx: AppleJWSTransactionDecodedPayload,
 
     if len(err.msg_list) == 0:
         assert tx.originalTransactionId, print_obj(tx)
-        assert tx.transactionId,         print_obj(tx)
-        result.provider             = base.PaymentProvider.iOSAppStore
+        assert tx.transactionId, print_obj(tx)
+        result.provider = base.PaymentProvider.iOSAppStore
         result.apple_original_tx_id = tx.originalTransactionId
-        result.apple_tx_id          = tx.transactionId
+        result.apple_tx_id = tx.transactionId
         if tx.webOrderLineItemId:
             result.apple_web_line_order_tx_id = tx.webOrderLineItemId
     return result

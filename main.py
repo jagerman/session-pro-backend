@@ -20,13 +20,13 @@ import db
 import server
 import platform_apple
 import platform_google
-import platform_google_api
 
-log                                                       = logging.Logger('PRO')
+log = logging.Logger('PRO')
 webhook_loggers: list[base.AsyncSessionWebhookLogHandler] = []
 
+
 def entry_point() -> flask.Flask:
-    log_formatter  = base.LogFormatter('%(asctime)s %(levelname)s %(name)s %(message)s')
+    log_formatter = base.LogFormatter('%(asctime)s %(levelname)s %(name)s %(message)s')
     console_logger = logging.StreamHandler()
     console_logger.setFormatter(log_formatter)
     # NOTE: Setup console logger
@@ -41,15 +41,17 @@ def entry_point() -> flask.Flask:
     except config.ConfigError as e:
         log.error(f'Failed to startup, invalid configuration options:\n  {e}')
         sys.exit(1)
-    base.UNSAFE_LOGGING       = parsed_args.unsafe_logging
-    base.DB_URL               = parsed_args.db_url
+    base.UNSAFE_LOGGING = parsed_args.unsafe_logging
+    base.DB_URL = parsed_args.db_url
     base.PLATFORM_TESTING_ENV = parsed_args.platform_testing_env
-    base.PROVIDER_DRY_RUN     = parsed_args.provider_dry_run
+    base.PROVIDER_DRY_RUN = parsed_args.provider_dry_run
 
     # NOTE: Setup file logger
     file_logger: logging.handlers.RotatingFileHandler | None = None
     if len(parsed_args.log_path) > 0:
-        file_logger = logging.handlers.RotatingFileHandler(filename=parsed_args.log_path, maxBytes=64 * 1024 * 1024, backupCount=2, encoding='utf-8')
+        file_logger = logging.handlers.RotatingFileHandler(
+            filename=parsed_args.log_path, maxBytes=64 * 1024 * 1024, backupCount=2, encoding='utf-8'
+        )
         file_logger.setFormatter(log_formatter)
         log.addHandler(file_logger)
         backend.log.addHandler(file_logger)
@@ -92,26 +94,28 @@ def entry_point() -> flask.Flask:
 
     with db.connection(engine) as conn:
         startup_log = '\n'
-        startup_log += f'Session Pro Backend\n'
-        startup_log += f'  Features:\n'
+        startup_log += 'Session Pro Backend\n'
+        startup_log += '  Features:\n'
         if len(parsed_args.ini_path) > 0:
             startup_log += f'    Config .INI file loaded: {parsed_args.ini_path}\n'
         startup_log += f'    DB loaded from: {parsed_args.db_url}\n'
         if len(parsed_args.log_path):
             startup_log += f'    Logging to: {parsed_args.log_path}\n'
         else:
-            startup_log += f'    Logging to disk disabled (no log_path specified in .INI file)\n'
+            startup_log += '    Logging to disk disabled (no log_path specified in .INI file)\n'
         if parsed_args.unsafe_logging:
-            startup_log += f'    Unsafe logging enabled (this must NOT be used in production)\n'
+            startup_log += '    Unsafe logging enabled (this must NOT be used in production)\n'
         if parsed_args.platform_testing_env:
-            startup_log += f'    Platform testing environment enabled (special behaviour for rounding timestamps to EOD)\n'
+            startup_log += (
+                '    Platform testing environment enabled (special behaviour for rounding timestamps to EOD)\n'
+            )
         if parsed_args.provider_dry_run:
-            startup_log += f'    provider_dry_run ENABLED: all payment-provider egress is stubbed (this must NOT be used in production)\n'
+            startup_log += '    provider_dry_run ENABLED: all payment-provider egress is stubbed (NO FOR PRODUCTION)\n'
         if parsed_args.with_platform_apple:
             label = 'Sandbox' if parsed_args.apple_sandbox_env else 'Production'
             startup_log += f'    Platform: {label} Apple iOS App Store notification handling enabled\n'
         if parsed_args.with_platform_google:
-            startup_log += f'    Platform: Google Play Store notification handling enabled\n'
+            startup_log += '    Platform: Google Play Store notification handling enabled\n'
         for it in parsed_args.session_webhooks:
             if it.enabled:
                 startup_log += f'    Webhook Logger: Enabled (display name: {it.name})\n'
@@ -119,7 +123,6 @@ def entry_point() -> flask.Flask:
         log.info(startup_log)
         for handler in webhook_loggers:
             handler.emit_text(f'Starting up instance: {startup_log}')
-
 
         # NOTE: Add flask to our global logger
         result: flask.Flask = server.init(testing_mode=False, database_url=parsed_args.db_url, backend_key=backend_key)
@@ -132,13 +135,15 @@ def entry_point() -> flask.Flask:
         # NOTE: Enable Apple iOS App Store notifications routes on the server if enabled. Apple will
         # contact the endpoint when a notification is generated.
         if parsed_args.with_platform_apple:
-            core: platform_apple.Core = platform_apple.init(key_id      = parsed_args.apple_key_id,
-                                                            issuer_id   = parsed_args.apple_issuer_id,
-                                                            bundle_id   = parsed_args.apple_bundle_id,
-                                                            app_id      = None if parsed_args.apple_sandbox_env else parsed_args.apple_app_id,
-                                                            key_bytes   = parsed_args.apple_key,
-                                                            root_certs  = parsed_args.apple_root_certs,
-                                                            sandbox_env = parsed_args.apple_sandbox_env)
+            core: platform_apple.Core = platform_apple.init(
+                key_id=parsed_args.apple_key_id,
+                issuer_id=parsed_args.apple_issuer_id,
+                bundle_id=parsed_args.apple_bundle_id,
+                app_id=None if parsed_args.apple_sandbox_env else parsed_args.apple_app_id,
+                key_bytes=parsed_args.apple_key,
+                root_certs=parsed_args.apple_root_certs,
+                sandbox_env=parsed_args.apple_sandbox_env,
+            )
             platform_apple.equip_flask_routes(core, result)
 
             # NOTE: Offset by 10s to account for clock drift between backend and the Apple servers
@@ -151,6 +156,7 @@ def entry_point() -> flask.Flask:
         # only Apple's startup catch-up remains per-worker for now (a one-shot — a follow-up could move
         # it to the mule too).
     return result
+
 
 # Flask entry point
 flask_app: flask.Flask = entry_point()

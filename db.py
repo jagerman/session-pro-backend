@@ -31,13 +31,13 @@ import typing
 
 import psycopg
 import psycopg_pool
-from psycopg.rows import dict_row as dict_row  # re-exported: pass as query(..., row_factory=db.dict_row)
+from psycopg.rows import dict_row as dict_row  # noqa: F401  (re-exported: query(..., row_factory=db.dict_row))
 
 # Pools are cached by DSN: production drives a single DSN (so a single pool), while the
 # test suite spins up many throwaway databases (a pool each). The lock guards the cache;
 # the pools themselves are internally thread-safe.
-_pools:      dict[str, psycopg_pool.ConnectionPool] = {}
-_pools_lock: threading.Lock                          = threading.Lock()
+_pools: dict[str, psycopg_pool.ConnectionPool] = {}
+_pools_lock: threading.Lock = threading.Lock()
 
 
 def _make_pool(conninfo: str, *, min_size: int = 0, max_size: int = 16) -> psycopg_pool.ConnectionPool:
@@ -110,7 +110,7 @@ def connection(pool: psycopg_pool.ConnectionPool) -> collections.abc.Iterator[ps
 
 @dataclasses.dataclass
 class SQLTransaction:
-    conn:   psycopg.Connection
+    conn: psycopg.Connection
     cancel: bool = False
 
 
@@ -128,7 +128,10 @@ def transaction(conn: psycopg.Connection) -> collections.abc.Iterator[SQLTransac
 _TxP = typing.ParamSpec('_TxP')
 _TxR = typing.TypeVar('_TxR')
 
-def transactional(fn: typing.Callable[typing.Concatenate[SQLTransaction, _TxP], _TxR]) -> typing.Callable[typing.Concatenate['psycopg.Connection | SQLTransaction', _TxP], _TxR]:
+
+def transactional(
+    fn: typing.Callable[typing.Concatenate[SQLTransaction, _TxP], _TxR],
+) -> typing.Callable[typing.Concatenate['psycopg.Connection | SQLTransaction', _TxP], _TxR]:
     """Write a multi-statement DB function ONCE as `def fn(tx: SQLTransaction, …)` and call it with EITHER a
     Connection or an existing SQLTransaction as the first argument. A Connection opens a fresh transaction
     for the call (committed / rolled back here); an existing SQLTransaction passes straight through — no
@@ -139,12 +142,14 @@ def transactional(fn: typing.Callable[typing.Concatenate[SQLTransaction, _TxP], 
     written as `foo(tx=…)` keep binding; a Connection can be passed positionally or as `tx=conn`. Reserve
     this for work that must be atomic when called standalone — a single-statement helper needs none of it
     and should just take a `Connection` (a mid-transaction caller passes `tx.conn`)."""
+
     @functools.wraps(fn)
     def wrapper(tx: 'psycopg.Connection | SQLTransaction', *args: _TxP.args, **kwargs: _TxP.kwargs) -> _TxR:
         if isinstance(tx, SQLTransaction):
             return fn(tx, *args, **kwargs)
         with transaction(tx) as opened:
             return fn(opened, *args, **kwargs)
+
     return wrapper
 
 
@@ -157,10 +162,10 @@ class Result:
     """
 
     def __init__(self, cursor: psycopg.Cursor) -> None:
-        self.rowcount: int              = cursor.rowcount
-        self.columns:  list[str]        = [c.name for c in cursor.description] if cursor.description else []
-        self._rows:    list[typing.Any] = cursor.fetchall() if cursor.description is not None else []
-        self._index:   int              = 0
+        self.rowcount: int = cursor.rowcount
+        self.columns: list[str] = [c.name for c in cursor.description] if cursor.description else []
+        self._rows: list[typing.Any] = cursor.fetchall() if cursor.description is not None else []
+        self._index: int = 0
 
     def __iter__(self) -> collections.abc.Iterator[typing.Any]:
         return iter(self._rows)
@@ -185,16 +190,20 @@ def _params(args: tuple[typing.Any, ...], kwargs: dict[str, typing.Any]) -> typi
     return args or None
 
 
-def query(conn: psycopg.Connection, sql: str, *args: typing.Any, row_factory: typing.Any = None, **kwargs: typing.Any) -> Result:
+def query(
+    conn: psycopg.Connection, sql: str, *args: typing.Any, row_factory: typing.Any = None, **kwargs: typing.Any
+) -> Result:
     # row_factory (e.g. db.dict_row) makes rows accessed by column name rather than position; default
     # is psycopg's tuple rows.
     cursor = conn.cursor(row_factory=row_factory) if row_factory is not None else conn.cursor()
     with cursor:
-        _ = cursor.execute(sql, _params(args, kwargs))
+        cursor.execute(sql, _params(args, kwargs))
         return Result(cursor)
 
 
-def query_one(conn: psycopg.Connection, sql: str, *args: typing.Any, row_factory: typing.Any = None, **kwargs: typing.Any) -> typing.Any | None:
+def query_one(
+    conn: psycopg.Connection, sql: str, *args: typing.Any, row_factory: typing.Any = None, **kwargs: typing.Any
+) -> typing.Any | None:
     return query(conn, sql, *args, row_factory=row_factory, **kwargs).fetchone()
 
 

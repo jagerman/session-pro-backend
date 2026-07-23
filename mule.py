@@ -14,6 +14,7 @@ every consuming query self-guards on expiry), the exact cadence doesn't matter.
 `run()` executes in the mule *post-fork*, so all Google/gRPC state is constructed here, never at module
 import in the master.
 '''
+
 import atexit
 import logging
 import sys
@@ -31,8 +32,9 @@ import platform_google_api
 
 log = logging.getLogger('PRO')
 
-CLEANUP_SIGNAL   = 17          # uWSGI user signal that drives the periodic prune
-PRUNE_INTERVAL_S = 600         # ~10 min; a no-op prune is a cheap indexed empty scan
+CLEANUP_SIGNAL = 17  # uWSGI user signal that drives the periodic prune
+PRUNE_INTERVAL_S = 600  # ~10 min; a no-op prune is a cheap indexed empty scan
+
 
 def _cleanup(pool: psycopg_pool.ConnectionPool) -> None:
     # Wrapped so a transient DB error logs and is retried on the next tick rather than killing the mule.
@@ -41,12 +43,19 @@ def _cleanup(pool: psycopg_pool.ConnectionPool) -> None:
         with db.connection(pool) as conn:
             result = backend.expire_payments_revocations_and_users(conn=conn, now=now)
         if result.success:
-            log.info('Pruned expired rows (revocations/users/apple/google={}/{}/{}/{})'.format(
-                result.revocations, result.users, result.apple_notification_uuid_history, result.google_notification_history))
+            log.info(
+                'Pruned expired rows (revocations/users/apple/google={}/{}/{}/{})'.format(
+                    result.revocations,
+                    result.users,
+                    result.apple_notification_uuid_history,
+                    result.google_notification_history,
+                )
+            )
         else:
             log.error('DB prune failed')
     except Exception as e:
         log.error(f'DB prune raised: {e}')
+
 
 def run() -> None:
     # The mule is its own process, so wire up console logging (uWSGI captures it into the vassal log).
@@ -56,26 +65,30 @@ def run() -> None:
         logger.addHandler(handler)
 
     try:
-        parsed                = config.parse_args()
+        parsed = config.parse_args()
     except config.ConfigError as e:
         log.error(f'Maintenance mule failed to start, invalid configuration:\n  {e}')
         sys.exit(1)
-    base.UNSAFE_LOGGING       = parsed.unsafe_logging
-    base.DB_URL               = parsed.db_url
+    base.UNSAFE_LOGGING = parsed.unsafe_logging
+    base.DB_URL = parsed.db_url
     base.PLATFORM_TESTING_ENV = parsed.platform_testing_env
-    base.PROVIDER_DRY_RUN     = parsed.provider_dry_run
+    base.PROVIDER_DRY_RUN = parsed.provider_dry_run
 
     pool = db.get_pool(parsed.db_url)
 
     # Google Pub/Sub subscriber — a single consumer. gRPC state is built here (post-fork, in the mule).
     if parsed.with_platform_google:
         if base.PLATFORM_TESTING_ENV:
-            base.DEFAULT_GOOGLE_GRACE_PERIOD = base.timedelta_from_ms(platform_google_api.testing_grace_period_duration_ms)
-        context = platform_google.start_subscriber(cloud_project_id        = parsed.google_cloud_project_id,
-                                                   package_name            = parsed.google_package_name,
-                                                   cloud_subscription_name = parsed.google_cloud_subscription_name,
-                                                   subscription_product_id = parsed.google_subscription_product_id,
-                                                   app_credentials_path    = parsed.google_cloud_app_credentials_path)
+            base.DEFAULT_GOOGLE_GRACE_PERIOD = base.timedelta_from_ms(
+                platform_google_api.testing_grace_period_duration_ms
+            )
+        context = platform_google.start_subscriber(
+            cloud_project_id=parsed.google_cloud_project_id,
+            package_name=parsed.google_package_name,
+            cloud_subscription_name=parsed.google_cloud_subscription_name,
+            subscription_product_id=parsed.google_subscription_product_id,
+            app_credentials_path=parsed.google_cloud_app_credentials_path,
+        )
         # Graceful teardown on mule shutdown: cancel the pull loop + drain gRPC. (Correctness does not
         # depend on this — Pub/Sub redelivers unacked messages and handlers are idempotent — it just
         # keeps reloads clean.)
