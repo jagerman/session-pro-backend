@@ -1,16 +1,10 @@
 '''
 Maintenance mule for the Session Pro Backend. Run as a uWSGI mule (`mule = mule:run` in the vassal ini)
-so the singleton background work runs in exactly ONE process — off the request workers — instead of
-duplicated in every worker (which used to race N daily-expiry threads and N subscribers pulling the same
-subscription). It hosts:
+so the Google Pub/Sub notification subscriber runs in exactly ONE process — a single consumer, off the
+request workers.
 
-  - the Google Pub/Sub notification subscriber (a single consumer), and
-  - the periodic DB prune (expired revocations / orphaned users / expired notification history).
-
-The prune runs in a simple loop (prune, then sleep PRUNE_INTERVAL_S): a mule cannot register uWSGI
-signals/timers ("only the master and the workers can register signal handlers"), so a plain sleep loop
-is the right tool. Because the prune is pure idempotent housekeeping (expiry is derived on read and
-every consuming query self-guards on expiry), the exact cadence doesn't matter.
+The periodic DB prune is NOT here: a mule cannot register uWSGI signals/timers, so it runs on worker 1
+via a `@timer(target='worker1')` in main.py instead.
 
 `run()` executes in the mule *post-fork*, so all Google/gRPC state is constructed here, never at module
 import in the master.
@@ -19,39 +13,13 @@ import in the master.
 import atexit
 import logging
 import sys
-import time
-
-import psycopg_pool
+import threading
 
 import base
 import backend
 import config
-import db
 
 log = logging.getLogger('PRO')
-
-PRUNE_INTERVAL_S = 600  # ~10 min; a no-op prune is a cheap indexed empty scan
-
-
-def _cleanup(pool: psycopg_pool.ConnectionPool) -> None:
-    # Wrapped so a transient DB error logs and is retried on the next tick rather than killing the mule.
-    try:
-        now = base.datetime_from_unix_ms(int(time.time() * 1000))
-        with db.connection(pool) as conn:
-            result = backend.expire_payments_revocations_and_users(conn=conn, now=now)
-        if result.success:
-            log.info(
-                'Pruned expired rows (revocations/users/apple/google={}/{}/{}/{})'.format(
-                    result.revocations,
-                    result.users,
-                    result.apple_notification_uuid_history,
-                    result.google_notification_history,
-                )
-            )
-        else:
-            log.error('DB prune failed')
-    except Exception as e:
-        log.error(f'DB prune raised: {e}')
 
 
 def run() -> None:
@@ -71,33 +39,31 @@ def run() -> None:
     base.PROVIDER_TESTING_ENV = parsed.provider_testing_env
     base.PROVIDER_DRY_RUN = parsed.provider_dry_run
 
-    pool = db.get_pool(parsed.db_url)
+    if not parsed.with_provider_google_play:
+        # The mule's only job is the Google subscriber; with Google disabled it has nothing to do. Park
+        # (rather than return, which uWSGI would treat as a dead mule and respawn-loop). No sleep loop.
+        log.info('Maintenance mule: Google disabled, nothing to run; idle')
+        threading.Event().wait()
+        return
 
-    # Google Pub/Sub subscriber — a single consumer. gRPC state is built here (post-fork, in the mule).
-    if parsed.with_provider_google_play:
-        # Import the Google provider only when enabled — disabled means nothing of it loads (keeps
-        # grpcio out of the mule entirely). DO NOT hoist to module scope.
-        from providers import google_play
+    # Import the Google provider only when enabled — disabled means nothing of it loads (keeps grpcio
+    # out of the mule until here, post-fork). DO NOT hoist to module scope.
+    from providers import google_play
 
-        google_play.log.addHandler(handler)
-        if base.PROVIDER_TESTING_ENV:
-            base.DEFAULT_GOOGLE_GRACE_PERIOD = base.timedelta_from_ms(google_play.api.testing_grace_period_duration_ms)
-        context = google_play.start_subscriber(
-            cloud_project_id=parsed.google_cloud_project_id,
-            package_name=parsed.google_package_name,
-            cloud_subscription_name=parsed.google_cloud_subscription_name,
-            subscription_product_id=parsed.google_subscription_product_id,
-            app_credentials_path=parsed.google_cloud_app_credentials_path,
-        )
-        # Graceful teardown on mule shutdown: cancel the pull loop + drain gRPC. (Correctness does not
-        # depend on this — Pub/Sub redelivers unacked messages and handlers are idempotent — it just
-        # keeps reloads clean.)
-        atexit.register(google_play.stop_subscriber, context)
-        log.info('Maintenance mule: Google subscriber started')
+    google_play.log.addHandler(handler)
+    if base.PROVIDER_TESTING_ENV:
+        base.DEFAULT_GOOGLE_GRACE_PERIOD = base.timedelta_from_ms(google_play.api.testing_grace_period_duration_ms)
+    context = google_play.start_subscriber(
+        cloud_project_id=parsed.google_cloud_project_id,
+        package_name=parsed.google_package_name,
+        cloud_subscription_name=parsed.google_cloud_subscription_name,
+        subscription_product_id=parsed.google_subscription_product_id,
+        app_credentials_path=parsed.google_cloud_app_credentials_path,
+    )
+    atexit.register(google_play.stop_subscriber, context)
+    log.info('Maintenance mule: Google subscriber started')
 
-    # Prune loop: once immediately (so a frequently-reloading box gets cleaned each start), then every
-    # PRUNE_INTERVAL_S. A mule can't register uWSGI signals/timers, so drive it with a plain sleep loop.
-    log.info(f'Maintenance mule started; pruning every {PRUNE_INTERVAL_S}s')
-    while True:
-        _cleanup(pool)
-        time.sleep(PRUNE_INTERVAL_S)
+    # Keep the mule alive by blocking on the subscriber thread — no sleep loop. If that thread ever
+    # exits, run() returns and uWSGI respawns the mule, which restarts the subscriber.
+    assert context.thread is not None
+    context.thread.join()

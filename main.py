@@ -7,11 +7,13 @@ For database operations (user errors, revocations, reports, etc.), use the cli.p
 
 import flask
 import time
+import datetime
 import nacl.signing
 import logging
 import logging.handlers
 import sys
 import psycopg_pool
+from uwsgidecorators import timer
 
 import base
 import backend
@@ -21,6 +23,33 @@ import server
 
 log = logging.Logger('PRO')
 webhook_loggers: list[base.AsyncSessionWebhookLogHandler] = []
+
+PRUNE_INTERVAL_S = 600  # ~10 min; a no-op prune is a cheap indexed empty scan
+
+
+@timer(PRUNE_INTERVAL_S, target='worker1')
+def _periodic_cleanup(signum: int) -> None:
+    # Periodic DB prune (expired revocations / orphaned users / expired notification history). uWSGI
+    # targets this signal at worker 1 ONLY, so exactly one process prunes — no N-worker race, and no
+    # dedicated mule (a mule can't register uWSGI signals). A busy worker just defers the tick; the
+    # prune is idempotent, non-urgent housekeeping, so a delay is harmless.
+    now = datetime.datetime.now(datetime.timezone.utc)
+    try:
+        with db.connection(db.get_pool(base.DB_URL)) as conn:
+            result = backend.expire_payments_revocations_and_users(conn=conn, now=now)
+        if result.success:
+            log.info(
+                'Pruned expired rows (revocations/users/apple/google={}/{}/{}/{})'.format(
+                    result.revocations,
+                    result.users,
+                    result.apple_notification_uuid_history,
+                    result.google_notification_history,
+                )
+            )
+        else:
+            log.error('DB prune failed')
+    except Exception as e:
+        log.error(f'DB prune raised: {e}')
 
 
 def entry_point() -> flask.Flask:
