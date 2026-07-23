@@ -23,10 +23,14 @@ log = logging.getLogger('PRO')
 
 
 def run() -> None:
-    # The mule is its own process, so wire up console logging (uWSGI captures it into the vassal log).
+    # The mule forks from the uWSGI master *after* main.entry_point() ran, so the shared backend (and
+    # later google) loggers arrive with the master's handlers already attached. Clear them before
+    # installing the mule's own, otherwise every mule log line is emitted once per inherited handler.
+    # uWSGI's `logto` captures this StreamHandler's stderr into the vassal log, same as the workers.
     handler = logging.StreamHandler()
     handler.setFormatter(base.LogFormatter('%(asctime)s %(levelname)s %(name)s %(message)s'))
     for logger in (log, backend.log):
+        logger.handlers.clear()
         logger.addHandler(handler)
 
     try:
@@ -50,6 +54,7 @@ def run() -> None:
     # out of the mule until here, post-fork). DO NOT hoist to module scope.
     from providers import google_play
 
+    google_play.log.handlers.clear()
     google_play.log.addHandler(handler)
     if base.PROVIDER_TESTING_ENV:
         base.DEFAULT_GOOGLE_GRACE_PERIOD = base.timedelta_from_ms(google_play.api.testing_grace_period_duration_ms)

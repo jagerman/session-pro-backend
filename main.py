@@ -6,11 +6,11 @@ For database operations (user errors, revocations, reports, etc.), use the cli.p
 '''
 
 import flask
+import flask.logging
 import time
 import datetime
 import nacl.signing
 import logging
-import logging.handlers
 import sys
 import psycopg_pool
 from uwsgidecorators import timer
@@ -71,15 +71,11 @@ def entry_point() -> flask.Flask:
     base.PROVIDER_TESTING_ENV = parsed_args.provider_testing_env
     base.PROVIDER_DRY_RUN = parsed_args.provider_dry_run
 
-    # NOTE: Setup file logger
-    file_logger: logging.handlers.RotatingFileHandler | None = None
-    if len(parsed_args.log_path) > 0:
-        file_logger = logging.handlers.RotatingFileHandler(
-            filename=parsed_args.log_path, maxBytes=64 * 1024 * 1024, backupCount=2, encoding='utf-8'
-        )
-        file_logger.setFormatter(log_formatter)
-        log.addHandler(file_logger)
-        backend.log.addHandler(file_logger)
+    # NOTE: log_path is deliberately ignored here. Under uWSGI the vassal's `logto` already captures
+    # this process's stdout/stderr into the log file and rotates it (log-maxsize/log-backupname); a
+    # second app-managed RotatingFileHandler on the same path would double-write, and it isn't
+    # rotation-safe across the multiple workers + mule anyway. log_path stays a config option only
+    # for non-uWSGI/CLI use (see cli.py) — it does nothing in the Flask/uWSGI process.
 
     # NOTE: Equip the session webhook URL if it's configured
     for it in parsed_args.session_webhooks:
@@ -99,8 +95,6 @@ def entry_point() -> flask.Flask:
         from providers import google_play
 
         google_play.log.addHandler(console_logger)
-        if file_logger:
-            google_play.log.addHandler(file_logger)
         for handler in webhook_loggers:
             google_play.log.addHandler(handler)
 
@@ -132,9 +126,7 @@ def entry_point() -> flask.Flask:
             startup_log += f'    Config .INI file loaded: {parsed_args.ini_path}\n'
         startup_log += f'    DB loaded from: {parsed_args.db_url}\n'
         if len(parsed_args.log_path):
-            startup_log += f'    Logging to: {parsed_args.log_path}\n'
-        else:
-            startup_log += '    Logging to disk disabled (no log_path specified in .INI file)\n'
+            startup_log += '    log_path is set but ignored under uWSGI (the vassal `logto` owns the log file)\n'
         if parsed_args.unsafe_logging:
             startup_log += '    Unsafe logging enabled (this must NOT be used in production)\n'
         if parsed_args.provider_testing_env:
@@ -158,9 +150,11 @@ def entry_point() -> flask.Flask:
 
         # NOTE: Add flask to our global logger
         result: flask.Flask = server.init(testing_mode=False, database_url=parsed_args.db_url, backend_key=backend_key)
+        # Flask lazily attaches its own default_handler to app.logger the first time it's accessed
+        # (the addHandler below triggers that); remove it so app records aren't emitted twice — once
+        # in Flask's format and once in ours.
         result.logger.addHandler(console_logger)
-        if file_logger:
-            result.logger.addHandler(file_logger)
+        result.logger.removeHandler(flask.logging.default_handler)
         for handler in webhook_loggers:
             result.logger.addHandler(handler)
 
@@ -171,8 +165,6 @@ def entry_point() -> flask.Flask:
             from providers import app_store
 
             app_store.log.addHandler(console_logger)
-            if file_logger:
-                app_store.log.addHandler(file_logger)
             for handler in webhook_loggers:
                 app_store.log.addHandler(handler)
             core: app_store.Core = app_store.init(

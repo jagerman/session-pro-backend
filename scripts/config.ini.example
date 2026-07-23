@@ -33,6 +33,9 @@ with_provider_app_store    = false
 with_provider_google_play   = false
 provider_testing_env   = true
 
+; log_path: file for the app's own logging, used ONLY for non-uWSGI/CLI invocations. Under uWSGI
+; (the normal deployment) it is IGNORED — the vassal's `logto` captures stdout/stderr to the log
+; file and rotates it, which also avoids two processes writing/rotating the same file unsafely.
 log_path               = /var/log/pro-backend/backend.log
 
 ; Optional outbound notification webhooks; add [session_webhook.1], etc. as needed.
