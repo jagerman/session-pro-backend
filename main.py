@@ -13,7 +13,19 @@ import nacl.signing
 import logging
 import sys
 import psycopg_pool
-from uwsgidecorators import timer
+
+try:
+    from uwsgidecorators import timer
+except ModuleNotFoundError:
+    # uwsgidecorators does `import uwsgi`, which only exists inside a uWSGI runtime. Outside it
+    # (`flask --app main run`, tests, tooling, a bare `import main`) fall back to a no-op decorator:
+    # the periodic prune is a uWSGI worker-1 concern and simply doesn't run in those contexts.
+    def timer(*_args, **_kwargs):  # type: ignore[no-redef]
+        def _decorator(fn):
+            return fn
+
+        return _decorator
+
 
 import base
 import backend
