@@ -18,8 +18,6 @@ import backend
 import config
 import db
 import server
-from providers import app_store
-from providers import google_play
 
 log = logging.Logger('PRO')
 webhook_loggers: list[base.AsyncSessionWebhookLogHandler] = []
@@ -32,8 +30,6 @@ def entry_point() -> flask.Flask:
     # NOTE: Setup console logger
     log.addHandler(console_logger)
     backend.log.addHandler(console_logger)
-    google_play.log.addHandler(console_logger)
-    app_store.log.addHandler(console_logger)
 
     # NOTE: Parse arguments from .INI if present and environment variables, then setup global variables
     try:
@@ -55,8 +51,6 @@ def entry_point() -> flask.Flask:
         file_logger.setFormatter(log_formatter)
         log.addHandler(file_logger)
         backend.log.addHandler(file_logger)
-        google_play.log.addHandler(file_logger)
-        app_store.log.addHandler(file_logger)
 
     # NOTE: Equip the session webhook URL if it's configured
     for it in parsed_args.session_webhooks:
@@ -69,8 +63,17 @@ def entry_point() -> flask.Flask:
             # NOTE: Setup loggers (main, backend, google, apple)
             log.addHandler(webhook_logger)
             backend.log.addHandler(webhook_logger)
-            google_play.log.addHandler(webhook_logger)
-            app_store.log.addHandler(webhook_logger)
+
+    # NOTE: Import the Google provider only if enabled — a disabled provider loads nothing at all (this
+    # is what keeps grpcio out of the process). Logging is wired here; its runtime work lives in the mule.
+    if parsed_args.with_provider_google_play:
+        from providers import google_play
+
+        google_play.log.addHandler(console_logger)
+        if file_logger:
+            google_play.log.addHandler(file_logger)
+        for handler in webhook_loggers:
+            google_play.log.addHandler(handler)
 
     # NOTE: Load the backend Ed25519 signing key from disk. It is NEVER stored in the DB. The app does
     # not (and its user should not be able to) write this file — deployment creates it — so a
@@ -135,6 +138,14 @@ def entry_point() -> flask.Flask:
         # NOTE: Enable Apple iOS App Store notifications routes on the server if enabled. Apple will
         # contact the endpoint when a notification is generated.
         if parsed_args.with_provider_app_store:
+            # Import the Apple provider only if enabled — zero footprint when disabled.
+            from providers import app_store
+
+            app_store.log.addHandler(console_logger)
+            if file_logger:
+                app_store.log.addHandler(file_logger)
+            for handler in webhook_loggers:
+                app_store.log.addHandler(handler)
             core: app_store.Core = app_store.init(
                 key_id=parsed_args.apple_key_id,
                 issuer_id=parsed_args.apple_issuer_id,
