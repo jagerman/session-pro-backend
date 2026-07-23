@@ -1,7 +1,18 @@
 # Development / test extras: the runtime deps plus tools not wanted in production.
 -r requirements.txt
 
+# Test runner + the ephemeral-PostgreSQL harness (conftest.py boots a throwaway cluster and hands
+# each test a fresh database — see conftest.py). pytest-postgresql is a hard test dependency, not
+# optional: the suite will not even collect without it.
 pytest
+pytest-postgresql
+
+# Lint / type tooling for local dev (CI installs these from Debian — python3-black / -flake8 / -mypy).
+# Deliberately unpinned: when a newer black/flake8/mypy lands and surfaces fresh formatting or type
+# errors, that's a signal to act on, not a version to chase.
+black
+flake8
+mypy
 
 # uWSGI for the local `uwsgi ...` example in the readme. In production uWSGI is provided by the
 # system uwsgi-emperor + uwsgi-plugin-python3 packages, not pip.
