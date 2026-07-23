@@ -18,12 +18,7 @@ import collections.abc
 
 from google.oauth2 import service_account
 
-# google.cloud is a namespace package; mypy can't see the pubsub_v1 submodule (imports fine at
-# runtime):
-from google.cloud import pubsub_v1  # type: ignore[attr-defined]
-import google.pubsub_v1.types
 import googleapiclient.discovery
-import google.api_core.exceptions
 
 import backend
 import base
@@ -89,7 +84,7 @@ class SortedMessage:
     message_id: str = ''
     ack_id: str = ''
     parse: ParsedNotification = dataclasses.field(default_factory=ParsedNotification)
-    raw: google.pubsub_v1.types.ReceivedMessage | None = None
+    raw: object | None = None  # a pubsub ReceivedMessage at runtime; only ever str()'d, so untyped here
 
     def increase_retry_delay(self, now_s: float):
         MIN_RETRY_DELAY_S: float = 1
@@ -264,6 +259,14 @@ def _process_notification_message(
 def thread_entry_point(
     context: ThreadContext, app_credentials_path: str, cloud_project_id: str, cloud_subscription_name: str
 ):
+    # grpcio (via google-cloud-pubsub) is imported HERE, not at module scope, deliberately: this is the
+    # subscriber thread body and runs only post-fork, inside the mule. A module-level import pulls
+    # grpcio's background C threads into the uWSGI master, and the forked mule then segfaults on the
+    # dead inherited threads. DO NOT HOIST these to the top of the file (see docs/refactor-plan.md).
+    from google.cloud import pubsub_v1  # type: ignore[attr-defined]
+    import google.pubsub_v1.types
+    import google.api_core.exceptions
+
     sorted_msg_list: list[SortedMessage] = []
 
     # NOTE Load unhandled messages from the DB and insert it in to the list of messages to start off
