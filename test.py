@@ -1277,967 +1277,940 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
         "providers.google_play.api.fetch_subscription_v2_details", lambda *args, **kwargs: dummy_sub_v2_data
     )
 
-    # nullcontext keeps this test's (large) body indented as-is now that the SQLite
-    # temp-file context is gone; the fresh PG database is dropped by the pg_database fixture.
-    with contextlib.nullcontext():
-        db_url = pg_database()
-        err = base.ErrorSink()
-        db_engine: psycopg_pool.ConnectionPool | None = backend.bootstrap_db(database_url=db_url)
-        assert db_engine
-        # Setup local flask instance. The signing key is external now (not in the DB), so generate
-        # one for this test and hand it to the server; use it directly to verify signatures below.
-        backend_key: nacl.signing.SigningKey = nacl.signing.SigningKey.generate()
-        db_conn: psycopg.Connection = db_engine.getconn()
-        flask_app: flask.Flask = server.init(testing_mode=True, database_url=db_url, backend_key=backend_key)
-        flask_client: werkzeug.Client = flask_app.test_client()
+    db_url = pg_database()
+    err = base.ErrorSink()
+    db_engine: psycopg_pool.ConnectionPool | None = backend.bootstrap_db(database_url=db_url)
+    assert db_engine
+    # Setup local flask instance. The signing key is external now (not in the DB), so generate
+    # one for this test and hand it to the server; use it directly to verify signatures below.
+    backend_key: nacl.signing.SigningKey = nacl.signing.SigningKey.generate()
+    db_conn: psycopg.Connection = db_engine.getconn()
+    flask_app: flask.Flask = server.init(testing_mode=True, database_url=db_url, backend_key=backend_key)
+    flask_client: werkzeug.Client = flask_app.test_client()
 
-        # Setup keys for onion requests
-        server_x25519_skey = backend_key.to_curve25519_private_key()
-        our_x25519_skey = nacl.public.PrivateKey.generate()
-        shared_key: bytes = onion_req.make_shared_key(
-            our_x25519_skey=our_x25519_skey, server_x25519_pkey=server_x25519_skey.public_key
-        )
+    # Setup keys for onion requests
+    server_x25519_skey = backend_key.to_curve25519_private_key()
+    our_x25519_skey = nacl.public.PrivateKey.generate()
+    shared_key: bytes = onion_req.make_shared_key(
+        our_x25519_skey=our_x25519_skey, server_x25519_pkey=server_x25519_skey.public_key
+    )
 
-        # Register an unredeemed payment (by writing the the token to the DB directly)
-        start_unix_ts_ms = int(time.time() * 1000)
-        unix_ts_ms = start_unix_ts_ms  # ms, for the wire bodies
-        request_at = base.datetime_from_unix_ms(unix_ts_ms)  # datetime, for hashes + DB seeding
-        next_day_at = base.round_datetime_to_next_day(request_at)
-        master_key = nacl.signing.SigningKey.generate()
-        rotating_key = nacl.signing.SigningKey.generate()
-        payment_tx = base.PaymentProviderTransaction()
-        payment_tx.provider = base.PaymentProvider.GooglePlayStore
-        payment_tx.google_payment_token = os.urandom(backend.BLAKE2B_DIGEST_SIZE).hex()
-        payment_tx.google_order_id = 'DEV.' + os.urandom(backend.BLAKE2B_DIGEST_SIZE).hex()
-        backend.add_unredeemed_payment(
-            db_conn,
-            payment_tx=payment_tx,
-            plan=base.ProPlan.OneMonth,
-            purchased_at=request_at,
-            expires_at=next_day_at + datetime.timedelta(days=90),
-            platform_refund_expires_at=base.EPOCH,
-            platform_obfuscated_account_id=backend.google_obfuscated_account_id_from_master_pkey(master_key.verify_key),
+    # Register an unredeemed payment (by writing the the token to the DB directly)
+    start_unix_ts_ms = int(time.time() * 1000)
+    unix_ts_ms = start_unix_ts_ms  # ms, for the wire bodies
+    request_at = base.datetime_from_unix_ms(unix_ts_ms)  # datetime, for hashes + DB seeding
+    next_day_at = base.round_datetime_to_next_day(request_at)
+    master_key = nacl.signing.SigningKey.generate()
+    rotating_key = nacl.signing.SigningKey.generate()
+    payment_tx = base.PaymentProviderTransaction()
+    payment_tx.provider = base.PaymentProvider.GooglePlayStore
+    payment_tx.google_payment_token = os.urandom(backend.BLAKE2B_DIGEST_SIZE).hex()
+    payment_tx.google_order_id = 'DEV.' + os.urandom(backend.BLAKE2B_DIGEST_SIZE).hex()
+    backend.add_unredeemed_payment(
+        db_conn,
+        payment_tx=payment_tx,
+        plan=base.ProPlan.OneMonth,
+        purchased_at=request_at,
+        expires_at=next_day_at + datetime.timedelta(days=90),
+        platform_refund_expires_at=base.EPOCH,
+        platform_obfuscated_account_id=backend.google_obfuscated_account_id_from_master_pkey(master_key.verify_key),
+        err=err,
+    )
+    assert not err.msg_list, f'{err.msg_list}'
+
+    # Grab the pro status before anything has happened
+    hash_to_sign = backend.make_get_pro_status_message(
+        master_pkey=master_key.verify_key, request_at=base.datetime_from_unix_seconds(unix_ts_ms // 1000)
+    )
+    request_body = {
+        'master_pkey': bytes(master_key.verify_key).hex(),
+        'master_sig': bytes(master_key.sign(hash_to_sign).signature).hex(),
+        'ts': unix_ts_ms // 1000,
+    }
+
+    onion_request = onion_req.make_request_v4(
+        our_x25519_pkey=our_x25519_skey.public_key,
+        shared_key=shared_key,
+        endpoint=server.FLASK_ROUTE_GET_PRO_STATUS,
+        request_body=request_body,
+    )
+
+    # POST and get response
+    response = flask_client.post(onion_req.ROUTE_OXEN_V4_LSRPC, data=onion_request)
+    onion_response = onion_req.make_response_v4(shared_key=shared_key, encrypted_response=response.data)
+    assert onion_response.success
+
+    # Parse the JSON from the response
+    response_json = json.loads(onion_response.body)
+    assert isinstance(response_json, dict), f'Response {onion_response.body!r}'
+    # Parse status from response
+    assert response_json['status'] == 'ok', f'Response was: {json.dumps(response_json, indent=2)}'
+    assert 'error' not in response_json, f'Response was: {json.dumps(response_json, indent=2)}'
+
+    # Parse result object is at root
+    assert 'result' in response_json, f'Response was: {json.dumps(response_json, indent=2)}'
+    result_json = response_json['result']
+
+    # Extract the fields — the cheap status endpoint carries the latest payment, none yet.
+    result_latest = result_json.get('latest_payment')
+    result_status = base.json_dict_require_str(d=result_json, key='user_status', err=err)
+    assert not err.msg_list, '{err.msg_list}'
+    assert result_status == server.UserProStatus.Never.value, f'Response was: {json.dumps(response_json, indent=2)}'
+    assert result_latest is None, f'Response was: {json.dumps(response_json, indent=2)}'
+
+    # Simulate client request to register a payment
+    add_pro_payment_tx = backend.UserPaymentTransaction()
+    add_pro_payment_tx.provider = payment_tx.provider
+    add_pro_payment_tx.google_payment_token = payment_tx.google_payment_token
+    add_pro_payment_tx.google_order_id = payment_tx.google_order_id
+    add_pro_payment_tx.payment_id = backend.payment_id_from_user_tx(add_pro_payment_tx)
+
+    payment_hash_to_sign = backend.make_add_pro_payment_message(
+        master_pkey=master_key.verify_key, rotating_pkey=rotating_key.verify_key, payment_tx=add_pro_payment_tx
+    )
+
+    onion_request = onion_req.make_request_v4(
+        our_x25519_pkey=our_x25519_skey.public_key,
+        shared_key=shared_key,
+        endpoint=server.FLASK_ROUTE_ADD_PRO_PAYMENT,
+        request_body={
+            'master_pkey': bytes(master_key.verify_key).hex(),
+            'rotating_pkey': bytes(rotating_key.verify_key).hex(),
+            'master_sig': bytes(master_key.sign(payment_hash_to_sign).signature).hex(),
+            'rotating_sig': bytes(rotating_key.sign(payment_hash_to_sign).signature).hex(),
+            'payment_tx': {'provider': add_pro_payment_tx.provider.value, 'payment_id': add_pro_payment_tx.payment_id},
+        },
+    )
+
+    # POST and get response
+    response = flask_client.post(onion_req.ROUTE_OXEN_V4_LSRPC, data=onion_request)
+    onion_response = onion_req.make_response_v4(shared_key=shared_key, encrypted_response=response.data)
+    assert onion_response.success
+
+    # Parse the JSON from the response
+    response_json = json.loads(onion_response.body)
+    assert isinstance(response_json, dict), f'Response {onion_response.body!r}'
+
+    # Parse status from response
+    assert response_json['status'] == 'ok', f'Response was: {json.dumps(response_json, indent=2)}'
+    assert 'error' not in response_json, f'Response was: {json.dumps(response_json, indent=2)}'
+
+    # Parse result object is at root
+    assert 'result' in response_json, f'Response was: {json.dumps(response_json, indent=2)}'
+    result_json = response_json['result']
+
+    # Extract the fields
+    assert isinstance(result_json, dict)
+    result_revocation_tag_hex = base.json_dict_require_str(d=result_json, key='revocation_tag', err=err)
+    result_rotating_pkey_hex = base.json_dict_require_str(d=result_json, key='rotating_pkey', err=err)
+    result_expiry_ts = base.json_dict_require_int(d=result_json, key='expiry_ts', err=err)
+    result_sig_hex = base.json_dict_require_str(d=result_json, key='sig', err=err)
+    assert not err.msg_list, '{err.msg_list}'
+
+    # Parse hex fields to bytes
+    result_rotating_pkey = nacl.signing.VerifyKey(
+        base.hex_to_bytes(
+            hex=result_rotating_pkey_hex,
+            label='Rotating public key',
+            hex_len=nacl.bindings.crypto_sign_PUBLICKEYBYTES * 2,
             err=err,
         )
-        assert not err.msg_list, f'{err.msg_list}'
+    )
+    result_sig = base.hex_to_bytes(
+        hex=result_sig_hex, label='Signature', hex_len=nacl.bindings.crypto_sign_BYTES * 2, err=err
+    )
+    result_revocation_tag = base.hex_to_bytes(
+        hex=result_revocation_tag_hex, label='Revocation tag', hex_len=backend.BLAKE2B_DIGEST_SIZE * 2, err=err
+    )
+    assert not err.msg_list, '{err.msg_list}'
 
-        if 1:  # Grab the pro status before anything has happened
-            hash_to_sign = backend.make_get_pro_status_message(
-                master_pkey=master_key.verify_key, request_at=base.datetime_from_unix_seconds(unix_ts_ms // 1000)
-            )
-            request_body = {
+    # Check the rotating key returned matches what we asked the server to sign
+    assert result_rotating_pkey == rotating_key.verify_key
+
+    # Check that the server signed our proof w/ their public key
+    proof_hash = backend.build_proof_message(
+        result_revocation_tag, result_rotating_pkey, base.datetime_from_unix_seconds(result_expiry_ts)
+    )
+    backend_key.verify_key.verify(smessage=proof_hash, signature=result_sig)
+
+    with db.transaction(db_conn) as tx:
+        get_user = backend.get_user_and_payments(tx, master_key.verify_key)
+        assert len(get_user.user.token) == backend.BLAKE2B_DIGEST_SIZE
+
+    # Authorise a new rotated key for the pro subscription
+    new_rotating_key = nacl.signing.SigningKey.generate()
+    unix_ts_ms = int(time.time() * 1000)
+    hash_to_sign = backend.make_generate_pro_proof_message(
+        master_pkey=master_key.verify_key,
+        rotating_pkey=new_rotating_key.verify_key,
+        request_at=base.datetime_from_unix_seconds(unix_ts_ms // 1000),
+    )
+
+    request_body = {
+        'master_pkey': bytes(master_key.verify_key).hex(),
+        'rotating_pkey': bytes(new_rotating_key.verify_key).hex(),
+        'ts': unix_ts_ms // 1000,
+        'master_sig': bytes(master_key.sign(hash_to_sign).signature).hex(),
+        'rotating_sig': bytes(new_rotating_key.sign(hash_to_sign).signature).hex(),
+    }
+
+    onion_request = onion_req.make_request_v4(
+        our_x25519_pkey=our_x25519_skey.public_key,
+        shared_key=shared_key,
+        endpoint=server.FLASK_ROUTE_GENERATE_PRO_PROOF,
+        request_body=request_body,
+    )
+
+    # POST and get response
+    response = flask_client.post(onion_req.ROUTE_OXEN_V4_LSRPC, data=onion_request)
+    onion_response = onion_req.make_response_v4(shared_key=shared_key, encrypted_response=response.data)
+    assert onion_response.success
+
+    # Parse the JSON from the response
+    response_json = json.loads(onion_response.body)
+    assert isinstance(response_json, dict), f'Response {onion_response.body!r}'
+
+    # Parse status from response
+    assert response_json['status'] == 'ok', f'Response was: {json.dumps(response_json, indent=2)}'
+    assert 'error' not in response_json, f'Response was: {json.dumps(response_json, indent=2)}'
+
+    # Parse result object is at root
+    assert 'result' in response_json, f'Response was: {json.dumps(response_json, indent=2)}'
+    result_json = response_json['result']
+
+    # Extract the fields
+    result_revocation_tag_hex = base.json_dict_require_str(d=result_json, key='revocation_tag', err=err)
+    result_rotating_pkey_hex = base.json_dict_require_str(d=result_json, key='rotating_pkey', err=err)
+    result_expiry_ts = base.json_dict_require_int(d=result_json, key='expiry_ts', err=err)
+    result_sig_hex = base.json_dict_require_str(d=result_json, key='sig', err=err)
+    assert not err.msg_list, '{err.msg_list}'
+
+    # Parse hex fields to bytes
+    result_rotating_pkey = nacl.signing.VerifyKey(
+        base.hex_to_bytes(
+            hex=result_rotating_pkey_hex,
+            label='Rotating public key',
+            hex_len=nacl.bindings.crypto_sign_PUBLICKEYBYTES * 2,
+            err=err,
+        )
+    )
+    result_sig = base.hex_to_bytes(
+        hex=result_sig_hex, label='Signature', hex_len=nacl.bindings.crypto_sign_BYTES * 2, err=err
+    )
+    result_revocation_tag = base.hex_to_bytes(
+        hex=result_revocation_tag_hex, label='Revocation tag', hex_len=backend.BLAKE2B_DIGEST_SIZE * 2, err=err
+    )
+    assert not err.msg_list, '{err.msg_list}'
+
+    # Check the rotating key returned matches what we asked the server to sign
+    assert result_rotating_pkey == new_rotating_key.verify_key
+
+    # Check that the server signed our proof w/ their public key
+    proof_hash = backend.build_proof_message(
+        result_revocation_tag, result_rotating_pkey, base.datetime_from_unix_seconds(result_expiry_ts)
+    )
+    backend_key.verify_key.verify(smessage=proof_hash, signature=result_sig)
+
+    # Check that the expiry time does not exceed 31 days (we clamped to 30 days and if there's
+    # overrun of 30 days we round up to 31 days)
+    assert result_expiry_ts % base.SECONDS_IN_DAY == 0
+    assert result_expiry_ts == base.unix_seconds_from_datetime(
+        base.round_datetime_to_start_of_day(request_at + datetime.timedelta(days=31))
+    ) or result_expiry_ts == base.unix_seconds_from_datetime(
+        base.round_datetime_to_start_of_day(request_at + datetime.timedelta(days=30))
+    )
+
+    new_add_pro_payment_tx = backend.UserPaymentTransaction()
+    # Register another payment on the same user, backend will choose the latest expiring payment
+    new_payment_tx = base.PaymentProviderTransaction()
+    new_payment_tx.provider = base.PaymentProvider.GooglePlayStore
+    new_payment_tx.google_payment_token = os.urandom(int(len(payment_tx.google_payment_token) / 2)).hex()
+    new_payment_tx.google_order_id = 'DEV.' + os.urandom(int(len(payment_tx.google_payment_token) / 2)).hex()
+    backend.add_unredeemed_payment(
+        db_conn,
+        payment_tx=new_payment_tx,
+        plan=base.ProPlan.OneMonth,
+        purchased_at=request_at,
+        expires_at=request_at + datetime.timedelta(days=30),
+        platform_refund_expires_at=base.EPOCH,
+        platform_obfuscated_account_id=backend.google_obfuscated_account_id_from_master_pkey(master_key.verify_key),
+        err=err,
+    )
+
+    new_add_pro_payment_tx.provider = new_payment_tx.provider
+    new_add_pro_payment_tx.google_payment_token = new_payment_tx.google_payment_token
+    new_add_pro_payment_tx.google_order_id = new_payment_tx.google_order_id
+    new_add_pro_payment_tx.payment_id = backend.payment_id_from_user_tx(new_add_pro_payment_tx)
+    payment_hash_to_sign = backend.make_add_pro_payment_message(
+        master_pkey=master_key.verify_key, rotating_pkey=rotating_key.verify_key, payment_tx=new_add_pro_payment_tx
+    )
+
+    request_body = {
+        'master_pkey': bytes(master_key.verify_key).hex(),
+        'rotating_pkey': bytes(rotating_key.verify_key).hex(),
+        'master_sig': bytes(master_key.sign(payment_hash_to_sign).signature).hex(),
+        'rotating_sig': bytes(rotating_key.sign(payment_hash_to_sign).signature).hex(),
+        'payment_tx': {
+            'provider': new_add_pro_payment_tx.provider.value,
+            'payment_id': new_add_pro_payment_tx.payment_id,
+        },
+    }
+
+    onion_request = onion_req.make_request_v4(
+        our_x25519_pkey=our_x25519_skey.public_key,
+        shared_key=shared_key,
+        endpoint=server.FLASK_ROUTE_ADD_PRO_PAYMENT,
+        request_body=request_body,
+    )
+
+    # POST and get response
+    response = flask_client.post(onion_req.ROUTE_OXEN_V4_LSRPC, data=onion_request)
+    onion_response = onion_req.make_response_v4(shared_key=shared_key, encrypted_response=response.data)
+    assert onion_response.success
+
+    # Parse the JSON from the response
+    response_json = json.loads(onion_response.body)
+    assert isinstance(response_json, dict), f'Response {onion_response.body!r}'
+
+    # Parse status from response
+    assert response_json['status'] == 'ok', f'Response was: {json.dumps(response_json, indent=2)}'
+    assert 'error' not in response_json, f'Response was: {json.dumps(response_json, indent=2)}'
+
+    # Parse result object is at root
+    assert 'result' in response_json, f'Response was: {json.dumps(response_json, indent=2)}'
+    result_json = response_json['result']
+
+    # Extract the fields
+    result_revocation_tag_hex = base.json_dict_require_str(d=result_json, key='revocation_tag', err=err)
+    result_rotating_pkey_hex = base.json_dict_require_str(d=result_json, key='rotating_pkey', err=err)
+    result_expiry_ts = base.json_dict_require_int(d=result_json, key='expiry_ts', err=err)
+    result_sig_hex = base.json_dict_require_str(d=result_json, key='sig', err=err)
+    assert not err.msg_list, '{err.msg_list}'
+
+    # Parse hex fields to bytes
+    result_rotating_pkey = nacl.signing.VerifyKey(
+        base.hex_to_bytes(
+            hex=result_rotating_pkey_hex,
+            label='Rotating public key',
+            hex_len=nacl.bindings.crypto_sign_PUBLICKEYBYTES * 2,
+            err=err,
+        )
+    )
+    result_sig = base.hex_to_bytes(
+        hex=result_sig_hex, label='Signature', hex_len=nacl.bindings.crypto_sign_BYTES * 2, err=err
+    )
+    result_revocation_tag = base.hex_to_bytes(
+        hex=result_revocation_tag_hex, label='Revocation tag', hex_len=backend.BLAKE2B_DIGEST_SIZE * 2, err=err
+    )
+    assert not err.msg_list, '{err.msg_list}'
+
+    # Check the rotating key returned matches what we asked the server to sign
+    assert result_rotating_pkey == rotating_key.verify_key
+
+    # Check that the server signed our proof w/ their public key
+    proof_hash = backend.build_proof_message(
+        result_revocation_tag, result_rotating_pkey, base.datetime_from_unix_seconds(result_expiry_ts)
+    )
+    backend_key.verify_key.verify(smessage=proof_hash, signature=result_sig)
+
+    curr_revocation_ticket: int = 0
+
+    # Get the revocation list
+    request_body = {'ticket': curr_revocation_ticket}
+    onion_request = onion_req.make_request_v4(
+        our_x25519_pkey=our_x25519_skey.public_key,
+        shared_key=shared_key,
+        endpoint=server.FLASK_ROUTE_GET_PRO_REVOCATIONS,
+        request_body=request_body,
+    )
+
+    # POST and get response
+    response = flask_client.post(onion_req.ROUTE_OXEN_V4_LSRPC, data=onion_request)
+    onion_response = onion_req.make_response_v4(shared_key=shared_key, encrypted_response=response.data)
+    assert onion_response.success
+
+    # Parse the JSON from the response
+    response_json = json.loads(onion_response.body)
+    assert isinstance(response_json, dict), f'Response {onion_response.body!r}'
+
+    # Parse status from response
+    assert response_json['status'] == 'ok', f'Response was: {json.dumps(response_json, indent=2)}'
+    assert 'error' not in response_json, f'Response was: {json.dumps(response_json, indent=2)}'
+
+    # Parse result object is at root
+    assert 'result' in response_json, f'Response was: {json.dumps(response_json, indent=2)}'
+    result_json = response_json['result']
+
+    # Extract the fields
+    result_items = base.json_dict_require_array(d=result_json, key='items', err=err)
+    result_ticket = base.json_dict_require_int(d=result_json, key='ticket', err=err)
+    result_retry_in = base.json_dict_require_int(d=result_json, key='retry_in', err=err)
+    assert not err.msg_list, '{err.msg_list}'
+    assert result_ticket == 0
+    assert result_retry_in == base.SECONDS_IN_DAY
+    curr_revocation_ticket = result_ticket
+
+    # Check that the server returned an empty revocation list, we no longer revoke the old
+    # payment but we _do_ increment the user's generation index
+    assert not result_items
+
+    # Flask did some writes using an independent connection so those writes are made visible by
+    # refreshing the connection and updating the "snapshot" that the following code sees.
+    db_conn = db_engine.getconn()
+
+    # Capture the user's current generation. The manual revoke below targets only the shorter
+    # (30-day) payment while the original (~90-day) payment survives, so item 4 must SKIP the
+    # revocation entirely: the surviving entitlement still covers everything any outstanding proof
+    # can certify (≤ 30 days of reach), so the generation must NOT roll and nothing must land on
+    # the (network-costly) revocation list.
+    with db.transaction(db_conn) as tx:
+        get_user = backend.get_user_and_payments(tx, master_key.verify_key)
+        assert len(get_user.user.token) == backend.BLAKE2B_DIGEST_SIZE
+    kept_generation_token: bytes = get_user.user.token
+    kept_generation_id: int = get_user.user.current_generation_id
+
+    # We will now manually revoke the shorter payment and check the revocation list again
+    with db.transaction(db_conn) as tx:
+        revoked = backend.add_google_revocation(
+            tx,
+            google_payment_token=new_add_pro_payment_tx.google_payment_token,
+            revoke_at=base.datetime_from_unix_ms(unix_ts_ms),
+            err=err,
+        )
+        assert revoked
+        assert not err.has()
+
+    # Get the revocation list, again
+    request_body = {'ticket': curr_revocation_ticket}
+    onion_request = onion_req.make_request_v4(
+        our_x25519_pkey=our_x25519_skey.public_key,
+        shared_key=shared_key,
+        endpoint=server.FLASK_ROUTE_GET_PRO_REVOCATIONS,
+        request_body=request_body,
+    )
+
+    # POST and get response
+    response = flask_client.post(onion_req.ROUTE_OXEN_V4_LSRPC, data=onion_request)
+    onion_response = onion_req.make_response_v4(shared_key=shared_key, encrypted_response=response.data)
+    assert onion_response.success
+
+    # Parse the JSON from the response
+    response_json = json.loads(onion_response.body)
+    assert isinstance(response_json, dict), f'Response {onion_response.body!r}'
+
+    # Parse status from response
+    assert response_json['status'] == 'ok', f'Response was: {json.dumps(response_json, indent=2)}'
+    assert 'error' not in response_json, f'Response was: {json.dumps(response_json, indent=2)}'
+
+    # Parse result object is at root
+    assert 'result' in response_json, f'Response was: {json.dumps(response_json, indent=2)}'
+    result_json = response_json['result']
+
+    # Extract the fields
+    result_items = base.json_dict_require_array(d=result_json, key='items', err=err)
+    result_ticket = base.json_dict_require_int(d=result_json, key='ticket', err=err)
+    result_retry_in = base.json_dict_require_int(d=result_json, key='retry_in', err=err)
+    result_retain_for = base.json_dict_require_int(d=result_json, key='retain_for', err=err)
+    assert not err.msg_list, '{err.msg_list}'
+    # Item 4: the non-cutting refund produced NO revocation entry, so the ticket is unchanged.
+    assert result_ticket == 0
+    assert result_retry_in == base.SECONDS_IN_DAY
+    assert result_retain_for == base.SECONDS_IN_MONTH
+    curr_revocation_ticket = result_ticket
+    assert not result_items
+
+    # The generation must be UNCHANGED and still LIVE: no roll happened, and the current
+    # generation is NOT on the revocation list (the surviving payment keeps it honest).
+    with db.transaction(db_conn) as tx:
+        get_user = backend.get_user_and_payments(tx, master_key.verify_key)
+        now_dt = base.datetime_from_unix_ms(unix_ts_ms)
+        assert get_user.user.current_generation_id == kept_generation_id
+        assert get_user.user.token == kept_generation_token
+        assert not backend.is_generation_revoked(tx.conn, get_user.user.current_generation_id, now_dt)
+
+    assert not err.has()
+
+    # Try grabbing the revocation again with the current ticket (we should get
+    # an empty list because we passed in the most up to date ticket)
+    onion_request = onion_req.make_request_v4(
+        our_x25519_pkey=our_x25519_skey.public_key,
+        shared_key=shared_key,
+        endpoint=server.FLASK_ROUTE_GET_PRO_REVOCATIONS,
+        request_body={'ticket': curr_revocation_ticket},
+    )
+
+    # POST and get response
+    response = flask_client.post(onion_req.ROUTE_OXEN_V4_LSRPC, data=onion_request)
+    onion_response = onion_req.make_response_v4(shared_key=shared_key, encrypted_response=response.data)
+    assert onion_response.success
+
+    # Parse the JSON from the response
+    response_json = json.loads(onion_response.body)
+    assert isinstance(response_json, dict), f'Response {onion_response.body!r}'
+
+    # Parse status from response
+    assert response_json['status'] == 'ok', f'Response was: {json.dumps(response_json, indent=2)}'
+    assert 'error' not in response_json, f'Response was: {json.dumps(response_json, indent=2)}'
+
+    # Parse result object is at root
+    assert 'result' in response_json, f'Response was: {json.dumps(response_json, indent=2)}'
+    result_json = response_json['result']
+
+    # Extract the fields
+    result_items = base.json_dict_require_array(d=result_json, key='items', err=err)
+    result_ticket = base.json_dict_require_int(d=result_json, key='ticket', err=err)
+    result_retry_in = base.json_dict_require_int(d=result_json, key='retry_in', err=err)
+    result_retain_for = base.json_dict_require_int(d=result_json, key='retain_for', err=err)
+    assert not err.msg_list, '{err.msg_list}'
+    # Item 4: the non-cutting refund above created no revocation entry, so the ticket is still 0.
+    assert result_ticket == 0, f'Response was: {json.dumps(response_json, indent=2)}'
+    assert result_retry_in == base.SECONDS_IN_DAY
+    assert result_retain_for == base.SECONDS_IN_MONTH
+
+    # List should be empty because we passed in the newest revocation
+    # ticket. There are no changes to the revocation list so the backend
+    # will return an empty list
+    assert not result_items, f'Response was: {json.dumps(response_json, indent=2)}'
+
+    # Get the pro status now w/ a bunch of payments
+    unix_ts_ms = int(time.time() * 1000)
+    hash_to_sign = backend.make_get_pro_status_message(
+        master_pkey=master_key.verify_key, request_at=base.datetime_from_unix_seconds(unix_ts_ms // 1000)
+    )
+
+    request_body = {
+        'master_pkey': bytes(master_key.verify_key).hex(),
+        'master_sig': bytes(master_key.sign(hash_to_sign).signature).hex(),
+        'ts': unix_ts_ms // 1000,
+    }
+
+    onion_request = onion_req.make_request_v4(
+        our_x25519_pkey=our_x25519_skey.public_key,
+        shared_key=shared_key,
+        endpoint=server.FLASK_ROUTE_GET_PRO_STATUS,
+        request_body=request_body,
+    )
+
+    # POST and get response
+    response = flask_client.post(onion_req.ROUTE_OXEN_V4_LSRPC, data=onion_request)
+    onion_response = onion_req.make_response_v4(shared_key=shared_key, encrypted_response=response.data)
+    assert onion_response.success
+
+    # Parse the JSON from the response
+    response_json = json.loads(onion_response.body)
+    assert isinstance(response_json, dict), f'Response {onion_response.body!r}'
+
+    # Parse status from response
+    assert response_json['status'] == 'ok', f'Response was: {json.dumps(response_json, indent=2)}'
+    assert 'error' not in response_json, f'Response was: {json.dumps(response_json, indent=2)}'
+
+    # Parse result object is at root
+    assert 'result' in response_json, f'Response was: {json.dumps(response_json, indent=2)}'
+    result_json = response_json['result']
+
+    # Extract the fields — status endpoint carries user_status + the single latest payment.
+    result_latest = result_json.get('latest_payment')
+    result_status = base.json_dict_require_str(d=result_json, key='user_status', err=err)
+    assert not err.msg_list, '{err.msg_list}'
+    assert result_status == server.UserProStatus.Active.value, f'Response was: {json.dumps(response_json, indent=2)}'
+    assert result_latest is not None, f'Response was: {json.dumps(response_json, indent=2)}'
+
+    # Retry the request but use a too old timestamp
+    unix_ts_ms = int((time.time() + base.DEFAULT_TIMESTAMP_TOLERANCE.total_seconds() * 2) * 1000)
+    hash_to_sign = backend.make_get_pro_status_message(
+        master_pkey=master_key.verify_key, request_at=base.datetime_from_unix_seconds(unix_ts_ms // 1000)
+    )
+    onion_request = onion_req.make_request_v4(
+        our_x25519_pkey=our_x25519_skey.public_key,
+        shared_key=shared_key,
+        endpoint=server.FLASK_ROUTE_GET_PRO_STATUS,
+        request_body={
+            'master_pkey': bytes(master_key.verify_key).hex(),
+            'master_sig': bytes(master_key.sign(hash_to_sign).signature).hex(),
+            'ts': unix_ts_ms // 1000,
+        },
+    )
+
+    # POST and get response
+    response = flask_client.post(onion_req.ROUTE_OXEN_V4_LSRPC, data=onion_request)
+    onion_response = onion_req.make_response_v4(shared_key=shared_key, encrypted_response=response.data)
+    assert onion_response.success
+
+    # Parse the JSON from the response
+    response_json = json.loads(onion_response.body)
+    assert isinstance(response_json, dict), f'Response {onion_response.body!r}'
+
+    # Parse status from response
+    assert response_json['status'] == 'fail', f'Response was: {json.dumps(response_json, indent=2)}'
+    assert len(response_json['error']) > 0, f'Response was: {json.dumps(response_json, indent=2)}'
+    assert 'result' not in response_json, f'Response was: {json.dumps(response_json, indent=2)}'
+
+    # Retry the request but create a hash with the rotating key
+    unix_ts_ms = int(time.time() * 1000)
+    hash_to_sign = backend.make_get_pro_status_message(
+        master_pkey=rotating_key.verify_key, request_at=base.datetime_from_unix_seconds(unix_ts_ms // 1000)
+    )
+    onion_request = onion_req.make_request_v4(
+        our_x25519_pkey=our_x25519_skey.public_key,
+        shared_key=shared_key,
+        endpoint=server.FLASK_ROUTE_GET_PRO_STATUS,
+        request_body={
+            'master_pkey': bytes(master_key.verify_key).hex(),
+            'master_sig': bytes(master_key.sign(hash_to_sign).signature).hex(),
+            'ts': unix_ts_ms // 1000,
+        },
+    )
+
+    # POST and get response
+    response = flask_client.post(onion_req.ROUTE_OXEN_V4_LSRPC, data=onion_request)
+    onion_response = onion_req.make_response_v4(shared_key=shared_key, encrypted_response=response.data)
+    assert onion_response.success
+
+    # Parse the JSON from the response
+    response_json = json.loads(onion_response.body)
+    assert isinstance(response_json, dict), f'Response {onion_response.body!r}'
+
+    # Parse status from response
+    assert response_json['status'] == 'fail', f'Response was: {json.dumps(response_json, indent=2)}'
+    assert len(response_json['error']) > 0, f'Response was: {json.dumps(response_json, indent=2)}'
+    assert 'result' not in response_json, f'Response was: {json.dumps(response_json, indent=2)}'
+
+    # Page the full payment history via the dedicated get-payment-details endpoint (keyset cursor,
+    # newest-first). The user has 2 redeemed payments; walk them one page at a time.
+
+    def get_payment_details_page(limit: int, before: str) -> dict:
+        unix_ts_ms = int(time.time() * 1000)
+        hash_to_sign = backend.make_get_payment_details_message(
+            master_pkey=master_key.verify_key,
+            request_at=base.datetime_from_unix_seconds(unix_ts_ms // 1000),
+            limit=limit,
+            before=before,
+        )
+        onion_request = onion_req.make_request_v4(
+            our_x25519_pkey=our_x25519_skey.public_key,
+            shared_key=shared_key,
+            endpoint=server.FLASK_ROUTE_GET_PAYMENT_DETAILS,
+            request_body={
                 'master_pkey': bytes(master_key.verify_key).hex(),
                 'master_sig': bytes(master_key.sign(hash_to_sign).signature).hex(),
                 'ts': unix_ts_ms // 1000,
-            }
-
-            onion_request = onion_req.make_request_v4(
-                our_x25519_pkey=our_x25519_skey.public_key,
-                shared_key=shared_key,
-                endpoint=server.FLASK_ROUTE_GET_PRO_STATUS,
-                request_body=request_body,
-            )
-
-            # POST and get response
-            response = flask_client.post(onion_req.ROUTE_OXEN_V4_LSRPC, data=onion_request)
-            onion_response = onion_req.make_response_v4(shared_key=shared_key, encrypted_response=response.data)
-            assert onion_response.success
-
-            # Parse the JSON from the response
-            response_json = json.loads(onion_response.body)
-            assert isinstance(response_json, dict), f'Response {onion_response.body!r}'
-            # Parse status from response
-            assert response_json['status'] == 'ok', f'Response was: {json.dumps(response_json, indent=2)}'
-            assert 'error' not in response_json, f'Response was: {json.dumps(response_json, indent=2)}'
-
-            # Parse result object is at root
-            assert 'result' in response_json, f'Response was: {json.dumps(response_json, indent=2)}'
-            result_json = response_json['result']
-
-            # Extract the fields — the cheap status endpoint carries the latest payment, none yet.
-            result_latest = result_json.get('latest_payment')
-            result_status = base.json_dict_require_str(d=result_json, key='user_status', err=err)
-            assert not err.msg_list, '{err.msg_list}'
-            assert (
-                result_status == server.UserProStatus.Never.value
-            ), f'Response was: {json.dumps(response_json, indent=2)}'
-            assert result_latest is None, f'Response was: {json.dumps(response_json, indent=2)}'
-
-        if 1:  # Simulate client request to register a payment
-            add_pro_payment_tx = backend.UserPaymentTransaction()
-            add_pro_payment_tx.provider = payment_tx.provider
-            add_pro_payment_tx.google_payment_token = payment_tx.google_payment_token
-            add_pro_payment_tx.google_order_id = payment_tx.google_order_id
-            add_pro_payment_tx.payment_id = backend.payment_id_from_user_tx(add_pro_payment_tx)
-
-            payment_hash_to_sign = backend.make_add_pro_payment_message(
-                master_pkey=master_key.verify_key, rotating_pkey=rotating_key.verify_key, payment_tx=add_pro_payment_tx
-            )
-
-            onion_request = onion_req.make_request_v4(
-                our_x25519_pkey=our_x25519_skey.public_key,
-                shared_key=shared_key,
-                endpoint=server.FLASK_ROUTE_ADD_PRO_PAYMENT,
-                request_body={
-                    'master_pkey': bytes(master_key.verify_key).hex(),
-                    'rotating_pkey': bytes(rotating_key.verify_key).hex(),
-                    'master_sig': bytes(master_key.sign(payment_hash_to_sign).signature).hex(),
-                    'rotating_sig': bytes(rotating_key.sign(payment_hash_to_sign).signature).hex(),
-                    'payment_tx': {
-                        'provider': add_pro_payment_tx.provider.value,
-                        'payment_id': add_pro_payment_tx.payment_id,
-                    },
-                },
-            )
-
-            # POST and get response
-            response = flask_client.post(onion_req.ROUTE_OXEN_V4_LSRPC, data=onion_request)
-            onion_response = onion_req.make_response_v4(shared_key=shared_key, encrypted_response=response.data)
-            assert onion_response.success
-
-            # Parse the JSON from the response
-            response_json = json.loads(onion_response.body)
-            assert isinstance(response_json, dict), f'Response {onion_response.body!r}'
-
-            # Parse status from response
-            assert response_json['status'] == 'ok', f'Response was: {json.dumps(response_json, indent=2)}'
-            assert 'error' not in response_json, f'Response was: {json.dumps(response_json, indent=2)}'
-
-            # Parse result object is at root
-            assert 'result' in response_json, f'Response was: {json.dumps(response_json, indent=2)}'
-            result_json = response_json['result']
-
-            # Extract the fields
-            assert isinstance(result_json, dict)
-            result_revocation_tag_hex = base.json_dict_require_str(d=result_json, key='revocation_tag', err=err)
-            result_rotating_pkey_hex = base.json_dict_require_str(d=result_json, key='rotating_pkey', err=err)
-            result_expiry_ts = base.json_dict_require_int(d=result_json, key='expiry_ts', err=err)
-            result_sig_hex = base.json_dict_require_str(d=result_json, key='sig', err=err)
-            assert not err.msg_list, '{err.msg_list}'
-
-            # Parse hex fields to bytes
-            result_rotating_pkey = nacl.signing.VerifyKey(
-                base.hex_to_bytes(
-                    hex=result_rotating_pkey_hex,
-                    label='Rotating public key',
-                    hex_len=nacl.bindings.crypto_sign_PUBLICKEYBYTES * 2,
-                    err=err,
-                )
-            )
-            result_sig = base.hex_to_bytes(
-                hex=result_sig_hex, label='Signature', hex_len=nacl.bindings.crypto_sign_BYTES * 2, err=err
-            )
-            result_revocation_tag = base.hex_to_bytes(
-                hex=result_revocation_tag_hex, label='Revocation tag', hex_len=backend.BLAKE2B_DIGEST_SIZE * 2, err=err
-            )
-            assert not err.msg_list, '{err.msg_list}'
-
-            # Check the rotating key returned matches what we asked the server to sign
-            assert result_rotating_pkey == rotating_key.verify_key
-
-            # Check that the server signed our proof w/ their public key
-            proof_hash = backend.build_proof_message(
-                result_revocation_tag, result_rotating_pkey, base.datetime_from_unix_seconds(result_expiry_ts)
-            )
-            backend_key.verify_key.verify(smessage=proof_hash, signature=result_sig)
-
-            with db.transaction(db_conn) as tx:
-                get_user = backend.get_user_and_payments(tx, master_key.verify_key)
-                assert len(get_user.user.token) == backend.BLAKE2B_DIGEST_SIZE
-
-        if 1:  # Authorise a new rotated key for the pro subscription
-            new_rotating_key = nacl.signing.SigningKey.generate()
-            unix_ts_ms = int(time.time() * 1000)
-            hash_to_sign = backend.make_generate_pro_proof_message(
-                master_pkey=master_key.verify_key,
-                rotating_pkey=new_rotating_key.verify_key,
-                request_at=base.datetime_from_unix_seconds(unix_ts_ms // 1000),
-            )
-
-            request_body = {
-                'master_pkey': bytes(master_key.verify_key).hex(),
-                'rotating_pkey': bytes(new_rotating_key.verify_key).hex(),
-                'ts': unix_ts_ms // 1000,
-                'master_sig': bytes(master_key.sign(hash_to_sign).signature).hex(),
-                'rotating_sig': bytes(new_rotating_key.sign(hash_to_sign).signature).hex(),
-            }
-
-            onion_request = onion_req.make_request_v4(
-                our_x25519_pkey=our_x25519_skey.public_key,
-                shared_key=shared_key,
-                endpoint=server.FLASK_ROUTE_GENERATE_PRO_PROOF,
-                request_body=request_body,
-            )
-
-            # POST and get response
-            response = flask_client.post(onion_req.ROUTE_OXEN_V4_LSRPC, data=onion_request)
-            onion_response = onion_req.make_response_v4(shared_key=shared_key, encrypted_response=response.data)
-            assert onion_response.success
-
-            # Parse the JSON from the response
-            response_json = json.loads(onion_response.body)
-            assert isinstance(response_json, dict), f'Response {onion_response.body!r}'
-
-            # Parse status from response
-            assert response_json['status'] == 'ok', f'Response was: {json.dumps(response_json, indent=2)}'
-            assert 'error' not in response_json, f'Response was: {json.dumps(response_json, indent=2)}'
-
-            # Parse result object is at root
-            assert 'result' in response_json, f'Response was: {json.dumps(response_json, indent=2)}'
-            result_json = response_json['result']
-
-            # Extract the fields
-            result_revocation_tag_hex = base.json_dict_require_str(d=result_json, key='revocation_tag', err=err)
-            result_rotating_pkey_hex = base.json_dict_require_str(d=result_json, key='rotating_pkey', err=err)
-            result_expiry_ts = base.json_dict_require_int(d=result_json, key='expiry_ts', err=err)
-            result_sig_hex = base.json_dict_require_str(d=result_json, key='sig', err=err)
-            assert not err.msg_list, '{err.msg_list}'
-
-            # Parse hex fields to bytes
-            result_rotating_pkey = nacl.signing.VerifyKey(
-                base.hex_to_bytes(
-                    hex=result_rotating_pkey_hex,
-                    label='Rotating public key',
-                    hex_len=nacl.bindings.crypto_sign_PUBLICKEYBYTES * 2,
-                    err=err,
-                )
-            )
-            result_sig = base.hex_to_bytes(
-                hex=result_sig_hex, label='Signature', hex_len=nacl.bindings.crypto_sign_BYTES * 2, err=err
-            )
-            result_revocation_tag = base.hex_to_bytes(
-                hex=result_revocation_tag_hex, label='Revocation tag', hex_len=backend.BLAKE2B_DIGEST_SIZE * 2, err=err
-            )
-            assert not err.msg_list, '{err.msg_list}'
-
-            # Check the rotating key returned matches what we asked the server to sign
-            assert result_rotating_pkey == new_rotating_key.verify_key
-
-            # Check that the server signed our proof w/ their public key
-            proof_hash = backend.build_proof_message(
-                result_revocation_tag, result_rotating_pkey, base.datetime_from_unix_seconds(result_expiry_ts)
-            )
-            backend_key.verify_key.verify(smessage=proof_hash, signature=result_sig)
-
-            # Check that the expiry time does not exceed 31 days (we clamped to 30 days and if there's
-            # overrun of 30 days we round up to 31 days)
-            assert result_expiry_ts % base.SECONDS_IN_DAY == 0
-            assert result_expiry_ts == base.unix_seconds_from_datetime(
-                base.round_datetime_to_start_of_day(request_at + datetime.timedelta(days=31))
-            ) or result_expiry_ts == base.unix_seconds_from_datetime(
-                base.round_datetime_to_start_of_day(request_at + datetime.timedelta(days=30))
-            )
-
-        new_add_pro_payment_tx = backend.UserPaymentTransaction()
-        if 1:  # Register another payment on the same user, backend will choose the latest expiring payment
-            new_payment_tx = base.PaymentProviderTransaction()
-            new_payment_tx.provider = base.PaymentProvider.GooglePlayStore
-            new_payment_tx.google_payment_token = os.urandom(int(len(payment_tx.google_payment_token) / 2)).hex()
-            new_payment_tx.google_order_id = 'DEV.' + os.urandom(int(len(payment_tx.google_payment_token) / 2)).hex()
-            backend.add_unredeemed_payment(
-                db_conn,
-                payment_tx=new_payment_tx,
-                plan=base.ProPlan.OneMonth,
-                purchased_at=request_at,
-                expires_at=request_at + datetime.timedelta(days=30),
-                platform_refund_expires_at=base.EPOCH,
-                platform_obfuscated_account_id=backend.google_obfuscated_account_id_from_master_pkey(
-                    master_key.verify_key
-                ),
-                err=err,
-            )
-
-            new_add_pro_payment_tx.provider = new_payment_tx.provider
-            new_add_pro_payment_tx.google_payment_token = new_payment_tx.google_payment_token
-            new_add_pro_payment_tx.google_order_id = new_payment_tx.google_order_id
-            new_add_pro_payment_tx.payment_id = backend.payment_id_from_user_tx(new_add_pro_payment_tx)
-            payment_hash_to_sign = backend.make_add_pro_payment_message(
-                master_pkey=master_key.verify_key,
-                rotating_pkey=rotating_key.verify_key,
-                payment_tx=new_add_pro_payment_tx,
-            )
-
-            request_body = {
-                'master_pkey': bytes(master_key.verify_key).hex(),
-                'rotating_pkey': bytes(rotating_key.verify_key).hex(),
-                'master_sig': bytes(master_key.sign(payment_hash_to_sign).signature).hex(),
-                'rotating_sig': bytes(rotating_key.sign(payment_hash_to_sign).signature).hex(),
-                'payment_tx': {
-                    'provider': new_add_pro_payment_tx.provider.value,
-                    'payment_id': new_add_pro_payment_tx.payment_id,
-                },
-            }
-
-            onion_request = onion_req.make_request_v4(
-                our_x25519_pkey=our_x25519_skey.public_key,
-                shared_key=shared_key,
-                endpoint=server.FLASK_ROUTE_ADD_PRO_PAYMENT,
-                request_body=request_body,
-            )
-
-            # POST and get response
-            response = flask_client.post(onion_req.ROUTE_OXEN_V4_LSRPC, data=onion_request)
-            onion_response = onion_req.make_response_v4(shared_key=shared_key, encrypted_response=response.data)
-            assert onion_response.success
-
-            # Parse the JSON from the response
-            response_json = json.loads(onion_response.body)
-            assert isinstance(response_json, dict), f'Response {onion_response.body!r}'
-
-            # Parse status from response
-            assert response_json['status'] == 'ok', f'Response was: {json.dumps(response_json, indent=2)}'
-            assert 'error' not in response_json, f'Response was: {json.dumps(response_json, indent=2)}'
-
-            # Parse result object is at root
-            assert 'result' in response_json, f'Response was: {json.dumps(response_json, indent=2)}'
-            result_json = response_json['result']
-
-            # Extract the fields
-            result_revocation_tag_hex = base.json_dict_require_str(d=result_json, key='revocation_tag', err=err)
-            result_rotating_pkey_hex = base.json_dict_require_str(d=result_json, key='rotating_pkey', err=err)
-            result_expiry_ts = base.json_dict_require_int(d=result_json, key='expiry_ts', err=err)
-            result_sig_hex = base.json_dict_require_str(d=result_json, key='sig', err=err)
-            assert not err.msg_list, '{err.msg_list}'
-
-            # Parse hex fields to bytes
-            result_rotating_pkey = nacl.signing.VerifyKey(
-                base.hex_to_bytes(
-                    hex=result_rotating_pkey_hex,
-                    label='Rotating public key',
-                    hex_len=nacl.bindings.crypto_sign_PUBLICKEYBYTES * 2,
-                    err=err,
-                )
-            )
-            result_sig = base.hex_to_bytes(
-                hex=result_sig_hex, label='Signature', hex_len=nacl.bindings.crypto_sign_BYTES * 2, err=err
-            )
-            result_revocation_tag = base.hex_to_bytes(
-                hex=result_revocation_tag_hex, label='Revocation tag', hex_len=backend.BLAKE2B_DIGEST_SIZE * 2, err=err
-            )
-            assert not err.msg_list, '{err.msg_list}'
-
-            # Check the rotating key returned matches what we asked the server to sign
-            assert result_rotating_pkey == rotating_key.verify_key
-
-            # Check that the server signed our proof w/ their public key
-            proof_hash = backend.build_proof_message(
-                result_revocation_tag, result_rotating_pkey, base.datetime_from_unix_seconds(result_expiry_ts)
-            )
-            backend_key.verify_key.verify(smessage=proof_hash, signature=result_sig)
-
-        curr_revocation_ticket: int = 0
-
-        if 1:  # Get the revocation list
-            request_body = {'ticket': curr_revocation_ticket}
-            onion_request = onion_req.make_request_v4(
-                our_x25519_pkey=our_x25519_skey.public_key,
-                shared_key=shared_key,
-                endpoint=server.FLASK_ROUTE_GET_PRO_REVOCATIONS,
-                request_body=request_body,
-            )
-
-            # POST and get response
-            response = flask_client.post(onion_req.ROUTE_OXEN_V4_LSRPC, data=onion_request)
-            onion_response = onion_req.make_response_v4(shared_key=shared_key, encrypted_response=response.data)
-            assert onion_response.success
-
-            # Parse the JSON from the response
-            response_json = json.loads(onion_response.body)
-            assert isinstance(response_json, dict), f'Response {onion_response.body!r}'
-
-            # Parse status from response
-            assert response_json['status'] == 'ok', f'Response was: {json.dumps(response_json, indent=2)}'
-            assert 'error' not in response_json, f'Response was: {json.dumps(response_json, indent=2)}'
-
-            # Parse result object is at root
-            assert 'result' in response_json, f'Response was: {json.dumps(response_json, indent=2)}'
-            result_json = response_json['result']
-
-            # Extract the fields
-            result_items = base.json_dict_require_array(d=result_json, key='items', err=err)
-            result_ticket = base.json_dict_require_int(d=result_json, key='ticket', err=err)
-            result_retry_in = base.json_dict_require_int(d=result_json, key='retry_in', err=err)
-            assert not err.msg_list, '{err.msg_list}'
-            assert result_ticket == 0
-            assert result_retry_in == base.SECONDS_IN_DAY
-            curr_revocation_ticket = result_ticket
-
-            # Check that the server returned an empty revocation list, we no longer revoke the old
-            # payment but we _do_ increment the user's generation index
-            assert not result_items
-
-            # Flask did some writes using an independent connection so those writes are made visible by
-            # refreshing the connection and updating the "snapshot" that the following code sees.
-            db_conn = db_engine.getconn()
-
-            # Capture the user's current generation. The manual revoke below targets only the shorter
-            # (30-day) payment while the original (~90-day) payment survives, so item 4 must SKIP the
-            # revocation entirely: the surviving entitlement still covers everything any outstanding proof
-            # can certify (≤ 30 days of reach), so the generation must NOT roll and nothing must land on
-            # the (network-costly) revocation list.
-            with db.transaction(db_conn) as tx:
-                get_user = backend.get_user_and_payments(tx, master_key.verify_key)
-                assert len(get_user.user.token) == backend.BLAKE2B_DIGEST_SIZE
-            kept_generation_token: bytes = get_user.user.token
-            kept_generation_id: int = get_user.user.current_generation_id
-
-            # We will now manually revoke the shorter payment and check the revocation list again
-            with db.transaction(db_conn) as tx:
-                revoked = backend.add_google_revocation(
-                    tx,
-                    google_payment_token=new_add_pro_payment_tx.google_payment_token,
-                    revoke_at=base.datetime_from_unix_ms(unix_ts_ms),
-                    err=err,
-                )
-                assert revoked
-                assert not err.has()
-
-            if 1:  # Get the revocation list, again
-                request_body = {'ticket': curr_revocation_ticket}
-                onion_request = onion_req.make_request_v4(
-                    our_x25519_pkey=our_x25519_skey.public_key,
-                    shared_key=shared_key,
-                    endpoint=server.FLASK_ROUTE_GET_PRO_REVOCATIONS,
-                    request_body=request_body,
-                )
-
-                # POST and get response
-                response = flask_client.post(onion_req.ROUTE_OXEN_V4_LSRPC, data=onion_request)
-                onion_response = onion_req.make_response_v4(shared_key=shared_key, encrypted_response=response.data)
-                assert onion_response.success
-
-                # Parse the JSON from the response
-                response_json = json.loads(onion_response.body)
-                assert isinstance(response_json, dict), f'Response {onion_response.body!r}'
-
-                # Parse status from response
-                assert response_json['status'] == 'ok', f'Response was: {json.dumps(response_json, indent=2)}'
-                assert 'error' not in response_json, f'Response was: {json.dumps(response_json, indent=2)}'
-
-                # Parse result object is at root
-                assert 'result' in response_json, f'Response was: {json.dumps(response_json, indent=2)}'
-                result_json = response_json['result']
-
-                # Extract the fields
-                result_items = base.json_dict_require_array(d=result_json, key='items', err=err)
-                result_ticket = base.json_dict_require_int(d=result_json, key='ticket', err=err)
-                result_retry_in = base.json_dict_require_int(d=result_json, key='retry_in', err=err)
-                result_retain_for = base.json_dict_require_int(d=result_json, key='retain_for', err=err)
-                assert not err.msg_list, '{err.msg_list}'
-                # Item 4: the non-cutting refund produced NO revocation entry, so the ticket is unchanged.
-                assert result_ticket == 0
-                assert result_retry_in == base.SECONDS_IN_DAY
-                assert result_retain_for == base.SECONDS_IN_MONTH
-                curr_revocation_ticket = result_ticket
-                assert not result_items
-
-                # The generation must be UNCHANGED and still LIVE: no roll happened, and the current
-                # generation is NOT on the revocation list (the surviving payment keeps it honest).
-                with db.transaction(db_conn) as tx:
-                    get_user = backend.get_user_and_payments(tx, master_key.verify_key)
-                    now_dt = base.datetime_from_unix_ms(unix_ts_ms)
-                    assert get_user.user.current_generation_id == kept_generation_id
-                    assert get_user.user.token == kept_generation_token
-                    assert not backend.is_generation_revoked(tx.conn, get_user.user.current_generation_id, now_dt)
-
-            assert not err.has()
-
-        # Try grabbing the revocation again with the current ticket (we should get
-        # an empty list because we passed in the most up to date ticket)
-        if 1:
-            onion_request = onion_req.make_request_v4(
-                our_x25519_pkey=our_x25519_skey.public_key,
-                shared_key=shared_key,
-                endpoint=server.FLASK_ROUTE_GET_PRO_REVOCATIONS,
-                request_body={'ticket': curr_revocation_ticket},
-            )
-
-            # POST and get response
-            response = flask_client.post(onion_req.ROUTE_OXEN_V4_LSRPC, data=onion_request)
-            onion_response = onion_req.make_response_v4(shared_key=shared_key, encrypted_response=response.data)
-            assert onion_response.success
-
-            # Parse the JSON from the response
-            response_json = json.loads(onion_response.body)
-            assert isinstance(response_json, dict), f'Response {onion_response.body!r}'
-
-            # Parse status from response
-            assert response_json['status'] == 'ok', f'Response was: {json.dumps(response_json, indent=2)}'
-            assert 'error' not in response_json, f'Response was: {json.dumps(response_json, indent=2)}'
-
-            # Parse result object is at root
-            assert 'result' in response_json, f'Response was: {json.dumps(response_json, indent=2)}'
-            result_json = response_json['result']
-
-            # Extract the fields
-            result_items = base.json_dict_require_array(d=result_json, key='items', err=err)
-            result_ticket = base.json_dict_require_int(d=result_json, key='ticket', err=err)
-            result_retry_in = base.json_dict_require_int(d=result_json, key='retry_in', err=err)
-            result_retain_for = base.json_dict_require_int(d=result_json, key='retain_for', err=err)
-            assert not err.msg_list, '{err.msg_list}'
-            # Item 4: the non-cutting refund above created no revocation entry, so the ticket is still 0.
-            assert result_ticket == 0, f'Response was: {json.dumps(response_json, indent=2)}'
-            assert result_retry_in == base.SECONDS_IN_DAY
-            assert result_retain_for == base.SECONDS_IN_MONTH
-
-            # List should be empty because we passed in the newest revocation
-            # ticket. There are no changes to the revocation list so the backend
-            # will return an empty list
-            assert not result_items, f'Response was: {json.dumps(response_json, indent=2)}'
-
-        # Get the pro status now w/ a bunch of payments
-        if 1:
-            unix_ts_ms = int(time.time() * 1000)
-            hash_to_sign = backend.make_get_pro_status_message(
-                master_pkey=master_key.verify_key, request_at=base.datetime_from_unix_seconds(unix_ts_ms // 1000)
-            )
-
-            request_body = {
-                'master_pkey': bytes(master_key.verify_key).hex(),
-                'master_sig': bytes(master_key.sign(hash_to_sign).signature).hex(),
-                'ts': unix_ts_ms // 1000,
-            }
-
-            onion_request = onion_req.make_request_v4(
-                our_x25519_pkey=our_x25519_skey.public_key,
-                shared_key=shared_key,
-                endpoint=server.FLASK_ROUTE_GET_PRO_STATUS,
-                request_body=request_body,
-            )
-
-            # POST and get response
-            response = flask_client.post(onion_req.ROUTE_OXEN_V4_LSRPC, data=onion_request)
-            onion_response = onion_req.make_response_v4(shared_key=shared_key, encrypted_response=response.data)
-            assert onion_response.success
-
-            # Parse the JSON from the response
-            response_json = json.loads(onion_response.body)
-            assert isinstance(response_json, dict), f'Response {onion_response.body!r}'
-
-            # Parse status from response
-            assert response_json['status'] == 'ok', f'Response was: {json.dumps(response_json, indent=2)}'
-            assert 'error' not in response_json, f'Response was: {json.dumps(response_json, indent=2)}'
-
-            # Parse result object is at root
-            assert 'result' in response_json, f'Response was: {json.dumps(response_json, indent=2)}'
-            result_json = response_json['result']
-
-            # Extract the fields — status endpoint carries user_status + the single latest payment.
-            result_latest = result_json.get('latest_payment')
-            result_status = base.json_dict_require_str(d=result_json, key='user_status', err=err)
-            assert not err.msg_list, '{err.msg_list}'
-            assert (
-                result_status == server.UserProStatus.Active.value
-            ), f'Response was: {json.dumps(response_json, indent=2)}'
-            assert result_latest is not None, f'Response was: {json.dumps(response_json, indent=2)}'
-
-            # Retry the request but use a too old timestamp
-            if 1:
-                unix_ts_ms = int((time.time() + base.DEFAULT_TIMESTAMP_TOLERANCE.total_seconds() * 2) * 1000)
-                hash_to_sign = backend.make_get_pro_status_message(
-                    master_pkey=master_key.verify_key, request_at=base.datetime_from_unix_seconds(unix_ts_ms // 1000)
-                )
-                onion_request = onion_req.make_request_v4(
-                    our_x25519_pkey=our_x25519_skey.public_key,
-                    shared_key=shared_key,
-                    endpoint=server.FLASK_ROUTE_GET_PRO_STATUS,
-                    request_body={
-                        'master_pkey': bytes(master_key.verify_key).hex(),
-                        'master_sig': bytes(master_key.sign(hash_to_sign).signature).hex(),
-                        'ts': unix_ts_ms // 1000,
-                    },
-                )
-
-                # POST and get response
-                response = flask_client.post(onion_req.ROUTE_OXEN_V4_LSRPC, data=onion_request)
-                onion_response = onion_req.make_response_v4(shared_key=shared_key, encrypted_response=response.data)
-                assert onion_response.success
-
-                # Parse the JSON from the response
-                response_json = json.loads(onion_response.body)
-                assert isinstance(response_json, dict), f'Response {onion_response.body!r}'
-
-                # Parse status from response
-                assert response_json['status'] == 'fail', f'Response was: {json.dumps(response_json, indent=2)}'
-                assert len(response_json['error']) > 0, f'Response was: {json.dumps(response_json, indent=2)}'
-                assert 'result' not in response_json, f'Response was: {json.dumps(response_json, indent=2)}'
-
-            # Retry the request but create a hash with the rotating key
-            if 1:
-                unix_ts_ms = int(time.time() * 1000)
-                hash_to_sign = backend.make_get_pro_status_message(
-                    master_pkey=rotating_key.verify_key, request_at=base.datetime_from_unix_seconds(unix_ts_ms // 1000)
-                )
-                onion_request = onion_req.make_request_v4(
-                    our_x25519_pkey=our_x25519_skey.public_key,
-                    shared_key=shared_key,
-                    endpoint=server.FLASK_ROUTE_GET_PRO_STATUS,
-                    request_body={
-                        'master_pkey': bytes(master_key.verify_key).hex(),
-                        'master_sig': bytes(master_key.sign(hash_to_sign).signature).hex(),
-                        'ts': unix_ts_ms // 1000,
-                    },
-                )
-
-                # POST and get response
-                response = flask_client.post(onion_req.ROUTE_OXEN_V4_LSRPC, data=onion_request)
-                onion_response = onion_req.make_response_v4(shared_key=shared_key, encrypted_response=response.data)
-                assert onion_response.success
-
-                # Parse the JSON from the response
-                response_json = json.loads(onion_response.body)
-                assert isinstance(response_json, dict), f'Response {onion_response.body!r}'
-
-                # Parse status from response
-                assert response_json['status'] == 'fail', f'Response was: {json.dumps(response_json, indent=2)}'
-                assert len(response_json['error']) > 0, f'Response was: {json.dumps(response_json, indent=2)}'
-                assert 'result' not in response_json, f'Response was: {json.dumps(response_json, indent=2)}'
-
-            # Page the full payment history via the dedicated get-payment-details endpoint (keyset cursor,
-            # newest-first). The user has 2 redeemed payments; walk them one page at a time.
-            if 1:
-
-                def get_payment_details_page(limit: int, before: str) -> dict:
-                    unix_ts_ms = int(time.time() * 1000)
-                    hash_to_sign = backend.make_get_payment_details_message(
-                        master_pkey=master_key.verify_key,
-                        request_at=base.datetime_from_unix_seconds(unix_ts_ms // 1000),
-                        limit=limit,
-                        before=before,
-                    )
-                    onion_request = onion_req.make_request_v4(
-                        our_x25519_pkey=our_x25519_skey.public_key,
-                        shared_key=shared_key,
-                        endpoint=server.FLASK_ROUTE_GET_PAYMENT_DETAILS,
-                        request_body={
-                            'master_pkey': bytes(master_key.verify_key).hex(),
-                            'master_sig': bytes(master_key.sign(hash_to_sign).signature).hex(),
-                            'ts': unix_ts_ms // 1000,
-                            'limit': limit,
-                            'before': before,
-                        },
-                    )
-                    response = flask_client.post(onion_req.ROUTE_OXEN_V4_LSRPC, data=onion_request)
-                    onion_response = onion_req.make_response_v4(shared_key=shared_key, encrypted_response=response.data)
-                    assert onion_response.success
-                    body = json.loads(onion_response.body)
-                    assert isinstance(body, dict) and body['status'] == 'ok', f'Response {onion_response.body!r}'
-                    return body['result']
-
-                # Page 1 (newest): one item, a cursor for more, total is 2, and NO account status here
-                # (that lives on get_pro_status now).
-                page1 = get_payment_details_page(limit=1, before='')
-                assert 'user_status' not in page1, page1
-                assert base.json_dict_require_int(d=page1, key='payments_total', err=err) == 2
-                page1_items = base.json_dict_require_array(d=page1, key='items', err=err)
-                assert len(page1_items) == 1, page1
-                cursor1 = page1.get('next_cursor')
-                assert isinstance(cursor1, str) and cursor1, page1
-
-                # Page 2 (older): the second, distinct payment.
-                page2 = get_payment_details_page(limit=1, before=cursor1)
-                page2_items = base.json_dict_require_array(d=page2, key='items', err=err)
-                assert not err.msg_list, err.msg_list
-                assert len(page2_items) == 1, page2
-                assert isinstance(page1_items[0], dict) and isinstance(page2_items[0], dict)
-                assert page1_items[0]['payment_id'] != page2_items[0]['payment_id'], (page1_items, page2_items)
-
-                # Page 3: past the end → empty, no further cursor.
-                page3 = get_payment_details_page(limit=1, before=(page2.get('next_cursor') or ''))
-                assert not base.json_dict_require_array(d=page3, key='items', err=err), page3
-                assert page3.get('next_cursor') is None, page3
-
-                # A garbage cursor is rejected (invalid_request) — never silently treated as page 1.
-                bad_ts = int(time.time() * 1000)
-                bad_hash = backend.make_get_payment_details_message(
-                    master_pkey=master_key.verify_key,
-                    request_at=base.datetime_from_unix_seconds(bad_ts // 1000),
-                    limit=1,
-                    before='deadbeef',
-                )
-                bad_onion = onion_req.make_request_v4(
-                    our_x25519_pkey=our_x25519_skey.public_key,
-                    shared_key=shared_key,
-                    endpoint=server.FLASK_ROUTE_GET_PAYMENT_DETAILS,
-                    request_body={
-                        'master_pkey': bytes(master_key.verify_key).hex(),
-                        'master_sig': bytes(master_key.sign(bad_hash).signature).hex(),
-                        'ts': bad_ts // 1000,
-                        'limit': 1,
-                        'before': 'deadbeef',
-                    },
-                )
-                bad_response = flask_client.post(onion_req.ROUTE_OXEN_V4_LSRPC, data=bad_onion)
-                bad_onion_response = onion_req.make_response_v4(
-                    shared_key=shared_key, encrypted_response=bad_response.data
-                )
-                assert bad_onion_response.success
-                bad_body = json.loads(bad_onion_response.body)
-                assert isinstance(bad_body, dict) and bad_body['status'] == 'fail', bad_body
-
-        # NOTE: Add a grace period to the payment and check that we can still generate proofs in said
-        # grace period
-        if 1:
-            # NOTE: Verify that there is no grace period set first
-            with db.transaction(db_conn) as tx:
-                get_user = backend.get_user_and_payments(tx, master_key.verify_key)
-                assert get_user.user.grace_period == datetime.timedelta(0)
-
-            # NOTE: Grab the latest expiring payment so that we have access to the payment details
-            last_payment = backend.PaymentRow()
-            for payment_it in backend.get_payments_list(db_conn):
-                if payment_it.expires_at > last_payment.expires_at:
-                    last_payment = payment_it
-
-            # NOTE: Add a grace period
-            payment_tx = base.PaymentProviderTransaction()
-            payment_tx.provider = last_payment.payment_provider
-            payment_tx.apple_original_tx_id = last_payment.apple.original_tx_id
-            payment_tx.apple_tx_id = last_payment.apple.tx_id
-            payment_tx.apple_web_line_order_tx_id = last_payment.apple.web_line_order_tx_id
-            payment_tx.google_payment_token = last_payment.google_payment_token
-            payment_tx.google_order_id = last_payment.google_order_id
-            backend.update_payment_renewal_info(
-                db_conn, payment_tx, grace_period=base.timedelta_from_ms(10 * 1000), auto_renewing=True, err=err
-            )
-            assert not err.has()
-
-            # NOTE: Verify that the grace period is set and calculate the pro-proof deadline
-            pro_proof_deadline_unix_ts_ms = 0
-            with db.transaction(db_conn) as tx:
-                get_user = backend.get_user_and_payments(tx, master_key.verify_key)
-                assert get_user.user.grace_period > datetime.timedelta(0)
-                pro_proof_deadline_unix_ts_ms = base.unix_ms_from_datetime(get_user.user.expires_at)
-
-            # NOTE: Try to generate a proof on the deadline timestamp (which includes grace), should be permitted
-            unix_ts_ms = pro_proof_deadline_unix_ts_ms
-            hash_to_sign = backend.make_generate_pro_proof_message(
-                master_pkey=master_key.verify_key,
-                rotating_pkey=rotating_key.verify_key,
-                request_at=base.datetime_from_unix_ms(unix_ts_ms),
-            )
-
-            proof = backend.generate_pro_proof(
-                conn=db_conn,
-                signing_key=backend_key,
-                master_pkey=master_key.verify_key,
-                rotating_pkey=rotating_key.verify_key,
-                request_at=base.datetime_from_unix_ms(unix_ts_ms),
-                master_sig=bytes(master_key.sign(hash_to_sign).signature),
-                rotating_sig=bytes(rotating_key.sign(hash_to_sign).signature),
-            )
-
-            # NOTE: Check that the proof verifies
-            proof_hash = backend.build_proof_message(proof.revocation_tag, proof.rotating_pkey, proof.expires_at)
-            backend_key.verify_key.verify(smessage=proof_hash, signature=proof.sig)
-
-            # NOTE: Generating a proof after the deadline must now fail — entitlement expired → FailError.
-            unix_ts_ms = pro_proof_deadline_unix_ts_ms + 1
-            hash_to_sign = backend.make_generate_pro_proof_message(
-                master_pkey=master_key.verify_key,
-                rotating_pkey=rotating_key.verify_key,
-                request_at=base.datetime_from_unix_ms(unix_ts_ms),
-            )
-
-            with pytest.raises(base.FailError) as exc_info:
-                backend.generate_pro_proof(
-                    conn=db_conn,
-                    signing_key=backend_key,
-                    master_pkey=master_key.verify_key,
-                    rotating_pkey=rotating_key.verify_key,
-                    request_at=base.datetime_from_unix_ms(unix_ts_ms),
-                    master_sig=bytes(master_key.sign(hash_to_sign).signature),
-                    rotating_sig=bytes(rotating_key.sign(hash_to_sign).signature),
-                )
-            assert exc_info.value.code == base.ErrorCode.subscription_expired
-
-        if 1:  # Revoke the original payment from the user (so we have ended up revoking everything)
-            with db.transaction(db_conn) as tx:
-                gen_before_final_revoke = backend.get_user_and_payments(
-                    tx, master_key.verify_key
-                ).user.current_generation_id
-                revoked = backend.add_google_revocation(
-                    tx,
-                    google_payment_token=payment_tx.google_payment_token,
-                    revoke_at=base.datetime_from_unix_ms(start_unix_ts_ms),
-                    err=err,
-                )
-            assert revoked
-            assert not err.has()
-
-            # Revoking the LAST valid payment must NOT roll onto a fresh generation — there's no remaining
-            # entitlement to roll onto, so the current generation stays put and is now terminally revoked
-            # (contrast the partial revoke above, which DID roll). This is the "shouldn't roll" case.
-            with db.transaction(db_conn) as tx:
-                get_user_after = backend.get_user_and_payments(tx, master_key.verify_key)
-                assert get_user_after.user.current_generation_id == gen_before_final_revoke
-                assert backend.is_generation_revoked(
-                    tx.conn, get_user_after.user.current_generation_id, base.datetime_from_unix_ms(start_unix_ts_ms)
-                )
-
-            # Try requesting a proof normally which should now fail as everything has been revoked
-            hash_to_sign = backend.make_generate_pro_proof_message(
-                master_pkey=master_key.verify_key,
-                rotating_pkey=rotating_key.verify_key,
-                request_at=base.datetime_from_unix_seconds(start_unix_ts_ms // 1000),
-            )
-
-            request_body = {
-                'master_pkey': bytes(master_key.verify_key).hex(),
-                'rotating_pkey': bytes(rotating_key.verify_key).hex(),
-                'ts': start_unix_ts_ms // 1000,
-                'master_sig': bytes(master_key.sign(hash_to_sign).signature).hex(),
-                'rotating_sig': bytes(rotating_key.sign(hash_to_sign).signature).hex(),
-            }
-
-            onion_request = onion_req.make_request_v4(
-                our_x25519_pkey=our_x25519_skey.public_key,
-                shared_key=shared_key,
-                endpoint=server.FLASK_ROUTE_GENERATE_PRO_PROOF,
-                request_body=request_body,
-            )
-
-            # POST and get response for pro proof
-            response = flask_client.post(onion_req.ROUTE_OXEN_V4_LSRPC, data=onion_request)
-            onion_response = onion_req.make_response_v4(shared_key=shared_key, encrypted_response=response.data)
-            assert onion_response.success
-
-            # Parse the JSON from the pro proof response
-            response_json = json.loads(onion_response.body)
-            assert isinstance(response_json, dict), f'Response {onion_response.body!r}'
-
-            # Parse status from the pro proof response
-            assert response_json['status'] == 'fail', f'Response was: {json.dumps(response_json, indent=2)}'
-            assert 'error' in response_json, f'Response was: {json.dumps(response_json, indent=2)}'
-
-        if 1:  # Initiate a "refund" request on the payment
-
-            throwaway_id = os.urandom(16).hex()
-
-            # Create Apple payment, only apple payments can set refund requested
-            apple_payment_tx = base.PaymentProviderTransaction()
-            apple_payment_tx.provider = base.PaymentProvider.iOSAppStore
-            apple_payment_tx.apple_original_tx_id = throwaway_id
-            apple_payment_tx.apple_tx_id = throwaway_id
-            apple_payment_tx.apple_web_line_order_tx_id = throwaway_id
-
-            apple_tx = backend.UserPaymentTransaction()
-            apple_tx.provider = base.PaymentProvider.iOSAppStore
-            apple_tx.apple_tx_id = throwaway_id
-            apple_tx.payment_id = backend.payment_id_from_user_tx(apple_tx)
-            backend.add_unredeemed_payment(
-                db_conn,
-                payment_tx=apple_payment_tx,
-                plan=base.ProPlan.OneMonth,
-                purchased_at=base.datetime_from_unix_ms(unix_ts_ms),
-                expires_at=base.datetime_from_unix_ms(unix_ts_ms) + datetime.timedelta(days=30),
-                platform_refund_expires_at=base.EPOCH,
-                platform_obfuscated_account_id='',
-                err=err,
-            )
-
-            # Register the payment
-            payment_hash_to_sign = backend.make_add_pro_payment_message(
-                master_pkey=master_key.verify_key, rotating_pkey=rotating_key.verify_key, payment_tx=apple_tx
-            )
-
-            onion_request = onion_req.make_request_v4(
-                our_x25519_pkey=our_x25519_skey.public_key,
-                shared_key=shared_key,
-                endpoint=server.FLASK_ROUTE_ADD_PRO_PAYMENT,
-                request_body={
-                    'master_pkey': bytes(master_key.verify_key).hex(),
-                    'rotating_pkey': bytes(rotating_key.verify_key).hex(),
-                    'master_sig': bytes(master_key.sign(payment_hash_to_sign).signature).hex(),
-                    'rotating_sig': bytes(rotating_key.sign(payment_hash_to_sign).signature).hex(),
-                    'payment_tx': {
-                        'provider': base.PaymentProvider.iOSAppStore.value,
-                        'payment_id': apple_tx.payment_id,
-                    },
-                },
-            )
-            response = flask_client.post(onion_req.ROUTE_OXEN_V4_LSRPC, data=onion_request)
-
-            # Set refunded
-            hash_to_sign = backend.make_set_payment_refund_requested_message(
-                master_pkey=master_key.verify_key,
-                request_at=base.datetime_from_unix_seconds(start_unix_ts_ms // 1000),
-                refund_requested_at=base.datetime_from_unix_seconds(start_unix_ts_ms // 1000),
-                payment_tx=apple_tx,
-            )
-
-            request_body = {
-                'master_pkey': bytes(master_key.verify_key).hex(),
-                'master_sig': bytes(master_key.sign(hash_to_sign).signature).hex(),
-                'ts': start_unix_ts_ms // 1000,
-                'refund_requested_ts': start_unix_ts_ms // 1000,
-                'payment_tx': {'provider': base.PaymentProvider.iOSAppStore.value, 'payment_id': apple_tx.payment_id},
-            }
-
-            onion_request = onion_req.make_request_v4(
-                our_x25519_pkey=our_x25519_skey.public_key,
-                shared_key=shared_key,
-                endpoint=server.FLASK_ROUTE_SET_PAYMENT_REFUND_REQUESTED,
-                request_body=request_body,
-            )
-
-            # POST and get response for refund request
-            response = flask_client.post(onion_req.ROUTE_OXEN_V4_LSRPC, data=onion_request)
-            onion_response = onion_req.make_response_v4(shared_key=shared_key, encrypted_response=response.data)
-            assert onion_response.success
-
-            # Parse the JSON refund request
-            response_json = json.loads(onion_response.body)
-            assert isinstance(response_json, dict), f'Response {onion_response.body!r}'
-
-            # Parse fields in the JSON
-            assert (
-                'error' not in response_json
-            ), f'Request was: {json.dumps(request_body, indent=2)}\nResponse was: {json.dumps(response_json, indent=2)}'
-            assert response_json['status'] == 'ok', f'Response was: {json.dumps(response_json, indent=2)}'
-            assert response_json['result']['updated'], f'Response was: {json.dumps(response_json, indent=2)}'
-
-        if 1:  # Initiate a "refund" on a non-existing payment
-
-            fake_payment = backend.UserPaymentTransaction()
-            fake_payment.provider = base.PaymentProvider.GooglePlayStore
-            fake_payment.google_payment_token = 'non-existent-payment-token-to-trigger-fail-response'
-            fake_payment.google_order_id = 'non-existent-order-id-to-trigger-fail-response'
-            fake_payment.payment_id = backend.payment_id_from_user_tx(fake_payment)
-
-            hash_to_sign = backend.make_set_payment_refund_requested_message(
-                master_pkey=master_key.verify_key,
-                request_at=base.datetime_from_unix_seconds(start_unix_ts_ms // 1000),
-                refund_requested_at=base.datetime_from_unix_seconds(start_unix_ts_ms // 1000),
-                payment_tx=fake_payment,
-            )
-
-            request_body = {
-                'master_pkey': bytes(master_key.verify_key).hex(),
-                'master_sig': bytes(master_key.sign(hash_to_sign).signature).hex(),
-                'payment_tx': {'provider': fake_payment.provider.value, 'payment_id': fake_payment.payment_id},
-                'ts': start_unix_ts_ms // 1000,
-                'refund_requested_ts': start_unix_ts_ms // 1000,
-            }
-
-            onion_request = onion_req.make_request_v4(
-                our_x25519_pkey=our_x25519_skey.public_key,
-                shared_key=shared_key,
-                endpoint=server.FLASK_ROUTE_SET_PAYMENT_REFUND_REQUESTED,
-                request_body=request_body,
-            )
-
-            # POST and get response for refund request
-            response = flask_client.post(onion_req.ROUTE_OXEN_V4_LSRPC, data=onion_request)
-            onion_response = onion_req.make_response_v4(shared_key=shared_key, encrypted_response=response.data)
-            assert onion_response.success
-
-            # Parse the JSON refund request
-            response_json = json.loads(onion_response.body)
-            assert isinstance(response_json, dict), f'Response {onion_response.body!r}'
-
-            # Parse fields in the JSON, we expect it to fail
-            assert 'error' in response_json, f'Response was: {json.dumps(response_json, indent=2)}'
+                'limit': limit,
+                'before': before,
+            },
+        )
+        response = flask_client.post(onion_req.ROUTE_OXEN_V4_LSRPC, data=onion_request)
+        onion_response = onion_req.make_response_v4(shared_key=shared_key, encrypted_response=response.data)
+        assert onion_response.success
+        body = json.loads(onion_response.body)
+        assert isinstance(body, dict) and body['status'] == 'ok', f'Response {onion_response.body!r}'
+        return body['result']
+
+    # Page 1 (newest): one item, a cursor for more, total is 2, and NO account status here
+    # (that lives on get_pro_status now).
+    page1 = get_payment_details_page(limit=1, before='')
+    assert 'user_status' not in page1, page1
+    assert base.json_dict_require_int(d=page1, key='payments_total', err=err) == 2
+    page1_items = base.json_dict_require_array(d=page1, key='items', err=err)
+    assert len(page1_items) == 1, page1
+    cursor1 = page1.get('next_cursor')
+    assert isinstance(cursor1, str) and cursor1, page1
+
+    # Page 2 (older): the second, distinct payment.
+    page2 = get_payment_details_page(limit=1, before=cursor1)
+    page2_items = base.json_dict_require_array(d=page2, key='items', err=err)
+    assert not err.msg_list, err.msg_list
+    assert len(page2_items) == 1, page2
+    assert isinstance(page1_items[0], dict) and isinstance(page2_items[0], dict)
+    assert page1_items[0]['payment_id'] != page2_items[0]['payment_id'], (page1_items, page2_items)
+
+    # Page 3: past the end → empty, no further cursor.
+    page3 = get_payment_details_page(limit=1, before=(page2.get('next_cursor') or ''))
+    assert not base.json_dict_require_array(d=page3, key='items', err=err), page3
+    assert page3.get('next_cursor') is None, page3
+
+    # A garbage cursor is rejected (invalid_request) — never silently treated as page 1.
+    bad_ts = int(time.time() * 1000)
+    bad_hash = backend.make_get_payment_details_message(
+        master_pkey=master_key.verify_key,
+        request_at=base.datetime_from_unix_seconds(bad_ts // 1000),
+        limit=1,
+        before='deadbeef',
+    )
+    bad_onion = onion_req.make_request_v4(
+        our_x25519_pkey=our_x25519_skey.public_key,
+        shared_key=shared_key,
+        endpoint=server.FLASK_ROUTE_GET_PAYMENT_DETAILS,
+        request_body={
+            'master_pkey': bytes(master_key.verify_key).hex(),
+            'master_sig': bytes(master_key.sign(bad_hash).signature).hex(),
+            'ts': bad_ts // 1000,
+            'limit': 1,
+            'before': 'deadbeef',
+        },
+    )
+    bad_response = flask_client.post(onion_req.ROUTE_OXEN_V4_LSRPC, data=bad_onion)
+    bad_onion_response = onion_req.make_response_v4(shared_key=shared_key, encrypted_response=bad_response.data)
+    assert bad_onion_response.success
+    bad_body = json.loads(bad_onion_response.body)
+    assert isinstance(bad_body, dict) and bad_body['status'] == 'fail', bad_body
+
+    # NOTE: Add a grace period to the payment and check that we can still generate proofs in said
+    # grace period
+    # NOTE: Verify that there is no grace period set first
+    with db.transaction(db_conn) as tx:
+        get_user = backend.get_user_and_payments(tx, master_key.verify_key)
+        assert get_user.user.grace_period == datetime.timedelta(0)
+
+    # NOTE: Grab the latest expiring payment so that we have access to the payment details
+    last_payment = backend.PaymentRow()
+    for payment_it in backend.get_payments_list(db_conn):
+        if payment_it.expires_at > last_payment.expires_at:
+            last_payment = payment_it
+
+    # NOTE: Add a grace period
+    payment_tx = base.PaymentProviderTransaction()
+    payment_tx.provider = last_payment.payment_provider
+    payment_tx.apple_original_tx_id = last_payment.apple.original_tx_id
+    payment_tx.apple_tx_id = last_payment.apple.tx_id
+    payment_tx.apple_web_line_order_tx_id = last_payment.apple.web_line_order_tx_id
+    payment_tx.google_payment_token = last_payment.google_payment_token
+    payment_tx.google_order_id = last_payment.google_order_id
+    backend.update_payment_renewal_info(
+        db_conn, payment_tx, grace_period=base.timedelta_from_ms(10 * 1000), auto_renewing=True, err=err
+    )
+    assert not err.has()
+
+    # NOTE: Verify that the grace period is set and calculate the pro-proof deadline
+    pro_proof_deadline_unix_ts_ms = 0
+    with db.transaction(db_conn) as tx:
+        get_user = backend.get_user_and_payments(tx, master_key.verify_key)
+        assert get_user.user.grace_period > datetime.timedelta(0)
+        pro_proof_deadline_unix_ts_ms = base.unix_ms_from_datetime(get_user.user.expires_at)
+
+    # NOTE: Try to generate a proof on the deadline timestamp (which includes grace), should be permitted
+    unix_ts_ms = pro_proof_deadline_unix_ts_ms
+    hash_to_sign = backend.make_generate_pro_proof_message(
+        master_pkey=master_key.verify_key,
+        rotating_pkey=rotating_key.verify_key,
+        request_at=base.datetime_from_unix_ms(unix_ts_ms),
+    )
+
+    proof = backend.generate_pro_proof(
+        conn=db_conn,
+        signing_key=backend_key,
+        master_pkey=master_key.verify_key,
+        rotating_pkey=rotating_key.verify_key,
+        request_at=base.datetime_from_unix_ms(unix_ts_ms),
+        master_sig=bytes(master_key.sign(hash_to_sign).signature),
+        rotating_sig=bytes(rotating_key.sign(hash_to_sign).signature),
+    )
+
+    # NOTE: Check that the proof verifies
+    proof_hash = backend.build_proof_message(proof.revocation_tag, proof.rotating_pkey, proof.expires_at)
+    backend_key.verify_key.verify(smessage=proof_hash, signature=proof.sig)
+
+    # NOTE: Generating a proof after the deadline must now fail — entitlement expired → FailError.
+    unix_ts_ms = pro_proof_deadline_unix_ts_ms + 1
+    hash_to_sign = backend.make_generate_pro_proof_message(
+        master_pkey=master_key.verify_key,
+        rotating_pkey=rotating_key.verify_key,
+        request_at=base.datetime_from_unix_ms(unix_ts_ms),
+    )
+
+    with pytest.raises(base.FailError) as exc_info:
+        backend.generate_pro_proof(
+            conn=db_conn,
+            signing_key=backend_key,
+            master_pkey=master_key.verify_key,
+            rotating_pkey=rotating_key.verify_key,
+            request_at=base.datetime_from_unix_ms(unix_ts_ms),
+            master_sig=bytes(master_key.sign(hash_to_sign).signature),
+            rotating_sig=bytes(rotating_key.sign(hash_to_sign).signature),
+        )
+    assert exc_info.value.code == base.ErrorCode.subscription_expired
+
+    # Revoke the original payment from the user (so we have ended up revoking everything)
+    with db.transaction(db_conn) as tx:
+        gen_before_final_revoke = backend.get_user_and_payments(tx, master_key.verify_key).user.current_generation_id
+        revoked = backend.add_google_revocation(
+            tx,
+            google_payment_token=payment_tx.google_payment_token,
+            revoke_at=base.datetime_from_unix_ms(start_unix_ts_ms),
+            err=err,
+        )
+    assert revoked
+    assert not err.has()
+
+    # Revoking the LAST valid payment must NOT roll onto a fresh generation — there's no remaining
+    # entitlement to roll onto, so the current generation stays put and is now terminally revoked
+    # (contrast the partial revoke above, which DID roll). This is the "shouldn't roll" case.
+    with db.transaction(db_conn) as tx:
+        get_user_after = backend.get_user_and_payments(tx, master_key.verify_key)
+        assert get_user_after.user.current_generation_id == gen_before_final_revoke
+        assert backend.is_generation_revoked(
+            tx.conn, get_user_after.user.current_generation_id, base.datetime_from_unix_ms(start_unix_ts_ms)
+        )
+
+    # Try requesting a proof normally which should now fail as everything has been revoked
+    hash_to_sign = backend.make_generate_pro_proof_message(
+        master_pkey=master_key.verify_key,
+        rotating_pkey=rotating_key.verify_key,
+        request_at=base.datetime_from_unix_seconds(start_unix_ts_ms // 1000),
+    )
+
+    request_body = {
+        'master_pkey': bytes(master_key.verify_key).hex(),
+        'rotating_pkey': bytes(rotating_key.verify_key).hex(),
+        'ts': start_unix_ts_ms // 1000,
+        'master_sig': bytes(master_key.sign(hash_to_sign).signature).hex(),
+        'rotating_sig': bytes(rotating_key.sign(hash_to_sign).signature).hex(),
+    }
+
+    onion_request = onion_req.make_request_v4(
+        our_x25519_pkey=our_x25519_skey.public_key,
+        shared_key=shared_key,
+        endpoint=server.FLASK_ROUTE_GENERATE_PRO_PROOF,
+        request_body=request_body,
+    )
+
+    # POST and get response for pro proof
+    response = flask_client.post(onion_req.ROUTE_OXEN_V4_LSRPC, data=onion_request)
+    onion_response = onion_req.make_response_v4(shared_key=shared_key, encrypted_response=response.data)
+    assert onion_response.success
+
+    # Parse the JSON from the pro proof response
+    response_json = json.loads(onion_response.body)
+    assert isinstance(response_json, dict), f'Response {onion_response.body!r}'
+
+    # Parse status from the pro proof response
+    assert response_json['status'] == 'fail', f'Response was: {json.dumps(response_json, indent=2)}'
+    assert 'error' in response_json, f'Response was: {json.dumps(response_json, indent=2)}'
+
+    # Initiate a "refund" request on the payment
+
+    throwaway_id = os.urandom(16).hex()
+
+    # Create Apple payment, only apple payments can set refund requested
+    apple_payment_tx = base.PaymentProviderTransaction()
+    apple_payment_tx.provider = base.PaymentProvider.iOSAppStore
+    apple_payment_tx.apple_original_tx_id = throwaway_id
+    apple_payment_tx.apple_tx_id = throwaway_id
+    apple_payment_tx.apple_web_line_order_tx_id = throwaway_id
+
+    apple_tx = backend.UserPaymentTransaction()
+    apple_tx.provider = base.PaymentProvider.iOSAppStore
+    apple_tx.apple_tx_id = throwaway_id
+    apple_tx.payment_id = backend.payment_id_from_user_tx(apple_tx)
+    backend.add_unredeemed_payment(
+        db_conn,
+        payment_tx=apple_payment_tx,
+        plan=base.ProPlan.OneMonth,
+        purchased_at=base.datetime_from_unix_ms(unix_ts_ms),
+        expires_at=base.datetime_from_unix_ms(unix_ts_ms) + datetime.timedelta(days=30),
+        platform_refund_expires_at=base.EPOCH,
+        platform_obfuscated_account_id='',
+        err=err,
+    )
+
+    # Register the payment
+    payment_hash_to_sign = backend.make_add_pro_payment_message(
+        master_pkey=master_key.verify_key, rotating_pkey=rotating_key.verify_key, payment_tx=apple_tx
+    )
+
+    onion_request = onion_req.make_request_v4(
+        our_x25519_pkey=our_x25519_skey.public_key,
+        shared_key=shared_key,
+        endpoint=server.FLASK_ROUTE_ADD_PRO_PAYMENT,
+        request_body={
+            'master_pkey': bytes(master_key.verify_key).hex(),
+            'rotating_pkey': bytes(rotating_key.verify_key).hex(),
+            'master_sig': bytes(master_key.sign(payment_hash_to_sign).signature).hex(),
+            'rotating_sig': bytes(rotating_key.sign(payment_hash_to_sign).signature).hex(),
+            'payment_tx': {'provider': base.PaymentProvider.iOSAppStore.value, 'payment_id': apple_tx.payment_id},
+        },
+    )
+    response = flask_client.post(onion_req.ROUTE_OXEN_V4_LSRPC, data=onion_request)
+
+    # Set refunded
+    hash_to_sign = backend.make_set_payment_refund_requested_message(
+        master_pkey=master_key.verify_key,
+        request_at=base.datetime_from_unix_seconds(start_unix_ts_ms // 1000),
+        refund_requested_at=base.datetime_from_unix_seconds(start_unix_ts_ms // 1000),
+        payment_tx=apple_tx,
+    )
+
+    request_body = {
+        'master_pkey': bytes(master_key.verify_key).hex(),
+        'master_sig': bytes(master_key.sign(hash_to_sign).signature).hex(),
+        'ts': start_unix_ts_ms // 1000,
+        'refund_requested_ts': start_unix_ts_ms // 1000,
+        'payment_tx': {'provider': base.PaymentProvider.iOSAppStore.value, 'payment_id': apple_tx.payment_id},
+    }
+
+    onion_request = onion_req.make_request_v4(
+        our_x25519_pkey=our_x25519_skey.public_key,
+        shared_key=shared_key,
+        endpoint=server.FLASK_ROUTE_SET_PAYMENT_REFUND_REQUESTED,
+        request_body=request_body,
+    )
+
+    # POST and get response for refund request
+    response = flask_client.post(onion_req.ROUTE_OXEN_V4_LSRPC, data=onion_request)
+    onion_response = onion_req.make_response_v4(shared_key=shared_key, encrypted_response=response.data)
+    assert onion_response.success
+
+    # Parse the JSON refund request
+    response_json = json.loads(onion_response.body)
+    assert isinstance(response_json, dict), f'Response {onion_response.body!r}'
+
+    # Parse fields in the JSON
+    assert (
+        'error' not in response_json
+    ), f'Request was: {json.dumps(request_body, indent=2)}\nResponse was: {json.dumps(response_json, indent=2)}'
+    assert response_json['status'] == 'ok', f'Response was: {json.dumps(response_json, indent=2)}'
+    assert response_json['result']['updated'], f'Response was: {json.dumps(response_json, indent=2)}'
+
+    # Initiate a "refund" on a non-existing payment
+
+    fake_payment = backend.UserPaymentTransaction()
+    fake_payment.provider = base.PaymentProvider.GooglePlayStore
+    fake_payment.google_payment_token = 'non-existent-payment-token-to-trigger-fail-response'
+    fake_payment.google_order_id = 'non-existent-order-id-to-trigger-fail-response'
+    fake_payment.payment_id = backend.payment_id_from_user_tx(fake_payment)
+
+    hash_to_sign = backend.make_set_payment_refund_requested_message(
+        master_pkey=master_key.verify_key,
+        request_at=base.datetime_from_unix_seconds(start_unix_ts_ms // 1000),
+        refund_requested_at=base.datetime_from_unix_seconds(start_unix_ts_ms // 1000),
+        payment_tx=fake_payment,
+    )
+
+    request_body = {
+        'master_pkey': bytes(master_key.verify_key).hex(),
+        'master_sig': bytes(master_key.sign(hash_to_sign).signature).hex(),
+        'payment_tx': {'provider': fake_payment.provider.value, 'payment_id': fake_payment.payment_id},
+        'ts': start_unix_ts_ms // 1000,
+        'refund_requested_ts': start_unix_ts_ms // 1000,
+    }
+
+    onion_request = onion_req.make_request_v4(
+        our_x25519_pkey=our_x25519_skey.public_key,
+        shared_key=shared_key,
+        endpoint=server.FLASK_ROUTE_SET_PAYMENT_REFUND_REQUESTED,
+        request_body=request_body,
+    )
+
+    # POST and get response for refund request
+    response = flask_client.post(onion_req.ROUTE_OXEN_V4_LSRPC, data=onion_request)
+    onion_response = onion_req.make_response_v4(shared_key=shared_key, encrypted_response=response.data)
+    assert onion_response.success
+
+    # Parse the JSON refund request
+    response_json = json.loads(onion_response.body)
+    assert isinstance(response_json, dict), f'Response {onion_response.body!r}'
+
+    # Parse fields in the JSON, we expect it to fail
+    assert 'error' in response_json, f'Response was: {json.dumps(response_json, indent=2)}'
 
 
 def test_onion_request_response_lifecycle():
@@ -2624,409 +2597,409 @@ def test_platform_apple(pg_database):
     # This was done by executing these sequences in the time-frame that a subscription is active for
     # on Apple's sandbox environment.
     with TestingContext(pg_database) as test:
-        if 1:  # Subscribe notification
+        # Subscribe notification
 
-            # NOTE: Generated by dump_apple_signed_payloads
-            # NOTE: Signed Payload
-            body = AppleResponseBodyV2DecodedPayload()
-            body_data = AppleData()
-            body_data.appAppleId = 1470168868
-            body_data.bundleId = 'com.loki-project.loki-messenger'
-            body_data.bundleVersion = '637'
-            body_data.consumptionRequestReason = None
-            body_data.environment = AppleEnvironment.SANDBOX
-            body_data.rawConsumptionRequestReason = None
-            body_data.rawEnvironment = 'Sandbox'
-            body_data.rawStatus = 1
-            body_data.signedRenewalInfo = 'eyJhbGciOiJFUzI1NiIsIng1YyI6WyJNSUlFTVRDQ0E3YWdBd0lCQWdJUVI4S0h6ZG41NTRaL1VvcmFkTng5dHpBS0JnZ3Foa2pPUFFRREF6QjFNVVF3UWdZRFZRUURERHRCY0hCc1pTQlhiM0pzWkhkcFpHVWdSR1YyWld4dmNHVnlJRkpsYkdGMGFXOXVjeUJEWlhKMGFXWnBZMkYwYVc5dUlFRjFkR2h2Y21sMGVURUxNQWtHQTFVRUN3d0NSell4RXpBUkJnTlZCQW9NQ2tGd2NHeGxJRWx1WXk0eEN6QUpCZ05WQkFZVEFsVlRNQjRYRFRJMU1Ea3hPVEU1TkRRMU1Wb1hEVEkzTVRBeE16RTNORGN5TTFvd2daSXhRREErQmdOVkJBTU1OMUJ5YjJRZ1JVTkRJRTFoWXlCQmNIQWdVM1J2Y21VZ1lXNWtJR2xVZFc1bGN5QlRkRzl5WlNCU1pXTmxhWEIwSUZOcFoyNXBibWN4TERBcUJnTlZCQXNNSTBGd2NHeGxJRmR2Y214a2QybGtaU0JFWlhabGJHOXdaWElnVW1Wc1lYUnBiMjV6TVJNd0VRWURWUVFLREFwQmNIQnNaU0JKYm1NdU1Rc3dDUVlEVlFRR0V3SlZVekJaTUJNR0J5cUdTTTQ5QWdFR0NDcUdTTTQ5QXdFSEEwSUFCTm5WdmhjdjdpVCs3RXg1dEJNQmdyUXNwSHpJc1hSaTBZeGZlazdsdjh3RW1qL2JIaVd0TndKcWMyQm9IenNRaUVqUDdLRklJS2c0WTh5MC9ueW51QW1qZ2dJSU1JSUNCREFNQmdOVkhSTUJBZjhFQWpBQU1COEdBMVVkSXdRWU1CYUFGRDh2bENOUjAxREptaWc5N2JCODVjK2xrR0taTUhBR0NDc0dBUVVGQndFQkJHUXdZakF0QmdnckJnRUZCUWN3QW9ZaGFIUjBjRG92TDJObGNuUnpMbUZ3Y0d4bExtTnZiUzkzZDJSeVp6WXVaR1Z5TURFR0NDc0dBUVVGQnpBQmhpVm9kSFJ3T2k4dmIyTnpjQzVoY0hCc1pTNWpiMjB2YjJOemNEQXpMWGQzWkhKbk5qQXlNSUlCSGdZRFZSMGdCSUlCRlRDQ0FSRXdnZ0VOQmdvcWhraUc5Mk5rQlFZQk1JSCtNSUhEQmdnckJnRUZCUWNDQWpDQnRneUJzMUpsYkdsaGJtTmxJRzl1SUhSb2FYTWdZMlZ5ZEdsbWFXTmhkR1VnWW5rZ1lXNTVJSEJoY25SNUlHRnpjM1Z0WlhNZ1lXTmpaWEIwWVc1alpTQnZaaUIwYUdVZ2RHaGxiaUJoY0hCc2FXTmhZbXhsSUhOMFlXNWtZWEprSUhSbGNtMXpJR0Z1WkNCamIyNWthWFJwYjI1eklHOW1JSFZ6WlN3Z1kyVnlkR2xtYVdOaGRHVWdjRzlzYVdONUlHRnVaQ0JqWlhKMGFXWnBZMkYwYVc5dUlIQnlZV04wYVdObElITjBZWFJsYldWdWRITXVNRFlHQ0NzR0FRVUZCd0lCRmlwb2RIUndPaTh2ZDNkM0xtRndjR3hsTG1OdmJTOWpaWEowYVdacFkyRjBaV0YxZEdodmNtbDBlUzh3SFFZRFZSME9CQllFRklGaW9HNHdNTVZBMWt1OXpKbUdOUEFWbjNlcU1BNEdBMVVkRHdFQi93UUVBd0lIZ0RBUUJnb3Foa2lHOTJOa0Jnc0JCQUlGQURBS0JnZ3Foa2pPUFFRREF3TnBBREJtQWpFQStxWG5SRUM3aFhJV1ZMc0x4em5qUnBJelBmN1ZIejlWL0NUbTgrTEpsclFlcG5tY1B2R0xOY1g2WFBubGNnTEFBakVBNUlqTlpLZ2c1cFE3OWtuRjRJYlRYZEt2OHZ1dElETVhEbWpQVlQzZEd2RnRzR1J3WE95d1Iya1pDZFNyZmVvdCIsIk1JSURGakNDQXB5Z0F3SUJBZ0lVSXNHaFJ3cDBjMm52VTRZU3ljYWZQVGp6Yk5jd0NnWUlLb1pJemowRUF3TXdaekViTUJrR0ExVUVBd3dTUVhCd2JHVWdVbTl2ZENCRFFTQXRJRWN6TVNZd0pBWURWUVFMREIxQmNIQnNaU0JEWlhKMGFXWnBZMkYwYVc5dUlFRjFkR2h2Y21sMGVURVRNQkVHQTFVRUNnd0tRWEJ3YkdVZ1NXNWpMakVMTUFrR0ExVUVCaE1DVlZNd0hoY05NakV3TXpFM01qQXpOekV3V2hjTk16WXdNekU1TURBd01EQXdXakIxTVVRd1FnWURWUVFERER0QmNIQnNaU0JYYjNKc1pIZHBaR1VnUkdWMlpXeHZjR1Z5SUZKbGJHRjBhVzl1Y3lCRFpYSjBhV1pwWTJGMGFXOXVJRUYxZEdodmNtbDBlVEVMTUFrR0ExVUVDd3dDUnpZeEV6QVJCZ05WQkFvTUNrRndjR3hsSUVsdVl5NHhDekFKQmdOVkJBWVRBbFZUTUhZd0VBWUhLb1pJemowQ0FRWUZLNEVFQUNJRFlnQUVic1FLQzk0UHJsV21aWG5YZ3R4emRWSkw4VDBTR1luZ0RSR3BuZ24zTjZQVDhKTUViN0ZEaTRiQm1QaENuWjMvc3E2UEYvY0djS1hXc0w1dk90ZVJoeUo0NXgzQVNQN2NPQithYW85MGZjcHhTdi9FWkZibmlBYk5nWkdoSWhwSW80SDZNSUgzTUJJR0ExVWRFd0VCL3dRSU1BWUJBZjhDQVFBd0h3WURWUjBqQkJnd0ZvQVV1N0Rlb1ZnemlKcWtpcG5ldnIzcnI5ckxKS3N3UmdZSUt3WUJCUVVIQVFFRU9qQTRNRFlHQ0NzR0FRVUZCekFCaGlwb2RIUndPaTh2YjJOemNDNWhjSEJzWlM1amIyMHZiMk56Y0RBekxXRndjR3hsY205dmRHTmhaek13TndZRFZSMGZCREF3TGpBc29DcWdLSVltYUhSMGNEb3ZMMk55YkM1aGNIQnNaUzVqYjIwdllYQndiR1Z5YjI5MFkyRm5NeTVqY213d0hRWURWUjBPQkJZRUZEOHZsQ05SMDFESm1pZzk3YkI4NWMrbGtHS1pNQTRHQTFVZER3RUIvd1FFQXdJQkJqQVFCZ29xaGtpRzkyTmtCZ0lCQkFJRkFEQUtCZ2dxaGtqT1BRUURBd05vQURCbEFqQkFYaFNxNUl5S29nTUNQdHc0OTBCYUI2NzdDYUVHSlh1ZlFCL0VxWkdkNkNTamlDdE9udU1UYlhWWG14eGN4ZmtDTVFEVFNQeGFyWlh2TnJreFUzVGtVTUkzM3l6dkZWVlJUNHd4V0pDOTk0T3NkY1o0K1JHTnNZRHlSNWdtZHIwbkRHZz0iLCJNSUlDUXpDQ0FjbWdBd0lCQWdJSUxjWDhpTkxGUzVVd0NnWUlLb1pJemowRUF3TXdaekViTUJrR0ExVUVBd3dTUVhCd2JHVWdVbTl2ZENCRFFTQXRJRWN6TVNZd0pBWURWUVFMREIxQmNIQnNaU0JEWlhKMGFXWnBZMkYwYVc5dUlFRjFkR2h2Y21sMGVURVRNQkVHQTFVRUNnd0tRWEJ3YkdVZ1NXNWpMakVMTUFrR0ExVUVCaE1DVlZNd0hoY05NVFF3TkRNd01UZ3hPVEEyV2hjTk16a3dORE13TVRneE9UQTJXakJuTVJzd0dRWURWUVFEREJKQmNIQnNaU0JTYjI5MElFTkJJQzBnUnpNeEpqQWtCZ05WQkFzTUhVRndjR3hsSUVObGNuUnBabWxqWVhScGIyNGdRWFYwYUc5eWFYUjVNUk13RVFZRFZRUUtEQXBCY0hCc1pTQkpibU11TVFzd0NRWURWUVFHRXdKVlV6QjJNQkFHQnlxR1NNNDlBZ0VHQlN1QkJBQWlBMklBQkpqcEx6MUFjcVR0a3lKeWdSTWMzUkNWOGNXalRuSGNGQmJaRHVXbUJTcDNaSHRmVGpqVHV4eEV0WC8xSDdZeVlsM0o2WVJiVHpCUEVWb0EvVmhZREtYMUR5eE5CMGNUZGRxWGw1ZHZNVnp0SzUxN0lEdll1VlRaWHBta09sRUtNYU5DTUVBd0hRWURWUjBPQkJZRUZMdXczcUZZTTRpYXBJcVozcjY5NjYvYXl5U3JNQThHQTFVZEV3RUIvd1FGTUFNQkFmOHdEZ1lEVlIwUEFRSC9CQVFEQWdFR01Bb0dDQ3FHU000OUJBTURBMmdBTUdVQ01RQ0Q2Y0hFRmw0YVhUUVkyZTN2OUd3T0FFWkx1Tit5UmhIRkQvM21lb3locG12T3dnUFVuUFdUeG5TNGF0K3FJeFVDTUcxbWloREsxQTNVVDgyTlF6NjBpbU9sTTI3amJkb1h0MlFmeUZNbStZaGlkRGtMRjF2TFVhZ002QmdENTZLeUtBPT0iXX0.eyJvcmlnaW5hbFRyYW5zYWN0aW9uSWQiOiIyMDAwMDAxMDI0OTkzMjk5IiwiYXV0b1JlbmV3UHJvZHVjdElkIjoiY29tLmdldHNlc3Npb24ub3JnLnByb19zdWIiLCJwcm9kdWN0SWQiOiJjb20uZ2V0c2Vzc2lvbi5vcmcucHJvX3N1YiIsImF1dG9SZW5ld1N0YXR1cyI6MSwicmVuZXdhbFByaWNlIjoxOTkwLCJjdXJyZW5jeSI6IkFVRCIsInNpZ25lZERhdGUiOjE3NTkzODg3NzY5NDEsImVudmlyb25tZW50IjoiU2FuZGJveCIsInJlY2VudFN1YnNjcmlwdGlvblN0YXJ0RGF0ZSI6MTc1OTM4ODc2NzAwMCwicmVuZXdhbERhdGUiOjE3NTkzODg5NDcwMDAsImFwcFRyYW5zYWN0aW9uSWQiOiI3MDQ4OTc0Njk5MDMzODM5MTkifQ.DBRrGNE2YqL0amjPVw62gZqfYtTqoSZGWhl0sKEpVfyn41aaVRKHA7CzntLV78RDyE30pzAsHM3ShH-eKXDsuA'
-            body_data.signedTransactionInfo = 'eyJhbGciOiJFUzI1NiIsIng1YyI6WyJNSUlFTVRDQ0E3YWdBd0lCQWdJUVI4S0h6ZG41NTRaL1VvcmFkTng5dHpBS0JnZ3Foa2pPUFFRREF6QjFNVVF3UWdZRFZRUURERHRCY0hCc1pTQlhiM0pzWkhkcFpHVWdSR1YyWld4dmNHVnlJRkpsYkdGMGFXOXVjeUJEWlhKMGFXWnBZMkYwYVc5dUlFRjFkR2h2Y21sMGVURUxNQWtHQTFVRUN3d0NSell4RXpBUkJnTlZCQW9NQ2tGd2NHeGxJRWx1WXk0eEN6QUpCZ05WQkFZVEFsVlRNQjRYRFRJMU1Ea3hPVEU1TkRRMU1Wb1hEVEkzTVRBeE16RTNORGN5TTFvd2daSXhRREErQmdOVkJBTU1OMUJ5YjJRZ1JVTkRJRTFoWXlCQmNIQWdVM1J2Y21VZ1lXNWtJR2xVZFc1bGN5QlRkRzl5WlNCU1pXTmxhWEIwSUZOcFoyNXBibWN4TERBcUJnTlZCQXNNSTBGd2NHeGxJRmR2Y214a2QybGtaU0JFWlhabGJHOXdaWElnVW1Wc1lYUnBiMjV6TVJNd0VRWURWUVFLREFwQmNIQnNaU0JKYm1NdU1Rc3dDUVlEVlFRR0V3SlZVekJaTUJNR0J5cUdTTTQ5QWdFR0NDcUdTTTQ5QXdFSEEwSUFCTm5WdmhjdjdpVCs3RXg1dEJNQmdyUXNwSHpJc1hSaTBZeGZlazdsdjh3RW1qL2JIaVd0TndKcWMyQm9IenNRaUVqUDdLRklJS2c0WTh5MC9ueW51QW1qZ2dJSU1JSUNCREFNQmdOVkhSTUJBZjhFQWpBQU1COEdBMVVkSXdRWU1CYUFGRDh2bENOUjAxREptaWc5N2JCODVjK2xrR0taTUhBR0NDc0dBUVVGQndFQkJHUXdZakF0QmdnckJnRUZCUWN3QW9ZaGFIUjBjRG92TDJObGNuUnpMbUZ3Y0d4bExtTnZiUzkzZDJSeVp6WXVaR1Z5TURFR0NDc0dBUVVGQnpBQmhpVm9kSFJ3T2k4dmIyTnpjQzVoY0hCc1pTNWpiMjB2YjJOemNEQXpMWGQzWkhKbk5qQXlNSUlCSGdZRFZSMGdCSUlCRlRDQ0FSRXdnZ0VOQmdvcWhraUc5Mk5rQlFZQk1JSCtNSUhEQmdnckJnRUZCUWNDQWpDQnRneUJzMUpsYkdsaGJtTmxJRzl1SUhSb2FYTWdZMlZ5ZEdsbWFXTmhkR1VnWW5rZ1lXNTVJSEJoY25SNUlHRnpjM1Z0WlhNZ1lXTmpaWEIwWVc1alpTQnZaaUIwYUdVZ2RHaGxiaUJoY0hCc2FXTmhZbXhsSUhOMFlXNWtZWEprSUhSbGNtMXpJR0Z1WkNCamIyNWthWFJwYjI1eklHOW1JSFZ6WlN3Z1kyVnlkR2xtYVdOaGRHVWdjRzlzYVdONUlHRnVaQ0JqWlhKMGFXWnBZMkYwYVc5dUlIQnlZV04wYVdObElITjBZWFJsYldWdWRITXVNRFlHQ0NzR0FRVUZCd0lCRmlwb2RIUndPaTh2ZDNkM0xtRndjR3hsTG1OdmJTOWpaWEowYVdacFkyRjBaV0YxZEdodmNtbDBlUzh3SFFZRFZSME9CQllFRklGaW9HNHdNTVZBMWt1OXpKbUdOUEFWbjNlcU1BNEdBMVVkRHdFQi93UUVBd0lIZ0RBUUJnb3Foa2lHOTJOa0Jnc0JCQUlGQURBS0JnZ3Foa2pPUFFRREF3TnBBREJtQWpFQStxWG5SRUM3aFhJV1ZMc0x4em5qUnBJelBmN1ZIejlWL0NUbTgrTEpsclFlcG5tY1B2R0xOY1g2WFBubGNnTEFBakVBNUlqTlpLZ2c1cFE3OWtuRjRJYlRYZEt2OHZ1dElETVhEbWpQVlQzZEd2RnRzR1J3WE95d1Iya1pDZFNyZmVvdCIsIk1JSURGakNDQXB5Z0F3SUJBZ0lVSXNHaFJ3cDBjMm52VTRZU3ljYWZQVGp6Yk5jd0NnWUlLb1pJemowRUF3TXdaekViTUJrR0ExVUVBd3dTUVhCd2JHVWdVbTl2ZENCRFFTQXRJRWN6TVNZd0pBWURWUVFMREIxQmNIQnNaU0JEWlhKMGFXWnBZMkYwYVc5dUlFRjFkR2h2Y21sMGVURVRNQkVHQTFVRUNnd0tRWEJ3YkdVZ1NXNWpMakVMTUFrR0ExVUVCaE1DVlZNd0hoY05NakV3TXpFM01qQXpOekV3V2hjTk16WXdNekU1TURBd01EQXdXakIxTVVRd1FnWURWUVFERER0QmNIQnNaU0JYYjNKc1pIZHBaR1VnUkdWMlpXeHZjR1Z5SUZKbGJHRjBhVzl1Y3lCRFpYSjBhV1pwWTJGMGFXOXVJRUYxZEdodmNtbDBlVEVMTUFrR0ExVUVDd3dDUnpZeEV6QVJCZ05WQkFvTUNrRndjR3hsSUVsdVl5NHhDekFKQmdOVkJBWVRBbFZUTUhZd0VBWUhLb1pJemowQ0FRWUZLNEVFQUNJRFlnQUVic1FLQzk0UHJsV21aWG5YZ3R4emRWSkw4VDBTR1luZ0RSR3BuZ24zTjZQVDhKTUViN0ZEaTRiQm1QaENuWjMvc3E2UEYvY0djS1hXc0w1dk90ZVJoeUo0NXgzQVNQN2NPQithYW85MGZjcHhTdi9FWkZibmlBYk5nWkdoSWhwSW80SDZNSUgzTUJJR0ExVWRFd0VCL3dRSU1BWUJBZjhDQVFBd0h3WURWUjBqQkJnd0ZvQVV1N0Rlb1ZnemlKcWtpcG5ldnIzcnI5ckxKS3N3UmdZSUt3WUJCUVVIQVFFRU9qQTRNRFlHQ0NzR0FRVUZCekFCaGlwb2RIUndPaTh2YjJOemNDNWhjSEJzWlM1amIyMHZiMk56Y0RBekxXRndjR3hsY205dmRHTmhaek13TndZRFZSMGZCREF3TGpBc29DcWdLSVltYUhSMGNEb3ZMMk55YkM1aGNIQnNaUzVqYjIwdllYQndiR1Z5YjI5MFkyRm5NeTVqY213d0hRWURWUjBPQkJZRUZEOHZsQ05SMDFESm1pZzk3YkI4NWMrbGtHS1pNQTRHQTFVZER3RUIvd1FFQXdJQkJqQVFCZ29xaGtpRzkyTmtCZ0lCQkFJRkFEQUtCZ2dxaGtqT1BRUURBd05vQURCbEFqQkFYaFNxNUl5S29nTUNQdHc0OTBCYUI2NzdDYUVHSlh1ZlFCL0VxWkdkNkNTamlDdE9udU1UYlhWWG14eGN4ZmtDTVFEVFNQeGFyWlh2TnJreFUzVGtVTUkzM3l6dkZWVlJUNHd4V0pDOTk0T3NkY1o0K1JHTnNZRHlSNWdtZHIwbkRHZz0iLCJNSUlDUXpDQ0FjbWdBd0lCQWdJSUxjWDhpTkxGUzVVd0NnWUlLb1pJemowRUF3TXdaekViTUJrR0ExVUVBd3dTUVhCd2JHVWdVbTl2ZENCRFFTQXRJRWN6TVNZd0pBWURWUVFMREIxQmNIQnNaU0JEWlhKMGFXWnBZMkYwYVc5dUlFRjFkR2h2Y21sMGVURVRNQkVHQTFVRUNnd0tRWEJ3YkdVZ1NXNWpMakVMTUFrR0ExVUVCaE1DVlZNd0hoY05NVFF3TkRNd01UZ3hPVEEyV2hjTk16a3dORE13TVRneE9UQTJXakJuTVJzd0dRWURWUVFEREJKQmNIQnNaU0JTYjI5MElFTkJJQzBnUnpNeEpqQWtCZ05WQkFzTUhVRndjR3hsSUVObGNuUnBabWxqWVhScGIyNGdRWFYwYUc5eWFYUjVNUk13RVFZRFZRUUtEQXBCY0hCc1pTQkpibU11TVFzd0NRWURWUVFHRXdKVlV6QjJNQkFHQnlxR1NNNDlBZ0VHQlN1QkJBQWlBMklBQkpqcEx6MUFjcVR0a3lKeWdSTWMzUkNWOGNXalRuSGNGQmJaRHVXbUJTcDNaSHRmVGpqVHV4eEV0WC8xSDdZeVlsM0o2WVJiVHpCUEVWb0EvVmhZREtYMUR5eE5CMGNUZGRxWGw1ZHZNVnp0SzUxN0lEdll1VlRaWHBta09sRUtNYU5DTUVBd0hRWURWUjBPQkJZRUZMdXczcUZZTTRpYXBJcVozcjY5NjYvYXl5U3JNQThHQTFVZEV3RUIvd1FGTUFNQkFmOHdEZ1lEVlIwUEFRSC9CQVFEQWdFR01Bb0dDQ3FHU000OUJBTURBMmdBTUdVQ01RQ0Q2Y0hFRmw0YVhUUVkyZTN2OUd3T0FFWkx1Tit5UmhIRkQvM21lb3locG12T3dnUFVuUFdUeG5TNGF0K3FJeFVDTUcxbWloREsxQTNVVDgyTlF6NjBpbU9sTTI3amJkb1h0MlFmeUZNbStZaGlkRGtMRjF2TFVhZ002QmdENTZLeUtBPT0iXX0.eyJ0cmFuc2FjdGlvbklkIjoiMjAwMDAwMTAyNTY4NjMxMyIsIm9yaWdpbmFsVHJhbnNhY3Rpb25JZCI6IjIwMDAwMDEwMjQ5OTMyOTkiLCJ3ZWJPcmRlckxpbmVJdGVtSWQiOiIyMDAwMDAwMTEzODQ0NzA2IiwiYnVuZGxlSWQiOiJjb20ubG9raS1wcm9qZWN0Lmxva2ktbWVzc2VuZ2VyIiwicHJvZHVjdElkIjoiY29tLmdldHNlc3Npb24ub3JnLnByb19zdWIiLCJzdWJzY3JpcHRpb25Hcm91cElkZW50aWZpZXIiOiIyMTc1MjgxNCIsInB1cmNoYXNlRGF0ZSI6MTc1OTM4ODc2NzAwMCwib3JpZ2luYWxQdXJjaGFzZURhdGUiOjE3NTkzMDE4MzMwMDAsImV4cGlyZXNEYXRlIjoxNzU5Mzg4OTQ3MDAwLCJxdWFudGl0eSI6MSwidHlwZSI6IkF1dG8tUmVuZXdhYmxlIFN1YnNjcmlwdGlvbiIsImluQXBwT3duZXJzaGlwVHlwZSI6IlBVUkNIQVNFRCIsInNpZ25lZERhdGUiOjE3NTkzODg3NzY5NDEsImVudmlyb25tZW50IjoiU2FuZGJveCIsInRyYW5zYWN0aW9uUmVhc29uIjoiUFVSQ0hBU0UiLCJzdG9yZWZyb250IjoiQVVTIiwic3RvcmVmcm9udElkIjoiMTQzNDYwIiwicHJpY2UiOjE5OTAsImN1cnJlbmN5IjoiQVVEIiwiYXBwVHJhbnNhY3Rpb25JZCI6IjcwNDg5NzQ2OTkwMzM4MzkxOSJ9.xKPDulHd1Iq8wQmkx99rc5ZZsNtib5HOhtVns62blRQK_YZbRKj-8YzK6QzE-UmVK3Xu73CC0TCU1VljYsjauw'
-            body_data.status = AppleStatus.ACTIVE
-            body.data = body_data
-            body.externalPurchaseToken = None
-            body.notificationType = AppleNotificationTypeV2.SUBSCRIBED
-            body.notificationUUID = '9f9730f8-f3df-436a-b7e5-e85ef9c6afe4'
-            body.rawNotificationType = 'SUBSCRIBED'
-            body.rawSubtype = 'RESUBSCRIBE'
-            body.signedDate = 1759388776941
-            body.subtype = AppleSubtype.RESUBSCRIBE
-            body.summary = None
-            body.version = '2.0'
+        # NOTE: Generated by dump_apple_signed_payloads
+        # NOTE: Signed Payload
+        body = AppleResponseBodyV2DecodedPayload()
+        body_data = AppleData()
+        body_data.appAppleId = 1470168868
+        body_data.bundleId = 'com.loki-project.loki-messenger'
+        body_data.bundleVersion = '637'
+        body_data.consumptionRequestReason = None
+        body_data.environment = AppleEnvironment.SANDBOX
+        body_data.rawConsumptionRequestReason = None
+        body_data.rawEnvironment = 'Sandbox'
+        body_data.rawStatus = 1
+        body_data.signedRenewalInfo = 'eyJhbGciOiJFUzI1NiIsIng1YyI6WyJNSUlFTVRDQ0E3YWdBd0lCQWdJUVI4S0h6ZG41NTRaL1VvcmFkTng5dHpBS0JnZ3Foa2pPUFFRREF6QjFNVVF3UWdZRFZRUURERHRCY0hCc1pTQlhiM0pzWkhkcFpHVWdSR1YyWld4dmNHVnlJRkpsYkdGMGFXOXVjeUJEWlhKMGFXWnBZMkYwYVc5dUlFRjFkR2h2Y21sMGVURUxNQWtHQTFVRUN3d0NSell4RXpBUkJnTlZCQW9NQ2tGd2NHeGxJRWx1WXk0eEN6QUpCZ05WQkFZVEFsVlRNQjRYRFRJMU1Ea3hPVEU1TkRRMU1Wb1hEVEkzTVRBeE16RTNORGN5TTFvd2daSXhRREErQmdOVkJBTU1OMUJ5YjJRZ1JVTkRJRTFoWXlCQmNIQWdVM1J2Y21VZ1lXNWtJR2xVZFc1bGN5QlRkRzl5WlNCU1pXTmxhWEIwSUZOcFoyNXBibWN4TERBcUJnTlZCQXNNSTBGd2NHeGxJRmR2Y214a2QybGtaU0JFWlhabGJHOXdaWElnVW1Wc1lYUnBiMjV6TVJNd0VRWURWUVFLREFwQmNIQnNaU0JKYm1NdU1Rc3dDUVlEVlFRR0V3SlZVekJaTUJNR0J5cUdTTTQ5QWdFR0NDcUdTTTQ5QXdFSEEwSUFCTm5WdmhjdjdpVCs3RXg1dEJNQmdyUXNwSHpJc1hSaTBZeGZlazdsdjh3RW1qL2JIaVd0TndKcWMyQm9IenNRaUVqUDdLRklJS2c0WTh5MC9ueW51QW1qZ2dJSU1JSUNCREFNQmdOVkhSTUJBZjhFQWpBQU1COEdBMVVkSXdRWU1CYUFGRDh2bENOUjAxREptaWc5N2JCODVjK2xrR0taTUhBR0NDc0dBUVVGQndFQkJHUXdZakF0QmdnckJnRUZCUWN3QW9ZaGFIUjBjRG92TDJObGNuUnpMbUZ3Y0d4bExtTnZiUzkzZDJSeVp6WXVaR1Z5TURFR0NDc0dBUVVGQnpBQmhpVm9kSFJ3T2k4dmIyTnpjQzVoY0hCc1pTNWpiMjB2YjJOemNEQXpMWGQzWkhKbk5qQXlNSUlCSGdZRFZSMGdCSUlCRlRDQ0FSRXdnZ0VOQmdvcWhraUc5Mk5rQlFZQk1JSCtNSUhEQmdnckJnRUZCUWNDQWpDQnRneUJzMUpsYkdsaGJtTmxJRzl1SUhSb2FYTWdZMlZ5ZEdsbWFXTmhkR1VnWW5rZ1lXNTVJSEJoY25SNUlHRnpjM1Z0WlhNZ1lXTmpaWEIwWVc1alpTQnZaaUIwYUdVZ2RHaGxiaUJoY0hCc2FXTmhZbXhsSUhOMFlXNWtZWEprSUhSbGNtMXpJR0Z1WkNCamIyNWthWFJwYjI1eklHOW1JSFZ6WlN3Z1kyVnlkR2xtYVdOaGRHVWdjRzlzYVdONUlHRnVaQ0JqWlhKMGFXWnBZMkYwYVc5dUlIQnlZV04wYVdObElITjBZWFJsYldWdWRITXVNRFlHQ0NzR0FRVUZCd0lCRmlwb2RIUndPaTh2ZDNkM0xtRndjR3hsTG1OdmJTOWpaWEowYVdacFkyRjBaV0YxZEdodmNtbDBlUzh3SFFZRFZSME9CQllFRklGaW9HNHdNTVZBMWt1OXpKbUdOUEFWbjNlcU1BNEdBMVVkRHdFQi93UUVBd0lIZ0RBUUJnb3Foa2lHOTJOa0Jnc0JCQUlGQURBS0JnZ3Foa2pPUFFRREF3TnBBREJtQWpFQStxWG5SRUM3aFhJV1ZMc0x4em5qUnBJelBmN1ZIejlWL0NUbTgrTEpsclFlcG5tY1B2R0xOY1g2WFBubGNnTEFBakVBNUlqTlpLZ2c1cFE3OWtuRjRJYlRYZEt2OHZ1dElETVhEbWpQVlQzZEd2RnRzR1J3WE95d1Iya1pDZFNyZmVvdCIsIk1JSURGakNDQXB5Z0F3SUJBZ0lVSXNHaFJ3cDBjMm52VTRZU3ljYWZQVGp6Yk5jd0NnWUlLb1pJemowRUF3TXdaekViTUJrR0ExVUVBd3dTUVhCd2JHVWdVbTl2ZENCRFFTQXRJRWN6TVNZd0pBWURWUVFMREIxQmNIQnNaU0JEWlhKMGFXWnBZMkYwYVc5dUlFRjFkR2h2Y21sMGVURVRNQkVHQTFVRUNnd0tRWEJ3YkdVZ1NXNWpMakVMTUFrR0ExVUVCaE1DVlZNd0hoY05NakV3TXpFM01qQXpOekV3V2hjTk16WXdNekU1TURBd01EQXdXakIxTVVRd1FnWURWUVFERER0QmNIQnNaU0JYYjNKc1pIZHBaR1VnUkdWMlpXeHZjR1Z5SUZKbGJHRjBhVzl1Y3lCRFpYSjBhV1pwWTJGMGFXOXVJRUYxZEdodmNtbDBlVEVMTUFrR0ExVUVDd3dDUnpZeEV6QVJCZ05WQkFvTUNrRndjR3hsSUVsdVl5NHhDekFKQmdOVkJBWVRBbFZUTUhZd0VBWUhLb1pJemowQ0FRWUZLNEVFQUNJRFlnQUVic1FLQzk0UHJsV21aWG5YZ3R4emRWSkw4VDBTR1luZ0RSR3BuZ24zTjZQVDhKTUViN0ZEaTRiQm1QaENuWjMvc3E2UEYvY0djS1hXc0w1dk90ZVJoeUo0NXgzQVNQN2NPQithYW85MGZjcHhTdi9FWkZibmlBYk5nWkdoSWhwSW80SDZNSUgzTUJJR0ExVWRFd0VCL3dRSU1BWUJBZjhDQVFBd0h3WURWUjBqQkJnd0ZvQVV1N0Rlb1ZnemlKcWtpcG5ldnIzcnI5ckxKS3N3UmdZSUt3WUJCUVVIQVFFRU9qQTRNRFlHQ0NzR0FRVUZCekFCaGlwb2RIUndPaTh2YjJOemNDNWhjSEJzWlM1amIyMHZiMk56Y0RBekxXRndjR3hsY205dmRHTmhaek13TndZRFZSMGZCREF3TGpBc29DcWdLSVltYUhSMGNEb3ZMMk55YkM1aGNIQnNaUzVqYjIwdllYQndiR1Z5YjI5MFkyRm5NeTVqY213d0hRWURWUjBPQkJZRUZEOHZsQ05SMDFESm1pZzk3YkI4NWMrbGtHS1pNQTRHQTFVZER3RUIvd1FFQXdJQkJqQVFCZ29xaGtpRzkyTmtCZ0lCQkFJRkFEQUtCZ2dxaGtqT1BRUURBd05vQURCbEFqQkFYaFNxNUl5S29nTUNQdHc0OTBCYUI2NzdDYUVHSlh1ZlFCL0VxWkdkNkNTamlDdE9udU1UYlhWWG14eGN4ZmtDTVFEVFNQeGFyWlh2TnJreFUzVGtVTUkzM3l6dkZWVlJUNHd4V0pDOTk0T3NkY1o0K1JHTnNZRHlSNWdtZHIwbkRHZz0iLCJNSUlDUXpDQ0FjbWdBd0lCQWdJSUxjWDhpTkxGUzVVd0NnWUlLb1pJemowRUF3TXdaekViTUJrR0ExVUVBd3dTUVhCd2JHVWdVbTl2ZENCRFFTQXRJRWN6TVNZd0pBWURWUVFMREIxQmNIQnNaU0JEWlhKMGFXWnBZMkYwYVc5dUlFRjFkR2h2Y21sMGVURVRNQkVHQTFVRUNnd0tRWEJ3YkdVZ1NXNWpMakVMTUFrR0ExVUVCaE1DVlZNd0hoY05NVFF3TkRNd01UZ3hPVEEyV2hjTk16a3dORE13TVRneE9UQTJXakJuTVJzd0dRWURWUVFEREJKQmNIQnNaU0JTYjI5MElFTkJJQzBnUnpNeEpqQWtCZ05WQkFzTUhVRndjR3hsSUVObGNuUnBabWxqWVhScGIyNGdRWFYwYUc5eWFYUjVNUk13RVFZRFZRUUtEQXBCY0hCc1pTQkpibU11TVFzd0NRWURWUVFHRXdKVlV6QjJNQkFHQnlxR1NNNDlBZ0VHQlN1QkJBQWlBMklBQkpqcEx6MUFjcVR0a3lKeWdSTWMzUkNWOGNXalRuSGNGQmJaRHVXbUJTcDNaSHRmVGpqVHV4eEV0WC8xSDdZeVlsM0o2WVJiVHpCUEVWb0EvVmhZREtYMUR5eE5CMGNUZGRxWGw1ZHZNVnp0SzUxN0lEdll1VlRaWHBta09sRUtNYU5DTUVBd0hRWURWUjBPQkJZRUZMdXczcUZZTTRpYXBJcVozcjY5NjYvYXl5U3JNQThHQTFVZEV3RUIvd1FGTUFNQkFmOHdEZ1lEVlIwUEFRSC9CQVFEQWdFR01Bb0dDQ3FHU000OUJBTURBMmdBTUdVQ01RQ0Q2Y0hFRmw0YVhUUVkyZTN2OUd3T0FFWkx1Tit5UmhIRkQvM21lb3locG12T3dnUFVuUFdUeG5TNGF0K3FJeFVDTUcxbWloREsxQTNVVDgyTlF6NjBpbU9sTTI3amJkb1h0MlFmeUZNbStZaGlkRGtMRjF2TFVhZ002QmdENTZLeUtBPT0iXX0.eyJvcmlnaW5hbFRyYW5zYWN0aW9uSWQiOiIyMDAwMDAxMDI0OTkzMjk5IiwiYXV0b1JlbmV3UHJvZHVjdElkIjoiY29tLmdldHNlc3Npb24ub3JnLnByb19zdWIiLCJwcm9kdWN0SWQiOiJjb20uZ2V0c2Vzc2lvbi5vcmcucHJvX3N1YiIsImF1dG9SZW5ld1N0YXR1cyI6MSwicmVuZXdhbFByaWNlIjoxOTkwLCJjdXJyZW5jeSI6IkFVRCIsInNpZ25lZERhdGUiOjE3NTkzODg3NzY5NDEsImVudmlyb25tZW50IjoiU2FuZGJveCIsInJlY2VudFN1YnNjcmlwdGlvblN0YXJ0RGF0ZSI6MTc1OTM4ODc2NzAwMCwicmVuZXdhbERhdGUiOjE3NTkzODg5NDcwMDAsImFwcFRyYW5zYWN0aW9uSWQiOiI3MDQ4OTc0Njk5MDMzODM5MTkifQ.DBRrGNE2YqL0amjPVw62gZqfYtTqoSZGWhl0sKEpVfyn41aaVRKHA7CzntLV78RDyE30pzAsHM3ShH-eKXDsuA'
+        body_data.signedTransactionInfo = 'eyJhbGciOiJFUzI1NiIsIng1YyI6WyJNSUlFTVRDQ0E3YWdBd0lCQWdJUVI4S0h6ZG41NTRaL1VvcmFkTng5dHpBS0JnZ3Foa2pPUFFRREF6QjFNVVF3UWdZRFZRUURERHRCY0hCc1pTQlhiM0pzWkhkcFpHVWdSR1YyWld4dmNHVnlJRkpsYkdGMGFXOXVjeUJEWlhKMGFXWnBZMkYwYVc5dUlFRjFkR2h2Y21sMGVURUxNQWtHQTFVRUN3d0NSell4RXpBUkJnTlZCQW9NQ2tGd2NHeGxJRWx1WXk0eEN6QUpCZ05WQkFZVEFsVlRNQjRYRFRJMU1Ea3hPVEU1TkRRMU1Wb1hEVEkzTVRBeE16RTNORGN5TTFvd2daSXhRREErQmdOVkJBTU1OMUJ5YjJRZ1JVTkRJRTFoWXlCQmNIQWdVM1J2Y21VZ1lXNWtJR2xVZFc1bGN5QlRkRzl5WlNCU1pXTmxhWEIwSUZOcFoyNXBibWN4TERBcUJnTlZCQXNNSTBGd2NHeGxJRmR2Y214a2QybGtaU0JFWlhabGJHOXdaWElnVW1Wc1lYUnBiMjV6TVJNd0VRWURWUVFLREFwQmNIQnNaU0JKYm1NdU1Rc3dDUVlEVlFRR0V3SlZVekJaTUJNR0J5cUdTTTQ5QWdFR0NDcUdTTTQ5QXdFSEEwSUFCTm5WdmhjdjdpVCs3RXg1dEJNQmdyUXNwSHpJc1hSaTBZeGZlazdsdjh3RW1qL2JIaVd0TndKcWMyQm9IenNRaUVqUDdLRklJS2c0WTh5MC9ueW51QW1qZ2dJSU1JSUNCREFNQmdOVkhSTUJBZjhFQWpBQU1COEdBMVVkSXdRWU1CYUFGRDh2bENOUjAxREptaWc5N2JCODVjK2xrR0taTUhBR0NDc0dBUVVGQndFQkJHUXdZakF0QmdnckJnRUZCUWN3QW9ZaGFIUjBjRG92TDJObGNuUnpMbUZ3Y0d4bExtTnZiUzkzZDJSeVp6WXVaR1Z5TURFR0NDc0dBUVVGQnpBQmhpVm9kSFJ3T2k4dmIyTnpjQzVoY0hCc1pTNWpiMjB2YjJOemNEQXpMWGQzWkhKbk5qQXlNSUlCSGdZRFZSMGdCSUlCRlRDQ0FSRXdnZ0VOQmdvcWhraUc5Mk5rQlFZQk1JSCtNSUhEQmdnckJnRUZCUWNDQWpDQnRneUJzMUpsYkdsaGJtTmxJRzl1SUhSb2FYTWdZMlZ5ZEdsbWFXTmhkR1VnWW5rZ1lXNTVJSEJoY25SNUlHRnpjM1Z0WlhNZ1lXTmpaWEIwWVc1alpTQnZaaUIwYUdVZ2RHaGxiaUJoY0hCc2FXTmhZbXhsSUhOMFlXNWtZWEprSUhSbGNtMXpJR0Z1WkNCamIyNWthWFJwYjI1eklHOW1JSFZ6WlN3Z1kyVnlkR2xtYVdOaGRHVWdjRzlzYVdONUlHRnVaQ0JqWlhKMGFXWnBZMkYwYVc5dUlIQnlZV04wYVdObElITjBZWFJsYldWdWRITXVNRFlHQ0NzR0FRVUZCd0lCRmlwb2RIUndPaTh2ZDNkM0xtRndjR3hsTG1OdmJTOWpaWEowYVdacFkyRjBaV0YxZEdodmNtbDBlUzh3SFFZRFZSME9CQllFRklGaW9HNHdNTVZBMWt1OXpKbUdOUEFWbjNlcU1BNEdBMVVkRHdFQi93UUVBd0lIZ0RBUUJnb3Foa2lHOTJOa0Jnc0JCQUlGQURBS0JnZ3Foa2pPUFFRREF3TnBBREJtQWpFQStxWG5SRUM3aFhJV1ZMc0x4em5qUnBJelBmN1ZIejlWL0NUbTgrTEpsclFlcG5tY1B2R0xOY1g2WFBubGNnTEFBakVBNUlqTlpLZ2c1cFE3OWtuRjRJYlRYZEt2OHZ1dElETVhEbWpQVlQzZEd2RnRzR1J3WE95d1Iya1pDZFNyZmVvdCIsIk1JSURGakNDQXB5Z0F3SUJBZ0lVSXNHaFJ3cDBjMm52VTRZU3ljYWZQVGp6Yk5jd0NnWUlLb1pJemowRUF3TXdaekViTUJrR0ExVUVBd3dTUVhCd2JHVWdVbTl2ZENCRFFTQXRJRWN6TVNZd0pBWURWUVFMREIxQmNIQnNaU0JEWlhKMGFXWnBZMkYwYVc5dUlFRjFkR2h2Y21sMGVURVRNQkVHQTFVRUNnd0tRWEJ3YkdVZ1NXNWpMakVMTUFrR0ExVUVCaE1DVlZNd0hoY05NakV3TXpFM01qQXpOekV3V2hjTk16WXdNekU1TURBd01EQXdXakIxTVVRd1FnWURWUVFERER0QmNIQnNaU0JYYjNKc1pIZHBaR1VnUkdWMlpXeHZjR1Z5SUZKbGJHRjBhVzl1Y3lCRFpYSjBhV1pwWTJGMGFXOXVJRUYxZEdodmNtbDBlVEVMTUFrR0ExVUVDd3dDUnpZeEV6QVJCZ05WQkFvTUNrRndjR3hsSUVsdVl5NHhDekFKQmdOVkJBWVRBbFZUTUhZd0VBWUhLb1pJemowQ0FRWUZLNEVFQUNJRFlnQUVic1FLQzk0UHJsV21aWG5YZ3R4emRWSkw4VDBTR1luZ0RSR3BuZ24zTjZQVDhKTUViN0ZEaTRiQm1QaENuWjMvc3E2UEYvY0djS1hXc0w1dk90ZVJoeUo0NXgzQVNQN2NPQithYW85MGZjcHhTdi9FWkZibmlBYk5nWkdoSWhwSW80SDZNSUgzTUJJR0ExVWRFd0VCL3dRSU1BWUJBZjhDQVFBd0h3WURWUjBqQkJnd0ZvQVV1N0Rlb1ZnemlKcWtpcG5ldnIzcnI5ckxKS3N3UmdZSUt3WUJCUVVIQVFFRU9qQTRNRFlHQ0NzR0FRVUZCekFCaGlwb2RIUndPaTh2YjJOemNDNWhjSEJzWlM1amIyMHZiMk56Y0RBekxXRndjR3hsY205dmRHTmhaek13TndZRFZSMGZCREF3TGpBc29DcWdLSVltYUhSMGNEb3ZMMk55YkM1aGNIQnNaUzVqYjIwdllYQndiR1Z5YjI5MFkyRm5NeTVqY213d0hRWURWUjBPQkJZRUZEOHZsQ05SMDFESm1pZzk3YkI4NWMrbGtHS1pNQTRHQTFVZER3RUIvd1FFQXdJQkJqQVFCZ29xaGtpRzkyTmtCZ0lCQkFJRkFEQUtCZ2dxaGtqT1BRUURBd05vQURCbEFqQkFYaFNxNUl5S29nTUNQdHc0OTBCYUI2NzdDYUVHSlh1ZlFCL0VxWkdkNkNTamlDdE9udU1UYlhWWG14eGN4ZmtDTVFEVFNQeGFyWlh2TnJreFUzVGtVTUkzM3l6dkZWVlJUNHd4V0pDOTk0T3NkY1o0K1JHTnNZRHlSNWdtZHIwbkRHZz0iLCJNSUlDUXpDQ0FjbWdBd0lCQWdJSUxjWDhpTkxGUzVVd0NnWUlLb1pJemowRUF3TXdaekViTUJrR0ExVUVBd3dTUVhCd2JHVWdVbTl2ZENCRFFTQXRJRWN6TVNZd0pBWURWUVFMREIxQmNIQnNaU0JEWlhKMGFXWnBZMkYwYVc5dUlFRjFkR2h2Y21sMGVURVRNQkVHQTFVRUNnd0tRWEJ3YkdVZ1NXNWpMakVMTUFrR0ExVUVCaE1DVlZNd0hoY05NVFF3TkRNd01UZ3hPVEEyV2hjTk16a3dORE13TVRneE9UQTJXakJuTVJzd0dRWURWUVFEREJKQmNIQnNaU0JTYjI5MElFTkJJQzBnUnpNeEpqQWtCZ05WQkFzTUhVRndjR3hsSUVObGNuUnBabWxqWVhScGIyNGdRWFYwYUc5eWFYUjVNUk13RVFZRFZRUUtEQXBCY0hCc1pTQkpibU11TVFzd0NRWURWUVFHRXdKVlV6QjJNQkFHQnlxR1NNNDlBZ0VHQlN1QkJBQWlBMklBQkpqcEx6MUFjcVR0a3lKeWdSTWMzUkNWOGNXalRuSGNGQmJaRHVXbUJTcDNaSHRmVGpqVHV4eEV0WC8xSDdZeVlsM0o2WVJiVHpCUEVWb0EvVmhZREtYMUR5eE5CMGNUZGRxWGw1ZHZNVnp0SzUxN0lEdll1VlRaWHBta09sRUtNYU5DTUVBd0hRWURWUjBPQkJZRUZMdXczcUZZTTRpYXBJcVozcjY5NjYvYXl5U3JNQThHQTFVZEV3RUIvd1FGTUFNQkFmOHdEZ1lEVlIwUEFRSC9CQVFEQWdFR01Bb0dDQ3FHU000OUJBTURBMmdBTUdVQ01RQ0Q2Y0hFRmw0YVhUUVkyZTN2OUd3T0FFWkx1Tit5UmhIRkQvM21lb3locG12T3dnUFVuUFdUeG5TNGF0K3FJeFVDTUcxbWloREsxQTNVVDgyTlF6NjBpbU9sTTI3amJkb1h0MlFmeUZNbStZaGlkRGtMRjF2TFVhZ002QmdENTZLeUtBPT0iXX0.eyJ0cmFuc2FjdGlvbklkIjoiMjAwMDAwMTAyNTY4NjMxMyIsIm9yaWdpbmFsVHJhbnNhY3Rpb25JZCI6IjIwMDAwMDEwMjQ5OTMyOTkiLCJ3ZWJPcmRlckxpbmVJdGVtSWQiOiIyMDAwMDAwMTEzODQ0NzA2IiwiYnVuZGxlSWQiOiJjb20ubG9raS1wcm9qZWN0Lmxva2ktbWVzc2VuZ2VyIiwicHJvZHVjdElkIjoiY29tLmdldHNlc3Npb24ub3JnLnByb19zdWIiLCJzdWJzY3JpcHRpb25Hcm91cElkZW50aWZpZXIiOiIyMTc1MjgxNCIsInB1cmNoYXNlRGF0ZSI6MTc1OTM4ODc2NzAwMCwib3JpZ2luYWxQdXJjaGFzZURhdGUiOjE3NTkzMDE4MzMwMDAsImV4cGlyZXNEYXRlIjoxNzU5Mzg4OTQ3MDAwLCJxdWFudGl0eSI6MSwidHlwZSI6IkF1dG8tUmVuZXdhYmxlIFN1YnNjcmlwdGlvbiIsImluQXBwT3duZXJzaGlwVHlwZSI6IlBVUkNIQVNFRCIsInNpZ25lZERhdGUiOjE3NTkzODg3NzY5NDEsImVudmlyb25tZW50IjoiU2FuZGJveCIsInRyYW5zYWN0aW9uUmVhc29uIjoiUFVSQ0hBU0UiLCJzdG9yZWZyb250IjoiQVVTIiwic3RvcmVmcm9udElkIjoiMTQzNDYwIiwicHJpY2UiOjE5OTAsImN1cnJlbmN5IjoiQVVEIiwiYXBwVHJhbnNhY3Rpb25JZCI6IjcwNDg5NzQ2OTkwMzM4MzkxOSJ9.xKPDulHd1Iq8wQmkx99rc5ZZsNtib5HOhtVns62blRQK_YZbRKj-8YzK6QzE-UmVK3Xu73CC0TCU1VljYsjauw'
+        body_data.status = AppleStatus.ACTIVE
+        body.data = body_data
+        body.externalPurchaseToken = None
+        body.notificationType = AppleNotificationTypeV2.SUBSCRIBED
+        body.notificationUUID = '9f9730f8-f3df-436a-b7e5-e85ef9c6afe4'
+        body.rawNotificationType = 'SUBSCRIBED'
+        body.rawSubtype = 'RESUBSCRIBE'
+        body.signedDate = 1759388776941
+        body.subtype = AppleSubtype.RESUBSCRIBE
+        body.summary = None
+        body.version = '2.0'
 
-            # NOTE: Signed Renewal Info
-            renewal_info = AppleJWSRenewalInfoDecodedPayload()
-            renewal_info.appAccountToken = None
-            renewal_info.appTransactionId = '704897469903383919'
-            renewal_info.autoRenewProductId = None
-            renewal_info.autoRenewStatus = None
-            renewal_info.currency = 'AUD'
-            renewal_info.eligibleWinBackOfferIds = None
-            renewal_info.environment = AppleEnvironment.SANDBOX
-            renewal_info.expirationIntent = None
-            renewal_info.gracePeriodExpiresDate = None
-            renewal_info.isInBillingRetryPeriod = None
-            renewal_info.offerDiscountType = None
-            renewal_info.offerIdentifier = None
-            renewal_info.offerPeriod = None
-            renewal_info.offerType = None
-            renewal_info.originalTransactionId = '2000001024993299'
-            renewal_info.priceIncreaseStatus = None
-            renewal_info.productId = 'com.getsession.org.pro_sub_1_month'
-            renewal_info.rawAutoRenewStatus = None
-            renewal_info.rawEnvironment = 'Sandbox'
-            renewal_info.rawExpirationIntent = None
-            renewal_info.rawOfferDiscountType = None
-            renewal_info.rawOfferType = None
-            renewal_info.rawPriceIncreaseStatus = None
-            renewal_info.recentSubscriptionStartDate = None
-            renewal_info.renewalDate = None
-            renewal_info.renewalPrice = None
-            renewal_info.signedDate = 1759388776941
+        # NOTE: Signed Renewal Info
+        renewal_info = AppleJWSRenewalInfoDecodedPayload()
+        renewal_info.appAccountToken = None
+        renewal_info.appTransactionId = '704897469903383919'
+        renewal_info.autoRenewProductId = None
+        renewal_info.autoRenewStatus = None
+        renewal_info.currency = 'AUD'
+        renewal_info.eligibleWinBackOfferIds = None
+        renewal_info.environment = AppleEnvironment.SANDBOX
+        renewal_info.expirationIntent = None
+        renewal_info.gracePeriodExpiresDate = None
+        renewal_info.isInBillingRetryPeriod = None
+        renewal_info.offerDiscountType = None
+        renewal_info.offerIdentifier = None
+        renewal_info.offerPeriod = None
+        renewal_info.offerType = None
+        renewal_info.originalTransactionId = '2000001024993299'
+        renewal_info.priceIncreaseStatus = None
+        renewal_info.productId = 'com.getsession.org.pro_sub_1_month'
+        renewal_info.rawAutoRenewStatus = None
+        renewal_info.rawEnvironment = 'Sandbox'
+        renewal_info.rawExpirationIntent = None
+        renewal_info.rawOfferDiscountType = None
+        renewal_info.rawOfferType = None
+        renewal_info.rawPriceIncreaseStatus = None
+        renewal_info.recentSubscriptionStartDate = None
+        renewal_info.renewalDate = None
+        renewal_info.renewalPrice = None
+        renewal_info.signedDate = 1759388776941
 
-            # NOTE: Signed Transaction Info
-            tx_info = AppleJWSTransactionDecodedPayload()
-            tx_info.appAccountToken = None
-            tx_info.appTransactionId = '704897469903383919'
-            tx_info.bundleId = 'com.loki-project.loki-messenger'
-            tx_info.currency = 'AUD'
-            tx_info.environment = AppleEnvironment.SANDBOX
-            tx_info.expiresDate = 1759388947000
-            tx_info.inAppOwnershipType = AppleInAppOwnershipType.PURCHASED
-            tx_info.isUpgraded = None
-            tx_info.offerDiscountType = None
-            tx_info.offerIdentifier = None
-            tx_info.offerPeriod = None
-            tx_info.offerType = None
-            tx_info.originalPurchaseDate = 1759301833000
-            tx_info.originalTransactionId = '2000001024993299'
-            tx_info.price = 1990
-            tx_info.productId = 'com.getsession.org.pro_sub_1_month'
-            tx_info.purchaseDate = 1759388767000
-            tx_info.quantity = 1
-            tx_info.rawEnvironment = 'Sandbox'
-            tx_info.rawInAppOwnershipType = 'PURCHASED'
-            tx_info.rawOfferDiscountType = None
-            tx_info.rawOfferType = None
-            tx_info.rawRevocationReason = None
-            tx_info.rawTransactionReason = 'PURCHASE'
-            tx_info.rawType = 'Auto-Renewable Subscription'
-            tx_info.revocationDate = None
-            tx_info.revocationReason = None
-            tx_info.signedDate = 1759388776941
-            tx_info.storefront = 'AUS'
-            tx_info.storefrontId = '143460'
-            tx_info.subscriptionGroupIdentifier = '21752814'
-            tx_info.transactionId = '2000001025686313'
-            tx_info.transactionReason = AppleTransactionReason.PURCHASE
-            tx_info.type = AppleType.AUTO_RENEWABLE_SUBSCRIPTION
-            tx_info.webOrderLineItemId = '2000000113844706'
+        # NOTE: Signed Transaction Info
+        tx_info = AppleJWSTransactionDecodedPayload()
+        tx_info.appAccountToken = None
+        tx_info.appTransactionId = '704897469903383919'
+        tx_info.bundleId = 'com.loki-project.loki-messenger'
+        tx_info.currency = 'AUD'
+        tx_info.environment = AppleEnvironment.SANDBOX
+        tx_info.expiresDate = 1759388947000
+        tx_info.inAppOwnershipType = AppleInAppOwnershipType.PURCHASED
+        tx_info.isUpgraded = None
+        tx_info.offerDiscountType = None
+        tx_info.offerIdentifier = None
+        tx_info.offerPeriod = None
+        tx_info.offerType = None
+        tx_info.originalPurchaseDate = 1759301833000
+        tx_info.originalTransactionId = '2000001024993299'
+        tx_info.price = 1990
+        tx_info.productId = 'com.getsession.org.pro_sub_1_month'
+        tx_info.purchaseDate = 1759388767000
+        tx_info.quantity = 1
+        tx_info.rawEnvironment = 'Sandbox'
+        tx_info.rawInAppOwnershipType = 'PURCHASED'
+        tx_info.rawOfferDiscountType = None
+        tx_info.rawOfferType = None
+        tx_info.rawRevocationReason = None
+        tx_info.rawTransactionReason = 'PURCHASE'
+        tx_info.rawType = 'Auto-Renewable Subscription'
+        tx_info.revocationDate = None
+        tx_info.revocationReason = None
+        tx_info.signedDate = 1759388776941
+        tx_info.storefront = 'AUS'
+        tx_info.storefrontId = '143460'
+        tx_info.subscriptionGroupIdentifier = '21752814'
+        tx_info.transactionId = '2000001025686313'
+        tx_info.transactionReason = AppleTransactionReason.PURCHASE
+        tx_info.type = AppleType.AUTO_RENEWABLE_SUBSCRIPTION
+        tx_info.webOrderLineItemId = '2000000113844706'
 
-            decoded_notification = app_store.DecodedNotification(body=body, tx_info=tx_info, renewal_info=renewal_info)
+        decoded_notification = app_store.DecodedNotification(body=body, tx_info=tx_info, renewal_info=renewal_info)
 
-            err = base.ErrorSink()
-            with test.connection() as conn:
-                app_store.handle_notification(
-                    decoded_notification=decoded_notification,
-                    conn=conn,
-                    notification_retry_duration=datetime.timedelta(0),
-                    err=err,
-                )
-                assert not err.has(), err.msg_list
+        err = base.ErrorSink()
+        with test.connection() as conn:
+            app_store.handle_notification(
+                decoded_notification=decoded_notification,
+                conn=conn,
+                notification_retry_duration=datetime.timedelta(0),
+                err=err,
+            )
+            assert not err.has(), err.msg_list
 
-                # NOTE: Subscription purchase is unredeemed
-                unredeemed_list = backend.get_unredeemed_payments_list(conn)
-                assert len(unredeemed_list) == 1
-                assert unredeemed_list[0].master_pkey is None
-                assert derived_status(unredeemed_list[0]) == base.PaymentStatus.Unredeemed
-                assert unredeemed_list[0].plan == base.ProPlan.OneMonth
-                assert unredeemed_list[0].payment_provider == base.PaymentProvider.iOSAppStore
-                assert unredeemed_list[0].auto_renewing
-                assert unredeemed_list[0].purchased_at == base.datetime_from_unix_ms(tx_info.purchaseDate)
-                assert unredeemed_list[0].redeemed_at is None
-                assert unredeemed_list[0].expires_at == base.datetime_from_unix_ms(tx_info.expiresDate)
-                assert unredeemed_list[0].grace_period == base.DEFAULT_APPLE_GRACE_PERIOD
-                assert unredeemed_list[0].platform_refund_expires_at == base.datetime_from_unix_ms(tx_info.expiresDate)
-                assert unredeemed_list[0].revoked_at is None
-            assert unredeemed_list[0].apple.original_tx_id == tx_info.originalTransactionId
-            assert unredeemed_list[0].apple.tx_id == tx_info.transactionId
-            assert unredeemed_list[0].apple.web_line_order_tx_id == tx_info.webOrderLineItemId
+            # NOTE: Subscription purchase is unredeemed
+            unredeemed_list = backend.get_unredeemed_payments_list(conn)
+            assert len(unredeemed_list) == 1
+            assert unredeemed_list[0].master_pkey is None
+            assert derived_status(unredeemed_list[0]) == base.PaymentStatus.Unredeemed
+            assert unredeemed_list[0].plan == base.ProPlan.OneMonth
+            assert unredeemed_list[0].payment_provider == base.PaymentProvider.iOSAppStore
+            assert unredeemed_list[0].auto_renewing
+            assert unredeemed_list[0].purchased_at == base.datetime_from_unix_ms(tx_info.purchaseDate)
+            assert unredeemed_list[0].redeemed_at is None
+            assert unredeemed_list[0].expires_at == base.datetime_from_unix_ms(tx_info.expiresDate)
+            assert unredeemed_list[0].grace_period == base.DEFAULT_APPLE_GRACE_PERIOD
+            assert unredeemed_list[0].platform_refund_expires_at == base.datetime_from_unix_ms(tx_info.expiresDate)
+            assert unredeemed_list[0].revoked_at is None
+        assert unredeemed_list[0].apple.original_tx_id == tx_info.originalTransactionId
+        assert unredeemed_list[0].apple.tx_id == tx_info.transactionId
+        assert unredeemed_list[0].apple.web_line_order_tx_id == tx_info.webOrderLineItemId
 
-        if 1:  # Did change renewal status notification
+        # Did change renewal status notification
 
-            # NOTE: Generated by dump_apple_signed_payloads
-            # NOTE: Signed Payload
-            body = AppleResponseBodyV2DecodedPayload()
-            body_data = AppleData()
-            body_data.appAppleId = 1470168868
-            body_data.bundleId = 'com.loki-project.loki-messenger'
-            body_data.bundleVersion = '637'
-            body_data.consumptionRequestReason = None
-            body_data.environment = AppleEnvironment.SANDBOX
-            body_data.rawConsumptionRequestReason = None
-            body_data.rawEnvironment = 'Sandbox'
-            body_data.rawStatus = 1
-            body_data.signedRenewalInfo = 'eyJhbGciOiJFUzI1NiIsIng1YyI6WyJNSUlFTVRDQ0E3YWdBd0lCQWdJUVI4S0h6ZG41NTRaL1VvcmFkTng5dHpBS0JnZ3Foa2pPUFFRREF6QjFNVVF3UWdZRFZRUURERHRCY0hCc1pTQlhiM0pzWkhkcFpHVWdSR1YyWld4dmNHVnlJRkpsYkdGMGFXOXVjeUJEWlhKMGFXWnBZMkYwYVc5dUlFRjFkR2h2Y21sMGVURUxNQWtHQTFVRUN3d0NSell4RXpBUkJnTlZCQW9NQ2tGd2NHeGxJRWx1WXk0eEN6QUpCZ05WQkFZVEFsVlRNQjRYRFRJMU1Ea3hPVEU1TkRRMU1Wb1hEVEkzTVRBeE16RTNORGN5TTFvd2daSXhRREErQmdOVkJBTU1OMUJ5YjJRZ1JVTkRJRTFoWXlCQmNIQWdVM1J2Y21VZ1lXNWtJR2xVZFc1bGN5QlRkRzl5WlNCU1pXTmxhWEIwSUZOcFoyNXBibWN4TERBcUJnTlZCQXNNSTBGd2NHeGxJRmR2Y214a2QybGtaU0JFWlhabGJHOXdaWElnVW1Wc1lYUnBiMjV6TVJNd0VRWURWUVFLREFwQmNIQnNaU0JKYm1NdU1Rc3dDUVlEVlFRR0V3SlZVekJaTUJNR0J5cUdTTTQ5QWdFR0NDcUdTTTQ5QXdFSEEwSUFCTm5WdmhjdjdpVCs3RXg1dEJNQmdyUXNwSHpJc1hSaTBZeGZlazdsdjh3RW1qL2JIaVd0TndKcWMyQm9IenNRaUVqUDdLRklJS2c0WTh5MC9ueW51QW1qZ2dJSU1JSUNCREFNQmdOVkhSTUJBZjhFQWpBQU1COEdBMVVkSXdRWU1CYUFGRDh2bENOUjAxREptaWc5N2JCODVjK2xrR0taTUhBR0NDc0dBUVVGQndFQkJHUXdZakF0QmdnckJnRUZCUWN3QW9ZaGFIUjBjRG92TDJObGNuUnpMbUZ3Y0d4bExtTnZiUzkzZDJSeVp6WXVaR1Z5TURFR0NDc0dBUVVGQnpBQmhpVm9kSFJ3T2k4dmIyTnpjQzVoY0hCc1pTNWpiMjB2YjJOemNEQXpMWGQzWkhKbk5qQXlNSUlCSGdZRFZSMGdCSUlCRlRDQ0FSRXdnZ0VOQmdvcWhraUc5Mk5rQlFZQk1JSCtNSUhEQmdnckJnRUZCUWNDQWpDQnRneUJzMUpsYkdsaGJtTmxJRzl1SUhSb2FYTWdZMlZ5ZEdsbWFXTmhkR1VnWW5rZ1lXNTVJSEJoY25SNUlHRnpjM1Z0WlhNZ1lXTmpaWEIwWVc1alpTQnZaaUIwYUdVZ2RHaGxiaUJoY0hCc2FXTmhZbXhsSUhOMFlXNWtZWEprSUhSbGNtMXpJR0Z1WkNCamIyNWthWFJwYjI1eklHOW1JSFZ6WlN3Z1kyVnlkR2xtYVdOaGRHVWdjRzlzYVdONUlHRnVaQ0JqWlhKMGFXWnBZMkYwYVc5dUlIQnlZV04wYVdObElITjBZWFJsYldWdWRITXVNRFlHQ0NzR0FRVUZCd0lCRmlwb2RIUndPaTh2ZDNkM0xtRndjR3hsTG1OdmJTOWpaWEowYVdacFkyRjBaV0YxZEdodmNtbDBlUzh3SFFZRFZSME9CQllFRklGaW9HNHdNTVZBMWt1OXpKbUdOUEFWbjNlcU1BNEdBMVVkRHdFQi93UUVBd0lIZ0RBUUJnb3Foa2lHOTJOa0Jnc0JCQUlGQURBS0JnZ3Foa2pPUFFRREF3TnBBREJtQWpFQStxWG5SRUM3aFhJV1ZMc0x4em5qUnBJelBmN1ZIejlWL0NUbTgrTEpsclFlcG5tY1B2R0xOY1g2WFBubGNnTEFBakVBNUlqTlpLZ2c1cFE3OWtuRjRJYlRYZEt2OHZ1dElETVhEbWpQVlQzZEd2RnRzR1J3WE95d1Iya1pDZFNyZmVvdCIsIk1JSURGakNDQXB5Z0F3SUJBZ0lVSXNHaFJ3cDBjMm52VTRZU3ljYWZQVGp6Yk5jd0NnWUlLb1pJemowRUF3TXdaekViTUJrR0ExVUVBd3dTUVhCd2JHVWdVbTl2ZENCRFFTQXRJRWN6TVNZd0pBWURWUVFMREIxQmNIQnNaU0JEWlhKMGFXWnBZMkYwYVc5dUlFRjFkR2h2Y21sMGVURVRNQkVHQTFVRUNnd0tRWEJ3YkdVZ1NXNWpMakVMTUFrR0ExVUVCaE1DVlZNd0hoY05NakV3TXpFM01qQXpOekV3V2hjTk16WXdNekU1TURBd01EQXdXakIxTVVRd1FnWURWUVFERER0QmNIQnNaU0JYYjNKc1pIZHBaR1VnUkdWMlpXeHZjR1Z5SUZKbGJHRjBhVzl1Y3lCRFpYSjBhV1pwWTJGMGFXOXVJRUYxZEdodmNtbDBlVEVMTUFrR0ExVUVDd3dDUnpZeEV6QVJCZ05WQkFvTUNrRndjR3hsSUVsdVl5NHhDekFKQmdOVkJBWVRBbFZUTUhZd0VBWUhLb1pJemowQ0FRWUZLNEVFQUNJRFlnQUVic1FLQzk0UHJsV21aWG5YZ3R4emRWSkw4VDBTR1luZ0RSR3BuZ24zTjZQVDhKTUViN0ZEaTRiQm1QaENuWjMvc3E2UEYvY0djS1hXc0w1dk90ZVJoeUo0NXgzQVNQN2NPQithYW85MGZjcHhTdi9FWkZibmlBYk5nWkdoSWhwSW80SDZNSUgzTUJJR0ExVWRFd0VCL3dRSU1BWUJBZjhDQVFBd0h3WURWUjBqQkJnd0ZvQVV1N0Rlb1ZnemlKcWtpcG5ldnIzcnI5ckxKS3N3UmdZSUt3WUJCUVVIQVFFRU9qQTRNRFlHQ0NzR0FRVUZCekFCaGlwb2RIUndPaTh2YjJOemNDNWhjSEJzWlM1amIyMHZiMk56Y0RBekxXRndjR3hsY205dmRHTmhaek13TndZRFZSMGZCREF3TGpBc29DcWdLSVltYUhSMGNEb3ZMMk55YkM1aGNIQnNaUzVqYjIwdllYQndiR1Z5YjI5MFkyRm5NeTVqY213d0hRWURWUjBPQkJZRUZEOHZsQ05SMDFESm1pZzk3YkI4NWMrbGtHS1pNQTRHQTFVZER3RUIvd1FFQXdJQkJqQVFCZ29xaGtpRzkyTmtCZ0lCQkFJRkFEQUtCZ2dxaGtqT1BRUURBd05vQURCbEFqQkFYaFNxNUl5S29nTUNQdHc0OTBCYUI2NzdDYUVHSlh1ZlFCL0VxWkdkNkNTamlDdE9udU1UYlhWWG14eGN4ZmtDTVFEVFNQeGFyWlh2TnJreFUzVGtVTUkzM3l6dkZWVlJUNHd4V0pDOTk0T3NkY1o0K1JHTnNZRHlSNWdtZHIwbkRHZz0iLCJNSUlDUXpDQ0FjbWdBd0lCQWdJSUxjWDhpTkxGUzVVd0NnWUlLb1pJemowRUF3TXdaekViTUJrR0ExVUVBd3dTUVhCd2JHVWdVbTl2ZENCRFFTQXRJRWN6TVNZd0pBWURWUVFMREIxQmNIQnNaU0JEWlhKMGFXWnBZMkYwYVc5dUlFRjFkR2h2Y21sMGVURVRNQkVHQTFVRUNnd0tRWEJ3YkdVZ1NXNWpMakVMTUFrR0ExVUVCaE1DVlZNd0hoY05NVFF3TkRNd01UZ3hPVEEyV2hjTk16a3dORE13TVRneE9UQTJXakJuTVJzd0dRWURWUVFEREJKQmNIQnNaU0JTYjI5MElFTkJJQzBnUnpNeEpqQWtCZ05WQkFzTUhVRndjR3hsSUVObGNuUnBabWxqWVhScGIyNGdRWFYwYUc5eWFYUjVNUk13RVFZRFZRUUtEQXBCY0hCc1pTQkpibU11TVFzd0NRWURWUVFHRXdKVlV6QjJNQkFHQnlxR1NNNDlBZ0VHQlN1QkJBQWlBMklBQkpqcEx6MUFjcVR0a3lKeWdSTWMzUkNWOGNXalRuSGNGQmJaRHVXbUJTcDNaSHRmVGpqVHV4eEV0WC8xSDdZeVlsM0o2WVJiVHpCUEVWb0EvVmhZREtYMUR5eE5CMGNUZGRxWGw1ZHZNVnp0SzUxN0lEdll1VlRaWHBta09sRUtNYU5DTUVBd0hRWURWUjBPQkJZRUZMdXczcUZZTTRpYXBJcVozcjY5NjYvYXl5U3JNQThHQTFVZEV3RUIvd1FGTUFNQkFmOHdEZ1lEVlIwUEFRSC9CQVFEQWdFR01Bb0dDQ3FHU000OUJBTURBMmdBTUdVQ01RQ0Q2Y0hFRmw0YVhUUVkyZTN2OUd3T0FFWkx1Tit5UmhIRkQvM21lb3locG12T3dnUFVuUFdUeG5TNGF0K3FJeFVDTUcxbWloREsxQTNVVDgyTlF6NjBpbU9sTTI3amJkb1h0MlFmeUZNbStZaGlkRGtMRjF2TFVhZ002QmdENTZLeUtBPT0iXX0.eyJvcmlnaW5hbFRyYW5zYWN0aW9uSWQiOiIyMDAwMDAxMDI0OTkzMjk5IiwiYXV0b1JlbmV3UHJvZHVjdElkIjoiY29tLmdldHNlc3Npb24ub3JnLnByb19zdWIiLCJwcm9kdWN0SWQiOiJjb20uZ2V0c2Vzc2lvbi5vcmcucHJvX3N1YiIsImF1dG9SZW5ld1N0YXR1cyI6MCwic2lnbmVkRGF0ZSI6MTc1OTM4ODg1NTQ3MywiZW52aXJvbm1lbnQiOiJTYW5kYm94IiwicmVjZW50U3Vic2NyaXB0aW9uU3RhcnREYXRlIjoxNzU5Mzg4NzY3MDAwLCJyZW5ld2FsRGF0ZSI6MTc1OTM4ODk0NzAwMCwiYXBwVHJhbnNhY3Rpb25JZCI6IjcwNDg5NzQ2OTkwMzM4MzkxOSJ9.PQSXN92IUZjgPP0WG8SiiYt8PJ1pgRr5E3p2JE73gX2Vu3lrOJEHh33k805X7_O-K80qbvIWS9KivV4FJ1BDTA'
-            body_data.signedTransactionInfo = 'eyJhbGciOiJFUzI1NiIsIng1YyI6WyJNSUlFTVRDQ0E3YWdBd0lCQWdJUVI4S0h6ZG41NTRaL1VvcmFkTng5dHpBS0JnZ3Foa2pPUFFRREF6QjFNVVF3UWdZRFZRUURERHRCY0hCc1pTQlhiM0pzWkhkcFpHVWdSR1YyWld4dmNHVnlJRkpsYkdGMGFXOXVjeUJEWlhKMGFXWnBZMkYwYVc5dUlFRjFkR2h2Y21sMGVURUxNQWtHQTFVRUN3d0NSell4RXpBUkJnTlZCQW9NQ2tGd2NHeGxJRWx1WXk0eEN6QUpCZ05WQkFZVEFsVlRNQjRYRFRJMU1Ea3hPVEU1TkRRMU1Wb1hEVEkzTVRBeE16RTNORGN5TTFvd2daSXhRREErQmdOVkJBTU1OMUJ5YjJRZ1JVTkRJRTFoWXlCQmNIQWdVM1J2Y21VZ1lXNWtJR2xVZFc1bGN5QlRkRzl5WlNCU1pXTmxhWEIwSUZOcFoyNXBibWN4TERBcUJnTlZCQXNNSTBGd2NHeGxJRmR2Y214a2QybGtaU0JFWlhabGJHOXdaWElnVW1Wc1lYUnBiMjV6TVJNd0VRWURWUVFLREFwQmNIQnNaU0JKYm1NdU1Rc3dDUVlEVlFRR0V3SlZVekJaTUJNR0J5cUdTTTQ5QWdFR0NDcUdTTTQ5QXdFSEEwSUFCTm5WdmhjdjdpVCs3RXg1dEJNQmdyUXNwSHpJc1hSaTBZeGZlazdsdjh3RW1qL2JIaVd0TndKcWMyQm9IenNRaUVqUDdLRklJS2c0WTh5MC9ueW51QW1qZ2dJSU1JSUNCREFNQmdOVkhSTUJBZjhFQWpBQU1COEdBMVVkSXdRWU1CYUFGRDh2bENOUjAxREptaWc5N2JCODVjK2xrR0taTUhBR0NDc0dBUVVGQndFQkJHUXdZakF0QmdnckJnRUZCUWN3QW9ZaGFIUjBjRG92TDJObGNuUnpMbUZ3Y0d4bExtTnZiUzkzZDJSeVp6WXVaR1Z5TURFR0NDc0dBUVVGQnpBQmhpVm9kSFJ3T2k4dmIyTnpjQzVoY0hCc1pTNWpiMjB2YjJOemNEQXpMWGQzWkhKbk5qQXlNSUlCSGdZRFZSMGdCSUlCRlRDQ0FSRXdnZ0VOQmdvcWhraUc5Mk5rQlFZQk1JSCtNSUhEQmdnckJnRUZCUWNDQWpDQnRneUJzMUpsYkdsaGJtTmxJRzl1SUhSb2FYTWdZMlZ5ZEdsbWFXTmhkR1VnWW5rZ1lXNTVJSEJoY25SNUlHRnpjM1Z0WlhNZ1lXTmpaWEIwWVc1alpTQnZaaUIwYUdVZ2RHaGxiaUJoY0hCc2FXTmhZbXhsSUhOMFlXNWtZWEprSUhSbGNtMXpJR0Z1WkNCamIyNWthWFJwYjI1eklHOW1JSFZ6WlN3Z1kyVnlkR2xtYVdOaGRHVWdjRzlzYVdONUlHRnVaQ0JqWlhKMGFXWnBZMkYwYVc5dUlIQnlZV04wYVdObElITjBZWFJsYldWdWRITXVNRFlHQ0NzR0FRVUZCd0lCRmlwb2RIUndPaTh2ZDNkM0xtRndjR3hsTG1OdmJTOWpaWEowYVdacFkyRjBaV0YxZEdodmNtbDBlUzh3SFFZRFZSME9CQllFRklGaW9HNHdNTVZBMWt1OXpKbUdOUEFWbjNlcU1BNEdBMVVkRHdFQi93UUVBd0lIZ0RBUUJnb3Foa2lHOTJOa0Jnc0JCQUlGQURBS0JnZ3Foa2pPUFFRREF3TnBBREJtQWpFQStxWG5SRUM3aFhJV1ZMc0x4em5qUnBJelBmN1ZIejlWL0NUbTgrTEpsclFlcG5tY1B2R0xOY1g2WFBubGNnTEFBakVBNUlqTlpLZ2c1cFE3OWtuRjRJYlRYZEt2OHZ1dElETVhEbWpQVlQzZEd2RnRzR1J3WE95d1Iya1pDZFNyZmVvdCIsIk1JSURGakNDQXB5Z0F3SUJBZ0lVSXNHaFJ3cDBjMm52VTRZU3ljYWZQVGp6Yk5jd0NnWUlLb1pJemowRUF3TXdaekViTUJrR0ExVUVBd3dTUVhCd2JHVWdVbTl2ZENCRFFTQXRJRWN6TVNZd0pBWURWUVFMREIxQmNIQnNaU0JEWlhKMGFXWnBZMkYwYVc5dUlFRjFkR2h2Y21sMGVURVRNQkVHQTFVRUNnd0tRWEJ3YkdVZ1NXNWpMakVMTUFrR0ExVUVCaE1DVlZNd0hoY05NakV3TXpFM01qQXpOekV3V2hjTk16WXdNekU1TURBd01EQXdXakIxTVVRd1FnWURWUVFERER0QmNIQnNaU0JYYjNKc1pIZHBaR1VnUkdWMlpXeHZjR1Z5SUZKbGJHRjBhVzl1Y3lCRFpYSjBhV1pwWTJGMGFXOXVJRUYxZEdodmNtbDBlVEVMTUFrR0ExVUVDd3dDUnpZeEV6QVJCZ05WQkFvTUNrRndjR3hsSUVsdVl5NHhDekFKQmdOVkJBWVRBbFZUTUhZd0VBWUhLb1pJemowQ0FRWUZLNEVFQUNJRFlnQUVic1FLQzk0UHJsV21aWG5YZ3R4emRWSkw4VDBTR1luZ0RSR3BuZ24zTjZQVDhKTUViN0ZEaTRiQm1QaENuWjMvc3E2UEYvY0djS1hXc0w1dk90ZVJoeUo0NXgzQVNQN2NPQithYW85MGZjcHhTdi9FWkZibmlBYk5nWkdoSWhwSW80SDZNSUgzTUJJR0ExVWRFd0VCL3dRSU1BWUJBZjhDQVFBd0h3WURWUjBqQkJnd0ZvQVV1N0Rlb1ZnemlKcWtpcG5ldnIzcnI5ckxKS3N3UmdZSUt3WUJCUVVIQVFFRU9qQTRNRFlHQ0NzR0FRVUZCekFCaGlwb2RIUndPaTh2YjJOemNDNWhjSEJzWlM1amIyMHZiMk56Y0RBekxXRndjR3hsY205dmRHTmhaek13TndZRFZSMGZCREF3TGpBc29DcWdLSVltYUhSMGNEb3ZMMk55YkM1aGNIQnNaUzVqYjIwdllYQndiR1Z5YjI5MFkyRm5NeTVqY213d0hRWURWUjBPQkJZRUZEOHZsQ05SMDFESm1pZzk3YkI4NWMrbGtHS1pNQTRHQTFVZER3RUIvd1FFQXdJQkJqQVFCZ29xaGtpRzkyTmtCZ0lCQkFJRkFEQUtCZ2dxaGtqT1BRUURBd05vQURCbEFqQkFYaFNxNUl5S29nTUNQdHc0OTBCYUI2NzdDYUVHSlh1ZlFCL0VxWkdkNkNTamlDdE9udU1UYlhWWG14eGN4ZmtDTVFEVFNQeGFyWlh2TnJreFUzVGtVTUkzM3l6dkZWVlJUNHd4V0pDOTk0T3NkY1o0K1JHTnNZRHlSNWdtZHIwbkRHZz0iLCJNSUlDUXpDQ0FjbWdBd0lCQWdJSUxjWDhpTkxGUzVVd0NnWUlLb1pJemowRUF3TXdaekViTUJrR0ExVUVBd3dTUVhCd2JHVWdVbTl2ZENCRFFTQXRJRWN6TVNZd0pBWURWUVFMREIxQmNIQnNaU0JEWlhKMGFXWnBZMkYwYVc5dUlFRjFkR2h2Y21sMGVURVRNQkVHQTFVRUNnd0tRWEJ3YkdVZ1NXNWpMakVMTUFrR0ExVUVCaE1DVlZNd0hoY05NVFF3TkRNd01UZ3hPVEEyV2hjTk16a3dORE13TVRneE9UQTJXakJuTVJzd0dRWURWUVFEREJKQmNIQnNaU0JTYjI5MElFTkJJQzBnUnpNeEpqQWtCZ05WQkFzTUhVRndjR3hsSUVObGNuUnBabWxqWVhScGIyNGdRWFYwYUc5eWFYUjVNUk13RVFZRFZRUUtEQXBCY0hCc1pTQkpibU11TVFzd0NRWURWUVFHRXdKVlV6QjJNQkFHQnlxR1NNNDlBZ0VHQlN1QkJBQWlBMklBQkpqcEx6MUFjcVR0a3lKeWdSTWMzUkNWOGNXalRuSGNGQmJaRHVXbUJTcDNaSHRmVGpqVHV4eEV0WC8xSDdZeVlsM0o2WVJiVHpCUEVWb0EvVmhZREtYMUR5eE5CMGNUZGRxWGw1ZHZNVnp0SzUxN0lEdll1VlRaWHBta09sRUtNYU5DTUVBd0hRWURWUjBPQkJZRUZMdXczcUZZTTRpYXBJcVozcjY5NjYvYXl5U3JNQThHQTFVZEV3RUIvd1FGTUFNQkFmOHdEZ1lEVlIwUEFRSC9CQVFEQWdFR01Bb0dDQ3FHU000OUJBTURBMmdBTUdVQ01RQ0Q2Y0hFRmw0YVhUUVkyZTN2OUd3T0FFWkx1Tit5UmhIRkQvM21lb3locG12T3dnUFVuUFdUeG5TNGF0K3FJeFVDTUcxbWloREsxQTNVVDgyTlF6NjBpbU9sTTI3amJkb1h0MlFmeUZNbStZaGlkRGtMRjF2TFVhZ002QmdENTZLeUtBPT0iXX0.eyJ0cmFuc2FjdGlvbklkIjoiMjAwMDAwMTAyNTY4NjMxMyIsIm9yaWdpbmFsVHJhbnNhY3Rpb25JZCI6IjIwMDAwMDEwMjQ5OTMyOTkiLCJ3ZWJPcmRlckxpbmVJdGVtSWQiOiIyMDAwMDAwMTEzODQ0NzA2IiwiYnVuZGxlSWQiOiJjb20ubG9raS1wcm9qZWN0Lmxva2ktbWVzc2VuZ2VyIiwicHJvZHVjdElkIjoiY29tLmdldHNlc3Npb24ub3JnLnByb19zdWIiLCJzdWJzY3JpcHRpb25Hcm91cElkZW50aWZpZXIiOiIyMTc1MjgxNCIsInB1cmNoYXNlRGF0ZSI6MTc1OTM4ODc2NzAwMCwib3JpZ2luYWxQdXJjaGFzZURhdGUiOjE3NTkzMDE4MzMwMDAsImV4cGlyZXNEYXRlIjoxNzU5Mzg4OTQ3MDAwLCJxdWFudGl0eSI6MSwidHlwZSI6IkF1dG8tUmVuZXdhYmxlIFN1YnNjcmlwdGlvbiIsImluQXBwT3duZXJzaGlwVHlwZSI6IlBVUkNIQVNFRCIsInNpZ25lZERhdGUiOjE3NTkzODg4NTU0NzMsImVudmlyb25tZW50IjoiU2FuZGJveCIsInRyYW5zYWN0aW9uUmVhc29uIjoiUFVSQ0hBU0UiLCJzdG9yZWZyb250IjoiQVVTIiwic3RvcmVmcm9udElkIjoiMTQzNDYwIiwicHJpY2UiOjE5OTAsImN1cnJlbmN5IjoiQVVEIiwiYXBwVHJhbnNhY3Rpb25JZCI6IjcwNDg5NzQ2OTkwMzM4MzkxOSJ9.9djRjpncPSUbAapGFYxImOjex47JXKUqQTOWlvuAwoJ8HvMlE4LciVZNMXN5-L7F3CEwmSywU62PfpYa6m6EiA'
-            body_data.status = AppleStatus.ACTIVE
-            body.data = body_data
-            body.externalPurchaseToken = None
-            body.notificationType = AppleNotificationTypeV2.DID_CHANGE_RENEWAL_STATUS
-            body.notificationUUID = 'ebb7519a-1f8b-4038-8228-5b1250ab998d'
-            body.rawNotificationType = 'DID_CHANGE_RENEWAL_STATUS'
-            body.rawSubtype = 'AUTO_RENEW_DISABLED'
-            body.signedDate = 1759388855473
-            body.subtype = AppleSubtype.AUTO_RENEW_DISABLED
-            body.summary = None
-            body.version = '2.0'
+        # NOTE: Generated by dump_apple_signed_payloads
+        # NOTE: Signed Payload
+        body = AppleResponseBodyV2DecodedPayload()
+        body_data = AppleData()
+        body_data.appAppleId = 1470168868
+        body_data.bundleId = 'com.loki-project.loki-messenger'
+        body_data.bundleVersion = '637'
+        body_data.consumptionRequestReason = None
+        body_data.environment = AppleEnvironment.SANDBOX
+        body_data.rawConsumptionRequestReason = None
+        body_data.rawEnvironment = 'Sandbox'
+        body_data.rawStatus = 1
+        body_data.signedRenewalInfo = 'eyJhbGciOiJFUzI1NiIsIng1YyI6WyJNSUlFTVRDQ0E3YWdBd0lCQWdJUVI4S0h6ZG41NTRaL1VvcmFkTng5dHpBS0JnZ3Foa2pPUFFRREF6QjFNVVF3UWdZRFZRUURERHRCY0hCc1pTQlhiM0pzWkhkcFpHVWdSR1YyWld4dmNHVnlJRkpsYkdGMGFXOXVjeUJEWlhKMGFXWnBZMkYwYVc5dUlFRjFkR2h2Y21sMGVURUxNQWtHQTFVRUN3d0NSell4RXpBUkJnTlZCQW9NQ2tGd2NHeGxJRWx1WXk0eEN6QUpCZ05WQkFZVEFsVlRNQjRYRFRJMU1Ea3hPVEU1TkRRMU1Wb1hEVEkzTVRBeE16RTNORGN5TTFvd2daSXhRREErQmdOVkJBTU1OMUJ5YjJRZ1JVTkRJRTFoWXlCQmNIQWdVM1J2Y21VZ1lXNWtJR2xVZFc1bGN5QlRkRzl5WlNCU1pXTmxhWEIwSUZOcFoyNXBibWN4TERBcUJnTlZCQXNNSTBGd2NHeGxJRmR2Y214a2QybGtaU0JFWlhabGJHOXdaWElnVW1Wc1lYUnBiMjV6TVJNd0VRWURWUVFLREFwQmNIQnNaU0JKYm1NdU1Rc3dDUVlEVlFRR0V3SlZVekJaTUJNR0J5cUdTTTQ5QWdFR0NDcUdTTTQ5QXdFSEEwSUFCTm5WdmhjdjdpVCs3RXg1dEJNQmdyUXNwSHpJc1hSaTBZeGZlazdsdjh3RW1qL2JIaVd0TndKcWMyQm9IenNRaUVqUDdLRklJS2c0WTh5MC9ueW51QW1qZ2dJSU1JSUNCREFNQmdOVkhSTUJBZjhFQWpBQU1COEdBMVVkSXdRWU1CYUFGRDh2bENOUjAxREptaWc5N2JCODVjK2xrR0taTUhBR0NDc0dBUVVGQndFQkJHUXdZakF0QmdnckJnRUZCUWN3QW9ZaGFIUjBjRG92TDJObGNuUnpMbUZ3Y0d4bExtTnZiUzkzZDJSeVp6WXVaR1Z5TURFR0NDc0dBUVVGQnpBQmhpVm9kSFJ3T2k4dmIyTnpjQzVoY0hCc1pTNWpiMjB2YjJOemNEQXpMWGQzWkhKbk5qQXlNSUlCSGdZRFZSMGdCSUlCRlRDQ0FSRXdnZ0VOQmdvcWhraUc5Mk5rQlFZQk1JSCtNSUhEQmdnckJnRUZCUWNDQWpDQnRneUJzMUpsYkdsaGJtTmxJRzl1SUhSb2FYTWdZMlZ5ZEdsbWFXTmhkR1VnWW5rZ1lXNTVJSEJoY25SNUlHRnpjM1Z0WlhNZ1lXTmpaWEIwWVc1alpTQnZaaUIwYUdVZ2RHaGxiaUJoY0hCc2FXTmhZbXhsSUhOMFlXNWtZWEprSUhSbGNtMXpJR0Z1WkNCamIyNWthWFJwYjI1eklHOW1JSFZ6WlN3Z1kyVnlkR2xtYVdOaGRHVWdjRzlzYVdONUlHRnVaQ0JqWlhKMGFXWnBZMkYwYVc5dUlIQnlZV04wYVdObElITjBZWFJsYldWdWRITXVNRFlHQ0NzR0FRVUZCd0lCRmlwb2RIUndPaTh2ZDNkM0xtRndjR3hsTG1OdmJTOWpaWEowYVdacFkyRjBaV0YxZEdodmNtbDBlUzh3SFFZRFZSME9CQllFRklGaW9HNHdNTVZBMWt1OXpKbUdOUEFWbjNlcU1BNEdBMVVkRHdFQi93UUVBd0lIZ0RBUUJnb3Foa2lHOTJOa0Jnc0JCQUlGQURBS0JnZ3Foa2pPUFFRREF3TnBBREJtQWpFQStxWG5SRUM3aFhJV1ZMc0x4em5qUnBJelBmN1ZIejlWL0NUbTgrTEpsclFlcG5tY1B2R0xOY1g2WFBubGNnTEFBakVBNUlqTlpLZ2c1cFE3OWtuRjRJYlRYZEt2OHZ1dElETVhEbWpQVlQzZEd2RnRzR1J3WE95d1Iya1pDZFNyZmVvdCIsIk1JSURGakNDQXB5Z0F3SUJBZ0lVSXNHaFJ3cDBjMm52VTRZU3ljYWZQVGp6Yk5jd0NnWUlLb1pJemowRUF3TXdaekViTUJrR0ExVUVBd3dTUVhCd2JHVWdVbTl2ZENCRFFTQXRJRWN6TVNZd0pBWURWUVFMREIxQmNIQnNaU0JEWlhKMGFXWnBZMkYwYVc5dUlFRjFkR2h2Y21sMGVURVRNQkVHQTFVRUNnd0tRWEJ3YkdVZ1NXNWpMakVMTUFrR0ExVUVCaE1DVlZNd0hoY05NakV3TXpFM01qQXpOekV3V2hjTk16WXdNekU1TURBd01EQXdXakIxTVVRd1FnWURWUVFERER0QmNIQnNaU0JYYjNKc1pIZHBaR1VnUkdWMlpXeHZjR1Z5SUZKbGJHRjBhVzl1Y3lCRFpYSjBhV1pwWTJGMGFXOXVJRUYxZEdodmNtbDBlVEVMTUFrR0ExVUVDd3dDUnpZeEV6QVJCZ05WQkFvTUNrRndjR3hsSUVsdVl5NHhDekFKQmdOVkJBWVRBbFZUTUhZd0VBWUhLb1pJemowQ0FRWUZLNEVFQUNJRFlnQUVic1FLQzk0UHJsV21aWG5YZ3R4emRWSkw4VDBTR1luZ0RSR3BuZ24zTjZQVDhKTUViN0ZEaTRiQm1QaENuWjMvc3E2UEYvY0djS1hXc0w1dk90ZVJoeUo0NXgzQVNQN2NPQithYW85MGZjcHhTdi9FWkZibmlBYk5nWkdoSWhwSW80SDZNSUgzTUJJR0ExVWRFd0VCL3dRSU1BWUJBZjhDQVFBd0h3WURWUjBqQkJnd0ZvQVV1N0Rlb1ZnemlKcWtpcG5ldnIzcnI5ckxKS3N3UmdZSUt3WUJCUVVIQVFFRU9qQTRNRFlHQ0NzR0FRVUZCekFCaGlwb2RIUndPaTh2YjJOemNDNWhjSEJzWlM1amIyMHZiMk56Y0RBekxXRndjR3hsY205dmRHTmhaek13TndZRFZSMGZCREF3TGpBc29DcWdLSVltYUhSMGNEb3ZMMk55YkM1aGNIQnNaUzVqYjIwdllYQndiR1Z5YjI5MFkyRm5NeTVqY213d0hRWURWUjBPQkJZRUZEOHZsQ05SMDFESm1pZzk3YkI4NWMrbGtHS1pNQTRHQTFVZER3RUIvd1FFQXdJQkJqQVFCZ29xaGtpRzkyTmtCZ0lCQkFJRkFEQUtCZ2dxaGtqT1BRUURBd05vQURCbEFqQkFYaFNxNUl5S29nTUNQdHc0OTBCYUI2NzdDYUVHSlh1ZlFCL0VxWkdkNkNTamlDdE9udU1UYlhWWG14eGN4ZmtDTVFEVFNQeGFyWlh2TnJreFUzVGtVTUkzM3l6dkZWVlJUNHd4V0pDOTk0T3NkY1o0K1JHTnNZRHlSNWdtZHIwbkRHZz0iLCJNSUlDUXpDQ0FjbWdBd0lCQWdJSUxjWDhpTkxGUzVVd0NnWUlLb1pJemowRUF3TXdaekViTUJrR0ExVUVBd3dTUVhCd2JHVWdVbTl2ZENCRFFTQXRJRWN6TVNZd0pBWURWUVFMREIxQmNIQnNaU0JEWlhKMGFXWnBZMkYwYVc5dUlFRjFkR2h2Y21sMGVURVRNQkVHQTFVRUNnd0tRWEJ3YkdVZ1NXNWpMakVMTUFrR0ExVUVCaE1DVlZNd0hoY05NVFF3TkRNd01UZ3hPVEEyV2hjTk16a3dORE13TVRneE9UQTJXakJuTVJzd0dRWURWUVFEREJKQmNIQnNaU0JTYjI5MElFTkJJQzBnUnpNeEpqQWtCZ05WQkFzTUhVRndjR3hsSUVObGNuUnBabWxqWVhScGIyNGdRWFYwYUc5eWFYUjVNUk13RVFZRFZRUUtEQXBCY0hCc1pTQkpibU11TVFzd0NRWURWUVFHRXdKVlV6QjJNQkFHQnlxR1NNNDlBZ0VHQlN1QkJBQWlBMklBQkpqcEx6MUFjcVR0a3lKeWdSTWMzUkNWOGNXalRuSGNGQmJaRHVXbUJTcDNaSHRmVGpqVHV4eEV0WC8xSDdZeVlsM0o2WVJiVHpCUEVWb0EvVmhZREtYMUR5eE5CMGNUZGRxWGw1ZHZNVnp0SzUxN0lEdll1VlRaWHBta09sRUtNYU5DTUVBd0hRWURWUjBPQkJZRUZMdXczcUZZTTRpYXBJcVozcjY5NjYvYXl5U3JNQThHQTFVZEV3RUIvd1FGTUFNQkFmOHdEZ1lEVlIwUEFRSC9CQVFEQWdFR01Bb0dDQ3FHU000OUJBTURBMmdBTUdVQ01RQ0Q2Y0hFRmw0YVhUUVkyZTN2OUd3T0FFWkx1Tit5UmhIRkQvM21lb3locG12T3dnUFVuUFdUeG5TNGF0K3FJeFVDTUcxbWloREsxQTNVVDgyTlF6NjBpbU9sTTI3amJkb1h0MlFmeUZNbStZaGlkRGtMRjF2TFVhZ002QmdENTZLeUtBPT0iXX0.eyJvcmlnaW5hbFRyYW5zYWN0aW9uSWQiOiIyMDAwMDAxMDI0OTkzMjk5IiwiYXV0b1JlbmV3UHJvZHVjdElkIjoiY29tLmdldHNlc3Npb24ub3JnLnByb19zdWIiLCJwcm9kdWN0SWQiOiJjb20uZ2V0c2Vzc2lvbi5vcmcucHJvX3N1YiIsImF1dG9SZW5ld1N0YXR1cyI6MCwic2lnbmVkRGF0ZSI6MTc1OTM4ODg1NTQ3MywiZW52aXJvbm1lbnQiOiJTYW5kYm94IiwicmVjZW50U3Vic2NyaXB0aW9uU3RhcnREYXRlIjoxNzU5Mzg4NzY3MDAwLCJyZW5ld2FsRGF0ZSI6MTc1OTM4ODk0NzAwMCwiYXBwVHJhbnNhY3Rpb25JZCI6IjcwNDg5NzQ2OTkwMzM4MzkxOSJ9.PQSXN92IUZjgPP0WG8SiiYt8PJ1pgRr5E3p2JE73gX2Vu3lrOJEHh33k805X7_O-K80qbvIWS9KivV4FJ1BDTA'
+        body_data.signedTransactionInfo = 'eyJhbGciOiJFUzI1NiIsIng1YyI6WyJNSUlFTVRDQ0E3YWdBd0lCQWdJUVI4S0h6ZG41NTRaL1VvcmFkTng5dHpBS0JnZ3Foa2pPUFFRREF6QjFNVVF3UWdZRFZRUURERHRCY0hCc1pTQlhiM0pzWkhkcFpHVWdSR1YyWld4dmNHVnlJRkpsYkdGMGFXOXVjeUJEWlhKMGFXWnBZMkYwYVc5dUlFRjFkR2h2Y21sMGVURUxNQWtHQTFVRUN3d0NSell4RXpBUkJnTlZCQW9NQ2tGd2NHeGxJRWx1WXk0eEN6QUpCZ05WQkFZVEFsVlRNQjRYRFRJMU1Ea3hPVEU1TkRRMU1Wb1hEVEkzTVRBeE16RTNORGN5TTFvd2daSXhRREErQmdOVkJBTU1OMUJ5YjJRZ1JVTkRJRTFoWXlCQmNIQWdVM1J2Y21VZ1lXNWtJR2xVZFc1bGN5QlRkRzl5WlNCU1pXTmxhWEIwSUZOcFoyNXBibWN4TERBcUJnTlZCQXNNSTBGd2NHeGxJRmR2Y214a2QybGtaU0JFWlhabGJHOXdaWElnVW1Wc1lYUnBiMjV6TVJNd0VRWURWUVFLREFwQmNIQnNaU0JKYm1NdU1Rc3dDUVlEVlFRR0V3SlZVekJaTUJNR0J5cUdTTTQ5QWdFR0NDcUdTTTQ5QXdFSEEwSUFCTm5WdmhjdjdpVCs3RXg1dEJNQmdyUXNwSHpJc1hSaTBZeGZlazdsdjh3RW1qL2JIaVd0TndKcWMyQm9IenNRaUVqUDdLRklJS2c0WTh5MC9ueW51QW1qZ2dJSU1JSUNCREFNQmdOVkhSTUJBZjhFQWpBQU1COEdBMVVkSXdRWU1CYUFGRDh2bENOUjAxREptaWc5N2JCODVjK2xrR0taTUhBR0NDc0dBUVVGQndFQkJHUXdZakF0QmdnckJnRUZCUWN3QW9ZaGFIUjBjRG92TDJObGNuUnpMbUZ3Y0d4bExtTnZiUzkzZDJSeVp6WXVaR1Z5TURFR0NDc0dBUVVGQnpBQmhpVm9kSFJ3T2k4dmIyTnpjQzVoY0hCc1pTNWpiMjB2YjJOemNEQXpMWGQzWkhKbk5qQXlNSUlCSGdZRFZSMGdCSUlCRlRDQ0FSRXdnZ0VOQmdvcWhraUc5Mk5rQlFZQk1JSCtNSUhEQmdnckJnRUZCUWNDQWpDQnRneUJzMUpsYkdsaGJtTmxJRzl1SUhSb2FYTWdZMlZ5ZEdsbWFXTmhkR1VnWW5rZ1lXNTVJSEJoY25SNUlHRnpjM1Z0WlhNZ1lXTmpaWEIwWVc1alpTQnZaaUIwYUdVZ2RHaGxiaUJoY0hCc2FXTmhZbXhsSUhOMFlXNWtZWEprSUhSbGNtMXpJR0Z1WkNCamIyNWthWFJwYjI1eklHOW1JSFZ6WlN3Z1kyVnlkR2xtYVdOaGRHVWdjRzlzYVdONUlHRnVaQ0JqWlhKMGFXWnBZMkYwYVc5dUlIQnlZV04wYVdObElITjBZWFJsYldWdWRITXVNRFlHQ0NzR0FRVUZCd0lCRmlwb2RIUndPaTh2ZDNkM0xtRndjR3hsTG1OdmJTOWpaWEowYVdacFkyRjBaV0YxZEdodmNtbDBlUzh3SFFZRFZSME9CQllFRklGaW9HNHdNTVZBMWt1OXpKbUdOUEFWbjNlcU1BNEdBMVVkRHdFQi93UUVBd0lIZ0RBUUJnb3Foa2lHOTJOa0Jnc0JCQUlGQURBS0JnZ3Foa2pPUFFRREF3TnBBREJtQWpFQStxWG5SRUM3aFhJV1ZMc0x4em5qUnBJelBmN1ZIejlWL0NUbTgrTEpsclFlcG5tY1B2R0xOY1g2WFBubGNnTEFBakVBNUlqTlpLZ2c1cFE3OWtuRjRJYlRYZEt2OHZ1dElETVhEbWpQVlQzZEd2RnRzR1J3WE95d1Iya1pDZFNyZmVvdCIsIk1JSURGakNDQXB5Z0F3SUJBZ0lVSXNHaFJ3cDBjMm52VTRZU3ljYWZQVGp6Yk5jd0NnWUlLb1pJemowRUF3TXdaekViTUJrR0ExVUVBd3dTUVhCd2JHVWdVbTl2ZENCRFFTQXRJRWN6TVNZd0pBWURWUVFMREIxQmNIQnNaU0JEWlhKMGFXWnBZMkYwYVc5dUlFRjFkR2h2Y21sMGVURVRNQkVHQTFVRUNnd0tRWEJ3YkdVZ1NXNWpMakVMTUFrR0ExVUVCaE1DVlZNd0hoY05NakV3TXpFM01qQXpOekV3V2hjTk16WXdNekU1TURBd01EQXdXakIxTVVRd1FnWURWUVFERER0QmNIQnNaU0JYYjNKc1pIZHBaR1VnUkdWMlpXeHZjR1Z5SUZKbGJHRjBhVzl1Y3lCRFpYSjBhV1pwWTJGMGFXOXVJRUYxZEdodmNtbDBlVEVMTUFrR0ExVUVDd3dDUnpZeEV6QVJCZ05WQkFvTUNrRndjR3hsSUVsdVl5NHhDekFKQmdOVkJBWVRBbFZUTUhZd0VBWUhLb1pJemowQ0FRWUZLNEVFQUNJRFlnQUVic1FLQzk0UHJsV21aWG5YZ3R4emRWSkw4VDBTR1luZ0RSR3BuZ24zTjZQVDhKTUViN0ZEaTRiQm1QaENuWjMvc3E2UEYvY0djS1hXc0w1dk90ZVJoeUo0NXgzQVNQN2NPQithYW85MGZjcHhTdi9FWkZibmlBYk5nWkdoSWhwSW80SDZNSUgzTUJJR0ExVWRFd0VCL3dRSU1BWUJBZjhDQVFBd0h3WURWUjBqQkJnd0ZvQVV1N0Rlb1ZnemlKcWtpcG5ldnIzcnI5ckxKS3N3UmdZSUt3WUJCUVVIQVFFRU9qQTRNRFlHQ0NzR0FRVUZCekFCaGlwb2RIUndPaTh2YjJOemNDNWhjSEJzWlM1amIyMHZiMk56Y0RBekxXRndjR3hsY205dmRHTmhaek13TndZRFZSMGZCREF3TGpBc29DcWdLSVltYUhSMGNEb3ZMMk55YkM1aGNIQnNaUzVqYjIwdllYQndiR1Z5YjI5MFkyRm5NeTVqY213d0hRWURWUjBPQkJZRUZEOHZsQ05SMDFESm1pZzk3YkI4NWMrbGtHS1pNQTRHQTFVZER3RUIvd1FFQXdJQkJqQVFCZ29xaGtpRzkyTmtCZ0lCQkFJRkFEQUtCZ2dxaGtqT1BRUURBd05vQURCbEFqQkFYaFNxNUl5S29nTUNQdHc0OTBCYUI2NzdDYUVHSlh1ZlFCL0VxWkdkNkNTamlDdE9udU1UYlhWWG14eGN4ZmtDTVFEVFNQeGFyWlh2TnJreFUzVGtVTUkzM3l6dkZWVlJUNHd4V0pDOTk0T3NkY1o0K1JHTnNZRHlSNWdtZHIwbkRHZz0iLCJNSUlDUXpDQ0FjbWdBd0lCQWdJSUxjWDhpTkxGUzVVd0NnWUlLb1pJemowRUF3TXdaekViTUJrR0ExVUVBd3dTUVhCd2JHVWdVbTl2ZENCRFFTQXRJRWN6TVNZd0pBWURWUVFMREIxQmNIQnNaU0JEWlhKMGFXWnBZMkYwYVc5dUlFRjFkR2h2Y21sMGVURVRNQkVHQTFVRUNnd0tRWEJ3YkdVZ1NXNWpMakVMTUFrR0ExVUVCaE1DVlZNd0hoY05NVFF3TkRNd01UZ3hPVEEyV2hjTk16a3dORE13TVRneE9UQTJXakJuTVJzd0dRWURWUVFEREJKQmNIQnNaU0JTYjI5MElFTkJJQzBnUnpNeEpqQWtCZ05WQkFzTUhVRndjR3hsSUVObGNuUnBabWxqWVhScGIyNGdRWFYwYUc5eWFYUjVNUk13RVFZRFZRUUtEQXBCY0hCc1pTQkpibU11TVFzd0NRWURWUVFHRXdKVlV6QjJNQkFHQnlxR1NNNDlBZ0VHQlN1QkJBQWlBMklBQkpqcEx6MUFjcVR0a3lKeWdSTWMzUkNWOGNXalRuSGNGQmJaRHVXbUJTcDNaSHRmVGpqVHV4eEV0WC8xSDdZeVlsM0o2WVJiVHpCUEVWb0EvVmhZREtYMUR5eE5CMGNUZGRxWGw1ZHZNVnp0SzUxN0lEdll1VlRaWHBta09sRUtNYU5DTUVBd0hRWURWUjBPQkJZRUZMdXczcUZZTTRpYXBJcVozcjY5NjYvYXl5U3JNQThHQTFVZEV3RUIvd1FGTUFNQkFmOHdEZ1lEVlIwUEFRSC9CQVFEQWdFR01Bb0dDQ3FHU000OUJBTURBMmdBTUdVQ01RQ0Q2Y0hFRmw0YVhUUVkyZTN2OUd3T0FFWkx1Tit5UmhIRkQvM21lb3locG12T3dnUFVuUFdUeG5TNGF0K3FJeFVDTUcxbWloREsxQTNVVDgyTlF6NjBpbU9sTTI3amJkb1h0MlFmeUZNbStZaGlkRGtMRjF2TFVhZ002QmdENTZLeUtBPT0iXX0.eyJ0cmFuc2FjdGlvbklkIjoiMjAwMDAwMTAyNTY4NjMxMyIsIm9yaWdpbmFsVHJhbnNhY3Rpb25JZCI6IjIwMDAwMDEwMjQ5OTMyOTkiLCJ3ZWJPcmRlckxpbmVJdGVtSWQiOiIyMDAwMDAwMTEzODQ0NzA2IiwiYnVuZGxlSWQiOiJjb20ubG9raS1wcm9qZWN0Lmxva2ktbWVzc2VuZ2VyIiwicHJvZHVjdElkIjoiY29tLmdldHNlc3Npb24ub3JnLnByb19zdWIiLCJzdWJzY3JpcHRpb25Hcm91cElkZW50aWZpZXIiOiIyMTc1MjgxNCIsInB1cmNoYXNlRGF0ZSI6MTc1OTM4ODc2NzAwMCwib3JpZ2luYWxQdXJjaGFzZURhdGUiOjE3NTkzMDE4MzMwMDAsImV4cGlyZXNEYXRlIjoxNzU5Mzg4OTQ3MDAwLCJxdWFudGl0eSI6MSwidHlwZSI6IkF1dG8tUmVuZXdhYmxlIFN1YnNjcmlwdGlvbiIsImluQXBwT3duZXJzaGlwVHlwZSI6IlBVUkNIQVNFRCIsInNpZ25lZERhdGUiOjE3NTkzODg4NTU0NzMsImVudmlyb25tZW50IjoiU2FuZGJveCIsInRyYW5zYWN0aW9uUmVhc29uIjoiUFVSQ0hBU0UiLCJzdG9yZWZyb250IjoiQVVTIiwic3RvcmVmcm9udElkIjoiMTQzNDYwIiwicHJpY2UiOjE5OTAsImN1cnJlbmN5IjoiQVVEIiwiYXBwVHJhbnNhY3Rpb25JZCI6IjcwNDg5NzQ2OTkwMzM4MzkxOSJ9.9djRjpncPSUbAapGFYxImOjex47JXKUqQTOWlvuAwoJ8HvMlE4LciVZNMXN5-L7F3CEwmSywU62PfpYa6m6EiA'
+        body_data.status = AppleStatus.ACTIVE
+        body.data = body_data
+        body.externalPurchaseToken = None
+        body.notificationType = AppleNotificationTypeV2.DID_CHANGE_RENEWAL_STATUS
+        body.notificationUUID = 'ebb7519a-1f8b-4038-8228-5b1250ab998d'
+        body.rawNotificationType = 'DID_CHANGE_RENEWAL_STATUS'
+        body.rawSubtype = 'AUTO_RENEW_DISABLED'
+        body.signedDate = 1759388855473
+        body.subtype = AppleSubtype.AUTO_RENEW_DISABLED
+        body.summary = None
+        body.version = '2.0'
 
-            # NOTE: Signed Renewal Info
-            renewal_info = AppleJWSRenewalInfoDecodedPayload()
-            renewal_info.appAccountToken = None
-            renewal_info.appTransactionId = '704897469903383919'
-            renewal_info.autoRenewProductId = None
-            renewal_info.autoRenewStatus = None
-            renewal_info.currency = 'AUD'
-            renewal_info.eligibleWinBackOfferIds = None
-            renewal_info.environment = AppleEnvironment.SANDBOX
-            renewal_info.expirationIntent = None
-            renewal_info.gracePeriodExpiresDate = None
-            renewal_info.isInBillingRetryPeriod = None
-            renewal_info.offerDiscountType = None
-            renewal_info.offerIdentifier = None
-            renewal_info.offerPeriod = None
-            renewal_info.offerType = None
-            renewal_info.originalTransactionId = '2000001024993299'
-            renewal_info.priceIncreaseStatus = None
-            renewal_info.productId = 'com.getsession.org.pro_sub_1_month'
-            renewal_info.rawAutoRenewStatus = None
-            renewal_info.rawEnvironment = 'Sandbox'
-            renewal_info.rawExpirationIntent = None
-            renewal_info.rawOfferDiscountType = None
-            renewal_info.rawOfferType = None
-            renewal_info.rawPriceIncreaseStatus = None
-            renewal_info.recentSubscriptionStartDate = None
-            renewal_info.renewalDate = None
-            renewal_info.renewalPrice = None
-            renewal_info.signedDate = 1759388855473
+        # NOTE: Signed Renewal Info
+        renewal_info = AppleJWSRenewalInfoDecodedPayload()
+        renewal_info.appAccountToken = None
+        renewal_info.appTransactionId = '704897469903383919'
+        renewal_info.autoRenewProductId = None
+        renewal_info.autoRenewStatus = None
+        renewal_info.currency = 'AUD'
+        renewal_info.eligibleWinBackOfferIds = None
+        renewal_info.environment = AppleEnvironment.SANDBOX
+        renewal_info.expirationIntent = None
+        renewal_info.gracePeriodExpiresDate = None
+        renewal_info.isInBillingRetryPeriod = None
+        renewal_info.offerDiscountType = None
+        renewal_info.offerIdentifier = None
+        renewal_info.offerPeriod = None
+        renewal_info.offerType = None
+        renewal_info.originalTransactionId = '2000001024993299'
+        renewal_info.priceIncreaseStatus = None
+        renewal_info.productId = 'com.getsession.org.pro_sub_1_month'
+        renewal_info.rawAutoRenewStatus = None
+        renewal_info.rawEnvironment = 'Sandbox'
+        renewal_info.rawExpirationIntent = None
+        renewal_info.rawOfferDiscountType = None
+        renewal_info.rawOfferType = None
+        renewal_info.rawPriceIncreaseStatus = None
+        renewal_info.recentSubscriptionStartDate = None
+        renewal_info.renewalDate = None
+        renewal_info.renewalPrice = None
+        renewal_info.signedDate = 1759388855473
 
-            # NOTE: Signed Transaction Info
-            tx_info = AppleJWSTransactionDecodedPayload()
-            tx_info.appAccountToken = None
-            tx_info.appTransactionId = '704897469903383919'
-            tx_info.bundleId = 'com.loki-project.loki-messenger'
-            tx_info.currency = 'AUD'
-            tx_info.environment = AppleEnvironment.SANDBOX
-            tx_info.expiresDate = 1759388947000
-            tx_info.inAppOwnershipType = AppleInAppOwnershipType.PURCHASED
-            tx_info.isUpgraded = None
-            tx_info.offerDiscountType = None
-            tx_info.offerIdentifier = None
-            tx_info.offerPeriod = None
-            tx_info.offerType = None
-            tx_info.originalPurchaseDate = 1759301833000
-            tx_info.originalTransactionId = '2000001024993299'
-            tx_info.price = 1990
-            tx_info.productId = 'com.getsession.org.pro_sub_1_month'
-            tx_info.purchaseDate = 1759388767000
-            tx_info.quantity = 1
-            tx_info.rawEnvironment = 'Sandbox'
-            tx_info.rawInAppOwnershipType = 'PURCHASED'
-            tx_info.rawOfferDiscountType = None
-            tx_info.rawOfferType = None
-            tx_info.rawRevocationReason = None
-            tx_info.rawTransactionReason = 'PURCHASE'
-            tx_info.rawType = 'Auto-Renewable Subscription'
-            tx_info.revocationDate = None
-            tx_info.revocationReason = None
-            tx_info.signedDate = 1759388855473
-            tx_info.storefront = 'AUS'
-            tx_info.storefrontId = '143460'
-            tx_info.subscriptionGroupIdentifier = '21752814'
-            tx_info.transactionId = '2000001025686313'
-            tx_info.transactionReason = AppleTransactionReason.PURCHASE
-            tx_info.type = AppleType.AUTO_RENEWABLE_SUBSCRIPTION
-            tx_info.webOrderLineItemId = '2000000113844706'
+        # NOTE: Signed Transaction Info
+        tx_info = AppleJWSTransactionDecodedPayload()
+        tx_info.appAccountToken = None
+        tx_info.appTransactionId = '704897469903383919'
+        tx_info.bundleId = 'com.loki-project.loki-messenger'
+        tx_info.currency = 'AUD'
+        tx_info.environment = AppleEnvironment.SANDBOX
+        tx_info.expiresDate = 1759388947000
+        tx_info.inAppOwnershipType = AppleInAppOwnershipType.PURCHASED
+        tx_info.isUpgraded = None
+        tx_info.offerDiscountType = None
+        tx_info.offerIdentifier = None
+        tx_info.offerPeriod = None
+        tx_info.offerType = None
+        tx_info.originalPurchaseDate = 1759301833000
+        tx_info.originalTransactionId = '2000001024993299'
+        tx_info.price = 1990
+        tx_info.productId = 'com.getsession.org.pro_sub_1_month'
+        tx_info.purchaseDate = 1759388767000
+        tx_info.quantity = 1
+        tx_info.rawEnvironment = 'Sandbox'
+        tx_info.rawInAppOwnershipType = 'PURCHASED'
+        tx_info.rawOfferDiscountType = None
+        tx_info.rawOfferType = None
+        tx_info.rawRevocationReason = None
+        tx_info.rawTransactionReason = 'PURCHASE'
+        tx_info.rawType = 'Auto-Renewable Subscription'
+        tx_info.revocationDate = None
+        tx_info.revocationReason = None
+        tx_info.signedDate = 1759388855473
+        tx_info.storefront = 'AUS'
+        tx_info.storefrontId = '143460'
+        tx_info.subscriptionGroupIdentifier = '21752814'
+        tx_info.transactionId = '2000001025686313'
+        tx_info.transactionReason = AppleTransactionReason.PURCHASE
+        tx_info.type = AppleType.AUTO_RENEWABLE_SUBSCRIPTION
+        tx_info.webOrderLineItemId = '2000000113844706'
 
-            decoded_notification = app_store.DecodedNotification(body=body, tx_info=tx_info, renewal_info=renewal_info)
+        decoded_notification = app_store.DecodedNotification(body=body, tx_info=tx_info, renewal_info=renewal_info)
 
-            err = base.ErrorSink()
-            with test.connection() as conn:
-                app_store.handle_notification(
-                    decoded_notification=decoded_notification,
-                    conn=conn,
-                    notification_retry_duration=datetime.timedelta(0),
-                    err=err,
-                )
-                assert not err.has(), err.msg_list
+        err = base.ErrorSink()
+        with test.connection() as conn:
+            app_store.handle_notification(
+                decoded_notification=decoded_notification,
+                conn=conn,
+                notification_retry_duration=datetime.timedelta(0),
+                err=err,
+            )
+            assert not err.has(), err.msg_list
 
-                # NOTE: Check payment is still in the DB and that auto-renewing was turned off
-                payment_list = backend.get_payments_list(conn)
-                assert len(payment_list) == 1
-                assert payment_list[0].master_pkey is None
-                assert derived_status(payment_list[0]) == base.PaymentStatus.Unredeemed
-                assert payment_list[0].plan == base.ProPlan.OneMonth
-                assert payment_list[0].payment_provider == base.PaymentProvider.iOSAppStore
-                assert not payment_list[0].auto_renewing
-                assert payment_list[0].purchased_at == base.datetime_from_unix_ms(tx_info.purchaseDate)
-                assert payment_list[0].redeemed_at is None
-                assert payment_list[0].expires_at == base.datetime_from_unix_ms(tx_info.expiresDate)
-                assert payment_list[0].grace_period == base.DEFAULT_APPLE_GRACE_PERIOD
-                assert payment_list[0].platform_refund_expires_at == base.datetime_from_unix_ms(tx_info.expiresDate)
-                assert payment_list[0].revoked_at is None
+            # NOTE: Check payment is still in the DB and that auto-renewing was turned off
+            payment_list = backend.get_payments_list(conn)
+            assert len(payment_list) == 1
+            assert payment_list[0].master_pkey is None
+            assert derived_status(payment_list[0]) == base.PaymentStatus.Unredeemed
+            assert payment_list[0].plan == base.ProPlan.OneMonth
+            assert payment_list[0].payment_provider == base.PaymentProvider.iOSAppStore
+            assert not payment_list[0].auto_renewing
+            assert payment_list[0].purchased_at == base.datetime_from_unix_ms(tx_info.purchaseDate)
+            assert payment_list[0].redeemed_at is None
+            assert payment_list[0].expires_at == base.datetime_from_unix_ms(tx_info.expiresDate)
+            assert payment_list[0].grace_period == base.DEFAULT_APPLE_GRACE_PERIOD
+            assert payment_list[0].platform_refund_expires_at == base.datetime_from_unix_ms(tx_info.expiresDate)
+            assert payment_list[0].revoked_at is None
+        assert payment_list[0].apple.original_tx_id == tx_info.originalTransactionId
+        assert payment_list[0].apple.tx_id == tx_info.transactionId
+        assert payment_list[0].apple.web_line_order_tx_id == tx_info.webOrderLineItemId
+
+        # Expire (voluntary) notification
+
+        # NOTE: Generated by dump_apple_signed_payloads
+        # NOTE: Signed Payload
+        body = AppleResponseBodyV2DecodedPayload()
+        body_data = AppleData()
+        body_data.appAppleId = 1470168868
+        body_data.bundleId = 'com.loki-project.loki-messenger'
+        body_data.bundleVersion = '637'
+        body_data.consumptionRequestReason = None
+        body_data.environment = AppleEnvironment.SANDBOX
+        body_data.rawConsumptionRequestReason = None
+        body_data.rawEnvironment = 'Sandbox'
+        body_data.rawStatus = 2
+        body_data.signedRenewalInfo = 'eyJhbGciOiJFUzI1NiIsIng1YyI6WyJNSUlFTVRDQ0E3YWdBd0lCQWdJUVI4S0h6ZG41NTRaL1VvcmFkTng5dHpBS0JnZ3Foa2pPUFFRREF6QjFNVVF3UWdZRFZRUURERHRCY0hCc1pTQlhiM0pzWkhkcFpHVWdSR1YyWld4dmNHVnlJRkpsYkdGMGFXOXVjeUJEWlhKMGFXWnBZMkYwYVc5dUlFRjFkR2h2Y21sMGVURUxNQWtHQTFVRUN3d0NSell4RXpBUkJnTlZCQW9NQ2tGd2NHeGxJRWx1WXk0eEN6QUpCZ05WQkFZVEFsVlRNQjRYRFRJMU1Ea3hPVEU1TkRRMU1Wb1hEVEkzTVRBeE16RTNORGN5TTFvd2daSXhRREErQmdOVkJBTU1OMUJ5YjJRZ1JVTkRJRTFoWXlCQmNIQWdVM1J2Y21VZ1lXNWtJR2xVZFc1bGN5QlRkRzl5WlNCU1pXTmxhWEIwSUZOcFoyNXBibWN4TERBcUJnTlZCQXNNSTBGd2NHeGxJRmR2Y214a2QybGtaU0JFWlhabGJHOXdaWElnVW1Wc1lYUnBiMjV6TVJNd0VRWURWUVFLREFwQmNIQnNaU0JKYm1NdU1Rc3dDUVlEVlFRR0V3SlZVekJaTUJNR0J5cUdTTTQ5QWdFR0NDcUdTTTQ5QXdFSEEwSUFCTm5WdmhjdjdpVCs3RXg1dEJNQmdyUXNwSHpJc1hSaTBZeGZlazdsdjh3RW1qL2JIaVd0TndKcWMyQm9IenNRaUVqUDdLRklJS2c0WTh5MC9ueW51QW1qZ2dJSU1JSUNCREFNQmdOVkhSTUJBZjhFQWpBQU1COEdBMVVkSXdRWU1CYUFGRDh2bENOUjAxREptaWc5N2JCODVjK2xrR0taTUhBR0NDc0dBUVVGQndFQkJHUXdZakF0QmdnckJnRUZCUWN3QW9ZaGFIUjBjRG92TDJObGNuUnpMbUZ3Y0d4bExtTnZiUzkzZDJSeVp6WXVaR1Z5TURFR0NDc0dBUVVGQnpBQmhpVm9kSFJ3T2k4dmIyTnpjQzVoY0hCc1pTNWpiMjB2YjJOemNEQXpMWGQzWkhKbk5qQXlNSUlCSGdZRFZSMGdCSUlCRlRDQ0FSRXdnZ0VOQmdvcWhraUc5Mk5rQlFZQk1JSCtNSUhEQmdnckJnRUZCUWNDQWpDQnRneUJzMUpsYkdsaGJtTmxJRzl1SUhSb2FYTWdZMlZ5ZEdsbWFXTmhkR1VnWW5rZ1lXNTVJSEJoY25SNUlHRnpjM1Z0WlhNZ1lXTmpaWEIwWVc1alpTQnZaaUIwYUdVZ2RHaGxiaUJoY0hCc2FXTmhZbXhsSUhOMFlXNWtZWEprSUhSbGNtMXpJR0Z1WkNCamIyNWthWFJwYjI1eklHOW1JSFZ6WlN3Z1kyVnlkR2xtYVdOaGRHVWdjRzlzYVdONUlHRnVaQ0JqWlhKMGFXWnBZMkYwYVc5dUlIQnlZV04wYVdObElITjBZWFJsYldWdWRITXVNRFlHQ0NzR0FRVUZCd0lCRmlwb2RIUndPaTh2ZDNkM0xtRndjR3hsTG1OdmJTOWpaWEowYVdacFkyRjBaV0YxZEdodmNtbDBlUzh3SFFZRFZSME9CQllFRklGaW9HNHdNTVZBMWt1OXpKbUdOUEFWbjNlcU1BNEdBMVVkRHdFQi93UUVBd0lIZ0RBUUJnb3Foa2lHOTJOa0Jnc0JCQUlGQURBS0JnZ3Foa2pPUFFRREF3TnBBREJtQWpFQStxWG5SRUM3aFhJV1ZMc0x4em5qUnBJelBmN1ZIejlWL0NUbTgrTEpsclFlcG5tY1B2R0xOY1g2WFBubGNnTEFBakVBNUlqTlpLZ2c1cFE3OWtuRjRJYlRYZEt2OHZ1dElETVhEbWpQVlQzZEd2RnRzR1J3WE95d1Iya1pDZFNyZmVvdCIsIk1JSURGakNDQXB5Z0F3SUJBZ0lVSXNHaFJ3cDBjMm52VTRZU3ljYWZQVGp6Yk5jd0NnWUlLb1pJemowRUF3TXdaekViTUJrR0ExVUVBd3dTUVhCd2JHVWdVbTl2ZENCRFFTQXRJRWN6TVNZd0pBWURWUVFMREIxQmNIQnNaU0JEWlhKMGFXWnBZMkYwYVc5dUlFRjFkR2h2Y21sMGVURVRNQkVHQTFVRUNnd0tRWEJ3YkdVZ1NXNWpMakVMTUFrR0ExVUVCaE1DVlZNd0hoY05NakV3TXpFM01qQXpOekV3V2hjTk16WXdNekU1TURBd01EQXdXakIxTVVRd1FnWURWUVFERER0QmNIQnNaU0JYYjNKc1pIZHBaR1VnUkdWMlpXeHZjR1Z5SUZKbGJHRjBhVzl1Y3lCRFpYSjBhV1pwWTJGMGFXOXVJRUYxZEdodmNtbDBlVEVMTUFrR0ExVUVDd3dDUnpZeEV6QVJCZ05WQkFvTUNrRndjR3hsSUVsdVl5NHhDekFKQmdOVkJBWVRBbFZUTUhZd0VBWUhLb1pJemowQ0FRWUZLNEVFQUNJRFlnQUVic1FLQzk0UHJsV21aWG5YZ3R4emRWSkw4VDBTR1luZ0RSR3BuZ24zTjZQVDhKTUViN0ZEaTRiQm1QaENuWjMvc3E2UEYvY0djS1hXc0w1dk90ZVJoeUo0NXgzQVNQN2NPQithYW85MGZjcHhTdi9FWkZibmlBYk5nWkdoSWhwSW80SDZNSUgzTUJJR0ExVWRFd0VCL3dRSU1BWUJBZjhDQVFBd0h3WURWUjBqQkJnd0ZvQVV1N0Rlb1ZnemlKcWtpcG5ldnIzcnI5ckxKS3N3UmdZSUt3WUJCUVVIQVFFRU9qQTRNRFlHQ0NzR0FRVUZCekFCaGlwb2RIUndPaTh2YjJOemNDNWhjSEJzWlM1amIyMHZiMk56Y0RBekxXRndjR3hsY205dmRHTmhaek13TndZRFZSMGZCREF3TGpBc29DcWdLSVltYUhSMGNEb3ZMMk55YkM1aGNIQnNaUzVqYjIwdllYQndiR1Z5YjI5MFkyRm5NeTVqY213d0hRWURWUjBPQkJZRUZEOHZsQ05SMDFESm1pZzk3YkI4NWMrbGtHS1pNQTRHQTFVZER3RUIvd1FFQXdJQkJqQVFCZ29xaGtpRzkyTmtCZ0lCQkFJRkFEQUtCZ2dxaGtqT1BRUURBd05vQURCbEFqQkFYaFNxNUl5S29nTUNQdHc0OTBCYUI2NzdDYUVHSlh1ZlFCL0VxWkdkNkNTamlDdE9udU1UYlhWWG14eGN4ZmtDTVFEVFNQeGFyWlh2TnJreFUzVGtVTUkzM3l6dkZWVlJUNHd4V0pDOTk0T3NkY1o0K1JHTnNZRHlSNWdtZHIwbkRHZz0iLCJNSUlDUXpDQ0FjbWdBd0lCQWdJSUxjWDhpTkxGUzVVd0NnWUlLb1pJemowRUF3TXdaekViTUJrR0ExVUVBd3dTUVhCd2JHVWdVbTl2ZENCRFFTQXRJRWN6TVNZd0pBWURWUVFMREIxQmNIQnNaU0JEWlhKMGFXWnBZMkYwYVc5dUlFRjFkR2h2Y21sMGVURVRNQkVHQTFVRUNnd0tRWEJ3YkdVZ1NXNWpMakVMTUFrR0ExVUVCaE1DVlZNd0hoY05NVFF3TkRNd01UZ3hPVEEyV2hjTk16a3dORE13TVRneE9UQTJXakJuTVJzd0dRWURWUVFEREJKQmNIQnNaU0JTYjI5MElFTkJJQzBnUnpNeEpqQWtCZ05WQkFzTUhVRndjR3hsSUVObGNuUnBabWxqWVhScGIyNGdRWFYwYUc5eWFYUjVNUk13RVFZRFZRUUtEQXBCY0hCc1pTQkpibU11TVFzd0NRWURWUVFHRXdKVlV6QjJNQkFHQnlxR1NNNDlBZ0VHQlN1QkJBQWlBMklBQkpqcEx6MUFjcVR0a3lKeWdSTWMzUkNWOGNXalRuSGNGQmJaRHVXbUJTcDNaSHRmVGpqVHV4eEV0WC8xSDdZeVlsM0o2WVJiVHpCUEVWb0EvVmhZREtYMUR5eE5CMGNUZGRxWGw1ZHZNVnp0SzUxN0lEdll1VlRaWHBta09sRUtNYU5DTUVBd0hRWURWUjBPQkJZRUZMdXczcUZZTTRpYXBJcVozcjY5NjYvYXl5U3JNQThHQTFVZEV3RUIvd1FGTUFNQkFmOHdEZ1lEVlIwUEFRSC9CQVFEQWdFR01Bb0dDQ3FHU000OUJBTURBMmdBTUdVQ01RQ0Q2Y0hFRmw0YVhUUVkyZTN2OUd3T0FFWkx1Tit5UmhIRkQvM21lb3locG12T3dnUFVuUFdUeG5TNGF0K3FJeFVDTUcxbWloREsxQTNVVDgyTlF6NjBpbU9sTTI3amJkb1h0MlFmeUZNbStZaGlkRGtMRjF2TFVhZ002QmdENTZLeUtBPT0iXX0.eyJleHBpcmF0aW9uSW50ZW50IjoxLCJvcmlnaW5hbFRyYW5zYWN0aW9uSWQiOiIyMDAwMDAxMDI0OTkzMjk5IiwiYXV0b1JlbmV3UHJvZHVjdElkIjoiY29tLmdldHNlc3Npb24ub3JnLnByb19zdWIiLCJwcm9kdWN0SWQiOiJjb20uZ2V0c2Vzc2lvbi5vcmcucHJvX3N1YiIsImF1dG9SZW5ld1N0YXR1cyI6MCwiaXNJbkJpbGxpbmdSZXRyeVBlcmlvZCI6ZmFsc2UsInNpZ25lZERhdGUiOjE3NTkzODkwNDE2MDQsImVudmlyb25tZW50IjoiU2FuZGJveCIsInJlY2VudFN1YnNjcmlwdGlvblN0YXJ0RGF0ZSI6MTc1OTM4ODc2NzAwMCwicmVuZXdhbERhdGUiOjE3NTkzODg5NDcwMDAsImFwcFRyYW5zYWN0aW9uSWQiOiI3MDQ4OTc0Njk5MDMzODM5MTkifQ.wTjYhoiB_reDAIaFXJs0MoMXlXqLAk_QsiS3-o08UeVihVhIUfQD_cYvooh9MHfUE7n6qF-NduDA5JXjij6dKw'
+        body_data.signedTransactionInfo = 'eyJhbGciOiJFUzI1NiIsIng1YyI6WyJNSUlFTVRDQ0E3YWdBd0lCQWdJUVI4S0h6ZG41NTRaL1VvcmFkTng5dHpBS0JnZ3Foa2pPUFFRREF6QjFNVVF3UWdZRFZRUURERHRCY0hCc1pTQlhiM0pzWkhkcFpHVWdSR1YyWld4dmNHVnlJRkpsYkdGMGFXOXVjeUJEWlhKMGFXWnBZMkYwYVc5dUlFRjFkR2h2Y21sMGVURUxNQWtHQTFVRUN3d0NSell4RXpBUkJnTlZCQW9NQ2tGd2NHeGxJRWx1WXk0eEN6QUpCZ05WQkFZVEFsVlRNQjRYRFRJMU1Ea3hPVEU1TkRRMU1Wb1hEVEkzTVRBeE16RTNORGN5TTFvd2daSXhRREErQmdOVkJBTU1OMUJ5YjJRZ1JVTkRJRTFoWXlCQmNIQWdVM1J2Y21VZ1lXNWtJR2xVZFc1bGN5QlRkRzl5WlNCU1pXTmxhWEIwSUZOcFoyNXBibWN4TERBcUJnTlZCQXNNSTBGd2NHeGxJRmR2Y214a2QybGtaU0JFWlhabGJHOXdaWElnVW1Wc1lYUnBiMjV6TVJNd0VRWURWUVFLREFwQmNIQnNaU0JKYm1NdU1Rc3dDUVlEVlFRR0V3SlZVekJaTUJNR0J5cUdTTTQ5QWdFR0NDcUdTTTQ5QXdFSEEwSUFCTm5WdmhjdjdpVCs3RXg1dEJNQmdyUXNwSHpJc1hSaTBZeGZlazdsdjh3RW1qL2JIaVd0TndKcWMyQm9IenNRaUVqUDdLRklJS2c0WTh5MC9ueW51QW1qZ2dJSU1JSUNCREFNQmdOVkhSTUJBZjhFQWpBQU1COEdBMVVkSXdRWU1CYUFGRDh2bENOUjAxREptaWc5N2JCODVjK2xrR0taTUhBR0NDc0dBUVVGQndFQkJHUXdZakF0QmdnckJnRUZCUWN3QW9ZaGFIUjBjRG92TDJObGNuUnpMbUZ3Y0d4bExtTnZiUzkzZDJSeVp6WXVaR1Z5TURFR0NDc0dBUVVGQnpBQmhpVm9kSFJ3T2k4dmIyTnpjQzVoY0hCc1pTNWpiMjB2YjJOemNEQXpMWGQzWkhKbk5qQXlNSUlCSGdZRFZSMGdCSUlCRlRDQ0FSRXdnZ0VOQmdvcWhraUc5Mk5rQlFZQk1JSCtNSUhEQmdnckJnRUZCUWNDQWpDQnRneUJzMUpsYkdsaGJtTmxJRzl1SUhSb2FYTWdZMlZ5ZEdsbWFXTmhkR1VnWW5rZ1lXNTVJSEJoY25SNUlHRnpjM1Z0WlhNZ1lXTmpaWEIwWVc1alpTQnZaaUIwYUdVZ2RHaGxiaUJoY0hCc2FXTmhZbXhsSUhOMFlXNWtZWEprSUhSbGNtMXpJR0Z1WkNCamIyNWthWFJwYjI1eklHOW1JSFZ6WlN3Z1kyVnlkR2xtYVdOaGRHVWdjRzlzYVdONUlHRnVaQ0JqWlhKMGFXWnBZMkYwYVc5dUlIQnlZV04wYVdObElITjBZWFJsYldWdWRITXVNRFlHQ0NzR0FRVUZCd0lCRmlwb2RIUndPaTh2ZDNkM0xtRndjR3hsTG1OdmJTOWpaWEowYVdacFkyRjBaV0YxZEdodmNtbDBlUzh3SFFZRFZSME9CQllFRklGaW9HNHdNTVZBMWt1OXpKbUdOUEFWbjNlcU1BNEdBMVVkRHdFQi93UUVBd0lIZ0RBUUJnb3Foa2lHOTJOa0Jnc0JCQUlGQURBS0JnZ3Foa2pPUFFRREF3TnBBREJtQWpFQStxWG5SRUM3aFhJV1ZMc0x4em5qUnBJelBmN1ZIejlWL0NUbTgrTEpsclFlcG5tY1B2R0xOY1g2WFBubGNnTEFBakVBNUlqTlpLZ2c1cFE3OWtuRjRJYlRYZEt2OHZ1dElETVhEbWpQVlQzZEd2RnRzR1J3WE95d1Iya1pDZFNyZmVvdCIsIk1JSURGakNDQXB5Z0F3SUJBZ0lVSXNHaFJ3cDBjMm52VTRZU3ljYWZQVGp6Yk5jd0NnWUlLb1pJemowRUF3TXdaekViTUJrR0ExVUVBd3dTUVhCd2JHVWdVbTl2ZENCRFFTQXRJRWN6TVNZd0pBWURWUVFMREIxQmNIQnNaU0JEWlhKMGFXWnBZMkYwYVc5dUlFRjFkR2h2Y21sMGVURVRNQkVHQTFVRUNnd0tRWEJ3YkdVZ1NXNWpMakVMTUFrR0ExVUVCaE1DVlZNd0hoY05NakV3TXpFM01qQXpOekV3V2hjTk16WXdNekU1TURBd01EQXdXakIxTVVRd1FnWURWUVFERER0QmNIQnNaU0JYYjNKc1pIZHBaR1VnUkdWMlpXeHZjR1Z5SUZKbGJHRjBhVzl1Y3lCRFpYSjBhV1pwWTJGMGFXOXVJRUYxZEdodmNtbDBlVEVMTUFrR0ExVUVDd3dDUnpZeEV6QVJCZ05WQkFvTUNrRndjR3hsSUVsdVl5NHhDekFKQmdOVkJBWVRBbFZUTUhZd0VBWUhLb1pJemowQ0FRWUZLNEVFQUNJRFlnQUVic1FLQzk0UHJsV21aWG5YZ3R4emRWSkw4VDBTR1luZ0RSR3BuZ24zTjZQVDhKTUViN0ZEaTRiQm1QaENuWjMvc3E2UEYvY0djS1hXc0w1dk90ZVJoeUo0NXgzQVNQN2NPQithYW85MGZjcHhTdi9FWkZibmlBYk5nWkdoSWhwSW80SDZNSUgzTUJJR0ExVWRFd0VCL3dRSU1BWUJBZjhDQVFBd0h3WURWUjBqQkJnd0ZvQVV1N0Rlb1ZnemlKcWtpcG5ldnIzcnI5ckxKS3N3UmdZSUt3WUJCUVVIQVFFRU9qQTRNRFlHQ0NzR0FRVUZCekFCaGlwb2RIUndPaTh2YjJOemNDNWhjSEJzWlM1amIyMHZiMk56Y0RBekxXRndjR3hsY205dmRHTmhaek13TndZRFZSMGZCREF3TGpBc29DcWdLSVltYUhSMGNEb3ZMMk55YkM1aGNIQnNaUzVqYjIwdllYQndiR1Z5YjI5MFkyRm5NeTVqY213d0hRWURWUjBPQkJZRUZEOHZsQ05SMDFESm1pZzk3YkI4NWMrbGtHS1pNQTRHQTFVZER3RUIvd1FFQXdJQkJqQVFCZ29xaGtpRzkyTmtCZ0lCQkFJRkFEQUtCZ2dxaGtqT1BRUURBd05vQURCbEFqQkFYaFNxNUl5S29nTUNQdHc0OTBCYUI2NzdDYUVHSlh1ZlFCL0VxWkdkNkNTamlDdE9udU1UYlhWWG14eGN4ZmtDTVFEVFNQeGFyWlh2TnJreFUzVGtVTUkzM3l6dkZWVlJUNHd4V0pDOTk0T3NkY1o0K1JHTnNZRHlSNWdtZHIwbkRHZz0iLCJNSUlDUXpDQ0FjbWdBd0lCQWdJSUxjWDhpTkxGUzVVd0NnWUlLb1pJemowRUF3TXdaekViTUJrR0ExVUVBd3dTUVhCd2JHVWdVbTl2ZENCRFFTQXRJRWN6TVNZd0pBWURWUVFMREIxQmNIQnNaU0JEWlhKMGFXWnBZMkYwYVc5dUlFRjFkR2h2Y21sMGVURVRNQkVHQTFVRUNnd0tRWEJ3YkdVZ1NXNWpMakVMTUFrR0ExVUVCaE1DVlZNd0hoY05NVFF3TkRNd01UZ3hPVEEyV2hjTk16a3dORE13TVRneE9UQTJXakJuTVJzd0dRWURWUVFEREJKQmNIQnNaU0JTYjI5MElFTkJJQzBnUnpNeEpqQWtCZ05WQkFzTUhVRndjR3hsSUVObGNuUnBabWxqWVhScGIyNGdRWFYwYUc5eWFYUjVNUk13RVFZRFZRUUtEQXBCY0hCc1pTQkpibU11TVFzd0NRWURWUVFHRXdKVlV6QjJNQkFHQnlxR1NNNDlBZ0VHQlN1QkJBQWlBMklBQkpqcEx6MUFjcVR0a3lKeWdSTWMzUkNWOGNXalRuSGNGQmJaRHVXbUJTcDNaSHRmVGpqVHV4eEV0WC8xSDdZeVlsM0o2WVJiVHpCUEVWb0EvVmhZREtYMUR5eE5CMGNUZGRxWGw1ZHZNVnp0SzUxN0lEdll1VlRaWHBta09sRUtNYU5DTUVBd0hRWURWUjBPQkJZRUZMdXczcUZZTTRpYXBJcVozcjY5NjYvYXl5U3JNQThHQTFVZEV3RUIvd1FGTUFNQkFmOHdEZ1lEVlIwUEFRSC9CQVFEQWdFR01Bb0dDQ3FHU000OUJBTURBMmdBTUdVQ01RQ0Q2Y0hFRmw0YVhUUVkyZTN2OUd3T0FFWkx1Tit5UmhIRkQvM21lb3locG12T3dnUFVuUFdUeG5TNGF0K3FJeFVDTUcxbWloREsxQTNVVDgyTlF6NjBpbU9sTTI3amJkb1h0MlFmeUZNbStZaGlkRGtMRjF2TFVhZ002QmdENTZLeUtBPT0iXX0.eyJ0cmFuc2FjdGlvbklkIjoiMjAwMDAwMTAyNTY4NjMxMyIsIm9yaWdpbmFsVHJhbnNhY3Rpb25JZCI6IjIwMDAwMDEwMjQ5OTMyOTkiLCJ3ZWJPcmRlckxpbmVJdGVtSWQiOiIyMDAwMDAwMTEzODQ0NzA2IiwiYnVuZGxlSWQiOiJjb20ubG9raS1wcm9qZWN0Lmxva2ktbWVzc2VuZ2VyIiwicHJvZHVjdElkIjoiY29tLmdldHNlc3Npb24ub3JnLnByb19zdWIiLCJzdWJzY3JpcHRpb25Hcm91cElkZW50aWZpZXIiOiIyMTc1MjgxNCIsInB1cmNoYXNlRGF0ZSI6MTc1OTM4ODc2NzAwMCwib3JpZ2luYWxQdXJjaGFzZURhdGUiOjE3NTkzMDE4MzMwMDAsImV4cGlyZXNEYXRlIjoxNzU5Mzg4OTQ3MDAwLCJxdWFudGl0eSI6MSwidHlwZSI6IkF1dG8tUmVuZXdhYmxlIFN1YnNjcmlwdGlvbiIsImluQXBwT3duZXJzaGlwVHlwZSI6IlBVUkNIQVNFRCIsInNpZ25lZERhdGUiOjE3NTkzODkwNDE2MDQsImVudmlyb25tZW50IjoiU2FuZGJveCIsInRyYW5zYWN0aW9uUmVhc29uIjoiUFVSQ0hBU0UiLCJzdG9yZWZyb250IjoiQVVTIiwic3RvcmVmcm9udElkIjoiMTQzNDYwIiwicHJpY2UiOjE5OTAsImN1cnJlbmN5IjoiQVVEIiwiYXBwVHJhbnNhY3Rpb25JZCI6IjcwNDg5NzQ2OTkwMzM4MzkxOSJ9.h6EK76-WgYIOnppoD5zJNc0gy2ItMzv20Vb-djXcw34wMFGd0_u66M4TnlkP_FrJ_20enN2rnRFFAhWWZbZIAg'
+        body_data.status = AppleStatus.EXPIRED
+        body.data = body_data
+        body.externalPurchaseToken = None
+        body.notificationType = AppleNotificationTypeV2.EXPIRED
+        body.notificationUUID = 'c7726298-32eb-48f7-9623-097ff6de4d69'
+        body.rawNotificationType = 'EXPIRED'
+        body.rawSubtype = 'VOLUNTARY'
+        body.signedDate = 1759389041604
+        body.subtype = AppleSubtype.VOLUNTARY
+        body.summary = None
+        body.version = '2.0'
+
+        # NOTE: Signed Renewal Info
+        renewal_info = AppleJWSRenewalInfoDecodedPayload()
+        renewal_info.appAccountToken = None
+        renewal_info.appTransactionId = '704897469903383919'
+        renewal_info.autoRenewProductId = None
+        renewal_info.autoRenewStatus = None
+        renewal_info.currency = 'AUD'
+        renewal_info.eligibleWinBackOfferIds = None
+        renewal_info.environment = AppleEnvironment.SANDBOX
+        renewal_info.expirationIntent = None
+        renewal_info.gracePeriodExpiresDate = None
+        renewal_info.isInBillingRetryPeriod = None
+        renewal_info.offerDiscountType = None
+        renewal_info.offerIdentifier = None
+        renewal_info.offerPeriod = None
+        renewal_info.offerType = None
+        renewal_info.originalTransactionId = '2000001024993299'
+        renewal_info.priceIncreaseStatus = None
+        renewal_info.productId = 'com.getsession.org.pro_sub_1_month'
+        renewal_info.rawAutoRenewStatus = None
+        renewal_info.rawEnvironment = 'Sandbox'
+        renewal_info.rawExpirationIntent = None
+        renewal_info.rawOfferDiscountType = None
+        renewal_info.rawOfferType = None
+        renewal_info.rawPriceIncreaseStatus = None
+        renewal_info.recentSubscriptionStartDate = None
+        renewal_info.renewalDate = None
+        renewal_info.renewalPrice = None
+        renewal_info.signedDate = 1759389041604
+
+        # NOTE: Signed Transaction Info
+        tx_info = AppleJWSTransactionDecodedPayload()
+        tx_info.appAccountToken = None
+        tx_info.appTransactionId = '704897469903383919'
+        tx_info.bundleId = 'com.loki-project.loki-messenger'
+        tx_info.currency = 'AUD'
+        tx_info.environment = AppleEnvironment.SANDBOX
+        tx_info.expiresDate = 1759388947000
+        tx_info.inAppOwnershipType = AppleInAppOwnershipType.PURCHASED
+        tx_info.isUpgraded = None
+        tx_info.offerDiscountType = None
+        tx_info.offerIdentifier = None
+        tx_info.offerPeriod = None
+        tx_info.offerType = None
+        tx_info.originalPurchaseDate = 1759301833000
+        tx_info.originalTransactionId = '2000001024993299'
+        tx_info.price = 1990
+        tx_info.productId = 'com.getsession.org.pro_sub_1_month'
+        tx_info.purchaseDate = 1759388767000
+        tx_info.quantity = 1
+        tx_info.rawEnvironment = 'Sandbox'
+        tx_info.rawInAppOwnershipType = 'PURCHASED'
+        tx_info.rawOfferDiscountType = None
+        tx_info.rawOfferType = None
+        tx_info.rawRevocationReason = None
+        tx_info.rawTransactionReason = 'PURCHASE'
+        tx_info.rawType = 'Auto-Renewable Subscription'
+        tx_info.revocationDate = None
+        tx_info.revocationReason = None
+        tx_info.signedDate = 1759389041604
+        tx_info.storefront = 'AUS'
+        tx_info.storefrontId = '143460'
+        tx_info.subscriptionGroupIdentifier = '21752814'
+        tx_info.transactionId = '2000001025686313'
+        tx_info.transactionReason = AppleTransactionReason.PURCHASE
+        tx_info.type = AppleType.AUTO_RENEWABLE_SUBSCRIPTION
+        tx_info.webOrderLineItemId = '2000000113844706'
+
+        decoded_notification = app_store.DecodedNotification(body=body, tx_info=tx_info, renewal_info=renewal_info)
+
+        err = base.ErrorSink()
+        with test.connection() as conn:
+            app_store.handle_notification(
+                decoded_notification=decoded_notification,
+                conn=conn,
+                notification_retry_duration=datetime.timedelta(0),
+                err=err,
+            )
+            assert not err.has(), err.msg_list
+
+            # NOTE: The payment expires as per Apple's notification. We don't have to do anything
+            # necessarily as our proofs will self-expire.
+
+            # NOTE: Check payment is still in the DB
+            payment_list = backend.get_payments_list(conn)
+            assert len(payment_list) == 1
+            assert payment_list[0].master_pkey is None
+            assert derived_status(payment_list[0]) == base.PaymentStatus.Unredeemed
+            assert payment_list[0].plan == base.ProPlan.OneMonth
+            assert payment_list[0].payment_provider == base.PaymentProvider.iOSAppStore
+            assert payment_list[0].purchased_at == base.datetime_from_unix_ms(tx_info.purchaseDate)
+            assert payment_list[0].redeemed_at is None
+            assert payment_list[0].expires_at == base.datetime_from_unix_ms(tx_info.expiresDate)
+            assert payment_list[0].grace_period == base.DEFAULT_APPLE_GRACE_PERIOD
+            assert payment_list[0].platform_refund_expires_at == base.datetime_from_unix_ms(tx_info.expiresDate)
+            assert payment_list[0].revoked_at is None
             assert payment_list[0].apple.original_tx_id == tx_info.originalTransactionId
             assert payment_list[0].apple.tx_id == tx_info.transactionId
             assert payment_list[0].apple.web_line_order_tx_id == tx_info.webOrderLineItemId
 
-        if 1:  # Expire (voluntary) notification
+        # NOTE: Now expire the payment
+        with test.connection() as conn:
+            backend.expire_payments_revocations_and_users(
+                conn=conn, now=payment_list[0].expires_at + datetime.timedelta(milliseconds=1)
+            )
 
-            # NOTE: Generated by dump_apple_signed_payloads
-            # NOTE: Signed Payload
-            body = AppleResponseBodyV2DecodedPayload()
-            body_data = AppleData()
-            body_data.appAppleId = 1470168868
-            body_data.bundleId = 'com.loki-project.loki-messenger'
-            body_data.bundleVersion = '637'
-            body_data.consumptionRequestReason = None
-            body_data.environment = AppleEnvironment.SANDBOX
-            body_data.rawConsumptionRequestReason = None
-            body_data.rawEnvironment = 'Sandbox'
-            body_data.rawStatus = 2
-            body_data.signedRenewalInfo = 'eyJhbGciOiJFUzI1NiIsIng1YyI6WyJNSUlFTVRDQ0E3YWdBd0lCQWdJUVI4S0h6ZG41NTRaL1VvcmFkTng5dHpBS0JnZ3Foa2pPUFFRREF6QjFNVVF3UWdZRFZRUURERHRCY0hCc1pTQlhiM0pzWkhkcFpHVWdSR1YyWld4dmNHVnlJRkpsYkdGMGFXOXVjeUJEWlhKMGFXWnBZMkYwYVc5dUlFRjFkR2h2Y21sMGVURUxNQWtHQTFVRUN3d0NSell4RXpBUkJnTlZCQW9NQ2tGd2NHeGxJRWx1WXk0eEN6QUpCZ05WQkFZVEFsVlRNQjRYRFRJMU1Ea3hPVEU1TkRRMU1Wb1hEVEkzTVRBeE16RTNORGN5TTFvd2daSXhRREErQmdOVkJBTU1OMUJ5YjJRZ1JVTkRJRTFoWXlCQmNIQWdVM1J2Y21VZ1lXNWtJR2xVZFc1bGN5QlRkRzl5WlNCU1pXTmxhWEIwSUZOcFoyNXBibWN4TERBcUJnTlZCQXNNSTBGd2NHeGxJRmR2Y214a2QybGtaU0JFWlhabGJHOXdaWElnVW1Wc1lYUnBiMjV6TVJNd0VRWURWUVFLREFwQmNIQnNaU0JKYm1NdU1Rc3dDUVlEVlFRR0V3SlZVekJaTUJNR0J5cUdTTTQ5QWdFR0NDcUdTTTQ5QXdFSEEwSUFCTm5WdmhjdjdpVCs3RXg1dEJNQmdyUXNwSHpJc1hSaTBZeGZlazdsdjh3RW1qL2JIaVd0TndKcWMyQm9IenNRaUVqUDdLRklJS2c0WTh5MC9ueW51QW1qZ2dJSU1JSUNCREFNQmdOVkhSTUJBZjhFQWpBQU1COEdBMVVkSXdRWU1CYUFGRDh2bENOUjAxREptaWc5N2JCODVjK2xrR0taTUhBR0NDc0dBUVVGQndFQkJHUXdZakF0QmdnckJnRUZCUWN3QW9ZaGFIUjBjRG92TDJObGNuUnpMbUZ3Y0d4bExtTnZiUzkzZDJSeVp6WXVaR1Z5TURFR0NDc0dBUVVGQnpBQmhpVm9kSFJ3T2k4dmIyTnpjQzVoY0hCc1pTNWpiMjB2YjJOemNEQXpMWGQzWkhKbk5qQXlNSUlCSGdZRFZSMGdCSUlCRlRDQ0FSRXdnZ0VOQmdvcWhraUc5Mk5rQlFZQk1JSCtNSUhEQmdnckJnRUZCUWNDQWpDQnRneUJzMUpsYkdsaGJtTmxJRzl1SUhSb2FYTWdZMlZ5ZEdsbWFXTmhkR1VnWW5rZ1lXNTVJSEJoY25SNUlHRnpjM1Z0WlhNZ1lXTmpaWEIwWVc1alpTQnZaaUIwYUdVZ2RHaGxiaUJoY0hCc2FXTmhZbXhsSUhOMFlXNWtZWEprSUhSbGNtMXpJR0Z1WkNCamIyNWthWFJwYjI1eklHOW1JSFZ6WlN3Z1kyVnlkR2xtYVdOaGRHVWdjRzlzYVdONUlHRnVaQ0JqWlhKMGFXWnBZMkYwYVc5dUlIQnlZV04wYVdObElITjBZWFJsYldWdWRITXVNRFlHQ0NzR0FRVUZCd0lCRmlwb2RIUndPaTh2ZDNkM0xtRndjR3hsTG1OdmJTOWpaWEowYVdacFkyRjBaV0YxZEdodmNtbDBlUzh3SFFZRFZSME9CQllFRklGaW9HNHdNTVZBMWt1OXpKbUdOUEFWbjNlcU1BNEdBMVVkRHdFQi93UUVBd0lIZ0RBUUJnb3Foa2lHOTJOa0Jnc0JCQUlGQURBS0JnZ3Foa2pPUFFRREF3TnBBREJtQWpFQStxWG5SRUM3aFhJV1ZMc0x4em5qUnBJelBmN1ZIejlWL0NUbTgrTEpsclFlcG5tY1B2R0xOY1g2WFBubGNnTEFBakVBNUlqTlpLZ2c1cFE3OWtuRjRJYlRYZEt2OHZ1dElETVhEbWpQVlQzZEd2RnRzR1J3WE95d1Iya1pDZFNyZmVvdCIsIk1JSURGakNDQXB5Z0F3SUJBZ0lVSXNHaFJ3cDBjMm52VTRZU3ljYWZQVGp6Yk5jd0NnWUlLb1pJemowRUF3TXdaekViTUJrR0ExVUVBd3dTUVhCd2JHVWdVbTl2ZENCRFFTQXRJRWN6TVNZd0pBWURWUVFMREIxQmNIQnNaU0JEWlhKMGFXWnBZMkYwYVc5dUlFRjFkR2h2Y21sMGVURVRNQkVHQTFVRUNnd0tRWEJ3YkdVZ1NXNWpMakVMTUFrR0ExVUVCaE1DVlZNd0hoY05NakV3TXpFM01qQXpOekV3V2hjTk16WXdNekU1TURBd01EQXdXakIxTVVRd1FnWURWUVFERER0QmNIQnNaU0JYYjNKc1pIZHBaR1VnUkdWMlpXeHZjR1Z5SUZKbGJHRjBhVzl1Y3lCRFpYSjBhV1pwWTJGMGFXOXVJRUYxZEdodmNtbDBlVEVMTUFrR0ExVUVDd3dDUnpZeEV6QVJCZ05WQkFvTUNrRndjR3hsSUVsdVl5NHhDekFKQmdOVkJBWVRBbFZUTUhZd0VBWUhLb1pJemowQ0FRWUZLNEVFQUNJRFlnQUVic1FLQzk0UHJsV21aWG5YZ3R4emRWSkw4VDBTR1luZ0RSR3BuZ24zTjZQVDhKTUViN0ZEaTRiQm1QaENuWjMvc3E2UEYvY0djS1hXc0w1dk90ZVJoeUo0NXgzQVNQN2NPQithYW85MGZjcHhTdi9FWkZibmlBYk5nWkdoSWhwSW80SDZNSUgzTUJJR0ExVWRFd0VCL3dRSU1BWUJBZjhDQVFBd0h3WURWUjBqQkJnd0ZvQVV1N0Rlb1ZnemlKcWtpcG5ldnIzcnI5ckxKS3N3UmdZSUt3WUJCUVVIQVFFRU9qQTRNRFlHQ0NzR0FRVUZCekFCaGlwb2RIUndPaTh2YjJOemNDNWhjSEJzWlM1amIyMHZiMk56Y0RBekxXRndjR3hsY205dmRHTmhaek13TndZRFZSMGZCREF3TGpBc29DcWdLSVltYUhSMGNEb3ZMMk55YkM1aGNIQnNaUzVqYjIwdllYQndiR1Z5YjI5MFkyRm5NeTVqY213d0hRWURWUjBPQkJZRUZEOHZsQ05SMDFESm1pZzk3YkI4NWMrbGtHS1pNQTRHQTFVZER3RUIvd1FFQXdJQkJqQVFCZ29xaGtpRzkyTmtCZ0lCQkFJRkFEQUtCZ2dxaGtqT1BRUURBd05vQURCbEFqQkFYaFNxNUl5S29nTUNQdHc0OTBCYUI2NzdDYUVHSlh1ZlFCL0VxWkdkNkNTamlDdE9udU1UYlhWWG14eGN4ZmtDTVFEVFNQeGFyWlh2TnJreFUzVGtVTUkzM3l6dkZWVlJUNHd4V0pDOTk0T3NkY1o0K1JHTnNZRHlSNWdtZHIwbkRHZz0iLCJNSUlDUXpDQ0FjbWdBd0lCQWdJSUxjWDhpTkxGUzVVd0NnWUlLb1pJemowRUF3TXdaekViTUJrR0ExVUVBd3dTUVhCd2JHVWdVbTl2ZENCRFFTQXRJRWN6TVNZd0pBWURWUVFMREIxQmNIQnNaU0JEWlhKMGFXWnBZMkYwYVc5dUlFRjFkR2h2Y21sMGVURVRNQkVHQTFVRUNnd0tRWEJ3YkdVZ1NXNWpMakVMTUFrR0ExVUVCaE1DVlZNd0hoY05NVFF3TkRNd01UZ3hPVEEyV2hjTk16a3dORE13TVRneE9UQTJXakJuTVJzd0dRWURWUVFEREJKQmNIQnNaU0JTYjI5MElFTkJJQzBnUnpNeEpqQWtCZ05WQkFzTUhVRndjR3hsSUVObGNuUnBabWxqWVhScGIyNGdRWFYwYUc5eWFYUjVNUk13RVFZRFZRUUtEQXBCY0hCc1pTQkpibU11TVFzd0NRWURWUVFHRXdKVlV6QjJNQkFHQnlxR1NNNDlBZ0VHQlN1QkJBQWlBMklBQkpqcEx6MUFjcVR0a3lKeWdSTWMzUkNWOGNXalRuSGNGQmJaRHVXbUJTcDNaSHRmVGpqVHV4eEV0WC8xSDdZeVlsM0o2WVJiVHpCUEVWb0EvVmhZREtYMUR5eE5CMGNUZGRxWGw1ZHZNVnp0SzUxN0lEdll1VlRaWHBta09sRUtNYU5DTUVBd0hRWURWUjBPQkJZRUZMdXczcUZZTTRpYXBJcVozcjY5NjYvYXl5U3JNQThHQTFVZEV3RUIvd1FGTUFNQkFmOHdEZ1lEVlIwUEFRSC9CQVFEQWdFR01Bb0dDQ3FHU000OUJBTURBMmdBTUdVQ01RQ0Q2Y0hFRmw0YVhUUVkyZTN2OUd3T0FFWkx1Tit5UmhIRkQvM21lb3locG12T3dnUFVuUFdUeG5TNGF0K3FJeFVDTUcxbWloREsxQTNVVDgyTlF6NjBpbU9sTTI3amJkb1h0MlFmeUZNbStZaGlkRGtMRjF2TFVhZ002QmdENTZLeUtBPT0iXX0.eyJleHBpcmF0aW9uSW50ZW50IjoxLCJvcmlnaW5hbFRyYW5zYWN0aW9uSWQiOiIyMDAwMDAxMDI0OTkzMjk5IiwiYXV0b1JlbmV3UHJvZHVjdElkIjoiY29tLmdldHNlc3Npb24ub3JnLnByb19zdWIiLCJwcm9kdWN0SWQiOiJjb20uZ2V0c2Vzc2lvbi5vcmcucHJvX3N1YiIsImF1dG9SZW5ld1N0YXR1cyI6MCwiaXNJbkJpbGxpbmdSZXRyeVBlcmlvZCI6ZmFsc2UsInNpZ25lZERhdGUiOjE3NTkzODkwNDE2MDQsImVudmlyb25tZW50IjoiU2FuZGJveCIsInJlY2VudFN1YnNjcmlwdGlvblN0YXJ0RGF0ZSI6MTc1OTM4ODc2NzAwMCwicmVuZXdhbERhdGUiOjE3NTkzODg5NDcwMDAsImFwcFRyYW5zYWN0aW9uSWQiOiI3MDQ4OTc0Njk5MDMzODM5MTkifQ.wTjYhoiB_reDAIaFXJs0MoMXlXqLAk_QsiS3-o08UeVihVhIUfQD_cYvooh9MHfUE7n6qF-NduDA5JXjij6dKw'
-            body_data.signedTransactionInfo = 'eyJhbGciOiJFUzI1NiIsIng1YyI6WyJNSUlFTVRDQ0E3YWdBd0lCQWdJUVI4S0h6ZG41NTRaL1VvcmFkTng5dHpBS0JnZ3Foa2pPUFFRREF6QjFNVVF3UWdZRFZRUURERHRCY0hCc1pTQlhiM0pzWkhkcFpHVWdSR1YyWld4dmNHVnlJRkpsYkdGMGFXOXVjeUJEWlhKMGFXWnBZMkYwYVc5dUlFRjFkR2h2Y21sMGVURUxNQWtHQTFVRUN3d0NSell4RXpBUkJnTlZCQW9NQ2tGd2NHeGxJRWx1WXk0eEN6QUpCZ05WQkFZVEFsVlRNQjRYRFRJMU1Ea3hPVEU1TkRRMU1Wb1hEVEkzTVRBeE16RTNORGN5TTFvd2daSXhRREErQmdOVkJBTU1OMUJ5YjJRZ1JVTkRJRTFoWXlCQmNIQWdVM1J2Y21VZ1lXNWtJR2xVZFc1bGN5QlRkRzl5WlNCU1pXTmxhWEIwSUZOcFoyNXBibWN4TERBcUJnTlZCQXNNSTBGd2NHeGxJRmR2Y214a2QybGtaU0JFWlhabGJHOXdaWElnVW1Wc1lYUnBiMjV6TVJNd0VRWURWUVFLREFwQmNIQnNaU0JKYm1NdU1Rc3dDUVlEVlFRR0V3SlZVekJaTUJNR0J5cUdTTTQ5QWdFR0NDcUdTTTQ5QXdFSEEwSUFCTm5WdmhjdjdpVCs3RXg1dEJNQmdyUXNwSHpJc1hSaTBZeGZlazdsdjh3RW1qL2JIaVd0TndKcWMyQm9IenNRaUVqUDdLRklJS2c0WTh5MC9ueW51QW1qZ2dJSU1JSUNCREFNQmdOVkhSTUJBZjhFQWpBQU1COEdBMVVkSXdRWU1CYUFGRDh2bENOUjAxREptaWc5N2JCODVjK2xrR0taTUhBR0NDc0dBUVVGQndFQkJHUXdZakF0QmdnckJnRUZCUWN3QW9ZaGFIUjBjRG92TDJObGNuUnpMbUZ3Y0d4bExtTnZiUzkzZDJSeVp6WXVaR1Z5TURFR0NDc0dBUVVGQnpBQmhpVm9kSFJ3T2k4dmIyTnpjQzVoY0hCc1pTNWpiMjB2YjJOemNEQXpMWGQzWkhKbk5qQXlNSUlCSGdZRFZSMGdCSUlCRlRDQ0FSRXdnZ0VOQmdvcWhraUc5Mk5rQlFZQk1JSCtNSUhEQmdnckJnRUZCUWNDQWpDQnRneUJzMUpsYkdsaGJtTmxJRzl1SUhSb2FYTWdZMlZ5ZEdsbWFXTmhkR1VnWW5rZ1lXNTVJSEJoY25SNUlHRnpjM1Z0WlhNZ1lXTmpaWEIwWVc1alpTQnZaaUIwYUdVZ2RHaGxiaUJoY0hCc2FXTmhZbXhsSUhOMFlXNWtZWEprSUhSbGNtMXpJR0Z1WkNCamIyNWthWFJwYjI1eklHOW1JSFZ6WlN3Z1kyVnlkR2xtYVdOaGRHVWdjRzlzYVdONUlHRnVaQ0JqWlhKMGFXWnBZMkYwYVc5dUlIQnlZV04wYVdObElITjBZWFJsYldWdWRITXVNRFlHQ0NzR0FRVUZCd0lCRmlwb2RIUndPaTh2ZDNkM0xtRndjR3hsTG1OdmJTOWpaWEowYVdacFkyRjBaV0YxZEdodmNtbDBlUzh3SFFZRFZSME9CQllFRklGaW9HNHdNTVZBMWt1OXpKbUdOUEFWbjNlcU1BNEdBMVVkRHdFQi93UUVBd0lIZ0RBUUJnb3Foa2lHOTJOa0Jnc0JCQUlGQURBS0JnZ3Foa2pPUFFRREF3TnBBREJtQWpFQStxWG5SRUM3aFhJV1ZMc0x4em5qUnBJelBmN1ZIejlWL0NUbTgrTEpsclFlcG5tY1B2R0xOY1g2WFBubGNnTEFBakVBNUlqTlpLZ2c1cFE3OWtuRjRJYlRYZEt2OHZ1dElETVhEbWpQVlQzZEd2RnRzR1J3WE95d1Iya1pDZFNyZmVvdCIsIk1JSURGakNDQXB5Z0F3SUJBZ0lVSXNHaFJ3cDBjMm52VTRZU3ljYWZQVGp6Yk5jd0NnWUlLb1pJemowRUF3TXdaekViTUJrR0ExVUVBd3dTUVhCd2JHVWdVbTl2ZENCRFFTQXRJRWN6TVNZd0pBWURWUVFMREIxQmNIQnNaU0JEWlhKMGFXWnBZMkYwYVc5dUlFRjFkR2h2Y21sMGVURVRNQkVHQTFVRUNnd0tRWEJ3YkdVZ1NXNWpMakVMTUFrR0ExVUVCaE1DVlZNd0hoY05NakV3TXpFM01qQXpOekV3V2hjTk16WXdNekU1TURBd01EQXdXakIxTVVRd1FnWURWUVFERER0QmNIQnNaU0JYYjNKc1pIZHBaR1VnUkdWMlpXeHZjR1Z5SUZKbGJHRjBhVzl1Y3lCRFpYSjBhV1pwWTJGMGFXOXVJRUYxZEdodmNtbDBlVEVMTUFrR0ExVUVDd3dDUnpZeEV6QVJCZ05WQkFvTUNrRndjR3hsSUVsdVl5NHhDekFKQmdOVkJBWVRBbFZUTUhZd0VBWUhLb1pJemowQ0FRWUZLNEVFQUNJRFlnQUVic1FLQzk0UHJsV21aWG5YZ3R4emRWSkw4VDBTR1luZ0RSR3BuZ24zTjZQVDhKTUViN0ZEaTRiQm1QaENuWjMvc3E2UEYvY0djS1hXc0w1dk90ZVJoeUo0NXgzQVNQN2NPQithYW85MGZjcHhTdi9FWkZibmlBYk5nWkdoSWhwSW80SDZNSUgzTUJJR0ExVWRFd0VCL3dRSU1BWUJBZjhDQVFBd0h3WURWUjBqQkJnd0ZvQVV1N0Rlb1ZnemlKcWtpcG5ldnIzcnI5ckxKS3N3UmdZSUt3WUJCUVVIQVFFRU9qQTRNRFlHQ0NzR0FRVUZCekFCaGlwb2RIUndPaTh2YjJOemNDNWhjSEJzWlM1amIyMHZiMk56Y0RBekxXRndjR3hsY205dmRHTmhaek13TndZRFZSMGZCREF3TGpBc29DcWdLSVltYUhSMGNEb3ZMMk55YkM1aGNIQnNaUzVqYjIwdllYQndiR1Z5YjI5MFkyRm5NeTVqY213d0hRWURWUjBPQkJZRUZEOHZsQ05SMDFESm1pZzk3YkI4NWMrbGtHS1pNQTRHQTFVZER3RUIvd1FFQXdJQkJqQVFCZ29xaGtpRzkyTmtCZ0lCQkFJRkFEQUtCZ2dxaGtqT1BRUURBd05vQURCbEFqQkFYaFNxNUl5S29nTUNQdHc0OTBCYUI2NzdDYUVHSlh1ZlFCL0VxWkdkNkNTamlDdE9udU1UYlhWWG14eGN4ZmtDTVFEVFNQeGFyWlh2TnJreFUzVGtVTUkzM3l6dkZWVlJUNHd4V0pDOTk0T3NkY1o0K1JHTnNZRHlSNWdtZHIwbkRHZz0iLCJNSUlDUXpDQ0FjbWdBd0lCQWdJSUxjWDhpTkxGUzVVd0NnWUlLb1pJemowRUF3TXdaekViTUJrR0ExVUVBd3dTUVhCd2JHVWdVbTl2ZENCRFFTQXRJRWN6TVNZd0pBWURWUVFMREIxQmNIQnNaU0JEWlhKMGFXWnBZMkYwYVc5dUlFRjFkR2h2Y21sMGVURVRNQkVHQTFVRUNnd0tRWEJ3YkdVZ1NXNWpMakVMTUFrR0ExVUVCaE1DVlZNd0hoY05NVFF3TkRNd01UZ3hPVEEyV2hjTk16a3dORE13TVRneE9UQTJXakJuTVJzd0dRWURWUVFEREJKQmNIQnNaU0JTYjI5MElFTkJJQzBnUnpNeEpqQWtCZ05WQkFzTUhVRndjR3hsSUVObGNuUnBabWxqWVhScGIyNGdRWFYwYUc5eWFYUjVNUk13RVFZRFZRUUtEQXBCY0hCc1pTQkpibU11TVFzd0NRWURWUVFHRXdKVlV6QjJNQkFHQnlxR1NNNDlBZ0VHQlN1QkJBQWlBMklBQkpqcEx6MUFjcVR0a3lKeWdSTWMzUkNWOGNXalRuSGNGQmJaRHVXbUJTcDNaSHRmVGpqVHV4eEV0WC8xSDdZeVlsM0o2WVJiVHpCUEVWb0EvVmhZREtYMUR5eE5CMGNUZGRxWGw1ZHZNVnp0SzUxN0lEdll1VlRaWHBta09sRUtNYU5DTUVBd0hRWURWUjBPQkJZRUZMdXczcUZZTTRpYXBJcVozcjY5NjYvYXl5U3JNQThHQTFVZEV3RUIvd1FGTUFNQkFmOHdEZ1lEVlIwUEFRSC9CQVFEQWdFR01Bb0dDQ3FHU000OUJBTURBMmdBTUdVQ01RQ0Q2Y0hFRmw0YVhUUVkyZTN2OUd3T0FFWkx1Tit5UmhIRkQvM21lb3locG12T3dnUFVuUFdUeG5TNGF0K3FJeFVDTUcxbWloREsxQTNVVDgyTlF6NjBpbU9sTTI3amJkb1h0MlFmeUZNbStZaGlkRGtMRjF2TFVhZ002QmdENTZLeUtBPT0iXX0.eyJ0cmFuc2FjdGlvbklkIjoiMjAwMDAwMTAyNTY4NjMxMyIsIm9yaWdpbmFsVHJhbnNhY3Rpb25JZCI6IjIwMDAwMDEwMjQ5OTMyOTkiLCJ3ZWJPcmRlckxpbmVJdGVtSWQiOiIyMDAwMDAwMTEzODQ0NzA2IiwiYnVuZGxlSWQiOiJjb20ubG9raS1wcm9qZWN0Lmxva2ktbWVzc2VuZ2VyIiwicHJvZHVjdElkIjoiY29tLmdldHNlc3Npb24ub3JnLnByb19zdWIiLCJzdWJzY3JpcHRpb25Hcm91cElkZW50aWZpZXIiOiIyMTc1MjgxNCIsInB1cmNoYXNlRGF0ZSI6MTc1OTM4ODc2NzAwMCwib3JpZ2luYWxQdXJjaGFzZURhdGUiOjE3NTkzMDE4MzMwMDAsImV4cGlyZXNEYXRlIjoxNzU5Mzg4OTQ3MDAwLCJxdWFudGl0eSI6MSwidHlwZSI6IkF1dG8tUmVuZXdhYmxlIFN1YnNjcmlwdGlvbiIsImluQXBwT3duZXJzaGlwVHlwZSI6IlBVUkNIQVNFRCIsInNpZ25lZERhdGUiOjE3NTkzODkwNDE2MDQsImVudmlyb25tZW50IjoiU2FuZGJveCIsInRyYW5zYWN0aW9uUmVhc29uIjoiUFVSQ0hBU0UiLCJzdG9yZWZyb250IjoiQVVTIiwic3RvcmVmcm9udElkIjoiMTQzNDYwIiwicHJpY2UiOjE5OTAsImN1cnJlbmN5IjoiQVVEIiwiYXBwVHJhbnNhY3Rpb25JZCI6IjcwNDg5NzQ2OTkwMzM4MzkxOSJ9.h6EK76-WgYIOnppoD5zJNc0gy2ItMzv20Vb-djXcw34wMFGd0_u66M4TnlkP_FrJ_20enN2rnRFFAhWWZbZIAg'
-            body_data.status = AppleStatus.EXPIRED
-            body.data = body_data
-            body.externalPurchaseToken = None
-            body.notificationType = AppleNotificationTypeV2.EXPIRED
-            body.notificationUUID = 'c7726298-32eb-48f7-9623-097ff6de4d69'
-            body.rawNotificationType = 'EXPIRED'
-            body.rawSubtype = 'VOLUNTARY'
-            body.signedDate = 1759389041604
-            body.subtype = AppleSubtype.VOLUNTARY
-            body.summary = None
-            body.version = '2.0'
+            # NOTE: Now check that the payments were marked expired
+            payment_list = backend.get_payments_list(conn)
 
-            # NOTE: Signed Renewal Info
-            renewal_info = AppleJWSRenewalInfoDecodedPayload()
-            renewal_info.appAccountToken = None
-            renewal_info.appTransactionId = '704897469903383919'
-            renewal_info.autoRenewProductId = None
-            renewal_info.autoRenewStatus = None
-            renewal_info.currency = 'AUD'
-            renewal_info.eligibleWinBackOfferIds = None
-            renewal_info.environment = AppleEnvironment.SANDBOX
-            renewal_info.expirationIntent = None
-            renewal_info.gracePeriodExpiresDate = None
-            renewal_info.isInBillingRetryPeriod = None
-            renewal_info.offerDiscountType = None
-            renewal_info.offerIdentifier = None
-            renewal_info.offerPeriod = None
-            renewal_info.offerType = None
-            renewal_info.originalTransactionId = '2000001024993299'
-            renewal_info.priceIncreaseStatus = None
-            renewal_info.productId = 'com.getsession.org.pro_sub_1_month'
-            renewal_info.rawAutoRenewStatus = None
-            renewal_info.rawEnvironment = 'Sandbox'
-            renewal_info.rawExpirationIntent = None
-            renewal_info.rawOfferDiscountType = None
-            renewal_info.rawOfferType = None
-            renewal_info.rawPriceIncreaseStatus = None
-            renewal_info.recentSubscriptionStartDate = None
-            renewal_info.renewalDate = None
-            renewal_info.renewalPrice = None
-            renewal_info.signedDate = 1759389041604
-
-            # NOTE: Signed Transaction Info
-            tx_info = AppleJWSTransactionDecodedPayload()
-            tx_info.appAccountToken = None
-            tx_info.appTransactionId = '704897469903383919'
-            tx_info.bundleId = 'com.loki-project.loki-messenger'
-            tx_info.currency = 'AUD'
-            tx_info.environment = AppleEnvironment.SANDBOX
-            tx_info.expiresDate = 1759388947000
-            tx_info.inAppOwnershipType = AppleInAppOwnershipType.PURCHASED
-            tx_info.isUpgraded = None
-            tx_info.offerDiscountType = None
-            tx_info.offerIdentifier = None
-            tx_info.offerPeriod = None
-            tx_info.offerType = None
-            tx_info.originalPurchaseDate = 1759301833000
-            tx_info.originalTransactionId = '2000001024993299'
-            tx_info.price = 1990
-            tx_info.productId = 'com.getsession.org.pro_sub_1_month'
-            tx_info.purchaseDate = 1759388767000
-            tx_info.quantity = 1
-            tx_info.rawEnvironment = 'Sandbox'
-            tx_info.rawInAppOwnershipType = 'PURCHASED'
-            tx_info.rawOfferDiscountType = None
-            tx_info.rawOfferType = None
-            tx_info.rawRevocationReason = None
-            tx_info.rawTransactionReason = 'PURCHASE'
-            tx_info.rawType = 'Auto-Renewable Subscription'
-            tx_info.revocationDate = None
-            tx_info.revocationReason = None
-            tx_info.signedDate = 1759389041604
-            tx_info.storefront = 'AUS'
-            tx_info.storefrontId = '143460'
-            tx_info.subscriptionGroupIdentifier = '21752814'
-            tx_info.transactionId = '2000001025686313'
-            tx_info.transactionReason = AppleTransactionReason.PURCHASE
-            tx_info.type = AppleType.AUTO_RENEWABLE_SUBSCRIPTION
-            tx_info.webOrderLineItemId = '2000000113844706'
-
-            decoded_notification = app_store.DecodedNotification(body=body, tx_info=tx_info, renewal_info=renewal_info)
-
-            err = base.ErrorSink()
-            with test.connection() as conn:
-                app_store.handle_notification(
-                    decoded_notification=decoded_notification,
-                    conn=conn,
-                    notification_retry_duration=datetime.timedelta(0),
-                    err=err,
-                )
-                assert not err.has(), err.msg_list
-
-                # NOTE: The payment expires as per Apple's notification. We don't have to do anything
-                # necessarily as our proofs will self-expire.
-
-                # NOTE: Check payment is still in the DB
-                payment_list = backend.get_payments_list(conn)
-                assert len(payment_list) == 1
-                assert payment_list[0].master_pkey is None
-                assert derived_status(payment_list[0]) == base.PaymentStatus.Unredeemed
-                assert payment_list[0].plan == base.ProPlan.OneMonth
-                assert payment_list[0].payment_provider == base.PaymentProvider.iOSAppStore
-                assert payment_list[0].purchased_at == base.datetime_from_unix_ms(tx_info.purchaseDate)
-                assert payment_list[0].redeemed_at is None
-                assert payment_list[0].expires_at == base.datetime_from_unix_ms(tx_info.expiresDate)
-                assert payment_list[0].grace_period == base.DEFAULT_APPLE_GRACE_PERIOD
-                assert payment_list[0].platform_refund_expires_at == base.datetime_from_unix_ms(tx_info.expiresDate)
-                assert payment_list[0].revoked_at is None
-                assert payment_list[0].apple.original_tx_id == tx_info.originalTransactionId
-                assert payment_list[0].apple.tx_id == tx_info.transactionId
-                assert payment_list[0].apple.web_line_order_tx_id == tx_info.webOrderLineItemId
-
-            # NOTE: Now expire the payment
-            with test.connection() as conn:
-                backend.expire_payments_revocations_and_users(
-                    conn=conn, now=payment_list[0].expires_at + datetime.timedelta(milliseconds=1)
-                )
-
-                # NOTE: Now check that the payments were marked expired
-                payment_list = backend.get_payments_list(conn)
-
-                assert len(payment_list) == 1
-                assert payment_list[0].master_pkey is None
-                assert derived_status(payment_list[0], payment_list[0].expires_at) == base.PaymentStatus.Expired
-                assert payment_list[0].plan == base.ProPlan.OneMonth
-                assert payment_list[0].payment_provider == base.PaymentProvider.iOSAppStore
-                assert payment_list[0].purchased_at == base.datetime_from_unix_ms(tx_info.purchaseDate)
-                assert payment_list[0].redeemed_at is None
-                assert payment_list[0].expires_at == base.datetime_from_unix_ms(tx_info.expiresDate)
-                assert payment_list[0].grace_period == base.DEFAULT_APPLE_GRACE_PERIOD
-                assert payment_list[0].platform_refund_expires_at == base.datetime_from_unix_ms(tx_info.expiresDate)
-                assert payment_list[0].revoked_at is None
-                assert payment_list[0].apple.original_tx_id == tx_info.originalTransactionId
-                assert payment_list[0].apple.tx_id == tx_info.transactionId
-                assert payment_list[0].apple.web_line_order_tx_id == tx_info.webOrderLineItemId
+            assert len(payment_list) == 1
+            assert payment_list[0].master_pkey is None
+            assert derived_status(payment_list[0], payment_list[0].expires_at) == base.PaymentStatus.Expired
+            assert payment_list[0].plan == base.ProPlan.OneMonth
+            assert payment_list[0].payment_provider == base.PaymentProvider.iOSAppStore
+            assert payment_list[0].purchased_at == base.datetime_from_unix_ms(tx_info.purchaseDate)
+            assert payment_list[0].redeemed_at is None
+            assert payment_list[0].expires_at == base.datetime_from_unix_ms(tx_info.expiresDate)
+            assert payment_list[0].grace_period == base.DEFAULT_APPLE_GRACE_PERIOD
+            assert payment_list[0].platform_refund_expires_at == base.datetime_from_unix_ms(tx_info.expiresDate)
+            assert payment_list[0].revoked_at is None
+            assert payment_list[0].apple.original_tx_id == tx_info.originalTransactionId
+            assert payment_list[0].apple.tx_id == tx_info.transactionId
+            assert payment_list[0].apple.web_line_order_tx_id == tx_info.webOrderLineItemId
 
     # NOTE: Execute the sequence
     #  - 0 [SUBSCRIBED,                sub: RESUBSCRIBE]         Subscribe to 3 months
@@ -3744,87 +3717,84 @@ def test_platform_apple(pg_database):
         rotating_key = nacl.signing.SigningKey.generate()
 
         # NOTE: Witness 3 month subscription
-        if 1:
-            unredeemed_payment_list = []
-            with test.connection() as conn:
-                app_store.handle_notification(
-                    decoded_notification=e00_sub_to_3_months_decoded_notification,
-                    conn=conn,
-                    notification_retry_duration=datetime.timedelta(0),
-                    err=err,
-                )
-                assert not err.has(), err.msg_list
-                unredeemed_payment_list = backend.get_unredeemed_payments_list(conn)
+        unredeemed_payment_list = []
+        with test.connection() as conn:
+            app_store.handle_notification(
+                decoded_notification=e00_sub_to_3_months_decoded_notification,
+                conn=conn,
+                notification_retry_duration=datetime.timedelta(0),
+                err=err,
+            )
+            assert not err.has(), err.msg_list
+            unredeemed_payment_list = backend.get_unredeemed_payments_list(conn)
 
-            assert len(unredeemed_payment_list) == 1
-            assert unredeemed_payment_list[0].master_pkey is None
-            assert derived_status(unredeemed_payment_list[0]) == base.PaymentStatus.Unredeemed
-            assert unredeemed_payment_list[0].plan == base.ProPlan.ThreeMonth
-            assert unredeemed_payment_list[0].payment_provider == base.PaymentProvider.iOSAppStore
-            assert unredeemed_payment_list[0].auto_renewing
-            assert unredeemed_payment_list[0].purchased_at == base.datetime_from_unix_ms(
-                e00_sub_to_3_months_tx_info.purchaseDate
-            )
-            assert unredeemed_payment_list[0].redeemed_at is None
-            assert unredeemed_payment_list[0].expires_at == base.datetime_from_unix_ms(
-                e00_sub_to_3_months_tx_info.expiresDate
-            )
-            assert unredeemed_payment_list[0].grace_period == base.DEFAULT_APPLE_GRACE_PERIOD
-            assert unredeemed_payment_list[0].platform_refund_expires_at == base.datetime_from_unix_ms(
-                e00_sub_to_3_months_tx_info.expiresDate
-            )
-            assert unredeemed_payment_list[0].revoked_at is None
-            assert unredeemed_payment_list[0].apple.original_tx_id == e00_sub_to_3_months_tx_info.originalTransactionId
-            assert unredeemed_payment_list[0].apple.tx_id == e00_sub_to_3_months_tx_info.transactionId
-            assert (
-                unredeemed_payment_list[0].apple.web_line_order_tx_id == e00_sub_to_3_months_tx_info.webOrderLineItemId
-            )
+        assert len(unredeemed_payment_list) == 1
+        assert unredeemed_payment_list[0].master_pkey is None
+        assert derived_status(unredeemed_payment_list[0]) == base.PaymentStatus.Unredeemed
+        assert unredeemed_payment_list[0].plan == base.ProPlan.ThreeMonth
+        assert unredeemed_payment_list[0].payment_provider == base.PaymentProvider.iOSAppStore
+        assert unredeemed_payment_list[0].auto_renewing
+        assert unredeemed_payment_list[0].purchased_at == base.datetime_from_unix_ms(
+            e00_sub_to_3_months_tx_info.purchaseDate
+        )
+        assert unredeemed_payment_list[0].redeemed_at is None
+        assert unredeemed_payment_list[0].expires_at == base.datetime_from_unix_ms(
+            e00_sub_to_3_months_tx_info.expiresDate
+        )
+        assert unredeemed_payment_list[0].grace_period == base.DEFAULT_APPLE_GRACE_PERIOD
+        assert unredeemed_payment_list[0].platform_refund_expires_at == base.datetime_from_unix_ms(
+            e00_sub_to_3_months_tx_info.expiresDate
+        )
+        assert unredeemed_payment_list[0].revoked_at is None
+        assert unredeemed_payment_list[0].apple.original_tx_id == e00_sub_to_3_months_tx_info.originalTransactionId
+        assert unredeemed_payment_list[0].apple.tx_id == e00_sub_to_3_months_tx_info.transactionId
+        assert unredeemed_payment_list[0].apple.web_line_order_tx_id == e00_sub_to_3_months_tx_info.webOrderLineItemId
 
-            # NOTE: Then redeem the payment
-            add_pro_payment_tx = backend.UserPaymentTransaction()
-            add_pro_payment_tx.provider = base.PaymentProvider.iOSAppStore
-            add_pro_payment_tx.apple_tx_id = unredeemed_payment_list[0].apple.tx_id
-            add_pro_payment_tx.payment_id = backend.payment_id_from_user_tx(add_pro_payment_tx)
-            payment_hash_to_sign = backend.make_add_pro_payment_message(
-                master_pkey=master_key.verify_key, rotating_pkey=rotating_key.verify_key, payment_tx=add_pro_payment_tx
-            )
+        # NOTE: Then redeem the payment
+        add_pro_payment_tx = backend.UserPaymentTransaction()
+        add_pro_payment_tx.provider = base.PaymentProvider.iOSAppStore
+        add_pro_payment_tx.apple_tx_id = unredeemed_payment_list[0].apple.tx_id
+        add_pro_payment_tx.payment_id = backend.payment_id_from_user_tx(add_pro_payment_tx)
+        payment_hash_to_sign = backend.make_add_pro_payment_message(
+            master_pkey=master_key.verify_key, rotating_pkey=rotating_key.verify_key, payment_tx=add_pro_payment_tx
+        )
 
-            # NOTE: POST and get response
-            response = test.flask_client.post(
-                server.FLASK_ROUTE_ADD_PRO_PAYMENT,
-                json={
-                    'master_pkey': bytes(master_key.verify_key).hex(),
-                    'rotating_pkey': bytes(rotating_key.verify_key).hex(),
-                    'master_sig': bytes(master_key.sign(payment_hash_to_sign).signature).hex(),
-                    'rotating_sig': bytes(rotating_key.sign(payment_hash_to_sign).signature).hex(),
-                    'payment_tx': {
-                        'provider': add_pro_payment_tx.provider.value,
-                        'payment_id': add_pro_payment_tx.payment_id,
-                    },
+        # NOTE: POST and get response
+        response = test.flask_client.post(
+            server.FLASK_ROUTE_ADD_PRO_PAYMENT,
+            json={
+                'master_pkey': bytes(master_key.verify_key).hex(),
+                'rotating_pkey': bytes(rotating_key.verify_key).hex(),
+                'master_sig': bytes(master_key.sign(payment_hash_to_sign).signature).hex(),
+                'rotating_sig': bytes(rotating_key.sign(payment_hash_to_sign).signature).hex(),
+                'payment_tx': {
+                    'provider': add_pro_payment_tx.provider.value,
+                    'payment_id': add_pro_payment_tx.payment_id,
                 },
-            )
+            },
+        )
 
-            # NOTE: Check payment got redeemed to the DB
-            with test.connection() as conn:
-                payment_list = backend.get_payments_list(conn)
+        # NOTE: Check payment got redeemed to the DB
+        with test.connection() as conn:
+            payment_list = backend.get_payments_list(conn)
 
-            assert len(payment_list) == 1
-            assert payment_list[0].master_pkey == bytes(master_key.verify_key)
-            assert derived_status(payment_list[0]) == base.PaymentStatus.Redeemed
-            assert payment_list[0].plan == base.ProPlan.ThreeMonth
-            assert payment_list[0].payment_provider == base.PaymentProvider.iOSAppStore
-            assert payment_list[0].auto_renewing
-            assert payment_list[0].purchased_at == base.datetime_from_unix_ms(e00_sub_to_3_months_tx_info.purchaseDate)
-            assert payment_list[0].redeemed_at is not None
-            assert payment_list[0].expires_at == base.datetime_from_unix_ms(e00_sub_to_3_months_tx_info.expiresDate)
-            assert payment_list[0].grace_period == base.DEFAULT_APPLE_GRACE_PERIOD
-            assert payment_list[0].platform_refund_expires_at == base.datetime_from_unix_ms(
-                e00_sub_to_3_months_tx_info.expiresDate
-            )
-            assert payment_list[0].revoked_at is None
-            assert payment_list[0].apple.original_tx_id == e00_sub_to_3_months_tx_info.originalTransactionId
-            assert payment_list[0].apple.tx_id == e00_sub_to_3_months_tx_info.transactionId
-            assert payment_list[0].apple.web_line_order_tx_id == e00_sub_to_3_months_tx_info.webOrderLineItemId
+        assert len(payment_list) == 1
+        assert payment_list[0].master_pkey == bytes(master_key.verify_key)
+        assert derived_status(payment_list[0]) == base.PaymentStatus.Redeemed
+        assert payment_list[0].plan == base.ProPlan.ThreeMonth
+        assert payment_list[0].payment_provider == base.PaymentProvider.iOSAppStore
+        assert payment_list[0].auto_renewing
+        assert payment_list[0].purchased_at == base.datetime_from_unix_ms(e00_sub_to_3_months_tx_info.purchaseDate)
+        assert payment_list[0].redeemed_at is not None
+        assert payment_list[0].expires_at == base.datetime_from_unix_ms(e00_sub_to_3_months_tx_info.expiresDate)
+        assert payment_list[0].grace_period == base.DEFAULT_APPLE_GRACE_PERIOD
+        assert payment_list[0].platform_refund_expires_at == base.datetime_from_unix_ms(
+            e00_sub_to_3_months_tx_info.expiresDate
+        )
+        assert payment_list[0].revoked_at is None
+        assert payment_list[0].apple.original_tx_id == e00_sub_to_3_months_tx_info.originalTransactionId
+        assert payment_list[0].apple.tx_id == e00_sub_to_3_months_tx_info.transactionId
+        assert payment_list[0].apple.web_line_order_tx_id == e00_sub_to_3_months_tx_info.webOrderLineItemId
 
         # NOTE: "Upgrade" to 1 week subscription. Initially when we set up the Apple subscriptions,
         # 1 week was put at the top of the list, this makes it have a higher ranking than the 3
