@@ -27,7 +27,6 @@ import base
 import backend
 import config
 import db
-from providers import google_play
 
 log = logging.getLogger('PRO')
 
@@ -60,7 +59,7 @@ def run() -> None:
     # The mule is its own process, so wire up console logging (uWSGI captures it into the vassal log).
     handler = logging.StreamHandler()
     handler.setFormatter(base.LogFormatter('%(asctime)s %(levelname)s %(name)s %(message)s'))
-    for logger in (log, backend.log, google_play.log):
+    for logger in (log, backend.log):
         logger.addHandler(handler)
 
     try:
@@ -77,6 +76,11 @@ def run() -> None:
 
     # Google Pub/Sub subscriber — a single consumer. gRPC state is built here (post-fork, in the mule).
     if parsed.with_provider_google_play:
+        # Import the Google provider only when enabled — disabled means nothing of it loads (keeps
+        # grpcio out of the mule entirely). DO NOT hoist to module scope.
+        from providers import google_play
+
+        google_play.log.addHandler(handler)
         if base.PROVIDER_TESTING_ENV:
             base.DEFAULT_GOOGLE_GRACE_PERIOD = base.timedelta_from_ms(google_play.api.testing_grace_period_duration_ms)
         context = google_play.start_subscriber(

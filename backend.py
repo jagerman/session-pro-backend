@@ -12,7 +12,6 @@ import enum
 import csv
 import io
 
-from providers import google_play
 import base
 import db
 import migrations
@@ -2182,6 +2181,11 @@ def add_pro_payment(
     # step, avoiding a client-acks-but-server-hasn't poll race. (Under provider_dry_run these Google calls
     # are stubbed in google_play.api — a synthetic already-acknowledged fetch + no-op acknowledge.)
     if payment_tx.provider == base.PaymentProvider.GooglePlayStore:
+        # Import the Google provider lazily, only on the Google redeem path: a bare `import backend`
+        # (main/mule/cli all do it) must never pull google_play in. A disabled provider then has zero
+        # footprint, and it keeps grpcio out of the uWSGI master/mule fork path. DO NOT hoist.
+        from providers import google_play
+
         # google_play.api is still ErrorSink-based (the deferred sweep); bridge with a local sink and
         # translate its failure into a raise.
         google_err = base.ErrorSink()
