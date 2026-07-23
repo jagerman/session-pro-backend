@@ -34,6 +34,15 @@ CLEANUP_SIGNAL = 17  # uWSGI user signal that drives the periodic prune
 PRUNE_INTERVAL_S = 600  # ~10 min; a no-op prune is a cheap indexed empty scan
 
 
+def _mark(msg: str) -> None:
+    # TEMP segfault instrumentation — raw stderr (uWSGI funnels it into the vassal log), bypasses logging.
+    sys.stderr.write(f'MULE-DEBUG: {msg}\n')
+    sys.stderr.flush()
+
+
+_mark('module imported')
+
+
 def _cleanup(pool: psycopg_pool.ConnectionPool) -> None:
     # Wrapped so a transient DB error logs and is retried on the next tick rather than killing the mule.
     try:
@@ -56,6 +65,7 @@ def _cleanup(pool: psycopg_pool.ConnectionPool) -> None:
 
 
 def run() -> None:
+    _mark('run() entered')
     # The mule is its own process, so wire up console logging (uWSGI captures it into the vassal log).
     handler = logging.StreamHandler()
     handler.setFormatter(base.LogFormatter('%(asctime)s %(levelname)s %(name)s %(message)s'))
@@ -71,8 +81,10 @@ def run() -> None:
     base.DB_URL = parsed.db_url
     base.PROVIDER_TESTING_ENV = parsed.provider_testing_env
     base.PROVIDER_DRY_RUN = parsed.provider_dry_run
+    _mark('config parsed + globals set')
 
     pool = db.get_pool(parsed.db_url)
+    _mark('pool created')
 
     # Google Pub/Sub subscriber — a single consumer. gRPC state is built here (post-fork, in the mule).
     if parsed.with_provider_google_play:
@@ -98,7 +110,9 @@ def run() -> None:
 
     # Prune once immediately (so a frequently-reloading box still gets cleaned each start), then let
     # uWSGI's timer drive it — event-driven, no sleeping thread.
+    _mark('about to run first prune')
     _cleanup(pool)
+    _mark('first prune returned')
     uwsgi.register_signal(CLEANUP_SIGNAL, 'mule1', lambda _signum: _cleanup(pool))
     uwsgi.add_timer(CLEANUP_SIGNAL, PRUNE_INTERVAL_S)
     log.info(f'Maintenance mule started; pruning every {PRUNE_INTERVAL_S}s')
