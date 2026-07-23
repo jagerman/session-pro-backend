@@ -7,8 +7,9 @@ subscription). It hosts:
   - the Google Pub/Sub notification subscriber (a single consumer), and
   - the periodic DB prune (expired revocations / orphaned users / expired notification history).
 
-The prune runs on uWSGI's own timer/signal loop — no sleeping thread — once immediately on startup, then
-every PRUNE_INTERVAL_S. Because the prune is pure idempotent housekeeping (expiry is derived on read and
+The prune runs in a simple loop (prune, then sleep PRUNE_INTERVAL_S): a mule cannot register uWSGI
+signals/timers ("only the master and the workers can register signal handlers"), so a plain sleep loop
+is the right tool. Because the prune is pure idempotent housekeeping (expiry is derived on read and
 every consuming query self-guards on expiry), the exact cadence doesn't matter.
 
 `run()` executes in the mule *post-fork*, so all Google/gRPC state is constructed here, never at module
@@ -21,7 +22,6 @@ import sys
 import time
 
 import psycopg_pool
-import uwsgi
 
 import base
 import backend
@@ -30,7 +30,6 @@ import db
 
 log = logging.getLogger('PRO')
 
-CLEANUP_SIGNAL = 17  # uWSGI user signal that drives the periodic prune
 PRUNE_INTERVAL_S = 600  # ~10 min; a no-op prune is a cheap indexed empty scan
 
 
@@ -96,12 +95,9 @@ def run() -> None:
         atexit.register(google_play.stop_subscriber, context)
         log.info('Maintenance mule: Google subscriber started')
 
-    # Prune once immediately (so a frequently-reloading box still gets cleaned each start), then let
-    # uWSGI's timer drive it — event-driven, no sleeping thread.
-    _cleanup(pool)
-    uwsgi.register_signal(CLEANUP_SIGNAL, 'mule1', lambda _signum: _cleanup(pool))
-    uwsgi.add_timer(CLEANUP_SIGNAL, PRUNE_INTERVAL_S)
+    # Prune loop: once immediately (so a frequently-reloading box gets cleaned each start), then every
+    # PRUNE_INTERVAL_S. A mule can't register uWSGI signals/timers, so drive it with a plain sleep loop.
     log.info(f'Maintenance mule started; pruning every {PRUNE_INTERVAL_S}s')
-
     while True:
-        uwsgi.signal_wait()
+        _cleanup(pool)
+        time.sleep(PRUNE_INTERVAL_S)
