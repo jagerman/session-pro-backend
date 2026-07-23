@@ -45,8 +45,8 @@ done
 GIT_REPO="${GIT_REPO:-https://github.com/session-foundation/session-pro-backend}"
 GIT_REF="${GIT_REF:-main}"
 PRO_DOMAIN="${PRO_DOMAIN:-pro.example.org}"
-WITH_PLATFORM_APPLE="${WITH_PLATFORM_APPLE:-false}"
-WITH_PLATFORM_GOOGLE="${WITH_PLATFORM_GOOGLE:-false}"
+WITH_PROVIDER_APP_STORE="${WITH_PROVIDER_APP_STORE:-false}"
+WITH_PROVIDER_GOOGLE_PLAY="${WITH_PROVIDER_GOOGLE_PLAY:-false}"
 PGBACKREST_REPO_HOST="${PGBACKREST_REPO_HOST:-}"
 PGBACKREST_REPO_HOST_USER="${PGBACKREST_REPO_HOST_USER:-pgbackrest}"
 PGBACKREST_REPO_PATH="${PGBACKREST_REPO_PATH:-/var/lib/pgbackrest}"
@@ -233,7 +233,7 @@ chown root:"$PRO_USER" "$BACKEND_KEY_FILE"
 chmod 0440 "$BACKEND_KEY_FILE"
 
 # --------------------------------------------------------------------------------------
-# 7. Application config (config.ini): install if absent, always fix db_url + platform toggles
+# 7. Application config (config.ini): install if absent, always fix db_url + provider toggles
 # --------------------------------------------------------------------------------------
 log "Writing application config"
 if [[ ! -f "$CONFIG_INI" ]]; then
@@ -245,8 +245,8 @@ DB_URL_ESC="${DB_URL//&/\\&}"
 sed -i \
     -e "s|^db_url .*|db_url                 = ${DB_URL_ESC}|" \
     -e "s|^backend_key_path .*|backend_key_path       = ${BACKEND_KEY_FILE}|" \
-    -e "s|^with_platform_apple .*|with_platform_apple    = ${WITH_PLATFORM_APPLE}|" \
-    -e "s|^with_platform_google .*|with_platform_google   = ${WITH_PLATFORM_GOOGLE}|" \
+    -e "s|^with_provider_app_store .*|with_provider_app_store    = ${WITH_PROVIDER_APP_STORE}|" \
+    -e "s|^with_provider_google_play .*|with_provider_google_play   = ${WITH_PROVIDER_GOOGLE_PLAY}|" \
     "$CONFIG_INI"
 
 # Apple root certificates, vendored in the repo (scripts/apple-certs/). The app-store-server-library
@@ -387,7 +387,7 @@ Session Pro Backend deployed.
 NEXT STEPS
   * TLS is NOT configured. Obtain a certificate, e.g.:
         certbot --nginx -d ${PRO_DOMAIN}
-  * If a platform is enabled, place its secrets in ${KEYS_DIR}, fill [apple]/[google]
+  * If a provider is enabled, place its secrets in ${KEYS_DIR}, fill [apple]/[google]
     in ${CONFIG_INI}, then reload the vassal: touch $VASSAL
   * Smoke test (once DNS/TLS are up):
         curl -X POST https://${PRO_DOMAIN}/get_pro_revocations \\

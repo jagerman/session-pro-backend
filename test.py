@@ -34,10 +34,8 @@ import psycopg_pool
 import traceback
 import datetime
 
-import platform_google
-import platform_google_api
-import platform_google_types
-from platform_google_types import GoogleDuration, SubscriptionProductDetails
+from providers import google_play
+from providers.google_play.types import GoogleDuration, SubscriptionProductDetails
 from vendor import onion_req
 import backend
 import base
@@ -45,7 +43,7 @@ import cli
 import config
 import migrations
 import server
-import platform_apple
+from providers import app_store
 import db
 
 from appstoreserverlibrary.models.ResponseBodyV2DecodedPayload import (
@@ -101,19 +99,17 @@ class TestingContext:
     db_engine: psycopg_pool.ConnectionPool
     flask_app: flask.Flask
     flask_client: werkzeug.Client
-    platform_testing_env: bool = False
+    provider_testing_env: bool = False
     db_url_factory: typing.Callable[[], str] | None = None
 
-    def __init__(self, db_url_factory: typing.Callable[[], str], platform_testing_env: bool = False):
+    def __init__(self, db_url_factory: typing.Callable[[], str], provider_testing_env: bool = False):
         self.db_url_factory = db_url_factory
-        self.platform_testing_env = platform_testing_env
+        self.provider_testing_env = provider_testing_env
 
     def __enter__(self):
-        base.PLATFORM_TESTING_ENV = self.platform_testing_env
-        if base.PLATFORM_TESTING_ENV:
-            base.DEFAULT_GOOGLE_GRACE_PERIOD = base.timedelta_from_ms(
-                platform_google_api.testing_grace_period_duration_ms
-            )
+        base.PROVIDER_TESTING_ENV = self.provider_testing_env
+        if base.PROVIDER_TESTING_ENV:
+            base.DEFAULT_GOOGLE_GRACE_PERIOD = base.timedelta_from_ms(google_play.api.testing_grace_period_duration_ms)
 
         # Mint a fresh database on the ephemeral PostgreSQL cluster
         assert self.db_url_factory is not None
@@ -137,7 +133,7 @@ class TestingContext:
         self, exc_type: object | None, exc_value: object | None, traceback: traceback.TracebackException | None
     ):
         self.db_engine.close()
-        base.PLATFORM_TESTING_ENV = False
+        base.PROVIDER_TESTING_ENV = False
         base.DEFAULT_GOOGLE_GRACE_PERIOD = base.DEFAULT_APPLE_GRACE_PERIOD
         return False
 
@@ -272,15 +268,15 @@ def test_config_parse_args(monkeypatch):
     # Nothing enabled -> clean parse, no raise.
     parsed = config.parse_args()
     assert isinstance(parsed, config.ParsedArgs)
-    assert parsed.with_platform_apple is False and parsed.with_platform_google is False
+    assert parsed.with_provider_app_store is False and parsed.with_provider_google_play is False
 
     # Enable Apple with no [apple] config -> every missing field is reported at once in one ConfigError.
-    monkeypatch.setenv('SESH_PRO_BACKEND_WITH_PLATFORM_APPLE', '1')
+    monkeypatch.setenv('SESH_PRO_BACKEND_WITH_PROVIDER_APP_STORE', '1')
     with pytest.raises(config.ConfigError) as excinfo:
         config.parse_args()
     assert isinstance(excinfo.value, ValueError)  # ConfigError is-a ValueError
     assert len(excinfo.value.errors) >= 5  # accumulates ALL problems, not just the first
-    assert all('Apple' in m for m in excinfo.value.errors)
+    assert all('app_store' in m for m in excinfo.value.errors)
 
 
 def test_google_handle_parsed_notification_fetch_failure(monkeypatch, pg_database):
@@ -297,10 +293,10 @@ def test_google_handle_parsed_notification_fetch_failure(monkeypatch, pg_databas
             args[2].msg_list.append('injected fetch failure')  # (package_name, purchase_token, err)
             return None
 
-        monkeypatch.setattr('platform_google_api.fetch_subscription_v2_details', boom_fetch)
+        monkeypatch.setattr('providers.google_play.api.fetch_subscription_v2_details', boom_fetch)
 
-        parse = platform_google.ParsedNotification(
-            payload_type=platform_google.ParsedNotificationPayloadType.Subscription,
+        parse = google_play.ParsedNotification(
+            payload_type=google_play.ParsedNotificationPayloadType.Subscription,
             purchase_token='tok-xyz',
             package_name='pkg',
             event_time_ms=1,
@@ -308,7 +304,7 @@ def test_google_handle_parsed_notification_fetch_failure(monkeypatch, pg_databas
         err = base.ErrorSink()
         with ctx.connection() as conn:
             with db.transaction(conn) as tx:
-                handled = platform_google.handle_parsed_notification(tx, parse, err)
+                handled = google_play.handle_parsed_notification(tx, parse, err)
                 assert handled is False
                 assert err.has()
                 assert tx.cancel is False  # fetch-fail early-return does NOT cancel (current behavior)
@@ -316,9 +312,9 @@ def test_google_handle_parsed_notification_fetch_failure(monkeypatch, pg_databas
 
 def _google_subscription_parse(monkeypatch):
     # Shared setup for the two below: fetch succeeds (returns a non-None sentinel), reaching the parse step.
-    monkeypatch.setattr('platform_google_api.fetch_subscription_v2_details', lambda *a, **k: object())
-    return platform_google.ParsedNotification(
-        payload_type=platform_google.ParsedNotificationPayloadType.Subscription,
+    monkeypatch.setattr('providers.google_play.api.fetch_subscription_v2_details', lambda *a, **k: object())
+    return google_play.ParsedNotification(
+        payload_type=google_play.ParsedNotificationPayloadType.Subscription,
         purchase_token='tok-xyz',
         package_name='pkg',
         event_time_ms=1,
@@ -331,14 +327,14 @@ def test_google_handle_parsed_notification_parse_failure(monkeypatch, pg_databas
     with TestingContext(pg_database) as ctx:
         parse = _google_subscription_parse(monkeypatch)
         monkeypatch.setattr(
-            'platform_google_api.parse_subscription_purchase_tx',
+            'providers.google_play.api.parse_subscription_purchase_tx',
             lambda *a, **k: (k['err'].msg_list.append('injected parse failure'), object())[1],
         )
-        monkeypatch.setattr('platform_google_api.parse_subscription_plan_event_tx', lambda *a, **k: object())
+        monkeypatch.setattr('providers.google_play.api.parse_subscription_plan_event_tx', lambda *a, **k: object())
         err = base.ErrorSink()
         with ctx.connection() as conn:
             with db.transaction(conn) as tx:
-                handled = platform_google.handle_parsed_notification(tx, parse, err)
+                handled = google_play.handle_parsed_notification(tx, parse, err)
                 assert handled is False
                 assert err.has()
                 assert tx.cancel is False  # parse-fail early-return also does NOT cancel
@@ -351,18 +347,18 @@ def test_google_handle_parsed_notification_deep_failure_cancels(monkeypatch, pg_
     # the fetch/parse early-returns skip.
     with TestingContext(pg_database) as ctx:
         parse = _google_subscription_parse(monkeypatch)
-        monkeypatch.setattr('platform_google_api.parse_subscription_purchase_tx', lambda *a, **k: object())
-        monkeypatch.setattr('platform_google_api.parse_subscription_plan_event_tx', lambda *a, **k: object())
+        monkeypatch.setattr('providers.google_play.api.parse_subscription_purchase_tx', lambda *a, **k: object())
+        monkeypatch.setattr('providers.google_play.api.parse_subscription_plan_event_tx', lambda *a, **k: object())
 
         def deep_boom(**k):
             k['err'].msg_list.append('injected deep failure')
             k['tx'].cancel = True
 
-        monkeypatch.setattr('platform_google.handle_subscription_notification', deep_boom)
+        monkeypatch.setattr('providers.google_play.notifications.handle_subscription_notification', deep_boom)
         err = base.ErrorSink()
         with ctx.connection() as conn:
             with db.transaction(conn) as tx:
-                handled = platform_google.handle_parsed_notification(tx, parse, err)
+                handled = google_play.handle_parsed_notification(tx, parse, err)
                 assert handled is False
                 assert err.has()
                 assert tx.cancel is True  # deep failure DOES cancel (reaches the tail assert)
@@ -379,10 +375,10 @@ def test_google_process_notification_message(monkeypatch, pg_database):
     seeded_at = base.datetime_from_unix_ms(int(now_s * 1000))
 
     def make_msg(message_id, token):
-        return platform_google.SortedMessage(
+        return google_play.SortedMessage(
             message_id=message_id,
-            parse=platform_google.ParsedNotification(
-                payload_type=platform_google.ParsedNotificationPayloadType.Subscription,
+            parse=google_play.ParsedNotification(
+                payload_type=google_play.ParsedNotificationPayloadType.Subscription,
                 purchase_token=token,
                 package_name='pkg',
                 event_time_ms=int(now_s * 1000),
@@ -407,7 +403,7 @@ def test_google_process_notification_message(monkeypatch, pg_database):
         # (A) message not in the DB -> handled=True (skip; someone may have deleted it out-of-band).
         with ctx.connection() as conn:
             assert (
-                platform_google._process_notification_message(
+                google_play.notifications._process_notification_message(
                     conn, make_msg('m-absent', 'tok-a'), base.ErrorSink(), now_s
                 )
                 is True
@@ -419,7 +415,7 @@ def test_google_process_notification_message(monkeypatch, pg_database):
                 backend.google_add_notification_id(tx, 'm-handled', expiry, '')
                 backend.google_set_notification_handled(tx, message_id='m-handled', delete=False)
             assert (
-                platform_google._process_notification_message(
+                google_play.notifications._process_notification_message(
                     conn, make_msg('m-handled', 'tok-b'), base.ErrorSink(), now_s
                 )
                 is True
@@ -427,13 +423,17 @@ def test_google_process_notification_message(monkeypatch, pg_database):
 
         # (C) present + unhandled + SUCCESS -> handled=True, the notification is marked handled, and a prior
         #     user_error for the token is cleared -- all committed in the one transaction.
-        monkeypatch.setattr('platform_google.handle_parsed_notification', lambda tx, parse, err: True)
+        monkeypatch.setattr(
+            'providers.google_play.notifications.handle_parsed_notification', lambda tx, parse, err: True
+        )
         with ctx.connection() as conn:
             with db.transaction(conn) as tx:
                 backend.google_add_notification_id(tx, 'm-ok', expiry, '')
             seed_user_error(conn, 'tok-c')
             assert (
-                platform_google._process_notification_message(conn, make_msg('m-ok', 'tok-c'), base.ErrorSink(), now_s)
+                google_play.notifications._process_notification_message(
+                    conn, make_msg('m-ok', 'tok-c'), base.ErrorSink(), now_s
+                )
                 is True
             )
             assert is_handled(conn, 'm-ok') is True
@@ -442,13 +442,15 @@ def test_google_process_notification_message(monkeypatch, pg_database):
         # (D) present + unhandled + FAILURE (no tx.cancel) WITH a prior user_error -> handled=False, the
         #     notification stays unhandled, and the prior error is left intact (the failure branch neither
         #     clears nor re-adds while already in error state -- so it never reaches the broken add path).
-        monkeypatch.setattr('platform_google.handle_parsed_notification', lambda tx, parse, err: False)
+        monkeypatch.setattr(
+            'providers.google_play.notifications.handle_parsed_notification', lambda tx, parse, err: False
+        )
         with ctx.connection() as conn:
             with db.transaction(conn) as tx:
                 backend.google_add_notification_id(tx, 'm-fail', expiry, '')
             seed_user_error(conn, 'tok-d')
             assert (
-                platform_google._process_notification_message(
+                google_play.notifications._process_notification_message(
                     conn, make_msg('m-fail', 'tok-d'), base.ErrorSink(), now_s
                 )
                 is False
@@ -461,14 +463,14 @@ def test_google_process_notification_message(monkeypatch, pg_database):
         #     stays unhandled, the token is now flagged. The poison ride the same tx, and this failure did
         #     not cancel, so it commits. (This branch used to raise TypeError before the add_user_error fix.)
         monkeypatch.setattr(
-            'platform_google.handle_parsed_notification', lambda tx, parse, err: False
+            'providers.google_play.notifications.handle_parsed_notification', lambda tx, parse, err: False
         )  # self-contained (not relying on (D))
         with ctx.connection() as conn:
             with db.transaction(conn) as tx:
                 backend.google_add_notification_id(tx, 'm-poison', expiry, '')
             assert backend.has_user_error(conn, base.PaymentProvider.GooglePlayStore, 'tok-e') is False
             assert (
-                platform_google._process_notification_message(
+                google_play.notifications._process_notification_message(
                     conn, make_msg('m-poison', 'tok-e'), base.ErrorSink(), now_s
                 )
                 is False
@@ -603,7 +605,7 @@ def test_stale_revocation_is_not_served(pg_database):
 def test_provider_dry_run_redeems_google_without_egress(monkeypatch, pg_database):
     # With provider_dry_run on, a Google payment redeems to a signed proof with NO call to Google: the
     # in-function stubs (synthetic already-acknowledged fetch + no-op acknowledge) stand in for the
-    # egress. Deliberately NOT monkeypatching platform_google_api here — exercising the real stubs is
+    # egress. Deliberately NOT monkeypatching google_play.api here — exercising the real stubs is
     # the point. (Contrast test_backend_same_user_stacks_... which monkeypatches those calls instead.)
     monkeypatch.setattr(base, 'PROVIDER_DRY_RUN', True)
 
@@ -665,10 +667,12 @@ def test_provider_dry_run_redeems_google_without_egress(monkeypatch, pg_database
 
 
 def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_database):
-    monkeypatch.setattr("platform_google_api.subscription_v1_acknowledge", lambda *args, **kwargs: None)
+    monkeypatch.setattr("providers.google_play.api.subscription_v1_acknowledge", lambda *args, **kwargs: None)
 
-    dummy_sub_v2_data = platform_google_types.SubscriptionV2Data()
-    monkeypatch.setattr("platform_google_api.fetch_subscription_v2_details", lambda *args, **kwargs: dummy_sub_v2_data)
+    dummy_sub_v2_data = google_play.types.SubscriptionV2Data()
+    monkeypatch.setattr(
+        "providers.google_play.api.fetch_subscription_v2_details", lambda *args, **kwargs: dummy_sub_v2_data
+    )
 
     # Test that the user's subscription stacks if they purchase two subscription with different
     # payment tokens.
@@ -1058,9 +1062,10 @@ def test_revocation_cutting_refund_rolls_generation(monkeypatch, pg_database):
     case between the two already covered in test_server_add_payment_flow: a non-cutting refund that leaves
     far-future entitlement (skip — no roll, no revocation entry) and a refund that leaves nothing (revoke
     without a roll — the terminally-revoked generation stays put)."""
-    monkeypatch.setattr("platform_google_api.subscription_v1_acknowledge", lambda *a, **k: None)
+    monkeypatch.setattr("providers.google_play.api.subscription_v1_acknowledge", lambda *a, **k: None)
     monkeypatch.setattr(
-        "platform_google_api.fetch_subscription_v2_details", lambda *a, **k: platform_google_types.SubscriptionV2Data()
+        "providers.google_play.api.fetch_subscription_v2_details",
+        lambda *a, **k: google_play.types.SubscriptionV2Data(),
     )
 
     err = base.ErrorSink()
@@ -1265,10 +1270,12 @@ def test_bump_revocation_ticket(pg_database):
 
 
 def test_server_add_payment_flow(monkeypatch, pg_database):
-    monkeypatch.setattr("platform_google_api.subscription_v1_acknowledge", lambda *args, **kwargs: None)
+    monkeypatch.setattr("providers.google_play.api.subscription_v1_acknowledge", lambda *args, **kwargs: None)
 
-    dummy_sub_v2_data = platform_google_types.SubscriptionV2Data()
-    monkeypatch.setattr("platform_google_api.fetch_subscription_v2_details", lambda *args, **kwargs: dummy_sub_v2_data)
+    dummy_sub_v2_data = google_play.types.SubscriptionV2Data()
+    monkeypatch.setattr(
+        "providers.google_play.api.fetch_subscription_v2_details", lambda *args, **kwargs: dummy_sub_v2_data
+    )
 
     # nullcontext keeps this test's (large) body indented as-is now that the SQLite
     # temp-file context is gone; the fresh PG database is dropped by the pg_database fixture.
@@ -2313,13 +2320,13 @@ def print_python_decl_code_for_apple_obj(obj: object, indent_level: int = 0, var
     return result
 
 
-def dump_apple_signed_payloads(core: platform_apple.Core, body: AppleResponseBodyV2DecodedPayload, prefix: str = ''):
+def dump_apple_signed_payloads(core: app_store.Core, body: AppleResponseBodyV2DecodedPayload, prefix: str = ''):
     print("# NOTE: Generated by dump_apple_signed_payloads")
     print("# NOTE: Signed Payload")
     print(print_python_decl_code_for_apple_obj(body, 0, prefix + "body"))
 
     err = base.ErrorSink()
-    decoded_notification = platform_apple.decoded_notification_from_apple_response_body_v2(
+    decoded_notification = app_store.decoded_notification_from_apple_response_body_v2(
         body, core.signed_data_verifier, err
     )
     assert not err.has(), err.msg_list
@@ -2331,10 +2338,10 @@ def dump_apple_signed_payloads(core: platform_apple.Core, body: AppleResponseBod
     print(print_python_decl_code_for_apple_obj(decoded_notification.tx_info, 0, prefix + 'tx_info') + "\n")
 
     print(
-        f'{prefix}decoded_notification = platform_apple.DecodedNotification(body={prefix}body, tx_info={prefix}tx_info, renewal_info={prefix}renewal_info)'
+        f'{prefix}decoded_notification = app_store.DecodedNotification(body={prefix}body, tx_info={prefix}tx_info, renewal_info={prefix}renewal_info)'
     )
     print(
-        f'_ = platform_apple.handle_notification(decoded_notification={prefix}decoded_notification, conn=test.conn, err=err)'
+        f'_ = app_store.handle_notification(decoded_notification={prefix}decoded_notification, conn=test.conn, err=err)'
     )
 
 
@@ -2392,8 +2399,8 @@ def test_apple_grace_period_stores_duration_not_absolute_date(pg_database):
             tx_info.webOrderLineItemId = web_line_id
             tx_info.expiresDate = expires_ms
 
-            decoded = platform_apple.DecodedNotification(body=body, tx_info=tx_info, renewal_info=renewal_info)
-            handled = platform_apple.handle_notification(
+            decoded = app_store.DecodedNotification(body=body, tx_info=tx_info, renewal_info=renewal_info)
+            handled = app_store.handle_notification(
                 decoded_notification=decoded, conn=conn, notification_retry_duration=datetime.timedelta(0), err=err
             )
             assert not err.has(), err.msg_list
@@ -2514,10 +2521,10 @@ def test_platform_apple(pg_database):
         tx_info.type = AppleType.AUTO_RENEWABLE_SUBSCRIPTION
         tx_info.webOrderLineItemId = '2000000113755461'
 
-        notification = platform_apple.DecodedNotification(body=body, tx_info=tx_info, renewal_info=renewal_info)
+        notification = app_store.DecodedNotification(body=body, tx_info=tx_info, renewal_info=renewal_info)
         err = base.ErrorSink()
         with test.connection() as conn:
-            platform_apple.handle_notification(
+            app_store.handle_notification(
                 decoded_notification=notification, conn=conn, notification_retry_duration=datetime.timedelta(0), err=err
             )
             assert not err.has(), err.msg_list
@@ -2713,13 +2720,11 @@ def test_platform_apple(pg_database):
             tx_info.type = AppleType.AUTO_RENEWABLE_SUBSCRIPTION
             tx_info.webOrderLineItemId = '2000000113844706'
 
-            decoded_notification = platform_apple.DecodedNotification(
-                body=body, tx_info=tx_info, renewal_info=renewal_info
-            )
+            decoded_notification = app_store.DecodedNotification(body=body, tx_info=tx_info, renewal_info=renewal_info)
 
             err = base.ErrorSink()
             with test.connection() as conn:
-                platform_apple.handle_notification(
+                app_store.handle_notification(
                     decoded_notification=decoded_notification,
                     conn=conn,
                     notification_retry_duration=datetime.timedelta(0),
@@ -2841,13 +2846,11 @@ def test_platform_apple(pg_database):
             tx_info.type = AppleType.AUTO_RENEWABLE_SUBSCRIPTION
             tx_info.webOrderLineItemId = '2000000113844706'
 
-            decoded_notification = platform_apple.DecodedNotification(
-                body=body, tx_info=tx_info, renewal_info=renewal_info
-            )
+            decoded_notification = app_store.DecodedNotification(body=body, tx_info=tx_info, renewal_info=renewal_info)
 
             err = base.ErrorSink()
             with test.connection() as conn:
-                platform_apple.handle_notification(
+                app_store.handle_notification(
                     decoded_notification=decoded_notification,
                     conn=conn,
                     notification_retry_duration=datetime.timedelta(0),
@@ -2969,13 +2972,11 @@ def test_platform_apple(pg_database):
             tx_info.type = AppleType.AUTO_RENEWABLE_SUBSCRIPTION
             tx_info.webOrderLineItemId = '2000000113844706'
 
-            decoded_notification = platform_apple.DecodedNotification(
-                body=body, tx_info=tx_info, renewal_info=renewal_info
-            )
+            decoded_notification = app_store.DecodedNotification(body=body, tx_info=tx_info, renewal_info=renewal_info)
 
             err = base.ErrorSink()
             with test.connection() as conn:
-                platform_apple.handle_notification(
+                app_store.handle_notification(
                     decoded_notification=decoded_notification,
                     conn=conn,
                     notification_retry_duration=datetime.timedelta(0),
@@ -3131,7 +3132,7 @@ def test_platform_apple(pg_database):
         e00_sub_to_3_months_tx_info.type = AppleType.AUTO_RENEWABLE_SUBSCRIPTION
         e00_sub_to_3_months_tx_info.webOrderLineItemId = '2000000113864605'
 
-        e00_sub_to_3_months_decoded_notification = platform_apple.DecodedNotification(
+        e00_sub_to_3_months_decoded_notification = app_store.DecodedNotification(
             body=e00_sub_to_3_months_body,
             tx_info=e00_sub_to_3_months_tx_info,
             renewal_info=e00_sub_to_3_months_renewal_info,
@@ -3231,7 +3232,7 @@ def test_platform_apple(pg_database):
         e01_upgrade_to_1wk_tx_info.type = AppleType.AUTO_RENEWABLE_SUBSCRIPTION
         e01_upgrade_to_1wk_tx_info.webOrderLineItemId = '2000000114202140'
 
-        e01_upgrade_to_1wk_decoded_notification = platform_apple.DecodedNotification(
+        e01_upgrade_to_1wk_decoded_notification = app_store.DecodedNotification(
             body=e01_upgrade_to_1wk_body,
             tx_info=e01_upgrade_to_1wk_tx_info,
             renewal_info=e01_upgrade_to_1wk_renewal_info,
@@ -3331,7 +3332,7 @@ def test_platform_apple(pg_database):
         e02_disable_auto_renew_tx_info.type = AppleType.AUTO_RENEWABLE_SUBSCRIPTION
         e02_disable_auto_renew_tx_info.webOrderLineItemId = '2000000114202140'
 
-        e02_disable_auto_renew_decoded_notification = platform_apple.DecodedNotification(
+        e02_disable_auto_renew_decoded_notification = app_store.DecodedNotification(
             body=e02_disable_auto_renew_body,
             tx_info=e02_disable_auto_renew_tx_info,
             renewal_info=e02_disable_auto_renew_renewal_info,
@@ -3431,7 +3432,7 @@ def test_platform_apple(pg_database):
         e03_queue_downgrade_to_3_months_tx_info.type = AppleType.AUTO_RENEWABLE_SUBSCRIPTION
         e03_queue_downgrade_to_3_months_tx_info.webOrderLineItemId = '2000000114202140'
 
-        e03_queue_downgrade_to_3_months_decoded_notification = platform_apple.DecodedNotification(
+        e03_queue_downgrade_to_3_months_decoded_notification = app_store.DecodedNotification(
             body=e03_queue_downgrade_to_3_months_body,
             tx_info=e03_queue_downgrade_to_3_months_tx_info,
             renewal_info=e03_queue_downgrade_to_3_months_renewal_info,
@@ -3531,7 +3532,7 @@ def test_platform_apple(pg_database):
         e04_cancel_downgrade_to_3_months_tx_info.type = AppleType.AUTO_RENEWABLE_SUBSCRIPTION
         e04_cancel_downgrade_to_3_months_tx_info.webOrderLineItemId = '2000000114202140'
 
-        e04_cancel_downgrade_to_3_months_decoded_notification = platform_apple.DecodedNotification(
+        e04_cancel_downgrade_to_3_months_decoded_notification = app_store.DecodedNotification(
             body=e04_cancel_downgrade_to_3_months_body,
             tx_info=e04_cancel_downgrade_to_3_months_tx_info,
             renewal_info=e04_cancel_downgrade_to_3_months_renewal_info,
@@ -3631,7 +3632,7 @@ def test_platform_apple(pg_database):
         e05_disable_auto_renew_tx_info.type = AppleType.AUTO_RENEWABLE_SUBSCRIPTION
         e05_disable_auto_renew_tx_info.webOrderLineItemId = '2000000114202140'
 
-        e05_disable_auto_renew_decoded_notification = platform_apple.DecodedNotification(
+        e05_disable_auto_renew_decoded_notification = app_store.DecodedNotification(
             body=e05_disable_auto_renew_body,
             tx_info=e05_disable_auto_renew_tx_info,
             renewal_info=e05_disable_auto_renew_renewal_info,
@@ -3731,7 +3732,7 @@ def test_platform_apple(pg_database):
         e06_expire_voluntary_tx_info.type = AppleType.AUTO_RENEWABLE_SUBSCRIPTION
         e06_expire_voluntary_tx_info.webOrderLineItemId = '2000000114202140'
 
-        e06_expire_voluntary_decoded_notification = platform_apple.DecodedNotification(
+        e06_expire_voluntary_decoded_notification = app_store.DecodedNotification(
             body=e06_expire_voluntary_body,
             tx_info=e06_expire_voluntary_tx_info,
             renewal_info=e06_expire_voluntary_renewal_info,
@@ -3746,7 +3747,7 @@ def test_platform_apple(pg_database):
         if 1:
             unredeemed_payment_list = []
             with test.connection() as conn:
-                platform_apple.handle_notification(
+                app_store.handle_notification(
                     decoded_notification=e00_sub_to_3_months_decoded_notification,
                     conn=conn,
                     notification_retry_duration=datetime.timedelta(0),
@@ -3830,7 +3831,7 @@ def test_platform_apple(pg_database):
         # month subscription following it. This means that going to a 1 week subscription is
         # considered an "upgrade".
         with test.connection() as conn:
-            platform_apple.handle_notification(
+            app_store.handle_notification(
                 decoded_notification=e01_upgrade_to_1wk_decoded_notification,
                 conn=conn,
                 notification_retry_duration=datetime.timedelta(0),
@@ -3901,7 +3902,7 @@ def test_platform_apple(pg_database):
             assert payment_list[1].apple.web_line_order_tx_id == e01_upgrade_to_1wk_tx_info.webOrderLineItemId
 
         with test.connection() as conn:
-            platform_apple.handle_notification(
+            app_store.handle_notification(
                 decoded_notification=e02_disable_auto_renew_decoded_notification,
                 conn=conn,
                 notification_retry_duration=datetime.timedelta(0),
@@ -3917,7 +3918,7 @@ def test_platform_apple(pg_database):
         # NOTE: A downgrade should be a no-op as it's queued to execute at the end of the billing
         # cycle, but it does implicitly mean that auto-renewing is turned back on.
         with test.connection() as conn:
-            platform_apple.handle_notification(
+            app_store.handle_notification(
                 decoded_notification=e03_queue_downgrade_to_3_months_decoded_notification,
                 conn=conn,
                 notification_retry_duration=datetime.timedelta(0),
@@ -3958,7 +3959,7 @@ def test_platform_apple(pg_database):
         # NOTE: Cancelling a downgrade means that the queued downgrade to 3 months is undone. We
         # remain on the 1wk plan
         with test.connection() as conn:
-            platform_apple.handle_notification(
+            app_store.handle_notification(
                 decoded_notification=e04_cancel_downgrade_to_3_months_decoded_notification,
                 conn=conn,
                 notification_retry_duration=datetime.timedelta(0),
@@ -4013,7 +4014,7 @@ def test_platform_apple(pg_database):
 
         # NOTE: Disable auto renew, flag should be turned false for the 1 week plan payment
         with test.connection() as conn:
-            platform_apple.handle_notification(
+            app_store.handle_notification(
                 decoded_notification=e05_disable_auto_renew_decoded_notification,
                 conn=conn,
                 notification_retry_duration=datetime.timedelta(0),
@@ -4028,7 +4029,7 @@ def test_platform_apple(pg_database):
 
         # NOTE: Expire the subscription
         with test.connection() as conn:
-            platform_apple.handle_notification(
+            app_store.handle_notification(
                 decoded_notification=e06_expire_voluntary_decoded_notification,
                 conn=conn,
                 notification_retry_duration=datetime.timedelta(0),
@@ -4173,13 +4174,13 @@ def test_platform_apple(pg_database):
         e00_sub_to_3_months_tx_info.type = AppleType.AUTO_RENEWABLE_SUBSCRIPTION
         e00_sub_to_3_months_tx_info.webOrderLineItemId = '2000000114930708'
 
-        e00_sub_to_3_months_decoded_notification = platform_apple.DecodedNotification(
+        e00_sub_to_3_months_decoded_notification = app_store.DecodedNotification(
             body=e00_sub_to_3_months_body,
             tx_info=e00_sub_to_3_months_tx_info,
             renewal_info=e00_sub_to_3_months_renewal_info,
         )
         with test.connection() as conn:
-            platform_apple.handle_notification(
+            app_store.handle_notification(
                 decoded_notification=e00_sub_to_3_months_decoded_notification,
                 conn=conn,
                 notification_retry_duration=datetime.timedelta(0),
@@ -4281,13 +4282,13 @@ def test_platform_apple(pg_database):
         e01_consumption_req_tx_info.type = AppleType.AUTO_RENEWABLE_SUBSCRIPTION
         e01_consumption_req_tx_info.webOrderLineItemId = '2000000114930653'
 
-        e01_consumption_req_decoded_notification = platform_apple.DecodedNotification(
+        e01_consumption_req_decoded_notification = app_store.DecodedNotification(
             body=e01_consumption_req_body,
             tx_info=e01_consumption_req_tx_info,
             renewal_info=e01_consumption_req_renewal_info,
         )
         with test.connection() as conn:
-            platform_apple.handle_notification(
+            app_store.handle_notification(
                 decoded_notification=e01_consumption_req_decoded_notification,
                 conn=conn,
                 notification_retry_duration=datetime.timedelta(0),
@@ -4389,11 +4390,11 @@ def test_platform_apple(pg_database):
         e02_apple_refund_tx_info.type = AppleType.AUTO_RENEWABLE_SUBSCRIPTION
         e02_apple_refund_tx_info.webOrderLineItemId = '2000000114930653'
 
-        e02_apple_refund_decoded_notification = platform_apple.DecodedNotification(
+        e02_apple_refund_decoded_notification = app_store.DecodedNotification(
             body=e02_apple_refund_body, tx_info=e02_apple_refund_tx_info, renewal_info=e02_apple_refund_renewal_info
         )
         with test.connection() as conn:
-            platform_apple.handle_notification(
+            app_store.handle_notification(
                 decoded_notification=e02_apple_refund_decoded_notification,
                 conn=conn,
                 notification_retry_duration=datetime.timedelta(0),
@@ -4414,7 +4415,7 @@ def test_platform_apple(pg_database):
 
 def test_google_platform_handle_notification(monkeypatch, pg_database):
     with TestingContext(pg_database) as ctx:
-        platform_google.init(
+        google_play.init(
             cloud_project_id='loki-5a81e',
             package_name='network.loki.messenger',
             cloud_subscription_name='session-pro-sub',
@@ -4429,9 +4430,10 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
     assert not err.has()
 
     monkeypatch.setattr(
-        "platform_google_api.fetch_subscription_details_for_base_plan_id", lambda *args, **kwargs: test_product_details
+        "providers.google_play.api.fetch_subscription_details_for_base_plan_id",
+        lambda *args, **kwargs: test_product_details,
     )
-    monkeypatch.setattr("platform_google_api.subscription_v1_acknowledge", lambda *args, **kwargs: None)
+    monkeypatch.setattr("providers.google_play.api.subscription_v1_acknowledge", lambda *args, **kwargs: None)
 
     @dataclasses.dataclass
     class TestScenario:
@@ -4463,11 +4465,13 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
 
     def test_notification(scenario: TestScenario, ctx: TestingContext) -> TestTx:
         err_parse = base.ErrorSink()
-        current_state = platform_google_api.parse_get_subscription_v2_response(scenario.current_state, err_parse)
+        current_state = google_play.api.parse_get_subscription_v2_response(scenario.current_state, err_parse)
         assert not err_parse.has()
         assert current_state is not None
 
-        monkeypatch.setattr("platform_google_api.fetch_subscription_v2_details", lambda *args, **kwargs: current_state)
+        monkeypatch.setattr(
+            "providers.google_play.api.fetch_subscription_v2_details", lambda *args, **kwargs: current_state
+        )
 
         event_time_ms_str = scenario.rtdn_event['eventTimeMillis']
         assert isinstance(event_time_ms_str, str)
@@ -4484,11 +4488,11 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
         assert isinstance(purchase_token, str)
 
         err_rtdn = base.ErrorSink()
-        parse = platform_google.parse_notification(scenario.rtdn_event, err_rtdn)
+        parse = google_play.parse_notification(scenario.rtdn_event, err_rtdn)
         handled = False
         with ctx.connection() as conn:
             with db.transaction(conn) as tx:
-                handled = platform_google.handle_parsed_notification(tx, parse, err_rtdn)
+                handled = google_play.handle_parsed_notification(tx, parse, err_rtdn)
         assert not err_rtdn.has() and handled and len(parse.purchase_token) > 0
 
         order_id = current_state.line_items[0].latest_successful_order_id
@@ -4571,7 +4575,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
 
     def backend_expire_payments_at_end_of_day(event_ms: int, assert_success: bool = False):
         boundary_ms = base.unix_ms_from_datetime(
-            backend.round_datetime_to_next_day_with_platform_testing_support(
+            backend.round_datetime_to_next_day_with_provider_testing_support(
                 payment_provider=base.PaymentProvider.GooglePlayStore, at=base.datetime_from_unix_ms(event_ms)
             )
         )
@@ -4777,7 +4781,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
         )
         return tx, platform_refund_expiry_unix_tx_ms, redeemed_ts_ms_rounded
 
-    with TestingContext(pg_database, platform_testing_env=True) as ctx:
+    with TestingContext(pg_database, provider_testing_env=True) as ctx:
         """
         1. User purchases 1-month subscription
         2. User cancels
@@ -4986,7 +4990,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             unix_ts_ms=refund_tx.event_ms + 1000,
         )
 
-    with TestingContext(pg_database, platform_testing_env=True) as ctx:
+    with TestingContext(pg_database, provider_testing_env=True) as ctx:
         """
         1. User purchases 1-month subscription
         2. User enters grace period as subscription fails to renew
@@ -5278,7 +5282,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             unix_ts_ms=tx_expire.event_ms,
         )
 
-    with TestingContext(pg_database, platform_testing_env=True) as ctx:
+    with TestingContext(pg_database, provider_testing_env=True) as ctx:
         """
         1. User purchases 1-month subscription
         2. User renews 1-month subscription
@@ -5797,7 +5801,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             unix_ts_ms=tx_grace.event_ms + test_product_details.grace_period.milliseconds,
         )
 
-    with TestingContext(pg_database, platform_testing_env=True) as ctx:
+    with TestingContext(pg_database, provider_testing_env=True) as ctx:
         """
         1. User purchases 1-month subscription
         2. User enters grace period as they fail to renew
@@ -6003,7 +6007,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             unix_ts_ms=tx_grace.event_ms + test_product_details.grace_period.milliseconds,
         )
 
-    with TestingContext(pg_database, platform_testing_env=True) as ctx:
+    with TestingContext(pg_database, provider_testing_env=True) as ctx:
         """
         1. User purchases 1-month subscription
         2. User enters grace period as they fail to renew
@@ -6263,7 +6267,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             unix_ts_ms=tx_grace.event_ms + test_product_details.grace_period.milliseconds,
         )
 
-    with TestingContext(pg_database, platform_testing_env=True) as ctx:
+    with TestingContext(pg_database, provider_testing_env=True) as ctx:
         """
         1. User purchases 1-month subscription
         2. User enters grace period as they fail to renew
@@ -6503,7 +6507,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             ctx=ctx,
         )
 
-    with TestingContext(pg_database, platform_testing_env=True) as ctx:
+    with TestingContext(pg_database, provider_testing_env=True) as ctx:
         """
         1. User purchases 1-month subscription
         2. User changes to 3-month plan
@@ -6694,7 +6698,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             ctx=ctx,
         )
 
-    with TestingContext(pg_database, platform_testing_env=True) as ctx:
+    with TestingContext(pg_database, provider_testing_env=True) as ctx:
         """
         1. User purchases 1-month subscription
         2. User changes to 3-month plan
@@ -6955,7 +6959,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             ctx=ctx,
         )
 
-    with TestingContext(pg_database, platform_testing_env=True) as ctx:
+    with TestingContext(pg_database, provider_testing_env=True) as ctx:
         """
         1. User purchases 1-month subscription
         2. User changes to 3-month plan
@@ -7269,7 +7273,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             ctx=ctx,
         )
 
-    with TestingContext(pg_database, platform_testing_env=True) as ctx:
+    with TestingContext(pg_database, provider_testing_env=True) as ctx:
         """
         1. User purchases 1-month subscription
         2. User changes to 3-month plan
@@ -7548,7 +7552,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             ctx=ctx,
         )
 
-    with TestingContext(pg_database, platform_testing_env=True) as ctx:
+    with TestingContext(pg_database, provider_testing_env=True) as ctx:
         """
         1. User purchases 3-month subscription
         2. Renews
@@ -7556,7 +7560,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
         3. Expires
         """
 
-    with TestingContext(pg_database, platform_testing_env=True) as ctx:
+    with TestingContext(pg_database, provider_testing_env=True) as ctx:
         """
         1. User purchases 12-month subscription
         2. Renews
@@ -7564,21 +7568,21 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
         3. Expires
         """
 
-    with TestingContext(pg_database, platform_testing_env=True) as ctx:
+    with TestingContext(pg_database, provider_testing_env=True) as ctx:
         """
         1. User purchases 3-month subscription
         2. User changes to 1-month subscription
         3. Renews
         """
 
-    with TestingContext(pg_database, platform_testing_env=True) as ctx:
+    with TestingContext(pg_database, provider_testing_env=True) as ctx:
         """
         1. User purchases 12-month subscription
         2. User changes to 1-month subscription
         3. Renews
         """
 
-    with TestingContext(pg_database, platform_testing_env=True) as ctx:
+    with TestingContext(pg_database, provider_testing_env=True) as ctx:
         """
         1. User purchases 1-month subscription
         2. Developer refunds subscription (removing entitlement)
@@ -7722,7 +7726,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             revoke_unix_ts_ms=tx_refund_a.event_ms,
         )
 
-    with TestingContext(pg_database, platform_testing_env=True) as ctx:
+    with TestingContext(pg_database, provider_testing_env=True) as ctx:
         """
         1. User purchases 1-month subscription
         2. Developer refunds subscription (removing entitlement)
@@ -7730,7 +7734,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
         4. User renews
         """
 
-    with TestingContext(pg_database, platform_testing_env=True) as ctx:
+    with TestingContext(pg_database, provider_testing_env=True) as ctx:
         """
         1. User purchases 12-month subscription
         2. Developer refunds subscription (removing entitlement)
@@ -7738,7 +7742,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
         4. User renews
         """
 
-    with TestingContext(pg_database, platform_testing_env=True) as ctx:
+    with TestingContext(pg_database, provider_testing_env=True) as ctx:
         """
         1. User purchases 1-month subscription, but does not redeem it.
         2. Developer refunds subscription (removing entitlement)

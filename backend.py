@@ -12,8 +12,7 @@ import enum
 import csv
 import io
 
-import platform_google_api
-import platform_google_types
+from providers import google_play
 import base
 import db
 import migrations
@@ -954,7 +953,7 @@ def revoke_payments_by_id_internal(tx: db.SQLTransaction, rows: typing.Any, revo
             id=id,
         )
 
-    revoke_at_next_day = round_datetime_to_next_day_with_platform_testing_support(base.PaymentProvider.Nil, revoke_at)
+    revoke_at_next_day = round_datetime_to_next_day_with_provider_testing_support(base.PaymentProvider.Nil, revoke_at)
 
     # The furthest into the future any outstanding proof can certify: a proof clamps its expiry to
     # round_up_day(request_at + 30d) (_build_proof_clamped_expiry_time) and request_at is only accepted
@@ -2181,15 +2180,13 @@ def add_pro_payment(
     # raise — the exception rolls the transaction back (undoing the redeem) and the client re-attempts.
     # Acknowledging on claim binds the client's knowledge of its own payment to the backend ack in one
     # step, avoiding a client-acks-but-server-hasn't poll race. (Under provider_dry_run these Google calls
-    # are stubbed in platform_google_api — a synthetic already-acknowledged fetch + no-op acknowledge.)
+    # are stubbed in google_play.api — a synthetic already-acknowledged fetch + no-op acknowledge.)
     if payment_tx.provider == base.PaymentProvider.GooglePlayStore:
-        # platform_google_api is still ErrorSink-based (the deferred sweep); bridge with a local sink and
+        # google_play.api is still ErrorSink-based (the deferred sweep); bridge with a local sink and
         # translate its failure into a raise.
         google_err = base.ErrorSink()
-        sub_data: platform_google_types.SubscriptionV2Data | None = platform_google_api.fetch_subscription_v2_details(
-            package_name=platform_google_api.package_name,
-            purchase_token=payment_tx.google_payment_token,
-            err=google_err,
+        sub_data: google_play.types.SubscriptionV2Data | None = google_play.api.fetch_subscription_v2_details(
+            package_name=google_play.api.package_name, purchase_token=payment_tx.google_payment_token, err=google_err
         )
         if sub_data is None or google_err.has():
             raise base.ServerError(f'Google subscription lookup failed during redeem: {google_err.build()}')
@@ -2200,10 +2197,8 @@ def add_pro_payment(
             f'acked={sub_data.acknowledgement_state})'
         )
 
-        if sub_data.acknowledgement_state != platform_google_types.SubscriptionsV2AcknowledgementState.ACKNOWLEDGED:
-            platform_google_api.subscription_v1_acknowledge(
-                purchase_token=payment_tx.google_payment_token, err=google_err
-            )
+        if sub_data.acknowledgement_state != google_play.types.SubscriptionsV2AcknowledgementState.ACKNOWLEDGED:
+            google_play.api.subscription_v1_acknowledge(purchase_token=payment_tx.google_payment_token, err=google_err)
             if google_err.has():
                 raise base.ServerError(
                     f'Google subscription acknowledgement failed during redeem: {google_err.build()}'
@@ -2279,12 +2274,12 @@ def revoke_master_pkey_proofs_and_allocate_new_gen_id(
     return result
 
 
-def round_datetime_to_next_day_with_platform_testing_support(
+def round_datetime_to_next_day_with_provider_testing_support(
     payment_provider: base.PaymentProvider, at: datetime.datetime
 ) -> datetime.datetime:
     """Round `at` up to the next day boundary. In some platforms' testing environments a "day" is
     compressed (Google: 10 seconds); only that case differs from the normal UTC-day rounding."""
-    if base.PLATFORM_TESTING_ENV and payment_provider == base.PaymentProvider.GooglePlayStore:
+    if base.PROVIDER_TESTING_ENV and payment_provider == base.PaymentProvider.GooglePlayStore:
         google_day = datetime.timedelta(seconds=10)  # in Google's test env, 1 day == 10s
         elapsed = at - base.EPOCH
         units = -((-elapsed) // google_day)  # ceil-divide the timedelta

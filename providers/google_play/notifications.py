@@ -40,9 +40,9 @@ from base import (
     reflect_enum,
 )
 
-import platform_google_api
-from platform_google_api import SubscriptionPlanEventTransaction, VoidedPurchaseTxFields
-from platform_google_types import (
+from . import api
+from .api import SubscriptionPlanEventTransaction, VoidedPurchaseTxFields
+from .types import (
     SubscriptionNotificationType,
     SubscriptionsV2AcknowledgementState,
     RefundType,
@@ -108,25 +108,19 @@ def init(
     app_credentials_path: str | None,
 ) -> ThreadContext:
     # NOTE: Setup credentials global variable
-    assert (
-        platform_google_api.credentials is None
-        and platform_google_api.publisher_service is None
-        and len(platform_google_api.package_name) == 0
-    ), (
+    assert api.credentials is None and api.publisher_service is None and len(api.package_name) == 0, (
         "Initialise was called twice. Google uses callbacks with no way to pass in a per-callback context"
         " so it needs global variables"
     )
 
     if app_credentials_path:
-        platform_google_api.credentials = service_account.Credentials.from_service_account_file(
+        api.credentials = service_account.Credentials.from_service_account_file(
             app_credentials_path, scopes=['https://www.googleapis.com/auth/androidpublisher']
         )
-        platform_google_api.publisher_service = googleapiclient.discovery.build(
-            'androidpublisher', 'v3', credentials=platform_google_api.credentials
-        )
+        api.publisher_service = googleapiclient.discovery.build('androidpublisher', 'v3', credentials=api.credentials)
 
-    platform_google_api.package_name = package_name
-    platform_google_api.subscription_product_id = subscription_product_id
+    api.package_name = package_name
+    api.subscription_product_id = subscription_product_id
 
     # NOTE: Setup thread for caller to use
     result = ThreadContext()
@@ -186,7 +180,7 @@ def handle_parsed_notification(tx: db.SQLTransaction, parse: ParsedNotification,
 
         case ParsedNotificationPayloadType.Subscription:
             try:
-                details: SubscriptionV2Data | None = platform_google_api.fetch_subscription_v2_details(
+                details: SubscriptionV2Data | None = api.fetch_subscription_v2_details(
                     parse.package_name, parse.purchase_token, err
                 )
                 if err.has():
@@ -194,12 +188,10 @@ def handle_parsed_notification(tx: db.SQLTransaction, parse: ParsedNotification,
                     return result
 
                 assert details is not None
-                tx_payment = platform_google_api.parse_subscription_purchase_tx(
+                tx_payment = api.parse_subscription_purchase_tx(
                     purchase_token=parse.purchase_token, details=details, err=err
                 )
-                tx_event = platform_google_api.parse_subscription_plan_event_tx(
-                    details, parse.event_time_ms, parse.sub_type, err=err
-                )
+                tx_event = api.parse_subscription_plan_event_tx(details, parse.event_time_ms, parse.sub_type, err=err)
                 if err.has():
                     err.msg_list.append('Parsing data from subscription V2 details failed')
                     return result
@@ -644,7 +636,7 @@ def handle_subscription_notification(
                             expires_at=base.datetime_from_unix_ms(tx_event.expiry_time.unix_milliseconds),
                             purchased_at=base.datetime_from_unix_ms(tx_event.event_ts_ms),
                             platform_refund_expires_at=base.datetime_from_unix_ms(
-                                tx_event.event_ts_ms + platform_google_api.refund_deadline_duration_ms
+                                tx_event.event_ts_ms + api.refund_deadline_duration_ms
                             ),
                             platform_obfuscated_account_id=obfuscated_external_account_id,
                             err=err,
@@ -657,7 +649,7 @@ def handle_subscription_notification(
 
         case SubscriptionNotificationType.IN_GRACE_PERIOD:
             if tx_event.subscription_state == SubscriptionsV2State.IN_GRACE_PERIOD:
-                plan_details = platform_google_api.fetch_subscription_details_for_base_plan_id(
+                plan_details = api.fetch_subscription_details_for_base_plan_id(
                     base_plan_id=tx_event.base_plan_id, err=err
                 )
                 payment_label = backend.payment_provider_tx_log_label_safe(tx_payment)
@@ -700,7 +692,7 @@ def handle_subscription_notification(
                         expires_at=base.datetime_from_unix_ms(tx_event.expiry_time.unix_milliseconds),
                         purchased_at=base.datetime_from_unix_ms(tx_event.event_ts_ms),
                         platform_refund_expires_at=base.datetime_from_unix_ms(
-                            tx_event.event_ts_ms + platform_google_api.refund_deadline_duration_ms
+                            tx_event.event_ts_ms + api.refund_deadline_duration_ms
                         ),
                         platform_obfuscated_account_id=obfuscated_external_account_id,
                         err=err,
@@ -786,10 +778,10 @@ def handle_subscription_notification(
 
                 if not err.has():
                     assert payment is not None
-                    rounded_expiry_at = backend.round_datetime_to_next_day_with_platform_testing_support(
+                    rounded_expiry_at = backend.round_datetime_to_next_day_with_provider_testing_support(
                         payment_provider=tx_payment.provider, at=payment.expires_at
                     )
-                    rounded_event_at = backend.round_datetime_to_next_day_with_platform_testing_support(
+                    rounded_event_at = backend.round_datetime_to_next_day_with_provider_testing_support(
                         payment_provider=tx_payment.provider, at=base.datetime_from_unix_ms(tx_event.event_ts_ms)
                     )
 
@@ -854,10 +846,9 @@ def parse_notification(body: JSONObject, err: base.ErrorSink) -> ParsedNotificat
     result.package_name = json_dict_require_str(body, "packageName", err)
     result.event_time_ms = json_dict_require_str_coerce_to_int(body, "eventTimeMillis", err)
 
-    if result.package_name != platform_google_api.package_name:
+    if result.package_name != api.package_name:
         err.msg_list.append(
-            f'{result.package_name} does not match google_package_name '
-            f'({platform_google_api.package_name}) from the .INI file!'
+            f'{result.package_name} does not match google_package_name ' f'({api.package_name}) from the .INI file!'
         )
 
     subscription = json_dict_optional_obj(body, "subscriptionNotification", err)

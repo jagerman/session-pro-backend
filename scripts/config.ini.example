@@ -27,11 +27,11 @@ unsafe_logging         = false
 ; credentials and no calls off-box. For local/integration testing ONLY — never enable on a real instance.
 provider_dry_run       = false
 
-; platform_testing_env=true selects the Apple sandbox / Google test environments, which is
-; what a testing deployment wants. Set both platform toggles per your deploy.env.
-with_platform_apple    = false
-with_platform_google   = false
-platform_testing_env   = true
+; provider_testing_env=true selects the Apple sandbox / Google test environments, which is
+; what a testing deployment wants. Set both provider toggles per your deploy.env.
+with_provider_app_store    = false
+with_provider_google_play   = false
+provider_testing_env   = true
 
 log_path               = /var/log/pro-backend/backend.log
 

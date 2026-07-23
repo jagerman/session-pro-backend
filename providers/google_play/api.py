@@ -26,7 +26,7 @@ from base import (
 from google.oauth2 import service_account
 import googleapiclient.discovery
 
-from platform_google_types import (
+from .types import (
     GoogleTimestamp,
     Monetizationv3SubscriptionData,
     ProductType,
@@ -463,7 +463,7 @@ def fetch_monetizationv3_subscriptions_for_product_id(
     """
     if base.PROVIDER_DRY_RUN:
         # Dry-run: no call to Google. This is only reached via the notification subscriber, which does not
-        # start under dry-run (see platform_google.start_subscriber), so this is belt-and-suspenders.
+        # start under dry-run (see notifications.start_subscriber), so this is belt-and-suspenders.
         return Monetizationv3SubscriptionData(base_plans=[])
 
     service = get_publisher_service()

@@ -27,8 +27,7 @@ import base
 import backend
 import config
 import db
-import platform_google
-import platform_google_api
+from providers import google_play
 
 log = logging.getLogger('PRO')
 
@@ -61,7 +60,7 @@ def run() -> None:
     # The mule is its own process, so wire up console logging (uWSGI captures it into the vassal log).
     handler = logging.StreamHandler()
     handler.setFormatter(base.LogFormatter('%(asctime)s %(levelname)s %(name)s %(message)s'))
-    for logger in (log, backend.log, platform_google.log):
+    for logger in (log, backend.log, google_play.log):
         logger.addHandler(handler)
 
     try:
@@ -71,18 +70,16 @@ def run() -> None:
         sys.exit(1)
     base.UNSAFE_LOGGING = parsed.unsafe_logging
     base.DB_URL = parsed.db_url
-    base.PLATFORM_TESTING_ENV = parsed.platform_testing_env
+    base.PROVIDER_TESTING_ENV = parsed.provider_testing_env
     base.PROVIDER_DRY_RUN = parsed.provider_dry_run
 
     pool = db.get_pool(parsed.db_url)
 
     # Google Pub/Sub subscriber — a single consumer. gRPC state is built here (post-fork, in the mule).
-    if parsed.with_platform_google:
-        if base.PLATFORM_TESTING_ENV:
-            base.DEFAULT_GOOGLE_GRACE_PERIOD = base.timedelta_from_ms(
-                platform_google_api.testing_grace_period_duration_ms
-            )
-        context = platform_google.start_subscriber(
+    if parsed.with_provider_google_play:
+        if base.PROVIDER_TESTING_ENV:
+            base.DEFAULT_GOOGLE_GRACE_PERIOD = base.timedelta_from_ms(google_play.api.testing_grace_period_duration_ms)
+        context = google_play.start_subscriber(
             cloud_project_id=parsed.google_cloud_project_id,
             package_name=parsed.google_package_name,
             cloud_subscription_name=parsed.google_cloud_subscription_name,
@@ -92,7 +89,7 @@ def run() -> None:
         # Graceful teardown on mule shutdown: cancel the pull loop + drain gRPC. (Correctness does not
         # depend on this — Pub/Sub redelivers unacked messages and handlers are idempotent — it just
         # keeps reloads clean.)
-        atexit.register(platform_google.stop_subscriber, context)
+        atexit.register(google_play.stop_subscriber, context)
         log.info('Maintenance mule: Google subscriber started')
 
     # Prune once immediately (so a frequently-reloading box still gets cleaned each start), then let

@@ -65,11 +65,11 @@ provider_dry_run             = false
 
 # Enable pulling subscription purchases from the iOS App Store. The [apple] section must be
 # configured if this is set
-with_platform_apple          = false
+with_provider_app_store          = false
 
 # Enable pulling subscription purchases from the Google Play Store. The [google] section must be
 # configured if this is set
-with_platform_google         = false
+with_provider_google_play         = false
 
 # Turn this on if you intend to pull test-notifications from Google/Apple and work with subscription
 # payments that have a modified duration (e.g. Google modifies a 1-day subscription to 10 seconds). This
@@ -78,7 +78,7 @@ with_platform_google         = false
 # One example is rounding timestamps to Google/Apple's modified timespan to determine whether or not
 # a revocation overlaps with the expiry of a payment. If there's an overlap the backend can skip
 # issuing a revocation (which is an expensive operation).
-platform_testing_env         = false
+provider_testing_env         = false
 
 # By default the backend is configured to strip personal-identifying information (PII) from the
 # logs. Enabling this preserves all information in logs. This should not be used in a
@@ -94,7 +94,7 @@ unsafe_logging               = false
 # url     = <url...>
 # name    = <display name...>
 
-# NOTE: The [apple] section and its fields are only required if `with_platform_apple` is defined
+# NOTE: The [apple] section and its fields are only required if `with_provider_app_store` is defined
 [apple]
 
 # Platform specific strings, see:
@@ -115,7 +115,7 @@ sandbox_env                  = true
 # unable to start up Apple's library
 app_id                       = <int: app_id>
 
-# NOTE: The [google] section and its fields are only required if `with_platform_google` is defined
+# NOTE: The [google] section and its fields are only required if `with_provider_google_play` is defined
 [google]
 package_name                 = <string: package_name> # e.g. com.company.my_application
 
@@ -144,8 +144,8 @@ SESH_PRO_BACKEND_INI_PATH=<path/to/ini/file.ini>
 SESH_PRO_BACKEND_DB_URL                  = <...>
 SESH_PRO_BACKEND_LOG_PATH                = <...>
 SESH_PRO_BACKEND_PROVIDER_DRY_RUN        = [0|1]
-SESH_PRO_BACKEND_WITH_PLATFORM_APPLE     = [0|1]
-SESH_PRO_BACKEND_WITH_PLATFORM_GOOGLE    = [0|1]
+SESH_PRO_BACKEND_WITH_PROVIDER_APP_STORE     = [0|1]
+SESH_PRO_BACKEND_WITH_PROVIDER_GOOGLE_PLAY    = [0|1]
 ```
 
 ## Build and run

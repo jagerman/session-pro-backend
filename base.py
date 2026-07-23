@@ -124,10 +124,10 @@ DEFAULT_GOOGLE_GRACE_PERIOD: datetime.timedelta = DEFAULT_APPLE_GRACE_PERIOD
 # NOTE: Global variables
 DB_URL = ''
 UNSAFE_LOGGING = False
-PLATFORM_TESTING_ENV = False
+PROVIDER_TESTING_ENV = False
 # When set, every payment provider treats all of its OUTBOUND interactions as already-succeeded and
 # performs no external side-effect: mutations (e.g. Google acknowledge) become no-ops and gating reads
-# return a synthetic success. Each provider module owns what dry-run means for it (see platform_*.py).
+# return a synthetic success. Each provider module owns what dry-run means for it (see providers/).
 # It does NOT fabricate payments — a real witnessed payment must still exist — so it is not a "grant
 # arbitrary Pro" backdoor; worst-case misuse breaks real subscriptions, it does not mint entitlements.
 PROVIDER_DRY_RUN = False
@@ -572,8 +572,8 @@ def safe_get_dict_value_type(d: dict[str, typing.Any], key: str) -> str:
 
 # Typed JSON accessors. Two callers, two error models, ONE branch point (`_require_fail`): the HTTP
 # request path (server.py) omits `err` → the first bad field raises a client-facing FailError; the
-# platform-notification parsers (platform_google*) pass an `err` sink → errors accumulate. (The `err`
-# arm is transitional — it retires when platform_google's error flow moves to exceptions in the
+# provider-notification parsers (providers.google_play*) pass an `err` sink → errors accumulate. (The `err`
+# arm is transitional — it retires when google_play's error flow moves to exceptions in the
 # ErrorSink-removal sweep; see the refactor plan.)
 def _require_fail(msg: str, err: ErrorSink | None) -> None:
     if err is not None:
