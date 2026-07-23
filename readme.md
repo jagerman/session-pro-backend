@@ -15,9 +15,6 @@ And so forth.
 
 - `vendor/`: 3rd party dependencies
 
-- `examples/`: Helper script to contact all the endpoints of a Pro Backend
-  development server dumping the JSON requests and responses for said endpoints.
-
 - `base.py`: Basic primitives shared across all modules where necessary.
 
 - `backend.py`: DB layer that validates incoming requests and stores/retrieves
@@ -42,6 +39,11 @@ layer and replies a response, if any.
 
 - `test.py`: Holds the unit tests implemented via pytest.
 
+- `docs/`: Design and operational docs. **`docs/limitations.md` — payment-provider limitations and the
+  store-config invariants they depend on; READ IT before enabling any new Google Play Console / App Store
+  Connect feature (one-time products, prepaid plans, subscription pause, promotional offers, etc.).** Also
+  the authoritative wire/proof spec, `docs/pro-wire-protocol.md`.
+
 ## Getting Started
 
 ```
@@ -56,25 +58,18 @@ db_url                       = sqlite:///backend.db
 # logging to a file completely)
 log_path                     = <path/to/log>
 
-# Start the server in developer mode, this is most likely only interesting if
-# you are developing locally. If the DB hasn't been bootstrapped yet, this
-# causes the backend to generate a deterministic secret Ed25519 key with 32 bytes of 0xCD
-# and hence creates the following key pairs:
-#
-#   Secret: 0xcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd
-#   Public: 0xfc947730f49eb01427a66e050733294d9e520e545c7a27125a780634e0860a27
-#
-# If the DB already exists this won't have any effect as it will not overwrite
-# the existing DB.
-dev                          = false
+# Stub ALL payment-provider egress (Apple/Google): outbound mutations become no-ops and gating reads
+# return synthetic success. This lets you exercise the payment flow locally/in integration tests with
+# no provider credentials and no calls off-box. For testing ONLY — never enable on a real instance.
+provider_dry_run             = false
 
 # Enable pulling subscription purchases from the iOS App Store. The [apple] section must be
 # configured if this is set
-with_platform_apple          = false
+with_provider_app_store          = false
 
 # Enable pulling subscription purchases from the Google Play Store. The [google] section must be
 # configured if this is set
-with_platform_google         = false
+with_provider_google_play         = false
 
 # Turn this on if you intend to pull test-notifications from Google/Apple and work with subscription
 # payments that have a modified duration (e.g. Google modifies a 1-day subscription to 10 seconds). This
@@ -83,7 +78,7 @@ with_platform_google         = false
 # One example is rounding timestamps to Google/Apple's modified timespan to determine whether or not
 # a revocation overlaps with the expiry of a payment. If there's an overlap the backend can skip
 # issuing a revocation (which is an expensive operation).
-platform_testing_env         = false
+provider_testing_env         = false
 
 # By default the backend is configured to strip personal-identifying information (PII) from the
 # logs. Enabling this preserves all information in logs. This should not be used in a
@@ -99,7 +94,7 @@ unsafe_logging               = false
 # url     = <url...>
 # name    = <display name...>
 
-# NOTE: The [apple] section and its fields are only required if `with_platform_apple` is defined
+# NOTE: The [apple] section and its fields are only required if `with_provider_app_store` is defined
 [apple]
 
 # Platform specific strings, see:
@@ -120,7 +115,7 @@ sandbox_env                  = true
 # unable to start up Apple's library
 app_id                       = <int: app_id>
 
-# NOTE: The [google] section and its fields are only required if `with_platform_google` is defined
+# NOTE: The [google] section and its fields are only required if `with_provider_google_play` is defined
 [google]
 package_name                 = <string: package_name> # e.g. com.company.my_application
 
@@ -148,9 +143,9 @@ SESH_PRO_BACKEND_INI_PATH=<path/to/ini/file.ini>
 # For the following options, see the .INI section for more information
 SESH_PRO_BACKEND_DB_URL                  = <...>
 SESH_PRO_BACKEND_LOG_PATH                = <...>
-SESH_PRO_BACKEND_DEV                     = [0|1]
-SESH_PRO_BACKEND_WITH_PLATFORM_APPLE     = [0|1]
-SESH_PRO_BACKEND_WITH_PLATFORM_GOOGLE    = [0|1]
+SESH_PRO_BACKEND_PROVIDER_DRY_RUN        = [0|1]
+SESH_PRO_BACKEND_WITH_PROVIDER_APP_STORE     = [0|1]
+SESH_PRO_BACKEND_WITH_PROVIDER_GOOGLE_PLAY    = [0|1]
 ```
 
 ## Build and run
@@ -165,8 +160,9 @@ sudo apt install libsession-util-dev
 git clone https://github.com/oxen-io/libsession-python
 cd libsession-python && python -m pip install .
 
-# Install Python dependencies for the Session Pro Backend
-python -m pip install -r requirements.txt
+# Install Python dependencies for the Session Pro Backend (use requirements-dev.txt for a
+# dev checkout — it adds pytest and a pip uWSGI on top of the runtime requirements.txt)
+python -m pip install -r requirements-dev.txt
 
 # Run backend w/ a local Flask server in debug mode
 python -m flask --app main run --debug
@@ -269,130 +265,35 @@ format specifications and examples.
 
 # Deploy Guide
 
-Using `scripts/ansible_deploy.yml` we have an idempotent
-script that can set up a primary server to have a Session Pro Backend that is
-configured for Google and Apple app stores and persists the state onto
-a postgres database. The database is replicated using postgres replication to
-the secondary server, details of this are in the `ansible_deploy.yml`
-documentation.
+Deployment is handled by `scripts/deploy.sh` — an idempotent bash installer, run on the
+target host, that provisions the backend under a dedicated non-root user in its own
+PostgreSQL cluster (leaving other databases on the box untouched), behind nginx, with
+off-host [pgBackRest](https://pgbackrest.org) backups and point-in-time recovery.
 
-The secondary server is optional, opt out by not specifying the `replica_host.`
-to the ansible command.
-
-Start by cloning the session-pro-backend at
-https://github.com/session-foundation/session-pro-backend.git
-
-Setup a config.ini with the following values and stub lines (the stubs will
-be populated by the ansible script and transferred onto the primary server).
-
-```
-[base]
-db_url                     =
-dev                        = true
-with_platform_apple        = true
-with_platform_google       = true
-unsafe_logging             = true
-platform_testing_env       = true
-
-[apple]
-app_id                     =
-bundle_id                  =
-issuer_id                  =
-key_id                     =
-key_path                   =
-root_cert_ca_g2_path       =
-root_cert_ca_g3_path       =
-root_cert_path             =
-sandbox_env                =
-
-[google]
-cloud_app_credentials_path =
-cloud_project_id           =
-cloud_subscription_name    =
-package_name               =
-subscription_product_id    =
-```
-
-Then create a hosts.yml file in the working directory with the following
-contents. Note for ansible to access the machine ensure that SSH access is setup
-from the host to the target servers (primary and secondary).
-
-```yaml
-global:
-  hosts:
-    pro_backend:
-      ansible_host: <Primary Instance's IP address>
-      ansible_user: root
-```
-
-Then attain the Google and Apple secrets (see the `ansible_deploy.yml` file for
-where to retrieve/generate these secrets) to enable communications with the
-respective platforms:
-
-- Apple Key Path (P8 file)
-- Apple Key ID
-- Google Cloud App Default Credentials (ADC JSON file)
-
-Additionally you will need various pieces of metadata required for
-authenticating to these platforms. See the ansible script for more information
-on where to source these from. It's possible to disable these platforms by
-simply setting `with_platform_apple` and `with_platform_google` to false. Stub
-data can then be supplied to their respective fields.
-
-Then run the ansible command as follows (we assume config.ini and the
-secrets are in the current working directory and substituting in the necessary
-values, again see `ansible_deploy.yml` for documentation on all these fields and
-where to source them):
+See **[docs/deploy.md](docs/deploy.md)** for the full guide, prerequisites, and the
+disaster-recovery runbook. In brief:
 
 ```bash
-ansible-playbook -i hosts.yml playbook_pro_backend_pgsql.yml \
-  -e replica_host=<root@secondary_server_address> \
-  -e config_ini_path=<path/to/config.ini> \
-  \
-  -e apple_app_id=<string> \
-  -e apple_bundle_id=<string> \
-  -e apple_issuer_id=<string> \
-  -e apple_key_id=<key_id> \
-  -e apple_key_path=<path/to/your_apple_api_key.p8> \
-  -e apple_sandbox=false \
-  \
-  -e google_cloud_app_default_credentials_path=<path/to/your_google_adc_key.json> \
-  -e google_cloud_project_id=<string> \
-  -e google_cloud_subscription_name=<string> \
-  -e google_package_name=<com.your_company.app_name> \
-  -e google_subscription_product_id=<string> \
-  \
-  -e domain=<your.domain.com> \
-  -e email=<your@email.com>
+git clone https://github.com/session-foundation/session-pro-backend
+cd session-pro-backend
+cp scripts/deploy.env.example deploy.env   # set PRO_DOMAIN, PGBACKREST_REPO_HOST, platforms, ...
+./scripts/deploy.sh            # run as root
 ```
 
-You will be prompted for a password interactively which is the password to
-secure the postgres DB instance under. The password is reused to secure the
-secondary's server replicated database.
-
-After the script has ran to completion, the server(s) are now successfully
-provisioned and should be accepting requests. On the replica instance you can
-run this command to dump the database to stdout to check if the users table was
-replicated:
+TLS is left to the operator (e.g. `certbot --nginx -d <domain>`), and Apple/Google
+credentials can be added after the first deploy. Once DNS/TLS are up, smoke-test an
+unauthenticated endpoint:
 
 ```
-sudo -u postgres psql --port={{ pg_port }} -d {{ pg_db_name }} -c "SELECT * FROM users"
-```
-
-On the primary instance test one of the unauthenticated endpoints to ensure that
-it's visible and accessible publicly:
-
-```
-curl -X POST <your_server_address>/get_pro_revocations -H "Content-Type: application/json" -d '{"version": 0, "ticket": 0}'
+curl -X POST https://<your-domain>/get_pro_revocations -H "Content-Type: application/json" -d '{"version": 0, "ticket": 0}'
 ```
 # Architecture
 
 ![Overview of Session Pro](docs/Session_Pro_Overview_200_zoom_10_border.png)
 
-Provided in this repository is an [Ansible](scripts/ansible_deploy.yml) script
-that installs the Session Pro infrastructure onto the target server and is
-a useful, technical description of the various components that the backend
-relies on. In general, the backend is designed as a set of distinct layers that
+The deployment tooling (`scripts/deploy.sh` and [docs/deploy.md](docs/deploy.md)) doubles as
+a concrete, technical description of the various components that the backend relies on. In
+general, the backend is designed as a set of distinct layers that
 feed data to each other, which is loosely described by the following diagram (in
 reality the links between the layers are a bit more entangled but conceptually
 stands).

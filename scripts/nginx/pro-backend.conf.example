@@ -1,0 +1,31 @@
+# Session Pro Backend — nginx reverse proxy (HTTP only).
+#
+# deploy.sh installs this to /etc/nginx/sites-available/pro-backend, substitutes the
+# server_name, and symlinks it into sites-enabled.
+#
+# TLS IS NOT CONFIGURED HERE — by design. After the first deploy, obtain a certificate
+# yourself, e.g.:
+#
+#     certbot --nginx -d <your-domain>
+#
+# certbot rewrites this vhost in place, adding the `listen 443 ssl` server block and an
+# HTTP->HTTPS redirect. Until you do that, the backend is reachable only over plain HTTP.
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name @PRO_DOMAIN@;
+
+    # Deny everything by default; only the known API endpoints are proxied through.
+    location / {
+        return 404;
+    }
+
+    location ~ ^/(add_pro_payment|generate_pro_proof|get_pro_revocations|get_pro_status|get_payment_details|set_payment_refund_requested|status|apple_notifications_v2|oxen/v4/lsrpc)$ {
+        include uwsgi_params;
+        uwsgi_pass unix:/run/pro-backend/pro-backend.sock;
+    }
+
+    access_log /var/log/nginx/pro-backend.access.log;
+    error_log  /var/log/nginx/pro-backend.error.log;
+}

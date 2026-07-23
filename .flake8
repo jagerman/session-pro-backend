@@ -1,0 +1,14 @@
+[flake8]
+# flake8 refuses to read pyproject.toml, so its config lives here. Keep max-line-length in sync
+# with black's line-length (pyproject.toml) so the two agree on 120.
+max-line-length = 120
+# black compatibility: black puts whitespace around ':' in slices (E203) and breaks lines before
+# binary operators (W503); both conflict with pycodestyle, so ignore them or flake8 fights the
+# formatter. (W503 is off by default, but be explicit.)
+extend-ignore = E203, W503
+# Don't lint the vendored third-party tree or the venv (matches mypy.ini / pyproject.toml).
+extend-exclude = .venv, vendor
+# test.py is dominated by opaque fixture strings (provider tokens, 64-char hex keys) with no meaningful
+# wrap point, so waive E501 there only; every other check still applies to it.
+per-file-ignores =
+    test.py: E501

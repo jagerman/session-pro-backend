@@ -3,6 +3,7 @@ The base layer contains common utilities that is useful to other files in the pr
 have no dependency on any project files, only, native Python packages. Typically useful to share
 functionality from the testing suite and the project but not limited to.
 '''
+
 import dataclasses
 import datetime
 import enum
@@ -19,16 +20,84 @@ import typing
 import typing_extensions
 import urllib.request
 
-import db
-import sqlalchemy
-
 # NOTE: Constants
-SECONDS_IN_DAY:        int     = 60 * 60 * 24
-MILLISECONDS_IN_DAY:   int     = 60 * 60 * 24 * 1000
-MILLISECONDS_IN_MONTH: int     = MILLISECONDS_IN_DAY * 30
-SECONDS_IN_MONTH:      int     = SECONDS_IN_DAY * 30
-MILLISECONDS_IN_YEAR:  int     = MILLISECONDS_IN_DAY * 365
-SECONDS_IN_YEAR:       int     = SECONDS_IN_DAY * 365
+# Backend software version, reported by the /status health endpoint. Bump on release; there is no other
+# version marker in the system (the wire/proof formats are versioned separately — see the wire spec).
+BACKEND_VERSION: str = '0.2.0'
+SECONDS_IN_DAY: int = 60 * 60 * 24
+MILLISECONDS_IN_DAY: int = 60 * 60 * 24 * 1000
+MILLISECONDS_IN_MONTH: int = MILLISECONDS_IN_DAY * 30
+SECONDS_IN_MONTH: int = SECONDS_IN_DAY * 30
+MILLISECONDS_IN_YEAR: int = MILLISECONDS_IN_DAY * 365
+SECONDS_IN_YEAR: int = SECONDS_IN_DAY * 365
+
+# How far the timestamp in a signed request may differ from the backend's clock. This currently matches
+# the storage server's store tolerance for onion-request forwarded messages as per:
+#
+#   https://github.com/session-foundation/session-storage-server/blob/3d159a10d465678d758131c1075c9a6e5b4d95cc/oxenss/rpc/request_handler.h#L48
+#
+# We choose the upper-bound of tolerance for requests for maximum compatibility. Currently, in the flask
+# context, no information is available to indicate if the request was forwarded or not so we default to
+# assuming it is. All platforms are designed to interact with the backend using onion requests.
+#
+# It is a protocol constant, not merely a server-side check: the backend's revocation-skip math
+# (revoke_payments_by_id_internal) depends on the same skew bound, so both must read this one value.
+DEFAULT_TIMESTAMP_TOLERANCE: datetime.timedelta = datetime.timedelta(seconds=70)
+
+# Every instant in this codebase is a tz-aware UTC `datetime` and every duration a `timedelta`. Integer
+# epochs live ONLY in the converters below, at two kinds of boundary with distinct units:
+#   - MILLISECONDS: the payment providers (Apple/Google App Store APIs) genuinely speak ms, so their
+#     ingest/egress uses the `*_ms` pair.
+#   - SECONDS: our own wire + proof format is seconds (the wire spec's unit, item 5b), so every
+#     client-facing boundary and every signed hash uses the `*_seconds` pair. Wire seconds are integer
+#     everywhere except two upstream provider event instants (`purchased_ts`, `revoked_ts`) that keep
+#     the provider's sub-second precision as a float via `unix_seconds_float_from_datetime` — see the
+#     wire spec §1. Nothing hashed is ever a float.
+# The two never mix: a value crossing the provider boundary is ms, a value crossing our wire is seconds.
+EPOCH: datetime.datetime = datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
+
+
+def datetime_from_unix_ms(unix_ms: int) -> datetime.datetime:
+    return EPOCH + datetime.timedelta(milliseconds=unix_ms)
+
+
+def unix_ms_from_datetime(value: datetime.datetime) -> int:
+    # Exact integer milliseconds via integer division — never float `.timestamp()` truncation.
+    return (value - EPOCH) // datetime.timedelta(milliseconds=1)
+
+
+def timedelta_from_ms(ms: int) -> datetime.timedelta:
+    return datetime.timedelta(milliseconds=ms)
+
+
+def ms_from_timedelta(value: datetime.timedelta) -> int:
+    return value // datetime.timedelta(milliseconds=1)
+
+
+def datetime_from_unix_seconds(unix_s: int) -> datetime.datetime:
+    return EPOCH + datetime.timedelta(seconds=unix_s)
+
+
+def unix_seconds_from_datetime(value: datetime.datetime) -> int:
+    # Exact integer seconds via integer division — never float `.timestamp()` truncation. Sub-second
+    # precision (a provider ms value) is floored: our wire is second-resolution by spec.
+    return (value - EPOCH) // datetime.timedelta(seconds=1)
+
+
+def timedelta_from_seconds(s: int) -> datetime.timedelta:
+    return datetime.timedelta(seconds=s)
+
+
+def seconds_from_timedelta(value: datetime.timedelta) -> int:
+    return value // datetime.timedelta(seconds=1)
+
+
+def unix_seconds_float_from_datetime(value: datetime.datetime) -> float:
+    # Fractional UNIX seconds (true division) — preserves the sub-second precision of an upstream
+    # provider instant on the wire. ONLY for the enumerated float display fields (wire spec §1); never
+    # for a hashed value, which must be integer seconds via `unix_seconds_from_datetime`.
+    return (value - EPOCH) / datetime.timedelta(seconds=1)
+
 
 # NOTE: Default grace period we add to the subscription payments because in real world situations
 # no payment processor/billing cycle is going to bill exactly on the dot due to real-world
@@ -47,80 +116,101 @@ SECONDS_IN_YEAR:       int     = SECONDS_IN_DAY * 365
 # which the billing for the end of the subscription cycle is executed can vary and similarly, users
 # may encounter that they lose Pro because the billing was late. The 1 hour grace period looks to
 # minimise that.
-DEFAULT_APPLE_GRACE_PERIOD_DURATION_MS:  int = 60 * 60 * 1 * 1000
+DEFAULT_APPLE_GRACE_PERIOD: datetime.timedelta = datetime.timedelta(hours=1)
 
 # NOTE: Always the same as Apple, unless we're in a testing environment where this gets changed
-DEFAULT_GOOGLE_GRACE_PERIOD_DURATION_MS: int = DEFAULT_APPLE_GRACE_PERIOD_DURATION_MS
+DEFAULT_GOOGLE_GRACE_PERIOD: datetime.timedelta = DEFAULT_APPLE_GRACE_PERIOD
 
 # NOTE: Global variables
-DB_URL                         = ''
-DEV_BACKEND_MODE               = False
-DEV_BACKEND_DETERMINISTIC_SKEY = bytes([0xCD] * 32)
-UNSAFE_LOGGING                 = False
-PLATFORM_TESTING_ENV           = False
+DB_URL = ''
+UNSAFE_LOGGING = False
+PROVIDER_TESTING_ENV = False
+# When set, every payment provider treats all of its OUTBOUND interactions as already-succeeded and
+# performs no external side-effect: mutations (e.g. Google acknowledge) become no-ops and gating reads
+# return a synthetic success. Each provider module owns what dry-run means for it (see providers/).
+# It does NOT fabricate payments — a real witnessed payment must still exist — so it is not a "grant
+# arbitrary Pro" backdoor; worst-case misuse breaks real subscriptions, it does not mint entitlements.
+PROVIDER_DRY_RUN = False
 
 # NOTE: Restricted type-set, JSON obviously supports much more than this, but
 # our use-case only needs a small subset of it as of current so KISS.
 JSONPrimitive: typing.TypeAlias = str | int | float | bool | None
-JSONValue:     typing.TypeAlias = JSONPrimitive | dict[str, 'JSONValue'] | list['JSONValue']
-JSONObject:    typing.TypeAlias = dict[str, JSONValue]
-JSONArray:     typing.TypeAlias = list[JSONValue]
+JSONValue: typing.TypeAlias = JSONPrimitive | dict[str, 'JSONValue'] | list['JSONValue']
+JSONObject: typing.TypeAlias = dict[str, JSONValue]
+JSONArray: typing.TypeAlias = list[JSONValue]
+
 
 @dataclasses.dataclass
 class BackupRotationDryRun:
-    to_keep: list[pathlib.Path]   = dataclasses.field(default_factory=list)
+    to_keep: list[pathlib.Path] = dataclasses.field(default_factory=list)
     to_delete: list[pathlib.Path] = dataclasses.field(default_factory=list)
+
 
 @dataclasses.dataclass
 class PaymentProviderData:
     id: int = 0
 
-class PaymentProvider(enum.Enum):
-    Nil             = 0
-    GooglePlayStore = 1
-    iOSAppStore     = 2
-    Rangeproof      = 3
+
+class PaymentProvider(enum.StrEnum):
+    # Values are the wire/DB `code` strings (see docs/pro-wire-protocol.md §1). Nil is an in-Python
+    # sentinel only — it is never a wire value and is never seeded into the payment_providers lookup.
+    Nil = 'nil'
+    GooglePlayStore = 'google_play'
+    iOSAppStore = 'app_store'
+    Rangeproof = 'rangeproof'
+
 
 @dataclasses.dataclass
 class PaymentProviderTransaction:
-    provider:                   PaymentProvider = PaymentProvider.Nil
-    apple_original_tx_id:       str = ''
-    apple_tx_id:                str = ''
+    provider: PaymentProvider = PaymentProvider.Nil
+    apple_original_tx_id: str = ''
+    apple_tx_id: str = ''
     apple_web_line_order_tx_id: str = ''
-    google_payment_token:       str = ''
-    google_order_id:            str = ''
-    rangeproof_order_id:        str = ''
+    google_payment_token: str = ''
+    google_order_id: str = ''
+    rangeproof_order_id: str = ''
 
-class PaymentStatus(enum.IntEnum):
-    Nil        = 0
-    Unredeemed = 1
-    Redeemed   = 2
-    Expired    = 3
-    Revoked    = 4
 
-class ProPlan(enum.Enum):
+class PaymentStatus(enum.StrEnum):
+    # A DERIVED display value (wire/logging), NOT a stored column — computed from a payment's
+    # redeemed/revoked/expiry timestamps against a caller-supplied clock (see
+    # backend.derive_payment_status). Values are the wire `code`s (docs/pro-wire-protocol.md §1).
+    Nil = 'nil'
+    Unredeemed = 'unredeemed'
+    Redeemed = 'redeemed'
+    Expired = 'expired'
+    Revoked = 'revoked'
+
+
+class ProPlan(enum.StrEnum):
     """Universal Pro Plan Identifier.
-    Enum is stored as an int in the database, existing entries must not be reordered or changed.
+
+    Values are the wire/DB `code` strings — compact billing-period codes (see
+    docs/pro-wire-protocol.md §1). Nil is an in-Python sentinel only (never a wire/DB value).
     """
-    Nil         = 0
-    OneMonth    = 1
-    ThreeMonth  = 2
-    TwelveMonth = 3
+
+    Nil = 'nil'
+    OneMonth = '1m'
+    ThreeMonth = '3m'
+    TwelveMonth = '1y'
 
     @classmethod
     def from_string(cls, val: str):
+        # Accept either the member name ("OneMonth") or the code value ("1m"), case-insensitively.
         val_lower = val.lower()
         for it in ProPlan:
-            if it.name.lower() == val_lower:
+            if it.name.lower() == val_lower or it.value == val_lower:
                 return it
         return None
+
 
 class LogFormatter(logging.Formatter):
     @typing_extensions.override
     def formatTime(self, record: logging.LogRecord, datefmt: str | None = None):
-        dt     = datetime.datetime.fromtimestamp(record.created)
+        dt = datetime.datetime.fromtimestamp(record.created)
         result = dt.strftime('%y-%m-%d %H:%M:%S.%f')[:-3]
         return result
+
 
 @dataclasses.dataclass
 class ErrorSink:
@@ -134,6 +224,7 @@ class ErrorSink:
 
     See the parsing code in server.py for an example of where this is useful.
     '''
+
     msg_list: list[str] = dataclasses.field(default_factory=list)
 
     def has(self) -> bool:
@@ -144,40 +235,85 @@ class ErrorSink:
         result = '\n  '.join(self.msg_list)
         return result
 
+
+class ErrorCode(enum.StrEnum):
+    '''Machine slugs for the response envelope's `error_code` (wire spec §5.1). Stable, additive: a client
+    keys its localized (Crowdin) message off these; an unrecognised one degrades to status-level handling.'''
+
+    invalid_request = 'invalid_request'  # fail:  malformed/missing/wrong-type field, bad hex, bad provider
+    bad_signature = 'bad_signature'  # fail:  a request signature failed to verify
+    stale_request = 'stale_request'  # fail:  request timestamp outside the replay-tolerance window
+    unknown_payment = 'unknown_payment'  # fail:  no payment matching those provider ids for this user
+    # NB: `subscription_expired`, NOT `expired` — the error_code vocabulary is deliberately DISJOINT from
+    # get-details `user_status` {never,active,expired}, so no token identifies two different fields.
+    subscription_expired = 'subscription_expired'  # fail:  the user's entitlement has lapsed
+    not_subscribed = 'not_subscribed'  # fail:  no entitlement on record (never subscribed / pruned)
+    revoked = 'revoked'  # fail:  the user's current entitlement was revoked
+    internal_error = 'internal_error'  # error: backend fault
+
+
+class ApiError(Exception):
+    '''An error that renders as a response envelope `{status, error_code, error}` (server.py's error
+    handler catches it). Raise these instead of threading an ErrorSink through the HTTP request path.'''
+
+    wire_status: str = 'error'
+    default_code: ErrorCode = ErrorCode.internal_error
+
+    def __init__(self, message: str, code: ErrorCode | None = None):
+        super().__init__(message)
+        self.code: ErrorCode = code if code is not None else self.default_code
+
+
+class FailError(ApiError):
+    '''The request was understood but rejected by the client's input or a state precondition (wire
+    `status: "fail"`). Default slug `invalid_request`; pass a more specific `code` where one applies.'''
+
+    wire_status = 'fail'
+    default_code = ErrorCode.invalid_request
+
+
+class ServerError(ApiError):
+    '''The backend faulted handling the request (wire `status: "error"`). The client did nothing wrong.'''
+
+    wire_status = 'error'
+    default_code = ErrorCode.internal_error
+
+
 @dataclasses.dataclass
 class TableStrings:
-    name:     str = ''
+    name: str = ''
     contents: list[list[str]] = dataclasses.field(default_factory=list)
 
+
 class AsyncSessionWebhookLogHandler(logging.Handler):
-    webhook_url:    str
-    display_name:   str
+    webhook_url: str
+    display_name: str
     _submit_thread: threading.Thread
-    timeout:        int       = 2
+    timeout: int = 2
 
     def __init__(self, url: str, name: str):
         super().__init__()
-        self.webhook_url    = url
-        self.display_name   = name
+        self.webhook_url = url
+        self.display_name = name
         assert len(self.display_name) <= 100, f'Display name must be less than 100 characters: {len(self.display_name)}'
-        self._lock          = threading.Lock()
-        self._stop_event    = threading.Event()
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
         self._queue_dirtied = threading.Event()
-        self.msg_queue      = []
+        self.msg_queue: list[str] = []
         self._submit_thread = threading.Thread(target=self._worker, daemon=True)
-        self._stop_event    = threading.Event()
+        self._stop_event = threading.Event()
         self._submit_thread.start()
 
     def emit_text(self, text: str, date_prefix: bool = True):
         prefix: str = ''
         if date_prefix:
-            date   = datetime.datetime.fromtimestamp(time.time())
+            date = datetime.datetime.fromtimestamp(time.time())
             prefix = date.strftime('%y-%m-%d %H:%M:%S.%f')[:-3]
 
         max_size = 128
         with self._lock:
             if len(self.msg_queue) >= max_size:
-                self.msg_queue = self.msg_queue[-(max_size - 2):]
+                self.msg_queue = self.msg_queue[-(max_size - 2) :]
                 self.msg_queue.append(f"{prefix} Message queue was full, overwriting old message")
             self.msg_queue.append(f"{prefix} {text}"[:2000])
         self._queue_dirtied.set()
@@ -190,7 +326,7 @@ class AsyncSessionWebhookLogHandler(logging.Handler):
 
     def _worker(self):
         while True:
-            _ = self._queue_dirtied.wait()
+            self._queue_dirtied.wait()
             if self._stop_event.is_set():
                 break
             self._queue_dirtied.clear()
@@ -199,15 +335,20 @@ class AsyncSessionWebhookLogHandler(logging.Handler):
             while True:
                 batch: list[str] = []
                 with self._lock:
-                    batch_size     = min(len(self.msg_queue), 8) # Pump at most, 8 at a time then yield
-                    batch          = self.msg_queue[:batch_size]
+                    batch_size = min(len(self.msg_queue), 8)  # Pump at most, 8 at a time then yield
+                    batch = self.msg_queue[:batch_size]
                     self.msg_queue = self.msg_queue[batch_size:]
 
-                for it in batch: # Blocking send
-                    payload: dict[str, str] = { "text": "```\n" + it + "\n```", "display_name": self.display_name }
-                    request                 = urllib.request.Request(self.webhook_url, data=json.dumps(payload).encode('utf-8'), headers={"Content-Type": "application/json"}, method="POST")
+                for it in batch:  # Blocking send
+                    payload: dict[str, str] = {"text": "```\n" + it + "\n```", "display_name": self.display_name}
+                    request = urllib.request.Request(
+                        self.webhook_url,
+                        data=json.dumps(payload).encode('utf-8'),
+                        headers={"Content-Type": "application/json"},
+                        method="POST",
+                    )
                     try:
-                        _ = urllib.request.urlopen(request, timeout=self.timeout)  # pyright: ignore[reportAny]
+                        urllib.request.urlopen(request, timeout=self.timeout)
                     except Exception as e:
                         print(f"Session webhook send failed: {e}", file=sys.stderr)
 
@@ -223,40 +364,39 @@ class AsyncSessionWebhookLogHandler(logging.Handler):
             self._submit_thread.join(timeout=2)
         super().close()
 
-def verify_payment_provider(payment_provider: PaymentProvider | int, err: ErrorSink | None) -> bool:
-    result = False
-    provider = PaymentProvider.Nil
+
+def verify_payment_provider(payment_provider: PaymentProvider | str, err: ErrorSink | None = None) -> bool:
     if isinstance(payment_provider, PaymentProvider):
         provider = payment_provider
-        result = True
     else:
         try:
             provider = PaymentProvider(payment_provider)
-            result = True
         except ValueError:
-            if err:
-                err.msg_list.append('Unrecognised payment provider: {}'.format(payment_provider))
+            _require_fail('Unrecognised payment provider: {}'.format(payment_provider), err)
+            return False
 
-    if err and len(err.msg_list) == 0 and provider == PaymentProvider.Nil:
-        err.msg_list.append('Nil payment provider is invalid, must be set to a provider')
+    if provider == PaymentProvider.Nil:
+        _require_fail('Nil payment provider is invalid, must be set to a provider', err)
+        return False
 
-    return result
+    return True
 
-def hex_to_bytes(hex: str, label: str, hex_len: int, err: ErrorSink) -> bytes:
-    result = b''
+
+def hex_to_bytes(hex: str, label: str, hex_len: int, err: ErrorSink | None = None) -> bytes:
     if len(hex) != hex_len:
-        err.msg_list.append(f'{label} was not {hex_len} characters, was {len(hex)} characters')
-    else:
-        try:
-            result = bytes.fromhex(hex)
-        except Exception as e:
-            err.msg_list.append(f'{label} was not valid hex: {e}')
-    return result
+        _require_fail(f'{label} was not {hex_len} characters, was {len(hex)} characters', err)
+        return b''
+    try:
+        return bytes.fromhex(hex)
+    except Exception as e:
+        _require_fail(f'{label} was not valid hex: {e}', err)
+    return b''
 
-def readable_unix_ts_ms(unix_ts_ms: int) -> str:
-    date_str = datetime.datetime.fromtimestamp(unix_ts_ms/1000.0).strftime('%y-%m-%d %H:%M:%S.%f')[:-3]
-    result   = f'{unix_ts_ms} ({date_str})'
-    return result
+
+def readable(value: datetime.datetime) -> str:
+    # Compact UTC timestamp for logs, millisecond precision (no strftime %f-slice hack).
+    return value.astimezone(datetime.timezone.utc).isoformat(sep=' ', timespec='milliseconds')
+
 
 def print_unicode_table(rows: list[list[str]]) -> None:
     # Calculate maximum width for each column
@@ -302,124 +442,26 @@ def print_unicode_table(rows: list[list[str]]) -> None:
     bottom += '┘'
     print(bottom)
 
-def print_db_to_stdout_tx(conn: sqlalchemy.engine.Connection) -> None:
-    table_strings: list[TableStrings] = []
 
-    # Detect database type and use appropriate table listing query
-    if db.is_postgres(conn.engine):
-        result = conn.execute(sqlalchemy.text("SELECT tablename FROM pg_tables WHERE schemaname='public'"))
-        tables = typing.cast(list[tuple[str]], result.fetchall())
-        table_names = [table[0] for table in tables]
-    else:
-        result = conn.execute(sqlalchemy.text('SELECT name FROM sqlite_master WHERE type="table"'))
-        tables = typing.cast(list[tuple[str]], result.fetchall())
-        table_names = [table[0] for table in tables]
+def round_datetime_to_start_of_day(value: datetime.datetime) -> datetime.datetime:
+    return value.astimezone(datetime.timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
 
-    for table_name in table_names:
-        result = conn.execute(sqlalchemy.text(f'SELECT * FROM {table_name}'))
-        rows = result.fetchall()
-        column_names: list[str] = list(result.keys())
 
-        table_str: TableStrings = TableStrings()
-        table_str.name          = table_name
-        table_str.contents      = [column_names]
+def round_datetime_to_next_day(value: datetime.datetime) -> datetime.datetime:
+    # Ceil to the next UTC midnight; a value already exactly at midnight stays put (matches the old
+    # `(ms + DAY-1)//DAY*DAY` ceil semantics).
+    start = round_datetime_to_start_of_day(value)
+    return start if start == value else start + datetime.timedelta(days=1)
 
-        if rows:
-            for row in rows:
-                content: list[str] = []
-                for index, value in enumerate(row):
-                    col = column_names[index]
-                    if value is None:
-                        content.append(str(value))
-                    elif isinstance(value, bytes) or isinstance(value, memoryview):
-                        if isinstance(value, memoryview):
-                            value = bytes(value)
-                        try:
-                            text = value.decode('utf-8');
-                            text = text.replace('\n', '')
-                            text = text.replace('\r', '')
-                            text = text.replace('\t', '')
-
-                            print_limit = 128
-                            if len(text) > print_limit:
-                                content.append(str(text[:print_limit]) + f'...({len(value)})')
-                            else:
-                                content.append(str(text))
-                        except Exception:
-                            content.append(value.hex())
-                    elif isinstance(value, str):
-                        try:
-                            text = value.replace('\n', '')
-                            text = text.replace('\r', '')
-                            text = text.replace('\t', '')
-
-                            print_limit = 128
-                            if len(text) > print_limit:
-                                content.append(str(text[:print_limit]) + f'...({len(value)})')
-                            else:
-                                content.append(str(text))
-                        except Exception:
-                            content.append(str(value))
-                    elif col.endswith('unix_ts_ms'):
-                        content.append(readable_unix_ts_ms(int(value)))
-                    elif col.endswith('_s'):
-                        seconds = int(value)
-                        days    = seconds / SECONDS_IN_DAY
-                        content.append(f'{seconds} ({days:.2f} days)')
-                    elif col == 'payment_provider':
-                        value_int = int(value)
-                        if value_int == PaymentProvider.Nil.value:
-                            content.append(f' Nil ({value_int})')
-                        elif value_int == PaymentProvider.GooglePlayStore.value:
-                            content.append(f'Google Play Store ({value_int})')
-                        elif value_int == PaymentProvider.iOSAppStore.value:
-                            content.append(f'iOS App Store ({value_int})')
-                        elif value_int == PaymentProvider.Rangeproof.value:
-                            content.append(f'Rangeproof ({value_int})')
-                        else:
-                            content.append(f'Unknown ({value_int})')
-                    elif table_name == 'payments' and col == 'status':
-                        value_enum = PaymentStatus(value)
-                        content.append(f'{value_enum.name} ({value_enum.value})')
-                    elif table_name == 'payments' and col == 'plan':
-                        value_enum = ProPlan(value)
-                        content.append(f'{value_enum.name} ({value_enum.value})')
-                    elif table_name == 'payments' and col == 'auto_renewing':
-                        content.append('Yes' if value else 'No' + f' ({value})')
-                    else:
-                        content.append(str(value))
-                table_str.contents.append(content)
-        table_strings.append(table_str)
-
-    for it in table_strings:
-        print(f'Table: {it.name}')
-        print_unicode_table(it.contents)
-
-def print_db_to_stdout(conn: sqlalchemy.engine.Connection) -> None:
-    with db.transaction(conn):
-        print_db_to_stdout_tx(conn)
-
-def round_unix_ts_ms_to_next_day(unix_ts_ms: int) -> int:
-    result: int = (unix_ts_ms + (MILLISECONDS_IN_DAY - 1)) // MILLISECONDS_IN_DAY * MILLISECONDS_IN_DAY
-    return result
-
-def round_unix_ts_ms_to_start_of_day(unix_ts_ms: int) -> int:
-    result: int = unix_ts_ms // MILLISECONDS_IN_DAY * MILLISECONDS_IN_DAY
-    return result
 
 def format_bytes(size: int):
-    units = [
-        (1 << 40, 'TB'),
-        (1 << 30, 'GB'),
-        (1 << 20, 'MB'),
-        (1 << 10, 'kB'),
-        (1,       'B')
-    ]
+    units = [(1 << 40, 'TB'), (1 << 30, 'GB'), (1 << 20, 'MB'), (1 << 10, 'kB'), (1, 'B')]
     for base, prefix in units:
         if size >= base:
             formatted_size = size / base
             return f'{formatted_size:.2f} {prefix}'
     return '0.00 B'
+
 
 def format_seconds(duration_s: float) -> str:
     hours = int(duration_s // 3600)
@@ -440,6 +482,7 @@ def format_seconds(duration_s: float) -> str:
         result += f"{' ' if result else ''}{sec_str}s"
     return result if result else '0s'
 
+
 def obfuscate(val: str) -> str:
     """
     Obfuscate a string by masking the contents preserving the prefix and suffix. If the string is
@@ -450,6 +493,7 @@ def obfuscate(val: str) -> str:
     n_ends = max(math.floor(len(val) * 0.3), 1)
     return f"{val[:n_ends]}…{val[-n_ends:]}"
 
+
 def maybe_obfuscate(val: typing.Any) -> str:
     if UNSAFE_LOGGING:
         return str(val) if val is not None else 'None'
@@ -457,17 +501,27 @@ def maybe_obfuscate(val: typing.Any) -> str:
         return 'None'
     return obfuscate(str(val))
 
+
 def maybe_obfuscate_bytes(val: typing.Any) -> str:
     return maybe_obfuscate(bytes(val).hex())
 
-def payment_provider_tx_to_safe_string(tx: PaymentProviderTransaction) -> str:
-    return (
-        f"{tx.provider.name}, "
-        f"apple(orig/tx/web)=({maybe_obfuscate(tx.apple_original_tx_id)}/{maybe_obfuscate(tx.apple_tx_id)}/{maybe_obfuscate(tx.apple_web_line_order_tx_id)}), "
-        f"google=({maybe_obfuscate(tx.google_payment_token)}/{maybe_obfuscate(tx.google_order_id)}), "
-        f"rangeproof={maybe_obfuscate(tx.rangeproof_order_id)}"
-    )
 
+def payment_provider_tx_to_safe_string(tx: PaymentProviderTransaction) -> str:
+    # Only the active provider's ids are populated; show just those rather than dumping every
+    # provider's (mostly-empty) fields.
+    match tx.provider:
+        case PaymentProvider.iOSAppStore:
+            detail = (
+                f"apple(orig/tx/web)=({maybe_obfuscate(tx.apple_original_tx_id)}/"
+                f"{maybe_obfuscate(tx.apple_tx_id)}/{maybe_obfuscate(tx.apple_web_line_order_tx_id)})"
+            )
+        case PaymentProvider.GooglePlayStore:
+            detail = f"google=({maybe_obfuscate(tx.google_payment_token)}/{maybe_obfuscate(tx.google_order_id)})"
+        case PaymentProvider.Rangeproof:
+            detail = f"rangeproof={maybe_obfuscate(tx.rangeproof_order_id)}"
+        case _:
+            detail = "(no provider ids)"
+    return f"{tx.provider.name}, {detail}"
 
 
 def reflect_enum(enum_value: enum.Enum) -> str:
@@ -477,46 +531,24 @@ def reflect_enum(enum_value: enum.Enum) -> str:
         value = enum_value.value
     return f'{name} ({value})' if value is not None else name
 
-def _extract_keys_format_value(value):
-    """
-    Internal helper function to format dictionary values,
-    it's better to define this outside the function.
-    """
-    if isinstance(value, dict):
-        # Get all keys from the dictionary
-        keys = []
-        for k, v in value.items():
-            if isinstance(v, dict):
-                # If the value is a dict, recursively format it
-                keys.append(f"{k}: {_extract_keys_format_value(v)}")
-            else:
-                keys.append(k)
-        return "{" + ', '.join(keys) + "}"
-    else:
-        return str(value)
 
 def extract_keys_recursive(d: dict[str, typing.Any]) -> str:
     """
     Recursively extract keys from a nested dictionary and format them.
-    
+
     Args:
         d: Dictionary to extract keys from
-    
+
     Returns:
-        String representation of keys in the format:
-        "{key1, key2: {subkey1, subkey2}, key3: {subkey: {subsubkey}}}"
+        The keys as a comma-separated string, nested dicts shown as `key: {subkeys}`, e.g.
+        "key1, key2: {subkey1, subkey2}, key3: {subkey: {subsubkey}}". No outer braces — the
+        caller wraps them (see safe_dump_dict_keys_or_data).
     """
-    try:
-        result = []
-        for key, value in d.items():
-            if isinstance(value, dict):
-                result.append(f"{key}: {_extract_keys_format_value(value)}")
-            else:
-                result.append(key)
-        
-        return ', '.join(result)
-    except Exception as e:
-        return "FAILED TO EXTRACT KEYS"
+
+    return ", ".join(
+        f"{key}: {{{extract_keys_recursive(value)}}}" if isinstance(value, dict) else key for key, value in d.items()
+    )
+
 
 def safe_dump_dict_keys_or_data(d: dict[str, typing.Any] | None) -> str:
     """Dump the dict or just the keys if UNSAFE_LOGGING is set"""
@@ -526,137 +558,132 @@ def safe_dump_dict_keys_or_data(d: dict[str, typing.Any] | None) -> str:
         return json.dumps(d)
     return "dictionary w/ keys: {" + extract_keys_recursive(d) + "}"
 
-def safe_dump_arbitrary_value_or_type(v: typing.Any) -> str:  # pyright: ignore[reportAny]
+
+def safe_dump_arbitrary_value_or_type(v: typing.Any) -> str:
     """Dump the value or just its type if UNSAFE_LOGGING is set"""
     result = f'({type(v)}) {v}' if UNSAFE_LOGGING else f'{type(v)}'
     return result
+
 
 def safe_get_dict_value_type(d: dict[str, typing.Any], key: str) -> str:
     v = d.get(key)
     return safe_dump_arbitrary_value_or_type(v)
 
-def json_dict_require_str(d: JSONObject, key: str, err: ErrorSink) -> str:
-    result = ''
-    if key in d:
-        if isinstance(d[key], str):
-            result = typing.cast(str, d[key])
-        else:
-            err.msg_list.append(f'Key "{key}" value was not a string: "{safe_get_dict_value_type(d, key)}"')
-    else:
-        err.msg_list.append(f'Required key "{key}" is missing from JSON: {safe_dump_dict_keys_or_data(d)}')
-    return result
 
-def json_dict_require_int(d: JSONObject, key: str, err: ErrorSink) -> int:
-    result = 0
-    if key in d:
-        if isinstance(d[key], int):
-            result = typing.cast(int, d[key])
-        else:
-            err.msg_list.append(f'Key "{key}" value was not an integer: "{safe_get_dict_value_type(d, key)}"')
+# Typed JSON accessors. Two callers, two error models, ONE branch point (`_require_fail`): the HTTP
+# request path (server.py) omits `err` → the first bad field raises a client-facing FailError; the
+# provider-notification parsers (providers.google_play*) pass an `err` sink → errors accumulate. (The `err`
+# arm is transitional — it retires when google_play's error flow moves to exceptions in the
+# ErrorSink-removal sweep; see the refactor plan.)
+def _require_fail(msg: str, err: ErrorSink | None) -> None:
+    if err is not None:
+        err.msg_list.append(msg)
     else:
-        err.msg_list.append(f'Required key "{key}" is missing from JSON: {safe_dump_dict_keys_or_data(d)}')
-    return result
+        raise FailError(msg, code=ErrorCode.invalid_request)
 
-def json_dict_require_bool(d: JSONObject, key: str, err: ErrorSink) -> bool:
-    result = False
-    if key in d:
-        if isinstance(d[key], bool):
-            result = typing.cast(bool, d[key])
-        else:
-            err.msg_list.append(f'Key "{key}" value was not a bool: "{safe_get_dict_value_type(d, key)}"')
-    else:
-        err.msg_list.append(f'Required key "{key}" is missing from JSON: {safe_dump_dict_keys_or_data(d)}')
-    return result
 
-def json_dict_require_array(d: JSONObject, key: str, err: ErrorSink) -> JSONArray:
-    result: list[JSONValue] = []
-    if key in d:
-        if isinstance(d[key], list):
-            result = typing.cast(list[JSONValue], d[key])
-        else:
-            err.msg_list.append(f'Key "{key}" value was not an array: "{safe_get_dict_value_type(d, key)}"')
-    else:
-        err.msg_list.append(f'Required key "{key}" is missing from JSON: {safe_dump_dict_keys_or_data(d)}')
-    return result
+# A JSON bool is-a int in Python; exclude it so `true` never satisfies an int/number field.
+def _json_is_int(v: typing.Any) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool)
 
-def json_dict_require_obj(d: dict[str, JSONValue], key: str, err: ErrorSink) -> JSONObject:
-    result: dict[str, JSONValue] = {}
-    if key in d:
-        if isinstance(d[key], dict):
-            result = typing.cast(dict[str, JSONValue], d[key])
-        else:
-            err.msg_list.append(f'Key "{key}" value was not an object: "{safe_get_dict_value_type(d, key)}"')
-    else:
-        err.msg_list.append(f'Required key "{key}" is missing from JSON: {safe_dump_dict_keys_or_data(d)}')
-    return result
 
-def json_dict_require_str_coerce_to_int(d: JSONObject, key: str, err: ErrorSink) -> int:
+def _json_is_number(v: typing.Any) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+# Single core for every typed accessor below: `ok` tests the value, `convert` normalises it. `required`
+# selects the missing-key behaviour — an error (require_*) vs. return `default` (optional_*).
+def _json_get(
+    d: JSONObject,
+    key: str,
+    type_name: str,
+    ok: typing.Callable[[typing.Any], bool],
+    convert: typing.Callable[[typing.Any], typing.Any],
+    default: typing.Any,
+    required: bool,
+    err: ErrorSink | None,
+) -> typing.Any:
+    if key not in d:
+        if required:
+            _require_fail(f'Required key "{key}" is missing from JSON: {safe_dump_dict_keys_or_data(d)}', err)
+        return default
+    if ok(d[key]):
+        return convert(d[key])
+    _require_fail(f'Key "{key}" value was not {type_name}: "{safe_get_dict_value_type(d, key)}"', err)
+    return default
+
+
+def json_dict_require_str(d: JSONObject, key: str, err: ErrorSink | None = None) -> str:
+    return _json_get(d, key, 'a string', lambda v: isinstance(v, str), lambda v: v, '', True, err)
+
+
+def json_dict_require_int(d: JSONObject, key: str, err: ErrorSink | None = None) -> int:
+    return _json_get(d, key, 'an integer', _json_is_int, lambda v: v, 0, True, err)
+
+
+def json_dict_require_float(d: JSONObject, key: str, err: ErrorSink | None = None) -> float:
+    # Accepts a JSON int or float (the wire's fractional-second fields may serialise as `X` or `X.0`).
+    return _json_get(d, key, 'a number', _json_is_number, float, 0.0, True, err)
+
+
+def json_dict_require_bool(d: JSONObject, key: str, err: ErrorSink | None = None) -> bool:
+    return _json_get(d, key, 'a bool', lambda v: isinstance(v, bool), lambda v: v, False, True, err)
+
+
+def json_dict_require_array(d: JSONObject, key: str, err: ErrorSink | None = None) -> JSONArray:
+    return _json_get(d, key, 'an array', lambda v: isinstance(v, list), lambda v: v, [], True, err)
+
+
+def json_dict_require_obj(d: dict[str, JSONValue], key: str, err: ErrorSink | None = None) -> JSONObject:
+    return _json_get(d, key, 'an object', lambda v: isinstance(v, dict), lambda v: v, {}, True, err)
+
+
+def json_dict_optional_bool(d: JSONObject, key: str, default: bool, err: ErrorSink | None = None) -> bool:
+    return _json_get(d, key, 'a bool', lambda v: isinstance(v, bool), lambda v: v, default, False, err)
+
+
+def json_dict_optional_str(d: JSONObject, key: str, err: ErrorSink | None = None) -> str | None:
+    return _json_get(d, key, 'a string', lambda v: isinstance(v, str), lambda v: v, None, False, err)
+
+
+def json_dict_optional_obj(d: JSONObject, key: str, err: ErrorSink | None = None) -> JSONObject | None:
+    return _json_get(d, key, 'an object', lambda v: isinstance(v, dict), lambda v: v, None, False, err)
+
+
+def json_dict_require_str_coerce_to_int(d: JSONObject, key: str, err: ErrorSink | None = None) -> int:
     result_str = json_dict_require_str(d, key, err)
-    result = 0
     try:
-        result = int(result_str)
+        return int(result_str)
     except Exception as e:
-        err.msg_list.append(f'Unable to parse {key} type to an int: {e}')
-    return result
+        _require_fail(f'Unable to parse {key} type to an int: {e}', err)
+    return 0
 
-def json_dict_require_str_coerce_to_enum(d: JSONObject, key: str, my_enum: typing.Type[enum.StrEnum], err: ErrorSink):
-    result_str = json_dict_require_str(d, key, err)
-    result = my_enum._value2member_map_.get(result_str)
+
+def json_dict_require_str_coerce_to_enum(
+    d: JSONObject, key: str, my_enum: typing.Type[enum.StrEnum], err: ErrorSink | None = None
+):
+    result = my_enum._value2member_map_.get(json_dict_require_str(d, key, err))
     if result is None:
-        err.msg_list.append(f'Unable to parse {key} type to an enum')
+        _require_fail(f'Unable to parse {key} type to an enum', err)
     return result
 
-def json_dict_require_int_coerce_to_enum(d: JSONObject, key: str, my_enum: typing.Type[enum.IntEnum], err: ErrorSink):
-    result = None
-    result_int = None
-    if key in d:
-        if isinstance(d[key], int):
-            result_int = typing.cast(int, d[key])
-        else:
-            err.msg_list.append(f'Key "{key}" value was not an integer: "{safe_get_dict_value_type(d, key)}"')
-    else:
-        err.msg_list.append(f'Required key "{key}" is missing from JSON: {safe_dump_dict_keys_or_data(d)}')
 
-    if result_int is not None:
-        result = my_enum._value2member_map_.get(result_int)
-
+def json_dict_require_int_coerce_to_enum(
+    d: JSONObject, key: str, my_enum: typing.Type[enum.IntEnum], err: ErrorSink | None = None
+):
+    result = my_enum._value2member_map_.get(json_dict_require_int(d, key, err))
     if result is None:
-        err.msg_list.append(f'Unable to parse {key} type to an enum')
-
+        _require_fail(f'Unable to parse {key} type to an enum', err)
     return result
 
-def json_dict_optional_bool(d: JSONObject, key: str, default: bool, err: ErrorSink) -> bool:
-    result = default
-    if key in d:
-        if isinstance(d[key], bool):
-            result = typing.cast(bool, d[key])
-        else:
-            err.msg_list.append(f'Key "{key}" value was not a bool: "{safe_get_dict_value_type(d, key)}"')
-    return result
-
-def json_dict_optional_str(d: JSONObject, key: str, err: ErrorSink) -> str | None:
-    result = None
-    if key in d:
-        if isinstance(d[key], str):
-            result = typing.cast(str, d[key])
-        else:
-            err.msg_list.append(f'Key "{key}" value was not a string: "{safe_get_dict_value_type(d, key)}"')
-    return result
-
-def json_dict_optional_obj(d: JSONObject, key: str, err: ErrorSink) -> JSONObject | None:
-    result: dict[str, JSONValue] | None = None
-    if key in d:
-        if isinstance(d[key], dict):
-            result = typing.cast(dict[str, JSONValue], d[key])
-        else:
-            err.msg_list.append(f'Key "{key}" value was not an object: "{safe_get_dict_value_type(d, key)}"')
-    return result
 
 def validate_string_list(items: list[JSONValue]) -> typing.TypeGuard[list[str]]:
     return all(isinstance(item, str) for item in items)
 
+
 def handle_not_implemented(name: str, err: ErrorSink):
     err.msg_list.append(f"'{name}' is not implemented!")
+
 
 def os_get_boolean_env(var_name: str, default: bool = False):
     value = os.getenv(var_name, str(int(default)))  # Default to 0 or 1
@@ -667,14 +694,18 @@ def os_get_boolean_env(var_name: str, default: bool = False):
     else:
         raise ValueError(f"Invalid value for environment variable '{var_name}': {value}. Allowed values are 0 or 1.")
 
+
 def backup_file_path(base_file_path: pathlib.Path, now: datetime.datetime) -> str:
-    date:      str          = now.strftime("%Y-%m-%d_%H%M%S")
-    file_name: str          = base_file_path.name
-    parent:    pathlib.Path = base_file_path.parent
-    result                  = str(parent / f'{date}_{file_name}.bak')
+    date: str = now.strftime("%Y-%m-%d_%H%M%S")
+    file_name: str = base_file_path.name
+    parent: pathlib.Path = base_file_path.parent
+    result = str(parent / f'{date}_{file_name}.bak')
     return result
 
-def backup_rotation_from_dated_files_dry_run(backup_files_listing: list[str], now: datetime.datetime) -> BackupRotationDryRun:
+
+def backup_rotation_from_dated_files_dry_run(
+    backup_files_listing: list[str], now: datetime.datetime
+) -> BackupRotationDryRun:
     """
     Given a list of files in the format "YYYY-MM-DD_HHMMSS_<rest_of_file_name_and>.<extension>"
     return the list of those files to delete to fulfill the rotating backup criteria:
@@ -696,18 +727,18 @@ def backup_rotation_from_dated_files_dry_run(backup_files_listing: list[str], no
     year_backups: dict[int, dict[int, list[BackupItem]]] = {}
     for item in backup_files_listing:
         try:
-            file_name:        str = pathlib.Path(item).name  # Extract file name
+            file_name: str = pathlib.Path(item).name  # Extract file name
             # Extract timestamp from filename of format
             # "YYYY-MM-DD_HHMMSS_<rest_of_file_name_and>.<extension>"
             expected_prefix: str = "YYYY-MM-DD_HHMMSS"
-            ts_str:          str = file_name[:len(expected_prefix)]
-            dt                   = datetime.datetime.strptime(ts_str, "%Y-%m-%d_%H%M%S") # Parse the timestamp
-            if not dt.year in year_backups:
+            ts_str: str = file_name[: len(expected_prefix)]
+            dt = datetime.datetime.strptime(ts_str, "%Y-%m-%d_%H%M%S")  # Parse the timestamp
+            if dt.year not in year_backups:
                 year_backups[dt.year] = {}
-            if not dt.month in year_backups[dt.year]:
+            if dt.month not in year_backups[dt.year]:
                 year_backups[dt.year][dt.month] = []
             year_backups[dt.year][dt.month].append(BackupItem(date=dt, path=pathlib.Path(item)))
-        except:
+        except Exception:
             continue  # skip malformed
 
     # NOTE: Sort each list of backups belonging to the (year, month)
@@ -724,10 +755,10 @@ def backup_rotation_from_dated_files_dry_run(backup_files_listing: list[str], no
             # NOTE: If we're within the recent cutoff date, keep the file
             for backup_it in backups:
                 if backup_it.date.timestamp() >= cutoff_unix_ts_s:
-                    backup_it.keep  = True
+                    backup_it.keep = True
 
             # NOTE: We keep the earliest one we have for that month
-            backups[0].keep  = True
+            backups[0].keep = True
 
     # NOTE: Generate the final result (the 2 lists, keep or delete)
     result = BackupRotationDryRun()
@@ -742,6 +773,7 @@ def backup_rotation_from_dated_files_dry_run(backup_files_listing: list[str], no
 
     return result
 
+
 def backup_rotation_dry_run(base_file_path: pathlib.Path, now: datetime.datetime) -> BackupRotationDryRun:
     """
     Given a path to the file denoted by 'base_file_path' enumerate for other files in the directory
@@ -749,11 +781,10 @@ def backup_rotation_dry_run(base_file_path: pathlib.Path, now: datetime.datetime
     keep and delete for the rotating backup criteria (see: dry_run_backup_rotation_from_dated_files)
     """
 
-    backup_dir:  pathlib.Path = pathlib.Path(base_file_path).parent
-    backup_name: str          = pathlib.Path(base_file_path).name
+    backup_dir: pathlib.Path = pathlib.Path(base_file_path).parent
+    backup_name: str = pathlib.Path(base_file_path).name
 
     # NOTE: Retrieve the list of backups
-    backup_files_listing: list[str]            = glob.glob(str(backup_dir / f"*_{backup_name}.bak"))
-    result:               BackupRotationDryRun = backup_rotation_from_dated_files_dry_run(backup_files_listing, now)
+    backup_files_listing: list[str] = glob.glob(str(backup_dir / f"*_{backup_name}.bak"))
+    result: BackupRotationDryRun = backup_rotation_from_dated_files_dry_run(backup_files_listing, now)
     return result
-

@@ -1,9 +1,19 @@
-flask==3.1.1
-pynacl==1.5.0
-uwsgi==2.0.30
-app-store-server-library==1.9.0
-google-cloud-pubsub==2.31.1
-google-api-python-client==2.181.0
-pytest
-sqlalchemy==2.0.47
-psycopg2-binary
+# Runtime dependencies for the Session Pro Backend.
+#
+# The deployment installs this into a --system-site-packages virtualenv, so pip treats whatever
+# Debian already provides as "already satisfied" and installs ONLY what the system lacks. That is
+# why flask and pynacl are left unpinned — the Debian-packaged versions are fine and get skipped on
+# the server; a plain dev venv just installs current releases.
+#
+# The DB layer is raw psycopg 3 (+ its connection pool); psycopg/psycopg-pool carry lower bounds for
+# the 3.x API the code relies on (conn.transaction(), pool check_connection). The Apple/Google SDKs
+# use compatible-release (~=) ranges so fixes flow in without a breaking major.
+#
+# Dev/test-only extras (pytest, a pip uWSGI for the local example) live in requirements-dev.txt.
+flask
+pynacl
+psycopg~=3.1
+psycopg-pool~=3.2
+app-store-server-library~=1.9
+google-cloud-pubsub~=2.31
+google-api-python-client~=2.181

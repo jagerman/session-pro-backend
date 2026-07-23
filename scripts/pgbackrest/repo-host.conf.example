@@ -1,0 +1,30 @@
+# pgBackRest config for the Session Pro REPOSITORY host (Option 2, repo-host-initiated).
+#
+# repo-host-setup.sh renders this to /etc/pgbackrest/session_pro.conf (0640, readable by the
+# pgbackrest user) and every invocation references it explicitly with --config, so the packaged
+# /etc/pgbackrest.conf stub (unreadable by the pgbackrest user, and carrying a clashing repo1-path)
+# is never read. This host holds the repository locally and PULLS PGDATA from the primary over SSH
+# (pg1-host). Values under [session_pro] MUST match the primary (data dir, port) and the cipher
+# pass MUST match the primary's — repo-host.env carries them across.
+
+[global]
+repo1-path=@REPO_PATH@
+repo1-retention-full=4
+repo1-cipher-type=aes-256-cbc
+repo1-cipher-pass=@CIPHER_PASS@
+compress-type=zst
+process-max=2
+log-path=/var/lib/pgbackrest/log
+log-level-console=info
+log-level-file=detail
+
+[session_pro]
+# The primary is remote: reach it over SSH as @PRIMARY_SSH_USER@ to read PGDATA, and use pg1-port
+# for the control (libpq) connection to its dedicated cluster. pg1-host-config is the path to this
+# same config file on the primary, so its remote helper reads our file rather than its default chain.
+pg1-host=@PRIMARY_HOST@
+pg1-host-user=@PRIMARY_SSH_USER@
+pg1-host-config=/etc/pgbackrest/session_pro.conf
+pg1-path=@PRIMARY_PG_DATA_DIR@
+pg1-port=@PRIMARY_PG_PORT@
+pg1-socket-path=/var/run/postgresql

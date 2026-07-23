@@ -1,0 +1,25 @@
+Database migrations for the Session Pro backend.
+
+Any file in this directory beginning with a number and ending in .sql or .py is a one-time migration.
+Migrations are processed in ascii-sorted order against the `migrations_applied` ledger: if a
+migration's filename is not recorded there, it is executed and its filename is then inserted into
+`migrations_applied`. Each migration runs inside its own transaction, so it need not start one
+itself; if it fails, the transaction (and the ledger insert) is rolled back.
+
+Name migrations `NNN_description.sql` (e.g. `000_payments.sql`). A migration that depends on an
+earlier one must use a larger `NNN`; migrations that depend on nothing else start at 000.
+
+Two kinds of migration are permitted:
+
+- SQL migrations are a file of statements to execute. Structural migrations should be written
+  idempotently (`CREATE TABLE IF NOT EXISTS`, `CREATE OR REPLACE FUNCTION`, `DROP … IF EXISTS` before
+  `CREATE`) so that re-applying the baseline against a database that predates the ledger is a no-op.
+
+- Python migrations are for data/semantic steps that need real logic. Such a file must define a
+  function `apply_<FILENAME>` in the session::core::schema sense — i.e. `apply_` followed by the
+  filename without its `.py` extension, with every non-alphanumeric character replaced by `_`
+  (so `010_backfill_ids.py` → `apply_010_backfill_ids`). It is called with the open connection
+  `(conn)`; a transaction is already active around the call, so raising rolls the migration back.
+
+It is not permitted to use the same base filename for both a .sql and a .py migration (e.g. both
+`007_foo.sql` and `007_foo.py`): give them different numeric prefixes or suffixes instead.

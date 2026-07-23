@@ -7,10 +7,12 @@ flushing historical notifications received, generating reports e.t.c
 import argparse
 import configparser
 import dataclasses
+import datetime
 import os
 import pathlib
 import sys
 import time
+import typing
 import uuid
 
 import nacl.signing
@@ -19,126 +21,25 @@ import base
 import backend
 import db
 
-
 # Epilog definitions
 BRIEF_EPILOG = """
-QUICK START EXAMPLES:
-  server              add-pro-payment              --url <url> --provider <google|apple|...> [--dev-plan <1M|3M|12M>] [--dev-duration-ms ...] [--dev-auto-renewing]
-  server              set-payment-refund-requested --url <url> --provider <google|apple> --payment-token <token> --order-id <id>
-  server              get-pro-revocations          --url <url> [--ticket <int>]
-  server              get-pro-details              --url <url> --master-skey <hex> [--count <n>]
-  server              generate-pro-proof           --url <url> --master-skey <hex> --rotating-skey <hex>
+QUICK START EXAMPLES (all commands require --config):
+  voucher                     --master-pkey <hex> --plan <1M|3M|12M> [--rotating-pkey <hex>] [--duration <s>]
+  user-error set              <provider>:<payment-id>=<true|false>[,...]
+  user-error delete           <provider>:<payment-id>[,...]
+  google-notification handle  <msgid>[,...]
+  google-notification delete  <msgid>[,...]
+  google-notification list
+  revoke list                 <master_pkey_hex>
+  revoke user                 [--creation-unix-ts-s <ts>] <master_pkey_hex>
+  revoke bump-ticket          <amount>
+  report generate             <daily|weekly|monthly> [--format <human|csv>] [--count <n>]
 
-  voucher                                           --master-pkey <hex> --plan <1M|3M|12M> [--rotating-pkey <hex>] [--dev-duration-ms <ms>] (requires --config)
-
-  user-error          set                          <provider>:<payment-id>=<true|false>[,...]                                               (requires --config)
-  user-error          delete                       <provider>:<payment-id>[,...]                                                            (requires --config)
-
-  google-notification handle                       <msgid>[,...]                                                                            (requires --config)
-  google-notification delete                       <msgid>[,...]                                                                            (requires --config)
-  google-notification list                                                                                                                  (requires --config)
-
-  revoke              list                         <master_pkey_hex>                                                                        (requires --config)
-  revoke              delete                       <master_pkey_hex>                                                                        (requires --config)
-  revoke              timestamp                    [--creation-unix-ts-s <ts>] <master_pkey_hex> <unix_ts_s>                                (requires --config)
-
-  report              generate                     <daily|weekly|monthly> [--format <human|csv>] [--count <n>]                              (requires --config)
-
-  db                  info                                                                                                                  (requires --config)
-  db                  print                                                                                                                 (requires --config)
+Run with --help-full for detailed command formats.
 """
 
 DETAILED_EPILOG = """
 COMMAND FORMATS DETAILED:
-  server add-pro-payment --url <url> --provider <google|apple|...> [options]
-    Add a development payment to a Session Pro backend server (requires backend to be running in dev mode).
-    Mirrors the /add_pro_payment endpoint.
-
-    Required:
-      --url <url>               Server URL (e.g., http://localhost:8000)
-      --provider                Payment provider (one of the following: google, apple, rangeproof)
-
-    Optional:
-      --master-skey <hex>       64-char hex master secret key (generates new if omitted)
-      --rotating-skey <hex>     64-char hex rotating secret key (generates new if omitted)
-      --version <int>           Request version (default: 0)
-      --dev-plan <1M|3M|12M>    Subscription plan (1M/3M/12M)
-      --dev-duration-ms <ms>    Override duration in milliseconds
-      --dev-auto-renewing       Set auto-renewing to true (default: false)
-
-    The command generates DEV.-prefixed order/tx IDs and sends them to the server.
-    Generated keys are always printed to stdout for reproducibility.
-
-    Examples:
-      python cli.py server add-pro-payment --url http://localhost:8000 --provider google --dev-plan 1M
-      python cli.py server add-pro-payment --url http://localhost:8000 --provider apple --dev-plan 3M --master-skey abcdef...
-
-  server set-payment-refund-requested --url <url> --provider <google|apple> --master-skey <hex> [options]
-    Mark a development payment as refund requested. Mirrors the /set_payment_refund_requested endpoint.
-
-    Required:
-      --url <url>               Server URL
-      --provider <google|apple> Payment provider
-      --master-skey <hex>       64-char hex master secret key
-
-    Google Required:
-      --payment-token <token>   Google: payment token
-      --order-id <id>           Google: order ID
-
-    Apple Required:
-      --tx-id <id>              Apple: transaction ID
-
-    Optional:
-      --refund-requested-unix-ts-ms <ms>  Unix timestamp ms for refund (default: now + 1s)
-      --version <int>                     Request version (default: 0)
-
-    Examples:
-      python cli.py server set-payment-refund-requested --url http://localhost:8000 --provider google --master-skey abcdef... --payment-token tok123 --order-id DEV.abc123
-      python cli.py server set-payment-refund-requested --url http://localhost:8000 --provider apple --master-skey abcdef... --tx-id DEV.xyz789
-
-  server get-pro-revocations --url <url> [--ticket <int>]
-    Get pro revocations from the server. Mirrors the /get_pro_revocations endpoint.
-
-    Required:
-      --url <url>    Server URL (e.g., http://localhost:8000)
-
-    Optional:
-      --ticket <int>  Revocation ticket to query from (default: 0)
-      --version <int> Request version (default: 0)
-
-    Examples:
-      python cli.py server get-pro-revocations --url http://localhost:8000
-      python cli.py server get-pro-revocations --url http://localhost:8000 --ticket 100
-
-  server get-pro-details --url <url> --master-skey <hex> [--count <n>]
-    Get pro details for a user. Mirrors the /get_pro_details endpoint.
-
-    Required:
-      --url <url>         Server URL (e.g., http://localhost:8000)
-      --master-skey <hex> 64-char hex master secret key for signing
-
-    Optional:
-      --count <n>     Number of payments to retrieve (default: 10)
-      --version <int> Request version (default: 0)
-
-    Examples:
-      python cli.py server get-pro-details --url http://localhost:8000 --master-skey abcdef...
-      python cli.py server get-pro-details --url http://localhost:8000 --master-skey abcdef... --count 5
-
-  server generate-pro-proof --url <url> --master-skey <hex> --rotating-skey <hex>
-    Generate a pro proof for a pre-existing subscription. Mirrors the /generate_pro_proof endpoint.
-
-    Required:
-      --url <url>             Server URL (e.g., http://localhost:8000)
-      --master-skey <hex>     64-char hex master secret key for signing
-      --rotating-skey <hex>   64-char hex rotating secret key
-
-    Optional:
-      --version <int>         Request version (default: 0)
-
-    Examples:
-      python cli.py server generate-pro-proof --url http://localhost:8000 --master-skey abcdef... --rotating-skey fedcba...
-
   user-error set "<provider>:<payment_id>=<flag>[,...]" (requires --config)
     A ',' delimited string to instruct the DB to delete the specified rows from the user errors table
     in the DB on startup. This value must be of the format
@@ -197,7 +98,7 @@ COMMAND FORMATS DETAILED:
       python cli.py --config config.ini user-error delete "1:abc123token"
       python cli.py --config config.ini user-error delete "1:token1,1:token2,2:apple1"
 
-  voucher --config <ini> --master-pkey <hex> --plan <1M|3M|12M> [--rotating-pkey <hex>] [--dev-duration-ms <ms>] (requires --config)
+  voucher --config <ini> --master-pkey <hex> --plan <1M|3M|12M> [--rotating-pkey <hex>] [--duration <s>]
     Create a Rangeproof voucher payment and auto-redeem it. This is an admin command for granting
     promotional or complimentary Session Pro subscriptions directly in the database.
 
@@ -208,12 +109,12 @@ COMMAND FORMATS DETAILED:
 
     Optional:
       --rotating-pkey <hex>   64-char hex rotating public key (generates new if omitted)
-      --dev-duration-ms <ms>  Override duration in milliseconds
+      --duration <s>          Override duration in seconds
 
     Examples:
       python cli.py voucher --config config.ini --master-pkey abcdef... --plan 1M
       python cli.py voucher --config config.ini --master-pkey abcdef... --plan 3M --rotating-pkey fedcba...
-      python cli.py voucher --config config.ini --master-pkey abcdef... --plan 12M --dev-duration-ms 5000
+      python cli.py voucher --config config.ini --master-pkey abcdef... --plan 12M --duration 5
 
   google-notification handle "<message_id>[,...]" (requires --config)
     A ',' delimited string of message IDs to instruct the DB to mark the specified rows as handled
@@ -234,7 +135,7 @@ COMMAND FORMATS DETAILED:
     know the intended consequences! Make a backup of the DB before proceeding!
 
     Options:
-      message_id: Google's notification message ID (an integer)
+      message_id: Google's notification message ID (an opaque string, but typically an integer)
 
     Examples:
       python cli.py --config config.ini google-notification handle "12345"
@@ -256,27 +157,22 @@ COMMAND FORMATS DETAILED:
       python cli.py --config config.ini revoke list aaaa...aaaa
       python cli.py --config config.ini revoke list 0xaaaa...aaaa
 
-  revoke delete <master_pkey_hex> (requires --config)
-    Removes the revocation entry for the specified master public key
+  revoke user [--creation-unix-ts-s <ts>] <master_pkey_hex> (requires --config)
+    Revoke the user's current generation and roll them onto a fresh one (if they still have valid
+    payments). Revocation is terminal: once a generation is revoked it can never be un-revoked, so
+    there is no delete/timestamp-edit counterpart.
 
-    The current generation index associated with the pkey will be looked up and the corresponding
-    hash will be revoked. If the user is not known by the database (e.g. the user doesn't exist, or,
-    the user's master public key mapping has been pruned because the user was inactive for example)
-    then no action is taken.
-
-  revoke timestamp [--creation-unix-ts-s <ts>] <master_pkey_hex> <unix_ts_s> (requires --config)
-    Add or update the time (or create a new revocation entry if it doesn't exist) at which the
-    revocation item will be effective until.
-
-    Note that executing any revoke action increments the global generation index counter to the next
-    value. This is expected behaviour as a side effect of modifying the revocation table.
+    The user's current generation is looked up from their master public key and its token is added to
+    the served revocation list. If the user is not known to the database (never existed, or their
+    master public key mapping was pruned after a period of inactivity) then no action is taken.
 
     Options:
-      master_pkey_hex:  64-character hex string
-      unix_ts_s:        Unix timestamp in seconds (not milliseconds!)
+      master_pkey_hex:      64-character hex string
+      --creation-unix-ts-s: Unix timestamp in seconds for the revocation instant (default: now)
 
     Examples:
-      python cli.py --config config.ini revoke timestamp --creation-unix-ts-s 1741170600 aaaa...aaaa 1741170720
+      python cli.py --config config.ini revoke user aaaa...aaaa
+      python cli.py --config config.ini revoke user --creation-unix-ts-s 1741170600 aaaa...aaaa
 
   report generate <period> [--format <format>] [--count <n>] (requires --config)
     Generate a report of the payments for the given report type, period and optional count. The
@@ -297,17 +193,12 @@ COMMAND FORMATS DETAILED:
       python cli.py --config config.ini report generate daily
       python cli.py --config config.ini report generate weekly --format csv --count 4
       python cli.py --config config.ini report generate monthly --count 3
-
-  db info (requires --config)
-    Shows database statistics and info
-
-  db print (requires --config)
-    Prints all tables to stdout (for debugging)
 """
 
 
-def parse_set_user_error_arg(arg: str, err: base.ErrorSink) -> list[tuple[base.PaymentProvider, str, bool]]:
-    """Parse a comma-separated string of errors into a list of (payment_provider, payment_id, set_flag) tuples."""
+def parse_set_user_error_arg(arg: str) -> list[tuple[base.PaymentProvider, str, bool]]:
+    """Parse a comma-separated string of errors into a list of (payment_provider, payment_id, set_flag)
+    tuples. Raises ValueError on malformed input."""
     result: list[tuple[base.PaymentProvider, str, bool]] = []
     if len(arg) == 0:
         return result
@@ -315,21 +206,22 @@ def parse_set_user_error_arg(arg: str, err: base.ErrorSink) -> list[tuple[base.P
     for item in arg.split(','):
         item = item.strip()
         if ':' not in item or '=' not in item:
-            err.msg_list.append(f"Invalid format for user error: '{item}'. Expected '<payment_provider>:<payment_id>=[true|false]'.")
-            return result
+            raise ValueError(
+                f"Invalid format for user error: '{item}'. Expected '<payment_provider>:<payment_id>=[true|false]'."
+            )
         payment_provider_str, remainder = item.split(':', 1)
         payment_id, set_flag_str = remainder.split('=', 1)
         payment_provider_str = payment_provider_str.strip()
-        payment_provider = base.PaymentProvider.Nil
 
         try:
-            payment_provider = base.PaymentProvider(int(payment_provider_str))
+            payment_provider = base.PaymentProvider(payment_provider_str)
         except Exception:
-            err.msg_list.append(f'Failed to parse payment provider ({payment_provider_str}) for item {item}')
-            return result
+            raise ValueError(f'Failed to parse payment provider ({payment_provider_str}) for item {item}')
 
-        assert payment_provider != base.PaymentProvider.Nil,        "Nil payment provider cannot be used for errors"
-        assert payment_provider != base.PaymentProvider.Rangeproof, "Rangeproof payment provider does not support errors"
+        if payment_provider == base.PaymentProvider.Nil:
+            raise ValueError(f'Nil payment provider cannot be used for errors (item {item})')
+        if payment_provider == base.PaymentProvider.Rangeproof:
+            raise ValueError(f'Rangeproof payment provider does not support errors (item {item})')
 
         set_flag = False
         if set_flag_str.lower() == 'true':
@@ -337,15 +229,14 @@ def parse_set_user_error_arg(arg: str, err: base.ErrorSink) -> list[tuple[base.P
         elif set_flag_str.lower() == 'false':
             set_flag = False
         else:
-            err.msg_list.append(f'Failed to parse set flag ({set_flag_str}) for item {item}')
-            return result
+            raise ValueError(f'Failed to parse set flag ({set_flag_str}) for item {item}')
 
         result.append((payment_provider, payment_id, set_flag))
     return result
 
 
-def parse_payment_id_list(arg: str, err: base.ErrorSink) -> list[tuple[base.PaymentProvider, str]]:
-    """Parse a comma-separated string of payment IDs for deletion."""
+def parse_payment_id_list(arg: str) -> list[tuple[base.PaymentProvider, str]]:
+    """Parse a comma-separated string of payment IDs for deletion. Raises ValueError on malformed input."""
     result: list[tuple[base.PaymentProvider, str]] = []
     if len(arg) == 0:
         return result
@@ -353,59 +244,59 @@ def parse_payment_id_list(arg: str, err: base.ErrorSink) -> list[tuple[base.Paym
     for item in arg.split(','):
         item = item.strip()
         if ':' not in item:
-            err.msg_list.append(f"Invalid format for payment ID: '{item}'. Expected '<payment_provider>:<payment_id>'.")
-            return result
+            raise ValueError(f"Invalid format for payment ID: '{item}'. Expected '<payment_provider>:<payment_id>'.")
         payment_provider_str, payment_id = item.split(':', 1)
         payment_provider_str = payment_provider_str.strip()
 
         try:
-            payment_provider = base.PaymentProvider(int(payment_provider_str))
+            payment_provider = base.PaymentProvider(payment_provider_str)
         except Exception:
-            err.msg_list.append(f'Failed to parse payment provider ({payment_provider_str}) for item {item}')
-            return result
+            raise ValueError(f'Failed to parse payment provider ({payment_provider_str}) for item {item}')
 
         result.append((payment_provider, payment_id))
     return result
 
 
-def parse_message_id_list(arg: str, err: base.ErrorSink) -> list[int]:
-    """Parse a comma-separated string of message IDs."""
-    result: list[int] = []
+def parse_message_id_list(arg: str) -> list[str]:
+    """Parse a comma-separated string of message IDs. Pub/Sub message ids are opaque strings, so entries
+    are taken verbatim (no numeric parsing). Raises ValueError on malformed input."""
+    result: list[str] = []
     if len(arg) == 0:
         return result
 
     for item in arg.split(','):
         item = item.strip()
-        try:
-            message_id = int(item)
-            result.append(message_id)
-        except Exception:
-            err.msg_list.append(f'Failed to parse message_id as integer ({item})')
-            return result
+        if len(item) == 0:
+            raise ValueError('Empty message_id in list')
+        result.append(item)
     return result
 
 
-def parse_master_pkey(hex_str: str, err: base.ErrorSink) -> nacl.signing.VerifyKey | None:
-    """Parse a hex string into a VerifyKey."""
+def parse_master_pkey(hex_str: str) -> nacl.signing.VerifyKey:
+    """Parse a hex string into a VerifyKey. Raises ValueError on malformed input."""
     if hex_str.startswith("0x"):
         hex_str = hex_str[2:]
 
     if len(hex_str) != 64:
-        err.msg_list.append(f"Expected 64 hex chars for master public key, received {len(hex_str)}")
-        return None
+        raise ValueError(f"Expected 64 hex chars for master public key, received {len(hex_str)}")
 
     try:
         hex_bytes = bytes.fromhex(hex_str)
         return nacl.signing.VerifyKey(hex_bytes)
     except Exception as e:
-        err.msg_list.append(f"Failed to parse hex as master public key: {e}")
-        return None
+        raise ValueError(f"Failed to parse hex as master public key: {e}")
 
 
 @dataclasses.dataclass
 class CLIConfig:
-    db_url:   str = ''
+    db_url: str = ''
+    backend_key_path: str = ''
     log_path: str = ''
+
+
+def _fail_config(reason: str) -> typing.NoReturn:
+    print(f"ERROR: Failed to load config:\n  {reason}", file=sys.stderr)
+    sys.exit(1)
 
 
 def require_config(args: argparse.Namespace) -> CLIConfig:
@@ -413,37 +304,28 @@ def require_config(args: argparse.Namespace) -> CLIConfig:
         print("ERROR: --config is required for this command", file=sys.stderr)
         sys.exit(1)
 
-    # NOTE: Parse the config
-    err              = base.ErrorSink()
-    result           = CLIConfig()
-    if 1:
-        config_path: str = args.config
-        if not pathlib.Path(config_path).exists():
-            err.msg_list.append(f'Config file "{config_path}" does not exist or is not readable')
-            return result
+    config_path: str = args.config
+    if not pathlib.Path(config_path).exists():
+        _fail_config(f'Config file "{config_path}" does not exist or is not readable')
 
-        try:
-            parser = configparser.ConfigParser()
-            _ = parser.read(config_path)
+    result = CLIConfig()
+    try:
+        parser = configparser.ConfigParser()
+        parser.read(config_path)
+    except Exception as e:
+        _fail_config(f'Failed to parse config file: {e}')
 
-            if 'base' not in parser:
-                err.msg_list.append(f'Config file "{config_path}" is missing [base] section')
-            else:
-                base_section          = parser['base']
-                result.db_url         = base_section.get('db_url', '')
-                result.log_path       = base_section.get('log_path', '')
-                base.DEV_BACKEND_MODE = base_section.getboolean('dev', fallback=False)
+    if 'base' not in parser:
+        _fail_config(f'Config file "{config_path}" is missing [base] section')
 
-                # Allow environment variable override
-                result.db_url = os.getenv('SESH_PRO_BACKEND_DB_URL', result.db_url)
-        except Exception as e:
-            err.msg_list.append(f'Failed to parse config file: {e}')
+    base_section = parser['base']
+    result.db_url = base_section.get('db_url', '')
+    result.backend_key_path = base_section.get('backend_key_path', '')
+    result.log_path = base_section.get('log_path', '')
 
-    # NOTE: Log errors
-    if err.has():
-        msg = "ERROR: Failed to load config:\n  " + "\n  ".join(err.msg_list)
-        print(msg, file=sys.stderr)
-        sys.exit(1)
+    # Allow environment variable override
+    result.db_url = os.getenv('SESH_PRO_BACKEND_DB_URL', result.db_url)
+    result.backend_key_path = os.getenv('SESH_PRO_BACKEND_KEY_PATH', result.backend_key_path)
 
     if not result.db_url:
         print("ERROR: No database URL configured in config file", file=sys.stderr)
@@ -452,19 +334,12 @@ def require_config(args: argparse.Namespace) -> CLIConfig:
     return result
 
 
-def load_config(config_path: str, err: base.ErrorSink) -> CLIConfig:
-    result = CLIConfig()
-
-    return result
-
-
 def cmd_user_error_set(args: argparse.Namespace, dry_run: bool) -> int:
     config = require_config(args)
-    err = base.ErrorSink()
-    items = parse_set_user_error_arg(args.items, err)
-
-    if err.has():
-        print(f"ERROR: Failed to parse arguments:\n  " + "\n  ".join(err.msg_list), file=sys.stderr)
+    try:
+        items = parse_set_user_error_arg(args.items)
+    except ValueError as e:
+        print(f"ERROR: Failed to parse arguments:\n  {e}", file=sys.stderr)
         return 1
 
     if len(items) == 0:
@@ -498,11 +373,15 @@ def cmd_user_error_set(args: argparse.Namespace, dry_run: bool) -> int:
                         if backend.has_user_error(conn=conn, payment_provider=payment_provider, payment_id=payment_id):
                             label += ' (skipped - already exists)'
                         else:
-                            backend.add_user_error(conn=conn, error=error, unix_ts_ms=int(time.time() * 1000))
+                            backend.add_user_error(
+                                conn, error=error, at=base.datetime_from_unix_ms(int(time.time() * 1000))
+                            )
                             count += 1
                             label += ' (added)'
                     else:
-                        if backend.delete_user_errors(conn=conn, payment_provider=payment_provider, payment_id=payment_id):
+                        if backend.delete_user_errors(
+                            conn=conn, payment_provider=payment_provider, payment_id=payment_id
+                        ):
                             count += 1
                             label += ' (deleted)'
                         else:
@@ -518,11 +397,10 @@ def cmd_user_error_set(args: argparse.Namespace, dry_run: bool) -> int:
 
 def cmd_user_error_delete(args: argparse.Namespace, dry_run: bool) -> int:
     config = require_config(args)
-    err = base.ErrorSink()
-    items = parse_payment_id_list(args.items, err)
-
-    if err.has():
-        print(f"ERROR: Failed to parse arguments:\n  " + "\n  ".join(err.msg_list), file=sys.stderr)
+    try:
+        items = parse_payment_id_list(args.items)
+    except ValueError as e:
+        print(f"ERROR: Failed to parse arguments:\n  {e}", file=sys.stderr)
         return 1
 
     if len(items) == 0:
@@ -561,11 +439,10 @@ def cmd_user_error_delete(args: argparse.Namespace, dry_run: bool) -> int:
 
 def cmd_google_notification_handle(args: argparse.Namespace, dry_run: bool) -> int:
     config = require_config(args)
-    err = base.ErrorSink()
-    message_ids = parse_message_id_list(args.items, err)
-
-    if err.has():
-        print(f"ERROR: Failed to parse arguments:\n  " + "\n  ".join(err.msg_list), file=sys.stderr)
+    try:
+        message_ids = parse_message_id_list(args.items)
+    except ValueError as e:
+        print(f"ERROR: Failed to parse arguments:\n  {e}", file=sys.stderr)
         return 1
 
     if len(message_ids) == 0:
@@ -605,11 +482,10 @@ def cmd_google_notification_handle(args: argparse.Namespace, dry_run: bool) -> i
 
 def cmd_google_notification_delete(args: argparse.Namespace, dry_run: bool) -> int:
     config = require_config(args)
-    err = base.ErrorSink()
-    message_ids = parse_message_id_list(args.items, err)
-
-    if err.has():
-        print(f"ERROR: Failed to parse arguments:\n  " + "\n  ".join(err.msg_list), file=sys.stderr)
+    try:
+        message_ids = parse_message_id_list(args.items)
+    except ValueError as e:
+        print(f"ERROR: Failed to parse arguments:\n  {e}", file=sys.stderr)
         return 1
 
     if len(message_ids) == 0:
@@ -662,8 +538,8 @@ def cmd_google_notification_list(args: argparse.Namespace) -> int:
 
                     print(f"Found {len(items)} unhandled google notifications:")
                     for index, item in enumerate(items):
-                        message_id, payload, expiry_unix_ts_ms = item
-                        expiry_str = base.readable_unix_ts_ms(expiry_unix_ts_ms)
+                        message_id, payload, expires_at = item
+                        expiry_str = base.readable(expires_at)
                         print(f"  {index:02d} message_id={message_id}, expiry={expiry_str}")
 
                     return 0
@@ -675,15 +551,10 @@ def cmd_google_notification_list(args: argparse.Namespace) -> int:
 
 def cmd_revoke_list(args: argparse.Namespace) -> int:
     config = require_config(args)
-    err = base.ErrorSink()
-    master_pkey = parse_master_pkey(args.master_pkey, err)
-
-    if err.has():
-        print(f"ERROR: Failed to parse arguments:\n  " + "\n  ".join(err.msg_list), file=sys.stderr)
-        return 1
-
-    if master_pkey is None:
-        print("ERROR: Master public key is required", file=sys.stderr)
+    try:
+        master_pkey = parse_master_pkey(args.master_pkey)
+    except ValueError as e:
+        print(f"ERROR: Failed to parse arguments:\n  {e}", file=sys.stderr)
         return 1
 
     try:
@@ -694,29 +565,44 @@ def cmd_revoke_list(args: argparse.Namespace) -> int:
 
                     eligible_count = 0
                     list_label = ''
+                    now = datetime.datetime.now(datetime.timezone.utc)
 
                     for row in user_and_payments.payments_it:
-                        faux_row_id = 0
-                        payment: backend.PaymentRow = backend.payment_row_from_tuple((faux_row_id, *row))
+                        payment: backend.PaymentRow = backend.payment_row_from_dict(row)
 
                         plan_label = ''
                         match payment.plan:
-                            case base.ProPlan.Nil:         plan_label = '??'
-                            case base.ProPlan.OneMonth:    plan_label = '1M'
-                            case base.ProPlan.ThreeMonth:  plan_label = '3M'
-                            case base.ProPlan.TwelveMonth: plan_label = '12M'
+                            case base.ProPlan.Nil:
+                                plan_label = '??'
+                            case base.ProPlan.OneMonth:
+                                plan_label = '1M'
+                            case base.ProPlan.ThreeMonth:
+                                plan_label = '3M'
+                            case base.ProPlan.TwelveMonth:
+                                plan_label = '12M'
 
                         payment_id = ''
                         match payment.payment_provider:
-                            case base.PaymentProvider.Nil:             pass
-                            case base.PaymentProvider.GooglePlayStore: payment_id = f'{payment.google_payment_token}-{payment.google_order_id}'
-                            case base.PaymentProvider.iOSAppStore:     payment_id = f'{payment.apple.original_tx_id}'
-                            case base.PaymentProvider.Rangeproof:      payment_id = f'{payment.rangeproof_order_id}'
+                            case base.PaymentProvider.Nil:
+                                pass
+                            case base.PaymentProvider.GooglePlayStore:
+                                payment_id = f'{payment.google_payment_token}-{payment.google_order_id}'
+                            case base.PaymentProvider.iOSAppStore:
+                                payment_id = f'{payment.apple.original_tx_id}'
+                            case base.PaymentProvider.Rangeproof:
+                                payment_id = f'{payment.rangeproof_order_id}'
 
-                        if payment.status == base.PaymentStatus.Expired or int(time.time() * 1000) >= payment.expiry_unix_ts_ms:
+                        if now >= payment.expires_at:
                             continue
 
-                        list_label += f'\n    {eligible_count:02d} RevokeID={payment.payment_provider.name}-{payment_id}; Status={payment.status.name}; Plan={plan_label}; Unredeemed={base.readable_unix_ts_ms(payment.unredeemed_unix_ts_ms)}; Expiry={base.readable_unix_ts_ms(payment.expiry_unix_ts_ms)};'
+                        status_label = backend.derive_payment_status(payment, now).name
+                        list_label += (
+                            f'\n    {eligible_count:02d} RevokeID={payment.payment_provider.name}-{payment_id}; '
+                            f'Status={status_label}; '
+                            f'Plan={plan_label}; '
+                            f'Unredeemed={base.readable(payment.purchased_at)}; '
+                            f'Expiry={base.readable(payment.expires_at)};'
+                        )
                         eligible_count += 1
 
                     print(f"User {args.master_pkey} has {eligible_count} revocable payments{list_label}")
@@ -726,66 +612,63 @@ def cmd_revoke_list(args: argparse.Namespace) -> int:
         print(f"ERROR: Database error: {e}", file=sys.stderr)
         return 1
 
-def cmd_revoke_delete(args: argparse.Namespace, dry_run: bool) -> int:
+
+def cmd_revoke(args: argparse.Namespace, dry_run: bool) -> int:
     config = require_config(args)
-    err = base.ErrorSink()
-    master_pkey = parse_master_pkey(args.master_pkey, err)
-
-    if err.has():
-        print(f"ERROR: Failed to parse arguments:\n  " + "\n  ".join(err.msg_list), file=sys.stderr)
+    try:
+        master_pkey = parse_master_pkey(args.master_pkey)
+    except ValueError as e:
+        print(f"ERROR: Failed to parse arguments:\n  {e}", file=sys.stderr)
         return 1
 
-    if master_pkey is None:
-        print("ERROR: Master public key is required", file=sys.stderr)
-        return 1
+    # Revocation is terminal, so there is no un-revoke; the manual revoke uses the one real revoke path
+    # (revoke the user's current generation + roll them onto a fresh one if they still have valid payments).
+    revoke_at = (
+        base.datetime_from_unix_ms(args.creation_unix_ts_s * 1000)
+        if args.creation_unix_ts_s
+        else datetime.datetime.now(datetime.timezone.utc)
+    )
 
     if dry_run:
-        print(f"(DRY RUN) Would delete revocation for {args.master_pkey}")
+        print(f"(DRY RUN) Would revoke {args.master_pkey} at {base.readable(revoke_at)}")
         return 0
 
     try:
         with db.open_database(config.db_url) as engine:
             with db.connection(engine) as conn:
                 with db.transaction(conn) as tx:
-                    set_result = backend.set_revocation_tx(tx=tx, master_pkey=master_pkey, creation_unix_ts_ms=int(time.time() * 1000), expiry_unix_ts_ms=0, delete_item=True)
-                    print(f"Deleted revocation for {args.master_pkey} ({set_result.value.lower()})")
-                    return 0
+                    backend.revoke_master_pkey_proofs_and_allocate_new_gen_id(tx, master_pkey, created_at=revoke_at)
+                print(f"Revoked current generation for {args.master_pkey} at {base.readable(revoke_at)}")
+                return 0
 
     except Exception as e:
         print(f"ERROR: Database error: {e}", file=sys.stderr)
         return 1
 
 
-def cmd_revoke_timestamp(args: argparse.Namespace, dry_run: bool) -> int:
+def cmd_revoke_bump_ticket(args: argparse.Namespace, dry_run: bool) -> int:
     config = require_config(args)
-    err = base.ErrorSink()
-    master_pkey = parse_master_pkey(args.master_pkey, err)
 
-    if err.has():
-        print(f"ERROR: Failed to parse arguments:\n  " + "\n  ".join(err.msg_list), file=sys.stderr)
-        return 1
-
-    if master_pkey is None:
-        print("ERROR: Master public key is required", file=sys.stderr)
+    # The ticket only ever moves forward (clients treat "my cached ticket < server's" as "list changed").
+    if args.amount < 1:
+        print("ERROR: amount must be a positive integer", file=sys.stderr)
         return 1
 
     if dry_run:
-        print(f"(DRY RUN) Would set revocation timestamp for {args.master_pkey} to {base.readable_unix_ts_ms(args.unix_ts_s * 1000)}")
+        print(f"(DRY RUN) Would advance the revocation ticket by {args.amount}")
         return 0
 
     try:
         with db.open_database(config.db_url) as engine:
             with db.connection(engine) as conn:
                 with db.transaction(conn) as tx:
-                    expiry_unix_ts_ms   = args.expiry_unix_ts_s * 1000
-                    creation_unix_ts_ms = args.creation_unix_ts_s * 1000
-                    set_result          = backend.set_revocation_tx(tx=tx, master_pkey=master_pkey, creation_unix_ts_ms=creation_unix_ts_ms, expiry_unix_ts_ms=expiry_unix_ts_ms, delete_item=False)
-                    print(f"Set revocation for {args.master_pkey} to {base.readable_unix_ts_ms(creation_unix_ts_ms)} to {base.readable_unix_ts_ms(expiry_unix_ts_ms)} ({set_result.value.lower()})")
-                    return 0
-
+                    new_ticket = backend.bump_revocation_ticket(tx.conn, args.amount)
+                print(f"Advanced the revocation ticket by {args.amount} to {new_ticket}")
+                return 0
     except Exception as e:
         print(f"ERROR: Database error: {e}", file=sys.stderr)
         return 1
+
 
 def cmd_report_generate(args: argparse.Namespace) -> int:
     config = require_config(args)
@@ -811,389 +694,6 @@ def cmd_report_generate(args: argparse.Namespace) -> int:
 
     except Exception as e:
         print(f"ERROR: Database error: {e}", file=sys.stderr)
-        return 1
-
-
-def cmd_db_info(args: argparse.Namespace) -> int:
-    config = require_config(args)
-    try:
-        with db.open_database(config.db_url) as engine:
-            with db.connection(engine) as conn:
-                err = base.ErrorSink()
-                info_str = backend.db_info_string(conn=conn, db_url=config.db_url, err=err)
-                if err.has():
-                    print(f"ERROR: Failed to get DB info: {err.msg_list}", file=sys.stderr)
-                    return 1
-
-                print(info_str)
-                return 0
-
-    except Exception as e:
-        print(f"ERROR: Database error: {e}", file=sys.stderr)
-        return 1
-
-
-def cmd_db_print(args: argparse.Namespace) -> int:
-    config = require_config(args)
-    try:
-        with db.open_database(config.db_url) as engine:
-            with db.connection(engine) as conn:
-                base.print_db_to_stdout(conn)
-                return 0
-
-    except Exception as e:
-        print(f"ERROR: Database error: {e}", file=sys.stderr)
-        return 1
-
-
-def cmd_server_add_pro_payment(args: argparse.Namespace) -> int:
-    import json
-    import os
-    import urllib.request
-    import urllib.error
-
-    # Parse or generate master key
-    if args.master_skey:
-        try:
-            master_skey = nacl.signing.SigningKey(bytes.fromhex(args.master_skey))
-        except Exception as e:
-            print(f"ERROR: Failed to parse master key: {e}", file=sys.stderr)
-            return 1
-    else:
-        master_skey = nacl.signing.SigningKey.generate()
-        print(f'Generated Master SKey: {bytes(master_skey).hex()}')
-        print(f'Generated Master PKey: {bytes(master_skey.verify_key).hex()}')
-
-    # Parse or generate rotating key
-    if args.rotating_skey:
-        try:
-            rotating_skey = nacl.signing.SigningKey(bytes.fromhex(args.rotating_skey))
-        except Exception as e:
-            print(f"ERROR: Failed to parse rotating key: {e}", file=sys.stderr)
-            return 1
-    else:
-        rotating_skey = nacl.signing.SigningKey.generate()
-        print(f'Generated Rotating SKey: {bytes(rotating_skey).hex()}')
-        print(f'Generated Rotating PKey: {bytes(rotating_skey.verify_key).hex()}')
-
-    # Determine provider enum and build payment_tx
-    if args.provider == 'google':
-        payment_tx_obj = backend.UserPaymentTransaction(
-            provider             = base.PaymentProvider.GooglePlayStore,
-            google_payment_token = os.urandom(8).hex(),
-            google_order_id      = 'DEV.' + os.urandom(8).hex()
-        )
-    elif args.provider == 'apple':
-        payment_tx_obj = backend.UserPaymentTransaction(
-            provider    = base.PaymentProvider.iOSAppStore,
-            apple_tx_id = 'DEV.' + os.urandom(8).hex()
-        )
-    elif args.provider == 'rangeproof':
-        payment_tx_obj = backend.UserPaymentTransaction(
-            provider            = base.PaymentProvider.Rangeproof,
-            rangeproof_order_id = 'DEV.' + os.urandom(8).hex()
-        )
-    else:
-        print(f"ERROR: Unsupported payment provider: {args.provider}", file=sys.stderr)
-        return 1
-
-    # Compute hash using backend function
-    hash_bytes = backend.make_add_pro_payment_hash(
-        version       = args.version,
-        master_pkey   = master_skey.verify_key,
-        rotating_pkey = rotating_skey.verify_key,
-        payment_tx    = payment_tx_obj
-    )
-
-    # Build request
-    request_body = {
-        'version':       args.version,
-        'master_pkey':   bytes(master_skey.verify_key).hex(),
-        'rotating_pkey': bytes(rotating_skey.verify_key).hex(),
-        'master_sig':    bytes(master_skey.sign(hash_bytes).signature).hex(),
-        'rotating_sig':  bytes(rotating_skey.sign(hash_bytes).signature).hex(),
-        'payment_tx':  {
-            'provider': payment_tx_obj.provider.value,
-        }
-    }
-
-    if payment_tx_obj.provider == base.PaymentProvider.GooglePlayStore:
-        request_body['payment_tx']['google_payment_token']  = payment_tx_obj.google_payment_token
-        request_body['payment_tx']['google_order_id']       = payment_tx_obj.google_order_id
-    elif payment_tx_obj.provider == base.PaymentProvider.iOSAppStore:
-        request_body['payment_tx']['apple_tx_id']           = payment_tx_obj.apple_tx_id
-    elif payment_tx_obj.provider == base.PaymentProvider.Rangeproof:
-        request_body['payment_tx']['rangeproof_order_id']   = payment_tx_obj.rangeproof_order_id
-    else:
-        print(f"ERROR: Unsupported payment provider: {args.provider}", file=sys.stderr)
-        return 1
-
-    # Add dev arguments
-    plan_map = {'1M': 'OneMonth', '3M': 'ThreeMonth', '12M': 'TwelveMonth'}
-    if args.dev_plan:
-        request_body['dev_plan'] = plan_map[args.dev_plan]
-    if args.dev_duration_ms is not None:
-        request_body['dev_duration_ms'] = args.dev_duration_ms
-    if args.dev_auto_renewing:
-        request_body['dev_auto_renewing'] = True
-
-    print(f'\nAdd Pro Payment via {"Google" if args.provider == "google" else "Apple"}')
-    print(f'Request:\n{json.dumps(request_body, indent=1)}')
-
-    # Send request
-    try:
-        request = urllib.request.Request(
-            f'{args.url}/add_pro_payment',
-            data=json.dumps(request_body).encode('utf-8'),
-            headers={"Content-Type": "application/json"},
-            method="POST"
-        )
-        with urllib.request.urlopen(request) as response:
-            response_data = json.loads(response.read().decode('utf-8'))
-            print(f"Response: {json.dumps(response_data, indent=1)}")
-            return 0
-    except urllib.error.HTTPError as e:
-        print(f"ERROR: Server returned {e.code}: {e.read().decode('utf-8')}", file=sys.stderr)
-        return 1
-    except Exception as e:
-        print(f"ERROR: Failed to connect to {args.url}: {e}", file=sys.stderr)
-        return 1
-
-
-def cmd_server_set_payment_refund_requested(args: argparse.Namespace) -> int:
-    import json
-    import time
-    import urllib.request
-    import urllib.error
-
-    # Parse master key
-    try:
-        master_skey = nacl.signing.SigningKey(bytes.fromhex(args.master_skey))
-    except Exception as e:
-        print(f"ERROR: Failed to parse master key: {e}", file=sys.stderr)
-        return 1
-
-    # Determine provider enum and payment details
-    if args.provider == 'google':
-        provider_enum = 1
-        if not args.payment_token or not args.order_id:
-            print("ERROR: --payment-token and --order-id are required for Google", file=sys.stderr)
-            return 1
-        payment_tx = {'provider': provider_enum, 'google_payment_token': args.payment_token, 'google_order_id': args.order_id}
-    else:  # apple
-        provider_enum = 2
-        if not args.tx_id:
-            print("ERROR: --tx-id is required for Apple", file=sys.stderr)
-            return 1
-        payment_tx = {'provider': provider_enum, 'apple_tx_id': args.tx_id}
-
-    # Set refund timestamp
-    if args.refund_requested_unix_ts_ms:
-        refund_unix_ts_ms = args.refund_requested_unix_ts_ms
-    else:
-        refund_unix_ts_ms = int((time.time() + 1) * 1000)
-
-    now_unix_ts_ms = int(time.time() * 1000)
-
-    # Compute hash
-    payment_tx = backend.UserPaymentTransaction()
-    if args.provider == 'google':
-        payment_tx.provider             = base.PaymentProvider.GooglePlayStore
-        payment_tx.google_payment_token = args.payment_token
-        payment_tx.google_order_id      = args.order_id
-    elif args.provider == 'apple':
-        payment_tx.provider    = base.PaymentProvider.iOSAppStore
-        payment_tx.apple_tx_id = args.tx_id
-    else:
-        print(f"ERROR: Unsupported payment provider: {args.provider}", file=sys.stderr)
-        return 1
-
-    hash_bytes: bytes = backend.make_set_payment_refund_requested_hash(args.version, master_skey.verify_key, now_unix_ts_ms, refund_unix_ts_ms, payment_tx)
-
-    # Build request
-    request_body = {
-        'version': args.version,
-        'master_pkey': bytes(master_skey.verify_key).hex(),
-        'master_sig': bytes(master_skey.sign(hash_bytes).signature).hex(),
-        'unix_ts_ms': now_unix_ts_ms,
-        'refund_requested_unix_ts_ms': refund_unix_ts_ms,
-        'payment_tx': payment_tx
-    }
-
-    print(f'\nSet payment refund requested via {"Google" if args.provider == "google" else "Apple"}')
-    print(f'Request:\n{json.dumps(request_body, indent=1)}')
-
-    # Send request
-    try:
-        request = urllib.request.Request(
-            f'{args.url}/set_payment_refund_requested',
-            data=json.dumps(request_body).encode('utf-8'),
-            headers={"Content-Type": "application/json"},
-            method="POST"
-        )
-        with urllib.request.urlopen(request) as response:
-            response_data = json.loads(response.read().decode('utf-8'))
-            print(f"Response: {json.dumps(response_data, indent=1)}")
-            return 0
-    except urllib.error.HTTPError as e:
-        print(f"ERROR: Server returned {e.code}: {e.read().decode('utf-8')}", file=sys.stderr)
-        return 1
-    except Exception as e:
-        print(f"ERROR: Failed to connect to {args.url}: {e}", file=sys.stderr)
-        return 1
-
-
-def cmd_server_get_pro_revocations(args: argparse.Namespace) -> int:
-    """Handle query revocations command."""
-    import json
-    import urllib.request
-    import urllib.error
-
-    request_body = {
-        'version': args.version,
-        'ticket': args.ticket
-    }
-
-    print(f'\nQuery Pro Revocations (ticket: {args.ticket})')
-    print(f'Request:\n{json.dumps(request_body, indent=1)}')
-
-    # Send request
-    try:
-        request = urllib.request.Request(
-            f'{args.url}/get_pro_revocations',
-            data=json.dumps(request_body).encode('utf-8'),
-            headers={"Content-Type": "application/json"},
-            method="POST"
-        )
-        with urllib.request.urlopen(request) as response:
-            response_data = json.loads(response.read().decode('utf-8'))
-            print(f"Response: {json.dumps(response_data, indent=1)}")
-            return 0
-    except urllib.error.HTTPError as e:
-        print(f"ERROR: Server returned {e.code}: {e.read().decode('utf-8')}", file=sys.stderr)
-        return 1
-    except Exception as e:
-        print(f"ERROR: Failed to connect to {args.url}: {e}", file=sys.stderr)
-        return 1
-
-
-def cmd_server_get_pro_details(args: argparse.Namespace) -> int:
-    """Handle query details command."""
-    import json
-    import time
-    import urllib.request
-    import urllib.error
-
-    # Parse master key
-    try:
-        master_skey = nacl.signing.SigningKey(bytes.fromhex(args.master_skey))
-    except Exception as e:
-        print(f"ERROR: Failed to parse master key: {e}", file=sys.stderr)
-        return 1
-
-    unix_ts_ms = int(time.time() * 1000)
-
-    # Compute hash
-    hash_bytes = backend.make_get_pro_details_hash(
-        version=args.version,
-        master_pkey=master_skey.verify_key,
-        unix_ts_ms=unix_ts_ms,
-        count=args.count
-    )
-
-    # Build request
-    request_body = {
-        'version': args.version,
-        'master_pkey': bytes(master_skey.verify_key).hex(),
-        'master_sig': bytes(master_skey.sign(hash_bytes).signature).hex(),
-        'unix_ts_ms': unix_ts_ms,
-        'count': args.count
-    }
-
-    print(f'\nQuery Pro Details')
-    print(f'Request:\n{json.dumps(request_body, indent=1)}')
-
-    # Send request
-    try:
-        request = urllib.request.Request(
-            f'{args.url}/get_pro_details',
-            data=json.dumps(request_body).encode('utf-8'),
-            headers={"Content-Type": "application/json"},
-            method="POST"
-        )
-        with urllib.request.urlopen(request) as response:
-            response_data = json.loads(response.read().decode('utf-8'))
-            print(f"Response: {json.dumps(response_data, indent=1)}")
-            return 0
-    except urllib.error.HTTPError as e:
-        print(f"ERROR: Server returned {e.code}: {e.read().decode('utf-8')}", file=sys.stderr)
-        return 1
-    except Exception as e:
-        print(f"ERROR: Failed to connect to {args.url}: {e}", file=sys.stderr)
-        return 1
-
-
-def cmd_server_generate_pro_proof(args: argparse.Namespace) -> int:
-    """Handle generate pro proof command."""
-    import json
-    import time
-    import urllib.request
-    import urllib.error
-
-    # Parse master key
-    try:
-        master_skey = nacl.signing.SigningKey(bytes.fromhex(args.master_skey))
-    except Exception as e:
-        print(f"ERROR: Failed to parse master key: {e}", file=sys.stderr)
-        return 1
-
-    # Parse rotating key
-    try:
-        rotating_skey = nacl.signing.SigningKey(bytes.fromhex(args.rotating_skey))
-    except Exception as e:
-        print(f"ERROR: Failed to parse rotating key: {e}", file=sys.stderr)
-        return 1
-
-    unix_ts_ms = int(time.time() * 1000)
-
-    # Compute hash
-    hash_bytes = backend.make_generate_pro_proof_hash(
-        version=args.version,
-        master_pkey=master_skey.verify_key,
-        rotating_pkey=rotating_skey.verify_key,
-        unix_ts_ms=unix_ts_ms
-    )
-
-    # Build request
-    request_body = {
-        'version': args.version,
-        'master_pkey': bytes(master_skey.verify_key).hex(),
-        'rotating_pkey': bytes(rotating_skey.verify_key).hex(),
-        'master_sig': bytes(master_skey.sign(hash_bytes).signature).hex(),
-        'rotating_sig': bytes(rotating_skey.sign(hash_bytes).signature).hex(),
-        'unix_ts_ms': unix_ts_ms
-    }
-
-    print(f'\nGenerate Pro Proof')
-    print(f'Request:\n{json.dumps(request_body, indent=1)}')
-
-    # Send request
-    try:
-        request = urllib.request.Request(
-            f'{args.url}/generate_pro_proof',
-            data=json.dumps(request_body).encode('utf-8'),
-            headers={"Content-Type": "application/json"},
-            method="POST"
-        )
-        with urllib.request.urlopen(request) as response:
-            response_data = json.loads(response.read().decode('utf-8'))
-            print(f"Response: {json.dumps(response_data, indent=1)}")
-            return 0
-    except urllib.error.HTTPError as e:
-        print(f"ERROR: Server returned {e.code}: {e.read().decode('utf-8')}", file=sys.stderr)
-        return 1
-    except Exception as e:
-        print(f"ERROR: Failed to connect to {args.url}: {e}", file=sys.stderr)
         return 1
 
 
@@ -1235,11 +735,11 @@ def cmd_voucher(args: argparse.Namespace) -> int:
 
     # Map plan to enum and calculate duration
     plan_map = {'1M': base.ProPlan.OneMonth, '3M': base.ProPlan.ThreeMonth, '12M': base.ProPlan.TwelveMonth}
-    plan     = plan_map[args.plan]
+    plan = plan_map[args.plan]
 
     # Calculate plan duration in milliseconds
-    if args.dev_duration_ms:
-        duration_ms = args.dev_duration_ms
+    if args.duration:
+        duration_ms = args.duration * 1000
     else:
         if plan == base.ProPlan.OneMonth:
             duration_ms = 30 * base.SECONDS_IN_DAY * 1000
@@ -1250,208 +750,169 @@ def cmd_voucher(args: argparse.Namespace) -> int:
 
     # Create payment transaction
     payment_tx = base.PaymentProviderTransaction(
-        provider=base.PaymentProvider.Rangeproof,
-        rangeproof_order_id=rangeproof_order_id
+        provider=base.PaymentProvider.Rangeproof, rangeproof_order_id=rangeproof_order_id
     )
 
     try:
         with db.open_database(config.db_url) as engine:
             with db.connection(engine) as conn:
                 with db.transaction(conn) as tx:
-                    unix_ts_ms            = int(time.time() * 1000)
-                    expiry_unix_ts_ms     = unix_ts_ms + duration_ms
-                    unredeemed_unix_ts_ms = unix_ts_ms
+                    unix_ts_ms = int(time.time() * 1000)
+                    request_at = base.datetime_from_unix_ms(unix_ts_ms)
+                    expires_at = base.datetime_from_unix_ms(unix_ts_ms + duration_ms)
+                    purchased_at = request_at
 
                     # Step 1: Add unredeemed payment
                     print('\nStep 1: Creating unredeemed Rangeproof payment...')
                     err = base.ErrorSink()
-                    backend.add_unredeemed_payment_tx(
-                        tx                                = tx,
-                        payment_tx                        = payment_tx,
-                        plan                              = plan,
-                        expiry_unix_ts_ms                 = expiry_unix_ts_ms,
-                        unredeemed_unix_ts_ms             = unredeemed_unix_ts_ms,
-                        platform_refund_expiry_unix_ts_ms = 0,
-                        platform_obfuscated_account_id    = b'',
-                        err                               = err
+                    backend.add_unredeemed_payment(
+                        tx,
+                        payment_tx=payment_tx,
+                        plan=plan,
+                        expires_at=expires_at,
+                        purchased_at=purchased_at,
+                        platform_refund_expires_at=base.EPOCH,
+                        platform_obfuscated_account_id=b'',
+                        err=err,
                     )
 
                     if err.has():
-                        print(f"ERROR: Failed to create unredeemed payment:\n  " + "\n  ".join(err.msg_list), file=sys.stderr)
+                        print(
+                            "ERROR: Failed to create unredeemed payment:\n  " + "\n  ".join(err.msg_list),
+                            file=sys.stderr,
+                        )
                         return 1
 
                     print("Success: Unredeemed payment created")
 
-                    # Get the backend signing key from runtime
-                    runtime_result = db.query(tx.conn, "SELECT backend_key FROM runtime")
-                    runtime_row    = runtime_result.fetchone()
-                    if not runtime_row:
-                        print("ERROR: Could not load runtime from database", file=sys.stderr)
+                    # Load the backend signing key from disk. It is not stored in the DB.
+                    if not config.backend_key_path:
+                        print("ERROR: No backend signing key configured ([base] backend_key_path)", file=sys.stderr)
                         return 1
+                    else:
+                        try:
+                            backend_key = backend.load_backend_signing_key(config.backend_key_path)
+                        except Exception as e:
+                            print(f"ERROR: Failed to load backend signing key: {e}", file=sys.stderr)
+                            return 1
 
-                    backend_key_bytes = bytes(runtime_row[0])
-                    backend_key       = nacl.signing.SigningKey(backend_key_bytes)
-
-                    # Step 2: Redeem the payment via add_pro_payment
+                    # Step 2: Redeem the payment via add_pro_payment (raises on failure → caught below).
                     print('\nStep 2: Redeeming payment and generating pro proof...')
-                    err = base.ErrorSink()
-                    redeem_result = backend.add_pro_payment_tx(
-                        tx                  = tx,
-                        version             = 0,
-                        signing_key         = backend_key,
-                        unix_ts_ms          = unix_ts_ms,
-                        redeemed_unix_ts_ms = backend.convert_unix_ts_ms_to_redeemed_unix_ts_ms(unix_ts_ms),
-                        master_pkey         = master_pkey,
-                        rotating_pkey       = rotating_pkey,
-                        payment_tx          = backend.UserPaymentTransaction(
-                            provider            = base.PaymentProvider.Rangeproof,
-                            rangeproof_order_id = rangeproof_order_id
+                    redeem_result = backend.add_pro_payment(
+                        tx,
+                        signing_key=backend_key,
+                        request_at=request_at,
+                        redeemed_at=backend.to_redeemed_at(request_at),
+                        master_pkey=master_pkey,
+                        rotating_pkey=rotating_pkey,
+                        payment_tx=backend.UserPaymentTransaction(
+                            provider=base.PaymentProvider.Rangeproof, rangeproof_order_id=rangeproof_order_id
                         ),
-                        err                 = err,
-                        THIS_WAS_A_DEBUG_PAYMENT_THAT_THE_DB_MADE_A_FAKE_UNCLAIMED_PAYMENT_TO_REDEEM_DO_NOT_USE_IN_PRODUCTION=False,
                     )
 
-                    if err.has():
-                        print(f"ERROR: Failed to redeem payment:\n  " + "\n  ".join(err.msg_list), file=sys.stderr)
-                        return 1
-
-                    if redeem_result.status != backend.RedeemPaymentStatus.Success:
-                        print(f"ERROR: Payment redemption failed with status: {redeem_result.status}", file=sys.stderr)
-                        return 1
-
                     print("Success: Payment redeemed and pro proof generated")
-                    print(f'\nProof Details:')
-                    print(f'  Expiry: {base.readable_unix_ts_ms(redeem_result.proof.expiry_unix_ts_ms)}')
-                    print(f'  Gen Index Hash: {redeem_result.proof.gen_index_hash.hex()}')
+                    print('\nProof Details:')
+                    print(f'  Expiry: {base.readable(redeem_result.proof.expires_at)}')
+                    print(f'  Revocation Tag: {redeem_result.proof.revocation_tag.hex()}')
 
                     return 0
 
     except Exception as e:
         print(f"ERROR: Database error: {e}", file=sys.stderr)
         import traceback
+
         traceback.print_exc()
         return 1
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description     = 'Session Pro Backend CLI',
-        formatter_class = argparse.RawDescriptionHelpFormatter,
-        epilog          = DETAILED_EPILOG if '--help-full' in sys.argv else BRIEF_EPILOG,
-        add_help        = False
+        description='Session Pro Backend CLI',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=DETAILED_EPILOG if '--help-full' in sys.argv else BRIEF_EPILOG,
+        add_help=False,
     )
 
     # Global options
-    _                       = parser.add_argument('--help',      action='help',       default=argparse.SUPPRESS, help='Show brief help message and exit')
-    _                       = parser.add_argument('--help-full', action='help',       default=argparse.SUPPRESS, help='Show detailed help with full documentation')
-    _                       = parser.add_argument('--config',                         required=False,            help='Path to config.ini file (required for DB operations)')
-    _                       = parser.add_argument('--dry-run',   action='store_true',                            help='Show what would be done without executing')
+    parser.add_argument('--help', action='help', default=argparse.SUPPRESS, help='Show brief help message and exit')
+    parser.add_argument(
+        '--help-full', action='help', default=argparse.SUPPRESS, help='Show detailed help with full documentation'
+    )
+    parser.add_argument('--config', required=False, help='Path to config.ini file (required for DB operations)')
+    parser.add_argument('--dry-run', action='store_true', help='Show what would be done without executing')
 
-    subparsers              = parser.add_subparsers(dest='command', help='Available commands')
-
-    # Server commands (no config required) - mirror HTTP endpoints
-    server_parser           = subparsers.add_parser('server', help='Server endpoint operations (no --config required)')
-    server_subparsers       = server_parser.add_subparsers(dest='server_command', help='Server endpoint subcommands')
-
-    # add-pro-payment endpoint
-    server_add_pro_payment  = server_subparsers.add_parser('add-pro-payment',                                                                      help='Add a pro payment. Mirrors /add_pro_payment')
-    _                       = server_add_pro_payment.add_argument('--url',               required=True,                                            help='Server URL (e.g., http://localhost:8000)')
-    _                       = server_add_pro_payment.add_argument('--provider',          required=True, choices=['google', 'apple', 'rangeproof'], help='Payment provider')
-    _                       = server_add_pro_payment.add_argument('--master-skey',                                                                 help='64-char hex master secret key (generates new if omitted)')
-    _                       = server_add_pro_payment.add_argument('--rotating-skey',                                                               help='64-char hex rotating secret key (generates new if omitted)')
-    _                       = server_add_pro_payment.add_argument('--version',           type=int, default=0,                                      help='Request version (default: 0)')
-    _                       = server_add_pro_payment.add_argument('--dev-plan',                         choices=['1M', '3M', '12M'],               help='Subscription plan (1M/3M/12M)')
-    _                       = server_add_pro_payment.add_argument('--dev-duration-ms',   type=int,                                                 help='Override duration in milliseconds')
-    _                       = server_add_pro_payment.add_argument('--dev-auto-renewing', action='store_true',                                      help='Set auto-renewing to true (default: false)')
-
-    # set-payment-refund-requested endpoint
-    server_set_refund       = server_subparsers.add_parser('set-payment-refund-requested',                                                help='Mark payment as refund requested. Mirrors /set_payment_refund_requested')
-    _                       = server_set_refund.add_argument('--url',                         required=True,                              help='Server URL')
-    _                       = server_set_refund.add_argument('--provider',                    required=True, choices=['google', 'apple'], help='Payment provider')
-    _                       = server_set_refund.add_argument('--master-skey',                 required=True,                              help='64-char hex master secret key')
-    _                       = server_set_refund.add_argument('--payment-token',                                                           help='Google: payment token')
-    _                       = server_set_refund.add_argument('--order-id',                                                                help='Google: order ID')
-    _                       = server_set_refund.add_argument('--tx-id',                                                                   help='Apple: transaction ID')
-    _                       = server_set_refund.add_argument('--refund-requested-unix-ts-ms', type=int,                                   help='Unix timestamp ms for refund (default: now + 1s)')
-    _                       = server_set_refund.add_argument('--version',                     type=int,      default=0,                   help='Request version (default: 0)')
-
-    # get-pro-revocations endpoint
-    server_get_revocations  = server_subparsers.add_parser('get-pro-revocations',                          help='Get pro revocations. Mirrors /get_pro_revocations')
-    _                       = server_get_revocations.add_argument('--url',     required=True,              help='Server URL (e.g., http://localhost:8000)')
-    _                       = server_get_revocations.add_argument('--ticket',  type=int, default=0,        help='Revocation ticket to query from (default: 0)')
-    _                       = server_get_revocations.add_argument('--version', type=int, default=0,        help='Request version (default: 0)')
-
-    # get-pro-details endpoint
-    server_get_details      = server_subparsers.add_parser('get-pro-details',                              help='Get pro details. Mirrors /get_pro_details')
-    _                       = server_get_details.add_argument('--url',         required=True,              help='Server URL (e.g., http://localhost:8000)')
-    _                       = server_get_details.add_argument('--master-skey', required=True,              help='64-char hex master secret key for signing')
-    _                       = server_get_details.add_argument('--count',       type=int, default=10,       help='Number of payments to retrieve (default: 10)')
-    _                       = server_get_details.add_argument('--version',     type=int, default=0,        help='Request version (default: 0)')
-
-    # generate-pro-proof endpoint
-    server_gen_proof        = server_subparsers.add_parser('generate-pro-proof',                           help='Generate pro proof. Mirrors /generate_pro_proof')
-    _                       = server_gen_proof.add_argument('--url',           required=True,              help='Server URL (e.g., http://localhost:8000)')
-    _                       = server_gen_proof.add_argument('--master-skey',   required=True,              help='64-char hex master secret key')
-    _                       = server_gen_proof.add_argument('--rotating-skey', required=True,              help='64-char hex rotating secret key')
-    _                       = server_gen_proof.add_argument('--version',       type=int, default=0,        help='Request version (default: 0)')
+    subparsers = parser.add_subparsers(dest='command', help='Available commands')
 
     # Voucher command (creates Rangeproof voucher and auto-redeems it)
-    voucher_parser          = subparsers.add_parser('voucher',                                                             help='Create a Rangeproof voucher payment (requires --config)')
-    _                       = voucher_parser.add_argument('--master-pkey',     required=True,                              help='64-char hex master public key of the recipient')
-    _                       = voucher_parser.add_argument('--plan',            required=True, choices=['1M', '3M', '12M'], help='Subscription plan (1M/3M/12M)')
-    _                       = voucher_parser.add_argument('--rotating-pkey',                                               help='64-char hex rotating public key (generates new if omitted)')
-    _                       = voucher_parser.add_argument('--dev-duration-ms', type=int,                                   help='Override duration in milliseconds')
+    voucher_parser = subparsers.add_parser('voucher', help='Create a Rangeproof voucher payment (requires --config)')
+    voucher_parser.add_argument('--master-pkey', required=True, help='64-char hex master public key of the recipient')
+    voucher_parser.add_argument(
+        '--plan', required=True, choices=['1M', '3M', '12M'], help='Subscription plan (1M/3M/12M)'
+    )
+    voucher_parser.add_argument('--rotating-pkey', help='64-char hex rotating public key (generates new if omitted)')
+    voucher_parser.add_argument('--duration', type=int, help='Override duration in seconds')
 
     # User error commands
-    user_error_parser       = subparsers.add_parser('user-error',                         help='Manage user errors')
-    user_error_subparsers   = user_error_parser.add_subparsers(dest='user_error_command', help='User error subcommands')
+    user_error_parser = subparsers.add_parser('user-error', help='Manage user errors')
+    user_error_subparsers = user_error_parser.add_subparsers(dest='user_error_command', help='User error subcommands')
 
-    user_error_set          = user_error_subparsers.add_parser('set',                     help='Set user errors (format: <provider>:<payment-id>=true|false,...)')
-    _                       = user_error_set.add_argument('items',                        help='Comma-separated list of errors')
+    user_error_set = user_error_subparsers.add_parser(
+        'set', help='Set user errors (format: <provider>:<payment-id>=true|false,...)'
+    )
+    user_error_set.add_argument('items', help='Comma-separated list of errors')
 
-    user_error_delete       = user_error_subparsers.add_parser('delete',                  help='Delete user errors (format: <provider>:<payment-id>,...)')
-    _                       = user_error_delete.add_argument('items',                     help='Comma-separated list of payment IDs')
+    user_error_delete = user_error_subparsers.add_parser(
+        'delete', help='Delete user errors (format: <provider>:<payment-id>,...)'
+    )
+    user_error_delete.add_argument('items', help='Comma-separated list of payment IDs')
 
     # Google notification commands
-    google_notif_parser     = subparsers.add_parser('google-notification',                    help='Manage the list of Google notifications received in the database')
-    google_notif_subparsers = google_notif_parser.add_subparsers(dest='google_notif_command', help='Google notification subcommands')
+    google_notif_parser = subparsers.add_parser(
+        'google-notification', help='Manage the list of Google notifications received in the database'
+    )
+    google_notif_subparsers = google_notif_parser.add_subparsers(
+        dest='google_notif_command', help='Google notification subcommands'
+    )
 
-    google_notif_handle     = google_notif_subparsers.add_parser('handle',                    help='Mark notifications as handled')
-    _                       = google_notif_handle.add_argument('items',                       help='Comma-separated list of message IDs')
+    google_notif_handle = google_notif_subparsers.add_parser('handle', help='Mark notifications as handled')
+    google_notif_handle.add_argument('items', help='Comma-separated list of message IDs')
 
-    google_notif_delete     = google_notif_subparsers.add_parser('delete',                    help='Delete notifications')
-    _                       = google_notif_delete.add_argument('items',                       help='Comma-separated list of message IDs')
-    _                       = google_notif_subparsers.add_parser('list',                      help='List unhandled notifications')
+    google_notif_delete = google_notif_subparsers.add_parser('delete', help='Delete notifications')
+    google_notif_delete.add_argument('items', help='Comma-separated list of message IDs')
+    google_notif_subparsers.add_parser('list', help='List unhandled notifications')
 
     # Revoke commands
-    revoke_parser           = subparsers.add_parser('revoke',                     help='Manage revocations')
-    revoke_subparsers       = revoke_parser.add_subparsers(dest='revoke_command', help='Revocation subcommands')
+    revoke_parser = subparsers.add_parser('revoke', help='Manage revocations')
+    revoke_subparsers = revoke_parser.add_subparsers(dest='revoke_command', help='Revocation subcommands')
 
-    revoke_list             = revoke_subparsers.add_parser('list',                help='List revocable payments for a user')
-    _                       = revoke_list.add_argument('master_pkey',             help='Master public key (64 hex chars)')
+    revoke_list = revoke_subparsers.add_parser('list', help='List revocable payments for a user')
+    revoke_list.add_argument('master_pkey', help='Master public key (64 hex chars)')
 
-    revoke_delete           = revoke_subparsers.add_parser('delete',              help='Delete revocation entry')
-    _                       = revoke_delete.add_argument('master_pkey',           help='Master public key (64 hex chars)')
+    revoke_now = revoke_subparsers.add_parser(
+        'user', help="Revoke a user's current generation (terminal — no un-revoke)"
+    )
+    revoke_now.add_argument('master_pkey', help='Master public key (64 hex chars)')
+    revoke_now.add_argument(
+        '--creation-unix-ts-s',
+        type=int,
+        default=int(time.time()),
+        help='Revocation instant in unix seconds (default: now)',
+    )
 
-    revoke_timestamp        = revoke_subparsers.add_parser('timestamp',             help='Set revocation with timestamp')
-    _                       = revoke_timestamp.add_argument('master_pkey',          help='Master public key (64 hex chars)')
-    _                       = revoke_timestamp.add_argument('--creation-unix-ts-s', type=int, default=int(time.time()), help='Revoke creation timestamp in seconds')
-    _                       = revoke_timestamp.add_argument('expiry_unix_ts_s',     type=int,                           help='Expiry unix timestamp in seconds')
+    revoke_bump_ticket = revoke_subparsers.add_parser(
+        'bump-ticket',
+        help='Advance the revocation ticket forward (DR: run after restoring the DB from an older backup)',
+    )
+    revoke_bump_ticket.add_argument('amount', type=int, help='Positive integer to add to the current revocation ticket')
 
     # Report commands
-    report_parser           = subparsers.add_parser('report',                     help='Generate reports')
-    report_subparsers       = report_parser.add_subparsers(dest='report_command', help='Report subcommands')
+    report_parser = subparsers.add_parser('report', help='Generate reports')
+    report_subparsers = report_parser.add_subparsers(dest='report_command', help='Report subcommands')
 
-    report_generate         = report_subparsers.add_parser('generate',                                                            help='Generate a report')
-    _                       = report_generate.add_argument('period',   choices=['daily', 'weekly',  'monthly'],                   help='Report period')
-    _                       = report_generate.add_argument('--format', choices=['human', 'csv'],                 default='human', help='Report format')
-    _                       = report_generate.add_argument('--count',  type=int,                                 default=7,       help='Number of periods to report')
-
-    # DB commands
-    db_parser               = subparsers.add_parser('db',                 help='Database operations')
-    db_subparsers           = db_parser.add_subparsers(dest='db_command', help='Database subcommands')
-    _                       = db_subparsers.add_parser('info',            help='Show database info')
-    _                       = db_subparsers.add_parser('print',           help='Print all tables')
+    report_generate = report_subparsers.add_parser('generate', help='Generate a report')
+    report_generate.add_argument('period', choices=['daily', 'weekly', 'monthly'], help='Report period')
+    report_generate.add_argument('--format', choices=['human', 'csv'], default='human', help='Report format')
+    report_generate.add_argument('--count', type=int, default=7, help='Number of periods to report')
 
     args = parser.parse_args()
 
@@ -1462,22 +923,7 @@ def main() -> int:
     # Dispatch to command handler - commands that need config will load it themselves
     dry_run = args.dry_run
 
-    if args.command == 'server':
-        if args.server_command == 'add-pro-payment':
-            return cmd_server_add_pro_payment(args)
-        elif args.server_command == 'set-payment-refund-requested':
-            return cmd_server_set_payment_refund_requested(args)
-        elif args.server_command == 'get-pro-revocations':
-            return cmd_server_get_pro_revocations(args)
-        elif args.server_command == 'get-pro-details':
-            return cmd_server_get_pro_details(args)
-        elif args.server_command == 'generate-pro-proof':
-            return cmd_server_generate_pro_proof(args)
-        else:
-            server_parser.print_help()
-            return 1
-
-    elif args.command == 'voucher':
+    if args.command == 'voucher':
         return cmd_voucher(args)
 
     elif args.command == 'user-error':
@@ -1503,10 +949,10 @@ def main() -> int:
     elif args.command == 'revoke':
         if args.revoke_command == 'list':
             return cmd_revoke_list(args)
-        elif args.revoke_command == 'delete':
-            return cmd_revoke_delete(args, dry_run)
-        elif args.revoke_command == 'timestamp':
-            return cmd_revoke_timestamp(args, dry_run)
+        elif args.revoke_command == 'user':
+            return cmd_revoke(args, dry_run)
+        elif args.revoke_command == 'bump-ticket':
+            return cmd_revoke_bump_ticket(args, dry_run)
         else:
             revoke_parser.print_help()
             return 1
@@ -1518,17 +964,10 @@ def main() -> int:
             report_parser.print_help()
             return 1
 
-    elif args.command == 'db':
-        if args.db_command == 'info':
-            return cmd_db_info(args)
-        elif args.db_command == 'print':
-            return cmd_db_print(args)
-        else:
-            db_parser.print_help()
-            return 1
-
     else:
         parser.print_help()
         return 1
+
+
 if __name__ == '__main__':
     sys.exit(main())

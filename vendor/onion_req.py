@@ -9,13 +9,10 @@ a long-term X25519 key for the server and then make it available to a Flask
 request by storing it in the Flask configuration dictionary so that the server
 can decrypt incoming client requests that are encrypted.
 
-1. Enable the desired routes on your Flask application. We currently have v3 and
-v4 routes (v3 is provided for legacy reasons, use v4 if you're starting a new
-application)
+1. Enable the desired routes on your Flask application. We currently have v4 routes.
 
     import onion_req
     flask_app = flask.Flask(__name__)
-    flask_app.register_blueprint(onion_req.flask_blueprint_v3)
     flask_app.register_blueprint(onion_req.flask_blueprint_v4)
 
 2. Set the long-term X25519 key on the Flask dictionary
@@ -25,10 +22,8 @@ application)
     flask_app.config[onion_req.FLASK_CONFIG_ONION_REQ_X25519_SKEY] = x25519_skey
 
 The integration application will now respond to onion requests on the following
-v3 and v4 routes respectively:
+v4 route:
 
-    /loki/v3/lsrpc
-    /oxen/v3/lsrpc
     /oxen/v4/lsrpc
 
 Upon sending a request, the encrypted request is decrypted by the X25519 secret
@@ -67,13 +62,10 @@ class Response:
     body:     bytes          = b''
 
 FLASK_CONFIG_ONION_REQ_X25519_SKEY = 'onion_req_x25519_skey'
-ROUTE_OXEN_V3_LSRPC                = '/oxen/v3/lsrpc'
-ROUTE_LOKI_V3_LSRPC                = '/loki/v3/lsrpc'
 ROUTE_OXEN_V4_LSRPC                = '/oxen/v4/lsrpc'
 HTTP_BODY_METHODS                  = ('POST', 'PUT')
 HTTP_BAD_REQUEST                   = 400
 HTTP_OK                            = 200
-flask_blueprint_v3                 = Blueprint('onion-req-blueprint-v3', __name__)
 flask_blueprint_v4                 = Blueprint('onion-req-blueprint-v4', __name__)
 
 def make_shared_key(our_x25519_skey: nacl.public.PrivateKey,
@@ -167,9 +159,6 @@ def make_response_v4(shared_key: bytes, encrypted_response: bytes) -> Response:
         body_decoded, _ = bencode_consume_string(memoryview(body_bytes))
         result.body     = body_decoded.tobytes()
     return result
-
-def encode_base64(data: bytes):
-    return base64.b64encode(data).decode()
 
 def bencode_consume_string(body: memoryview) -> Tuple[memoryview, memoryview]:
     """
@@ -288,54 +277,6 @@ def make_subrequest(
         current_app.logger.warning(f"Sub-request for {method} {path} failed: {traceback.format_exc()}")
         raise
 
-def handle_v3_onionreq_plaintext(body):
-    try:
-        if not body.startswith(b'{'):
-            raise RuntimeError("Invalid v3 onion request body: expected JSON object")
-
-        req = json.loads(body)
-        endpoint, method = req['endpoint'], req['method']
-        subreq_headers = {k.lower(): v for k, v in req.get('headers', {}).items()}
-
-        if method in HTTP_BODY_METHODS:
-            subreq_body = req.get('body', '').encode()
-        else:
-            subreq_body = b''
-            # Android bug workaround: Android Session (at least up to v1.11.12) sends a body on
-            # GET requests with a 4-character string "null" when it should send no body.
-            if 'body' in req and len(req['body']) == 4 and req['body'] == 'null':
-                del req['body']
-
-            if 'body' in req and req['body']:
-                raise RuntimeError(
-                    "Invalid {} {} request: request must not contain a body".format(
-                        method, endpoint
-                    )
-                )
-
-        if not endpoint.startswith('/'):
-            endpoint = '/' + endpoint
-
-        response, _headers = make_subrequest(
-            method,
-            endpoint,
-            headers=subreq_headers,
-            body=subreq_body,
-            content_type='application/json',
-        )
-
-        if response.status_code == HTTP_OK:
-            data = response.get_data()
-            current_app.logger.debug(
-                f"Onion sub-request for {endpoint} returned success, {len(data)} bytes"
-            )
-            return data
-        return json.dumps({'status_code': response.status_code}).encode()
-
-    except Exception as e:
-        current_app.logger.warning("Invalid onion request: {}".format(e))
-        return json.dumps({'status_code': HTTP_BAD_REQUEST}).encode()
-
 
 def handle_v4_onionreq_plaintext(body):
     try:
@@ -345,24 +286,23 @@ def handle_v4_onionreq_plaintext(body):
         belems = memoryview(body)[1:-1]
 
         # Metadata json; this element is always required:
-        meta, belems = bencode_consume_string(belems)
+        req_meta_bytes, belems = bencode_consume_string(belems)
+        req_meta = json.loads(req_meta_bytes.tobytes())
 
-        meta = json.loads(meta.tobytes())
-
-        # Then we can have a second optional string containing the body:
+        # Then we can have a second optional string containing the body (bencode_consume_string hands back
+        # a memoryview; the no-body case is an empty bytes literal, hence the union):
+        subreq_body: bytes | memoryview = b''
         if len(belems) > 1:
             subreq_body, belems = bencode_consume_string(belems)
             if len(belems):
                 raise RuntimeError("Invalid v4 onion request: found more than 2 parts")
-        else:
-            subreq_body = b''
 
-        method, endpoint = meta['method'], meta['endpoint']
+        method, endpoint = req_meta['method'], req_meta['endpoint']
         if not endpoint.startswith('/'):
             raise RuntimeError("Invalid v4 onion request: endpoint must start with /")
 
         response, headers = make_subrequest(
-            method, endpoint, headers=meta.get('headers', {}), body=subreq_body
+            method, endpoint, headers=req_meta.get('headers', {}), body=subreq_body
         )
 
         data = response.get_data()
@@ -370,16 +310,16 @@ def handle_v4_onionreq_plaintext(body):
             f"Onion sub-request for {endpoint} returned {response.status_code}, {len(data)} bytes"
         )
 
-        meta = {'code': response.status_code, 'headers': headers}
+        resp_meta = {'code': response.status_code, 'headers': headers}
 
     except Exception as e:
         current_app.logger.warning("Invalid v4 onion request: {}".format(e))
-        meta = {'code': HTTP_BAD_REQUEST, 'headers': {'content-type': 'text/plain; charset=utf-8'}}
+        resp_meta = {'code': HTTP_BAD_REQUEST, 'headers': {'content-type': 'text/plain; charset=utf-8'}}
         data = b'Invalid v4 onion request'
 
-    meta = json.dumps(meta).encode()
+    resp_meta_bytes = json.dumps(resp_meta).encode()
     return b''.join(
-        (b'l', str(len(meta)).encode(), b':', meta, str(len(data)).encode(), b':', data, b'e')
+        (b'l', str(len(resp_meta_bytes)).encode(), b':', resp_meta_bytes, str(len(data)).encode(), b':', data, b'e')
     )
 
 
@@ -397,48 +337,6 @@ def decrypt_onionreq():
         current_app.logger.warning("Failed to decrypt onion request: {}".format(e))
     abort(HTTP_BAD_REQUEST)
 
-
-@flask_blueprint_v3.post(ROUTE_OXEN_V3_LSRPC)
-@flask_blueprint_v3.post(ROUTE_LOKI_V3_LSRPC)
-def handle_onion_request():
-    """
-    Parse an onion request, handle it as a subrequest, then throw away the subrequest headers,
-    replace the subrequest body with a json string, encrypt the final result and then pointlessly
-    base64 encodes the body before sending it back to the requestor.
-
-    Deprecated in favour of /v4/.
-
-    This injects a subrequest to process it then returns the result of that subrequest (as bytes).
-
-    The body must be JSON containing two always-required keys:
-
-    - "endpoint" -- the HTTP endpoint to invoke (e.g. "/room/some-room").
-    - "method" -- the HTTP method (e.g. "POST", "GET")
-
-    Plus, when method is POST or PUT, the required field:
-
-    - "body" -- the request body for POST/PUT requests
-
-    Optional keys that may be included are:
-    - "headers" -- optional dict of HTTP headers for the request.  Header names are
-                   case-insensitive (i.e. `X-Foo` and `x-FoO` are equivalent).
-
-    When returning, we invoke the subrequest and then, if it returns a 200 response code, we take
-    the response body, encrypt it, and then base64 the encrypted body and send that back as the
-    response body of the onion request.
-
-    If the subrequest returned a non-200 response code then instead of the returned body we return
-    `{"status_code":xxx}` (where xxx is the numeric status code) and encrypt/base64 encode that.
-
-    Response headers are completely ignored, as are bodies of non-200 responses.
-
-    This is deprecated because it amplifies request and response sizes, it doesn't allow non-json
-    requests, and it drops pertinent request information (such as response headers and error
-    bodies).  Prefer v4 requests which do not have these drawbacks.
-    """
-
-    parser = decrypt_onionreq()
-    return encode_base64(parser.encrypt_reply(handle_v3_onionreq_plaintext(parser.payload)))
 
 @flask_blueprint_v4.post(ROUTE_OXEN_V4_LSRPC)
 def handle_v4_onion_request():

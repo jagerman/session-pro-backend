@@ -1,0 +1,22 @@
+#!/bin/sh
+#
+# Forced-command wrapper for pgBackRest SSH keys. Referenced from authorized_keys as:
+#
+#   command="/usr/local/bin/pgbackrest-ssh-restrict",restrict <pubkey>
+#
+# It permits ONLY pgbackrest invocations (the remote helper pgBackRest runs over SSH) and
+# denies everything else, so a key compromised on the other host cannot get a shell or run
+# arbitrary commands. Denied attempts are logged to the invoking user's home for auditing and
+# to reveal the real invocation if the whitelist ever needs adjusting.
+set -f
+case "$SSH_ORIGINAL_COMMAND" in
+    pgbackrest\ *|pgbackrest)
+        exec $SSH_ORIGINAL_COMMAND
+        ;;
+    *)
+        printf '%s DENIED: %s\n' "$(date -u +%FT%TZ 2>/dev/null)" "$SSH_ORIGINAL_COMMAND" \
+            >> "$HOME/pgbackrest-ssh-denied.log" 2>/dev/null
+        echo "restricted: pgbackrest only" >&2
+        exit 1
+        ;;
+esac

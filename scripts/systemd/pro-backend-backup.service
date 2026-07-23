@@ -1,0 +1,11 @@
+[Unit]
+Description=Session Pro Backend pgBackRest backup (runs on the repository host)
+Documentation=https://github.com/session-foundation/session-pro-backend
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=pgbackrest
+Group=pgbackrest
+ExecStart=/usr/local/bin/pro-backend-repo-backup
