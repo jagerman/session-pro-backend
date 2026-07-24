@@ -117,10 +117,17 @@ def init(
     api.package_name = package_name
     api.subscription_product_id = subscription_product_id
 
-    # NOTE: Setup thread for caller to use
+    # NOTE: Setup thread for caller to use. daemon=True is load-bearing for uWSGI reloads: the pull loop
+    # blocks in client.pull() (a long-poll) and can't be interrupted mid-call, and CPython's interpreter
+    # shutdown JOINS every non-daemon thread BEFORE atexit runs — so a non-daemon subscriber wedges the
+    # whole mule until the pull's deadline and uWSGI NO-MERCY-kills it. As a daemon it's abandoned at
+    # exit instead (stop_subscriber still gives it a brief chance to drain); an abandoned in-flight pull
+    # just means those messages are never acked, so Google redelivers them — nothing is lost.
     result = ThreadContext()
     result.thread = threading.Thread(
-        target=thread_entry_point, args=(result, app_credentials_path, cloud_project_id, cloud_subscription_name)
+        target=thread_entry_point,
+        args=(result, app_credentials_path, cloud_project_id, cloud_subscription_name),
+        daemon=True,
     )
     return result
 
@@ -159,12 +166,15 @@ def start_subscriber(
 def stop_subscriber(context: ThreadContext) -> None:
     '''
     Signal the subscriber pull loop to stop and wait briefly for it to drain (idempotent; safe to
-    call on shutdown even if never started).
+    call on shutdown even if never started). The thread is a daemon (see init): if it's blocked in a
+    pull and can't drain within the window it's abandoned at interpreter exit rather than wedging the
+    mule — unacked messages redeliver, so nothing is lost. The short wait is only to let a mid-batch
+    cycle finish cleanly when it can.
     '''
     context.kill_thread = True
     context.sleep_event.set()
     if context.thread and context.thread.is_alive():
-        context.thread.join(timeout=10)
+        context.thread.join(timeout=3)
 
 
 def handle_parsed_notification(tx: db.SQLTransaction, parse: ParsedNotification, err: base.ErrorSink) -> bool:
