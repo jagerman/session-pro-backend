@@ -406,9 +406,9 @@ def handle_notification_tx(
                 # NOTE: Process notification
                 sql_tx.cancel = True
                 if not err.has():
-                    # TODO: To be updated when Session iOS figures out how it will generate UUID from the
-                    # master pkey, then this can be asserted to have to exist in the payload
-                    platform_obfuscated_account_id = tx.appAccountToken if tx.appAccountToken else ''
+                    # Force Apple's echoed appAccountToken lowercase on receipt so it's stored lowercase,
+                    # matching our lowercase uuid_from_master_pk so the redeem equality can't fail on case.
+                    platform_obfuscated_account_id = (tx.appAccountToken or '').lower()
 
                     backend.add_unredeemed_payment(
                         sql_tx,
@@ -566,9 +566,9 @@ def handle_notification_tx(
 
                         # NOTE: Submit the upgraded payment (e.g. the new payment)
                         if not err.has():
-                            # TODO: To be updated when Session iOS figures out how it will generate UUID from the
-                            # master pkey, then this can be asserted to have to exist in the payload
-                            platform_obfuscated_account_id = tx.appAccountToken if tx.appAccountToken else ''
+                            # Force Apple's echoed appAccountToken lowercase on receipt so it's stored lowercase,
+                            # matching our lowercase uuid_from_master_pk so the redeem equality can't fail on case.
+                            platform_obfuscated_account_id = (tx.appAccountToken or '').lower()
 
                             backend.add_unredeemed_payment(
                                 sql_tx,
@@ -673,9 +673,9 @@ def handle_notification_tx(
                             f'New payment (unredeemed/refund expiry/expiry) ts = ({unredeemed}/{refund}/{expiry})'
                         )
 
-                    # TODO: To be updated when Session iOS figures out how it will generate UUID from the
-                    # master pkey, then this can be asserted to have to exist in the payload
-                    platform_obfuscated_account_id = tx.appAccountToken if tx.appAccountToken else ''
+                    # Force Apple's echoed appAccountToken lowercase on receipt so it's stored lowercase,
+                    # matching our lowercase uuid_from_master_pk so the redeem equality can't fail on case.
+                    platform_obfuscated_account_id = (tx.appAccountToken or '').lower()
 
                     backend.add_unredeemed_payment(
                         sql_tx,
@@ -731,9 +731,9 @@ def handle_notification_tx(
 
                     # NOTE: Submit the 'new' payment
                     if not err.has():
-                        # TODO: To be updated when Session iOS figures out how it will generate UUID from the
-                        # master pkey, then this can be asserted to have to exist in the payload
-                        platform_obfuscated_account_id = tx.appAccountToken if tx.appAccountToken else ''
+                        # Force Apple's echoed appAccountToken lowercase on receipt so it's stored lowercase,
+                        # matching our lowercase uuid_from_master_pk so the redeem equality can't fail on case.
+                        platform_obfuscated_account_id = (tx.appAccountToken or '').lower()
 
                         backend.add_unredeemed_payment(
                             sql_tx,
