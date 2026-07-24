@@ -22,10 +22,13 @@ import atexit
 import collections.abc
 import contextlib
 import dataclasses
+import faulthandler
 import functools
 import logging
 import os
+import sys
 import threading
+import time
 import traceback
 import typing
 
@@ -65,15 +68,34 @@ def get_pool(conninfo: str) -> psycopg_pool.ConnectionPool:
         return pool
 
 
+def _shutdown_dbg(msg: str) -> None:
+    # TEMP shutdown instrumentation. atexit/uWSGI-reload runs while the logging handlers may already be
+    # torn down, so write straight to stderr (uWSGI's `logto` captures it) and flush, so nothing is lost
+    # if we get NO-MERCY-killed right after.
+    print(f'[shutdown-dbg] {msg}', file=sys.stderr, flush=True)
+
+
 def close_pools() -> None:
     with _pools_lock:
         pools = list(_pools.values())
         _pools.clear()
+    _shutdown_dbg(
+        f'close_pools: {len(pools)} pool(s); live threads: {[(t.name, t.daemon) for t in threading.enumerate()]}'
+    )
     for pool in pools:
+        t0 = time.monotonic()
+        _shutdown_dbg(f'close_pools: closing pool {pool.name!r} (dumping all stacks every 2s if it hangs)')
+        # If pool.close() hangs joining a worker, dump every thread's stack so we SEE where it's stuck.
+        faulthandler.dump_traceback_later(2.0, repeat=True, exit=False)
         try:
             pool.close()
-        except Exception:
-            pass  # e.g. a test database was already dropped out from under us
+        except Exception as e:
+            # e.g. a test database was already dropped out from under us
+            _shutdown_dbg(f'close_pools: pool {pool.name!r} close() raised after {time.monotonic() - t0:.2f}s: {e!r}')
+        finally:
+            faulthandler.cancel_dump_traceback_later()
+        _shutdown_dbg(f'close_pools: closed pool {pool.name!r} in {time.monotonic() - t0:.2f}s')
+    _shutdown_dbg(f'close_pools: done; live threads now: {[t.name for t in threading.enumerate()]}')
 
 
 atexit.register(close_pools)

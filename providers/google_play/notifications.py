@@ -15,6 +15,7 @@ import typing
 import time
 import enum
 import collections.abc
+import faulthandler
 
 from google.oauth2 import service_account
 
@@ -161,10 +162,20 @@ def stop_subscriber(context: ThreadContext) -> None:
     Signal the subscriber pull loop to stop and wait briefly for it to drain (idempotent; safe to
     call on shutdown even if never started).
     '''
+    db._shutdown_dbg('stop_subscriber: setting kill_thread + sleep_event')
     context.kill_thread = True
     context.sleep_event.set()
     if context.thread and context.thread.is_alive():
+        db._shutdown_dbg('stop_subscriber: joining subscriber thread (dumping all stacks every 2s if it hangs)')
+        faulthandler.dump_traceback_later(2.0, repeat=True, exit=False)
+        t0 = time.monotonic()
         context.thread.join(timeout=10)
+        faulthandler.cancel_dump_traceback_later()
+        db._shutdown_dbg(
+            f'stop_subscriber: join returned after {time.monotonic() - t0:.2f}s, alive={context.thread.is_alive()}'
+        )
+    else:
+        db._shutdown_dbg('stop_subscriber: no live subscriber thread to join')
 
 
 def handle_parsed_notification(tx: db.SQLTransaction, parse: ParsedNotification, err: base.ErrorSink) -> bool:
