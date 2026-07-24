@@ -17,6 +17,7 @@ import pprint
 import logging
 import time
 import traceback
+import uuid
 
 from appstoreserverlibrary.models.SendTestNotificationResponse import (
     SendTestNotificationResponse as AppleSendTestNotificationResponse,
@@ -177,6 +178,21 @@ def get_platform_refund_expires_at(tx: AppleJWSTransactionDecodedPayload) -> dat
     # through apple for the entirety of their subscription duration as a "sane" default.
     assert tx.expiresDate
     return base.datetime_from_unix_ms(tx.expiresDate)
+
+
+def uuid_from_master_pk(master_pk: bytes) -> str:
+    '''Derive an account's Apple `appAccountToken` (a UUID) from its 32-byte Ed25519 master pubkey.
+
+    A UUID holds only 16 bytes, so we take the first 16 — the uniform low half of the little-endian
+    Ed25519 encoding — and stamp the RFC 4122 v4 version/variant bits: 122 bits of the key, no hash.
+    The client sets this at purchase; the backend recomputes it and binds a redeem by equality against
+    the request-signed key.
+    '''
+    assert len(master_pk) == 32
+    b = bytearray(master_pk[:16])
+    b[6] = (b[6] & 0x0F) | 0x40  # version 4
+    b[8] = (b[8] & 0x3F) | 0x80  # variant 10xx (RFC 4122)
+    return str(uuid.UUID(bytes=bytes(b)))
 
 
 def handle_notification_tx(

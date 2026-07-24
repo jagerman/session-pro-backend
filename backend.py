@@ -395,16 +395,6 @@ def backend_signing_key_to_hex(skey: nacl.signing.SigningKey) -> str:
     return (bytes(skey) + bytes(skey.verify_key)).hex()
 
 
-def google_obfuscated_account_id_from_master_pkey(pkey: nacl.signing.VerifyKey) -> bytes:
-    result: bytes = hashlib.sha256(bytes(pkey)).digest()
-    return result
-
-
-def apple_obfuscated_account_id_from_master_pkey(pkey: nacl.signing.VerifyKey) -> str:
-    result = ''  # TODO: Figure out how we derive Apple's app token account id from the master pkey
-    return result
-
-
 def payment_provider_tx_log_label_safe(tx: base.PaymentProviderTransaction) -> str:
     # Only the active provider's ids are populated; show just those (obfuscated).
     match tx.provider:
@@ -1229,9 +1219,16 @@ def redeem_payment(
             # WHERE values
             token=payment_tx.google_payment_token,
             order_id=payment_tx.google_order_id,
-            account_id=google_obfuscated_account_id_from_master_pkey(master_pkey),
+            # The account tag Google attests IS the master pubkey (the client sets obfuscatedAccountId
+            # to it verbatim), so binding is a direct byte-equality against the request-signed key.
+            account_id=bytes(master_pkey),
         )
     elif payment_tx.provider == base.PaymentProvider.iOSAppStore:
+        # Import the Apple provider lazily, only on the Apple redeem path: a bare `import backend`
+        # (main/mule/cli) must not pull the Apple SDK in. Zero footprint when disabled; mirrors the
+        # Google lazy-import discipline. DO NOT hoist.
+        from providers import app_store
+
         row_result = db.query(
             tx.conn,
             '''
@@ -1245,7 +1242,9 @@ def redeem_payment(
             redeemed_at=redeemed_at,
             # WHERE fields
             tx_id=payment_tx.apple_tx_id,
-            account_token=apple_obfuscated_account_id_from_master_pkey(master_pkey),
+            # Apple attests appAccountToken = UUID(first 16 bytes of the master pubkey); binding is
+            # equality against the same UUID recomputed from the request-signed key.
+            account_token=app_store.uuid_from_master_pk(bytes(master_pkey)),
         )
     elif payment_tx.provider == base.PaymentProvider.Rangeproof:
         row_result = db.query(

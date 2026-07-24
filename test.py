@@ -633,7 +633,7 @@ def test_provider_dry_run_redeems_google_without_egress(monkeypatch, pg_database
             purchased_at=now,
             expires_at=redeemed_at + datetime.timedelta(days=30),
             platform_refund_expires_at=base.EPOCH,
-            platform_obfuscated_account_id=backend.google_obfuscated_account_id_from_master_pkey(master_key.verify_key),
+            platform_obfuscated_account_id=bytes(master_key.verify_key),
             err=err,
         )
         assert not err.msg_list, f'{err.msg_list}'
@@ -735,7 +735,7 @@ def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_d
             purchased_at=now,
             expires_at=it.expires_at,
             platform_refund_expires_at=base.EPOCH,
-            platform_obfuscated_account_id=backend.google_obfuscated_account_id_from_master_pkey(master_key.verify_key),
+            platform_obfuscated_account_id=bytes(master_key.verify_key),
             err=err,
         )
         assert not err.msg_list
@@ -967,9 +967,7 @@ def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_d
             purchased_at=now,
             expires_at=it.expires_at,
             platform_refund_expires_at=base.EPOCH,
-            platform_obfuscated_account_id=backend.google_obfuscated_account_id_from_master_pkey(
-                auto_redeem_user_master_key.verify_key
-            ),
+            platform_obfuscated_account_id=bytes(auto_redeem_user_master_key.verify_key),
             err=err,
         )
         assert not err.msg_list
@@ -1092,7 +1090,7 @@ def test_revocation_cutting_refund_rolls_generation(monkeypatch, pg_database):
             purchased_at=now,
             expires_at=expires_at,
             platform_refund_expires_at=base.EPOCH,
-            platform_obfuscated_account_id=backend.google_obfuscated_account_id_from_master_pkey(master_key.verify_key),
+            platform_obfuscated_account_id=bytes(master_key.verify_key),
             err=err,
         )
         user_tx = backend.UserPaymentTransaction()
@@ -1179,7 +1177,7 @@ def test_apple_refund_reversal_reinstates_and_rolls_generation(pg_database):
             purchased_at=now,
             expires_at=expires_at,
             platform_refund_expires_at=base.EPOCH,
-            platform_obfuscated_account_id='',
+            platform_obfuscated_account_id=app_store.uuid_from_master_pk(bytes(master_key.verify_key)),
             err=err,
         )
         assert not err.has(), err.msg_list
@@ -1250,6 +1248,96 @@ def test_apple_refund_reversal_reinstates_and_rolls_generation(pg_database):
         db_engine.close()
 
 
+def test_payment_binding_rejects_mismatched_master_key(monkeypatch, pg_database):
+    '''The store-attested account tag binds a redeem to exactly one master key: a purchase tagged for
+    key A cannot be claimed by a different key B, even though B's own request signature is valid.
+    Covers both providers -- Google's raw-pubkey tag and Apple's derived-UUID tag -- i.e. the property
+    that closes the Apple tx_id authorization hole (the old `''` stub let any key claim any tx_id).'''
+    # Google's redeem path fetches+acks against Google; stub both so the owner-success path stays local.
+    monkeypatch.setattr("providers.google_play.api.subscription_v1_acknowledge", lambda *a, **k: None)
+    monkeypatch.setattr(
+        "providers.google_play.api.fetch_subscription_v2_details",
+        lambda *a, **k: google_play.types.SubscriptionV2Data(),
+    )
+
+    db_engine = backend.bootstrap_db(database_url=pg_database())
+    assert db_engine
+    backend_key = nacl.signing.SigningKey.generate()
+    owner = nacl.signing.SigningKey.generate()
+    owner_rot = nacl.signing.SigningKey.generate()
+    attacker = nacl.signing.SigningKey.generate()
+    attacker_rot = nacl.signing.SigningKey.generate()
+    now = datetime.datetime.now(datetime.timezone.utc)
+    redeemed_at = base.round_datetime_to_next_day(now)
+
+    db_conn = db_engine.getconn()
+    try:
+
+        def redeem(redeem_tx, signer, rot):
+            msg = backend.make_add_pro_payment_message(
+                master_pkey=signer.verify_key, rotating_pkey=rot.verify_key, payment_tx=redeem_tx
+            )
+            return backend.verify_and_add_pro_payment(
+                conn=db_conn,
+                signing_key=backend_key,
+                request_at=now,
+                redeemed_at=redeemed_at,
+                master_pkey=signer.verify_key,
+                rotating_pkey=rot.verify_key,
+                payment_tx=redeem_tx,
+                master_sig=signer.sign(msg).signature,
+                rotating_sig=rot.sign(msg).signature,
+            )
+
+        def check_binding(seed_tx, redeem_tx, owner_tag):
+            err = base.ErrorSink()
+            backend.add_unredeemed_payment(
+                db_conn,
+                payment_tx=seed_tx,
+                plan=base.ProPlan.OneMonth,
+                purchased_at=now,
+                expires_at=redeemed_at + datetime.timedelta(days=30),
+                platform_refund_expires_at=base.EPOCH,
+                platform_obfuscated_account_id=owner_tag,
+                err=err,
+            )
+            assert not err.has(), err.msg_list
+
+            # A different key -- validly signed -- must be rejected: its derived tag != the stored tag.
+            with pytest.raises(base.FailError) as exc:
+                redeem(redeem_tx, attacker, attacker_rot)
+            assert exc.value.code == base.ErrorCode.unknown_payment
+            db_conn.rollback()
+
+            # The tagged owner can claim the very same payment.
+            assert redeem(redeem_tx, owner, owner_rot).status == backend.RedeemPaymentStatus.Success
+
+        # Google: the tag is the raw 32-byte master pubkey.
+        g_seed = base.PaymentProviderTransaction()
+        g_seed.provider = base.PaymentProvider.GooglePlayStore
+        g_seed.google_payment_token = os.urandom(8).hex()
+        g_seed.google_order_id = os.urandom(8).hex()
+        g_redeem = backend.UserPaymentTransaction()
+        g_redeem.provider = base.PaymentProvider.GooglePlayStore
+        g_redeem.google_payment_token = g_seed.google_payment_token
+        g_redeem.google_order_id = g_seed.google_order_id
+        check_binding(g_seed, g_redeem, bytes(owner.verify_key))
+
+        # Apple: the tag is the derived v4 UUID of the pubkey.
+        a_seed = base.PaymentProviderTransaction()
+        a_seed.provider = base.PaymentProvider.iOSAppStore
+        a_seed.apple_original_tx_id = os.urandom(8).hex()
+        a_seed.apple_tx_id = os.urandom(8).hex()
+        a_seed.apple_web_line_order_tx_id = os.urandom(8).hex()
+        a_redeem = backend.UserPaymentTransaction()
+        a_redeem.provider = base.PaymentProvider.iOSAppStore
+        a_redeem.apple_tx_id = a_seed.apple_tx_id
+        check_binding(a_seed, a_redeem, app_store.uuid_from_master_pk(bytes(owner.verify_key)))
+    finally:
+        db_engine.putconn(db_conn)
+        db_engine.close()
+
+
 def test_bump_revocation_ticket(pg_database):
     """Item 7: the manual DR bump (backing the `revoke bump-ticket` CLI command) advances the monotonic
     revocation ticket by the given amount and returns the new value. Used to recover after a DB restore
@@ -1313,7 +1401,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
         purchased_at=request_at,
         expires_at=next_day_at + datetime.timedelta(days=90),
         platform_refund_expires_at=base.EPOCH,
-        platform_obfuscated_account_id=backend.google_obfuscated_account_id_from_master_pkey(master_key.verify_key),
+        platform_obfuscated_account_id=bytes(master_key.verify_key),
         err=err,
     )
     assert not err.msg_list, f'{err.msg_list}'
@@ -1533,7 +1621,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
         purchased_at=request_at,
         expires_at=request_at + datetime.timedelta(days=30),
         platform_refund_expires_at=base.EPOCH,
-        platform_obfuscated_account_id=backend.google_obfuscated_account_id_from_master_pkey(master_key.verify_key),
+        platform_obfuscated_account_id=bytes(master_key.verify_key),
         err=err,
     )
 
@@ -2392,6 +2480,13 @@ def test_apple_grace_period_stores_duration_not_absolute_date(pg_database):
 def test_platform_apple(pg_database):
     err = base.ErrorSink()
 
+    # One Session account is claimed then auto-redeemed across every phase below; the client sets this
+    # UUID as each purchase's appAccountToken, so the notifications carry it and the redeem (and the
+    # later auto-redeems) bind against it.
+    master_key = nacl.signing.SigningKey.generate()
+    rotating_key = nacl.signing.SigningKey.generate()
+    apple_token = app_store.uuid_from_master_pk(bytes(master_key.verify_key))
+
     # NOTE: These tests were using the old debug product id, "com.getsession.org.pro_sub" which was
     # for 1 week. The codebase shortly after removed these but the captured data was from prior to
     # that. For the most part, the tests still work if we patch up the productId even though the
@@ -2458,7 +2553,7 @@ def test_platform_apple(pg_database):
         renewal_info.signedDate = 1759302518835
 
         tx_info = AppleJWSTransactionDecodedPayload()
-        tx_info.appAccountToken = None
+        tx_info.appAccountToken = apple_token
         tx_info.appTransactionId = '704897469903383919'
         tx_info.bundleId = 'com.loki-project.loki-messenger'
         tx_info.currency = 'AUD'
@@ -2512,10 +2607,7 @@ def test_platform_apple(pg_database):
             assert unredeemed_list[0].apple.tx_id == tx_info.transactionId
             assert unredeemed_list[0].apple.web_line_order_tx_id == tx_info.webOrderLineItemId
 
-        # NOTE: Then claim the payment
-        master_key = nacl.signing.SigningKey.generate()
-        rotating_key = nacl.signing.SigningKey.generate()
-
+        # NOTE: Then claim the payment (master_key/rotating_key generated at the top of the test)
         add_pro_payment_tx = backend.UserPaymentTransaction()
         add_pro_payment_tx.provider = base.PaymentProvider.iOSAppStore
         add_pro_payment_tx.apple_tx_id = unredeemed_list[0].apple.tx_id
@@ -2657,7 +2749,7 @@ def test_platform_apple(pg_database):
 
         # NOTE: Signed Transaction Info
         tx_info = AppleJWSTransactionDecodedPayload()
-        tx_info.appAccountToken = None
+        tx_info.appAccountToken = apple_token
         tx_info.appTransactionId = '704897469903383919'
         tx_info.bundleId = 'com.loki-project.loki-messenger'
         tx_info.currency = 'AUD'
@@ -2783,7 +2875,7 @@ def test_platform_apple(pg_database):
 
         # NOTE: Signed Transaction Info
         tx_info = AppleJWSTransactionDecodedPayload()
-        tx_info.appAccountToken = None
+        tx_info.appAccountToken = apple_token
         tx_info.appTransactionId = '704897469903383919'
         tx_info.bundleId = 'com.loki-project.loki-messenger'
         tx_info.currency = 'AUD'
@@ -2909,7 +3001,7 @@ def test_platform_apple(pg_database):
 
         # NOTE: Signed Transaction Info
         tx_info = AppleJWSTransactionDecodedPayload()
-        tx_info.appAccountToken = None
+        tx_info.appAccountToken = apple_token
         tx_info.appTransactionId = '704897469903383919'
         tx_info.bundleId = 'com.loki-project.loki-messenger'
         tx_info.currency = 'AUD'
@@ -3069,7 +3161,7 @@ def test_platform_apple(pg_database):
 
         # NOTE: Signed Transaction Info
         e00_sub_to_3_months_tx_info = AppleJWSTransactionDecodedPayload()
-        e00_sub_to_3_months_tx_info.appAccountToken = None
+        e00_sub_to_3_months_tx_info.appAccountToken = apple_token
         e00_sub_to_3_months_tx_info.appTransactionId = '704897469903383919'
         e00_sub_to_3_months_tx_info.bundleId = 'com.loki-project.loki-messenger'
         e00_sub_to_3_months_tx_info.currency = 'AUD'
@@ -3169,7 +3261,7 @@ def test_platform_apple(pg_database):
 
         # NOTE: Signed Transaction Info
         e01_upgrade_to_1wk_tx_info = AppleJWSTransactionDecodedPayload()
-        e01_upgrade_to_1wk_tx_info.appAccountToken = None
+        e01_upgrade_to_1wk_tx_info.appAccountToken = apple_token
         e01_upgrade_to_1wk_tx_info.appTransactionId = '704897469903383919'
         e01_upgrade_to_1wk_tx_info.bundleId = 'com.loki-project.loki-messenger'
         e01_upgrade_to_1wk_tx_info.currency = 'AUD'
@@ -3269,7 +3361,7 @@ def test_platform_apple(pg_database):
 
         # NOTE: Signed Transaction Info
         e02_disable_auto_renew_tx_info = AppleJWSTransactionDecodedPayload()
-        e02_disable_auto_renew_tx_info.appAccountToken = None
+        e02_disable_auto_renew_tx_info.appAccountToken = apple_token
         e02_disable_auto_renew_tx_info.appTransactionId = '704897469903383919'
         e02_disable_auto_renew_tx_info.bundleId = 'com.loki-project.loki-messenger'
         e02_disable_auto_renew_tx_info.currency = 'AUD'
@@ -3369,7 +3461,7 @@ def test_platform_apple(pg_database):
 
         # NOTE: Signed Transaction Info
         e03_queue_downgrade_to_3_months_tx_info = AppleJWSTransactionDecodedPayload()
-        e03_queue_downgrade_to_3_months_tx_info.appAccountToken = None
+        e03_queue_downgrade_to_3_months_tx_info.appAccountToken = apple_token
         e03_queue_downgrade_to_3_months_tx_info.appTransactionId = '704897469903383919'
         e03_queue_downgrade_to_3_months_tx_info.bundleId = 'com.loki-project.loki-messenger'
         e03_queue_downgrade_to_3_months_tx_info.currency = 'AUD'
@@ -3469,7 +3561,7 @@ def test_platform_apple(pg_database):
 
         # NOTE: Signed Transaction Info
         e04_cancel_downgrade_to_3_months_tx_info = AppleJWSTransactionDecodedPayload()
-        e04_cancel_downgrade_to_3_months_tx_info.appAccountToken = None
+        e04_cancel_downgrade_to_3_months_tx_info.appAccountToken = apple_token
         e04_cancel_downgrade_to_3_months_tx_info.appTransactionId = '704897469903383919'
         e04_cancel_downgrade_to_3_months_tx_info.bundleId = 'com.loki-project.loki-messenger'
         e04_cancel_downgrade_to_3_months_tx_info.currency = 'AUD'
@@ -3569,7 +3661,7 @@ def test_platform_apple(pg_database):
 
         # NOTE: Signed Transaction Info
         e05_disable_auto_renew_tx_info = AppleJWSTransactionDecodedPayload()
-        e05_disable_auto_renew_tx_info.appAccountToken = None
+        e05_disable_auto_renew_tx_info.appAccountToken = apple_token
         e05_disable_auto_renew_tx_info.appTransactionId = '704897469903383919'
         e05_disable_auto_renew_tx_info.bundleId = 'com.loki-project.loki-messenger'
         e05_disable_auto_renew_tx_info.currency = 'AUD'
@@ -3669,7 +3761,7 @@ def test_platform_apple(pg_database):
 
         # NOTE: Signed Transaction Info
         e06_expire_voluntary_tx_info = AppleJWSTransactionDecodedPayload()
-        e06_expire_voluntary_tx_info.appAccountToken = None
+        e06_expire_voluntary_tx_info.appAccountToken = apple_token
         e06_expire_voluntary_tx_info.appTransactionId = '704897469903383919'
         e06_expire_voluntary_tx_info.bundleId = 'com.loki-project.loki-messenger'
         e06_expire_voluntary_tx_info.currency = 'AUD'
@@ -3711,10 +3803,8 @@ def test_platform_apple(pg_database):
             renewal_info=e06_expire_voluntary_renewal_info,
         )
 
-        # NOTE: Execute and test notifications
+        # NOTE: Execute and test notifications (master_key/rotating_key from the top of the test)
         err = base.ErrorSink()
-        master_key = nacl.signing.SigningKey.generate()
-        rotating_key = nacl.signing.SigningKey.generate()
 
         # NOTE: Witness 3 month subscription
         unredeemed_payment_list = []
@@ -4108,7 +4198,7 @@ def test_platform_apple(pg_database):
 
         # NOTE: Signed Transaction Info
         e00_sub_to_3_months_tx_info = AppleJWSTransactionDecodedPayload()
-        e00_sub_to_3_months_tx_info.appAccountToken = None
+        e00_sub_to_3_months_tx_info.appAccountToken = apple_token
         e00_sub_to_3_months_tx_info.appTransactionId = '704897469903383919'
         e00_sub_to_3_months_tx_info.bundleId = 'com.loki-project.loki-messenger'
         e00_sub_to_3_months_tx_info.currency = 'AUD'
@@ -4216,7 +4306,7 @@ def test_platform_apple(pg_database):
 
         # NOTE: Signed Transaction Info
         e01_consumption_req_tx_info = AppleJWSTransactionDecodedPayload()
-        e01_consumption_req_tx_info.appAccountToken = None
+        e01_consumption_req_tx_info.appAccountToken = apple_token
         e01_consumption_req_tx_info.appTransactionId = '704897469903383919'
         e01_consumption_req_tx_info.bundleId = 'com.loki-project.loki-messenger'
         e01_consumption_req_tx_info.currency = 'AUD'
@@ -4324,7 +4414,7 @@ def test_platform_apple(pg_database):
 
         # NOTE: Signed Transaction Info
         e02_apple_refund_tx_info = AppleJWSTransactionDecodedPayload()
-        e02_apple_refund_tx_info.appAccountToken = None
+        e02_apple_refund_tx_info.appAccountToken = apple_token
         e02_apple_refund_tx_info.appTransactionId = '704897469903383919'
         e02_apple_refund_tx_info.bundleId = 'com.loki-project.loki-messenger'
         e02_apple_refund_tx_info.currency = 'AUD'
@@ -4422,9 +4512,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             seed = bytes([0x01] * 32)
             self.master_key = nacl.signing.SigningKey(seed)
             self.rotating_key = nacl.signing.SigningKey.generate()
-            self.google_obfuscated_account_id = backend.google_obfuscated_account_id_from_master_pkey(
-                self.master_key.verify_key
-            )
+            self.google_obfuscated_account_id = bytes(self.master_key.verify_key)
 
     @dataclasses.dataclass
     class TestTx:
