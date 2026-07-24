@@ -55,15 +55,6 @@ FLASK_CONFIG_DB_URL_KEY = 'session_pro_backend_db_url'
 # the flask config rather than the DB so it never touches the database (or its backups).
 FLASK_CONFIG_BACKEND_SKEY_KEY = 'session_pro_backend_signing_key'
 
-# Name of the endpoints exposed on the server
-FLASK_ROUTE_ADD_PRO_PAYMENT = '/add_pro_payment'
-FLASK_ROUTE_GENERATE_PRO_PROOF = '/generate_pro_proof'
-FLASK_ROUTE_GET_PRO_REVOCATIONS = '/get_pro_revocations'
-FLASK_ROUTE_GET_PRO_STATUS = '/get_pro_status'
-FLASK_ROUTE_GET_PAYMENT_DETAILS = '/get_payment_details'
-FLASK_ROUTE_SET_PAYMENT_REFUND_REQUESTED = '/set_payment_refund_requested'
-FLASK_ROUTE_STATUS = '/status'
-
 # The object containing routes that you register onto a Flask app to turn it
 # into an app that accepts Session Pro Backend client requests.
 flask_blueprint = flask.Blueprint('session-pro-backend-blueprint', __name__)
@@ -135,7 +126,7 @@ def init(
     return result
 
 
-@flask_blueprint.route(FLASK_ROUTE_STATUS, methods=['GET', 'POST'])
+@flask_blueprint.route('/status', methods=['GET', 'POST'])
 def status():
     # Health/readiness probe. Unauthenticated, no DB access, no request body — reachable both directly
     # (a plain GET, for monitors) and over the v4 onion transport (GET or POST). Returns the backend
@@ -151,7 +142,7 @@ def status():
     )
 
 
-@flask_blueprint.route(FLASK_ROUTE_ADD_PRO_PAYMENT, methods=['POST'])
+@flask_blueprint.route('/add_pro_payment', methods=['POST'])
 def add_pro_payment():
     # Extract + validate request fields (each raises FailError(invalid_request) on the first bad field).
     get_json = get_json_from_flask_request(flask.request)
@@ -204,7 +195,7 @@ def add_pro_payment():
             return make_success_response(dict_result=redeemed_payment.proof.to_dict())
 
 
-@flask_blueprint.route(FLASK_ROUTE_GENERATE_PRO_PROOF, methods=['POST'])
+@flask_blueprint.route('/generate_pro_proof', methods=['POST'])
 def generate_pro_proof() -> flask.Response:
     # Extract + validate request fields (each raises FailError(invalid_request) on the first bad field).
     get_json = get_json_from_flask_request(flask.request)
@@ -252,7 +243,7 @@ def generate_pro_proof() -> flask.Response:
             return make_success_response(dict_result=proof.to_dict())
 
 
-@flask_blueprint.route(FLASK_ROUTE_GET_PRO_REVOCATIONS, methods=['POST'])
+@flask_blueprint.route('/get_pro_revocations', methods=['POST'])
 def get_pro_revocations():
     get_json = get_json_from_flask_request(flask.request)
     ticket: int = base.json_dict_require_int(get_json, 'ticket')
@@ -349,7 +340,7 @@ def _payment_item_wire(
     }
 
 
-@flask_blueprint.route(FLASK_ROUTE_GET_PRO_STATUS, methods=['POST'])
+@flask_blueprint.route('/get_pro_status', methods=['POST'])
 def get_pro_status():
     # Cheap, hot-path entitlement check: the account's Pro status + the single latest payment item. No
     # history, no pagination — this is what clients hit to render "am I Pro?" / the Pro-settings screen.
@@ -419,7 +410,7 @@ def get_pro_status():
     )
 
 
-@flask_blueprint.route(FLASK_ROUTE_GET_PAYMENT_DETAILS, methods=['POST'])
+@flask_blueprint.route('/get_payment_details', methods=['POST'])
 def get_payment_details():
     # Extract + validate request fields (each raises FailError(invalid_request) on the first bad field).
     get_json = get_json_from_flask_request(flask.request)
@@ -484,7 +475,7 @@ def get_payment_details():
     return make_success_response({'payments_total': payments_total, 'items': items, 'next_cursor': next_cursor})
 
 
-@flask_blueprint.route(FLASK_ROUTE_SET_PAYMENT_REFUND_REQUESTED, methods=['POST'])
+@flask_blueprint.route('/set_payment_refund_requested', methods=['POST'])
 def set_payment_refund_requested():
     # Extract + validate request fields (each raises FailError(invalid_request) on the first bad field).
     get_json = get_json_from_flask_request(flask.request)
