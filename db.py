@@ -1,10 +1,12 @@
 """
 PostgreSQL access layer (psycopg 3) for the Session Pro backend.
 
-Connections come from a per-DSN `psycopg_pool.ConnectionPool` (autocommit). Pools are
-created on demand, cached by connection string, reset across `fork()` so each worker
-builds its own, and closed at interpreter exit. The public shape mirrors the old
-SQLAlchemy layer so callers are unchanged:
+Connections come from a per-DSN `psycopg_pool.ConnectionPool` (autocommit), created lazily
+on first use, cached by connection string, and closed at interpreter exit. A pool spawns
+background worker threads, so it must only ever be created AFTER `fork()`: each uWSGI worker
+and the mule build their own on first use, and one-shot work that runs in the pre-fork master
+(schema migration, startup reads) uses `connect_one` instead of a pool. The public shape
+mirrors the old SQLAlchemy layer so callers are unchanged:
 
     with db.open_database(dsn) as pool:      # process-wide pool for this DSN
         with db.connection(pool) as conn:    # a pooled connection
@@ -24,7 +26,6 @@ import contextlib
 import dataclasses
 import functools
 import logging
-import os
 import threading
 import traceback
 import typing
@@ -65,6 +66,18 @@ def get_pool(conninfo: str) -> psycopg_pool.ConnectionPool:
         return pool
 
 
+def connect_one(conninfo: str) -> psycopg.Connection:
+    """Open a single standalone autocommit connection (NOT pooled); use it as a context manager
+    (`with db.connect_one(dsn) as conn: ...`) so it closes promptly.
+
+    For one-shot work that must not start a pool — above all the uWSGI master's pre-fork startup
+    (schema migration, startup reads). A pool spawns background worker threads, and forking a
+    multi-threaded process leaves the children's thread state corrupt: pool teardown then segfaults
+    at reload (Python 3.13, in _PyParkingLot_Unpark). Pools belong to post-fork workers; the master
+    gets this threadless connection instead."""
+    return psycopg.connect(conninfo, autocommit=True)
+
+
 def close_pools() -> None:
     with _pools_lock:
         pools = list(_pools.values())
@@ -77,18 +90,6 @@ def close_pools() -> None:
 
 
 atexit.register(close_pools)
-
-
-def _reset_pools_after_fork() -> None:
-    # A pool's connections belong to the process that opened them; a forked child must
-    # never touch the parent's sockets. Drop the references (without closing them from
-    # the child) so each child lazily builds its own pool on next use.
-    global _pools, _pools_lock
-    _pools = {}
-    _pools_lock = threading.Lock()
-
-
-os.register_at_fork(after_in_child=_reset_pools_after_fork)
 
 
 @contextlib.contextmanager

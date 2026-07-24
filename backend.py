@@ -779,18 +779,28 @@ def bump_revocation_ticket(conn: psycopg.Connection, amount: int) -> int:
     return row[0]
 
 
+def migrate_schema(conn: psycopg.Connection) -> None:
+    """Bootstrap/migrate the schema on `conn` if needed. Raises RuntimeError on failure."""
+    try:
+        migrations.apply_migrations(conn)
+    except Exception as e:
+        raise RuntimeError('Failed to bootstrap DB tables') from e
+
+
 def bootstrap_db(database_url: str) -> psycopg_pool.ConnectionPool:
-    """Opens the database pool and bootstraps/migrates the schema if needed. Raises on failure."""
+    """Open a pool for `database_url` and migrate the schema, returning the pool. Raises on failure.
+
+    Single-process convenience (tests, CLI) where a pool is safe to open eagerly. The uWSGI master
+    must NOT use this: it runs pre-fork, and a pool's worker threads inherited across fork() corrupt
+    the children (see db.connect_one). The master migrates on a throwaway connection and lets each
+    worker build its own pool post-fork."""
     try:
         pool = db.get_pool(database_url)
     except Exception as e:
         raise RuntimeError(f'Failed to open/connect to DB at {database_url}: {e}') from e
 
-    try:
-        with db.connection(pool) as conn:
-            migrations.apply_migrations(conn)
-    except Exception as e:
-        raise RuntimeError('Failed to bootstrap DB tables') from e
+    with db.connection(pool) as conn:
+        migrate_schema(conn)
 
     return pool
 

@@ -12,7 +12,6 @@ import datetime
 import nacl.signing
 import logging
 import sys
-import psycopg_pool
 
 try:
     from uwsgidecorators import timer
@@ -123,14 +122,25 @@ def entry_point() -> flask.Flask:
         log.error(f'Failed to load backend signing key from "{parsed_args.backend_key_path}": {e}')
         sys.exit(1)
 
-    # NOTE: Open the DB (create tables if necessary)
+    # NOTE: entry_point runs in the uWSGI master, BEFORE it forks the workers and mule. Everything it
+    # does with the DB is one-shot startup work (schema migration, the startup-log read, Apple's
+    # missed-notification catch-up), so it runs on a single throwaway connection, NEVER a pool: a
+    # ConnectionPool opened here would spawn background worker threads, and forking a multi-threaded
+    # process corrupts the children's thread state — a hard segfault when the pool is closed at reload
+    # (Python 3.13). Each worker/mule builds its own pool lazily, post-fork (server.get_db -> get_pool).
     try:
-        engine: psycopg_pool.ConnectionPool = backend.bootstrap_db(database_url=parsed_args.db_url)
+        conn = db.connect_one(parsed_args.db_url)
     except Exception as e:
-        log.error(f'{e}', exc_info=True)
+        log.error(f'Failed to open/connect to DB at {parsed_args.db_url}: {e}', exc_info=True)
         sys.exit(1)
 
-    with db.connection(engine) as conn:
+    with conn:
+        try:
+            backend.migrate_schema(conn)
+        except Exception as e:
+            log.error(f'{e}', exc_info=True)
+            sys.exit(1)
+
         startup_log = '\n'
         startup_log += 'Session Pro Backend\n'
         startup_log += '  Features:\n'
