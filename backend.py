@@ -1731,6 +1731,7 @@ def add_unredeemed_payment(
     platform_refund_expires_at: datetime.datetime,
     platform_obfuscated_account_id: bytes | str,
     err: base.ErrorSink,
+    needs_ack: bool = False,
 ):
 
     if log.getEffectiveLevel() <= logging.INFO:
@@ -1768,6 +1769,9 @@ def add_unredeemed_payment(
                 'payment_token': payment_tx.google_payment_token,
                 'order_id': payment_tx.google_order_id,
                 'obfuscated_account_id': platform_obfuscated_account_id,
+                # Outstanding Google purchase-ack obligation. The mule's sweep acks and clears it; a
+                # fresh, not-yet-acknowledged purchase sets it TRUE (renewals arrive acknowledged).
+                'needs_ack': needs_ack,
             },
             dedup_keys=['payment_token', 'order_id'],
         )
@@ -2701,6 +2705,22 @@ def google_notification_message_id_is_in_db(tx: db.SQLTransaction, message_id: s
         result.present = True
         result.handled = row[0] > 0  # NOTE: Should always be 0 or 1 but we'll be extra careful
     return result
+
+
+def google_payment_tokens_needing_ack(conn: psycopg.Connection) -> list[str]:
+    """Distinct Google purchase-tokens with an outstanding acknowledgement (needs_ack). The mule's
+    sweep acks each against Google and clears the flag via google_clear_needs_ack."""
+    rows = db.query(conn, '''SELECT DISTINCT payment_token FROM google_play_payment_details WHERE needs_ack''')
+    return [row[0] for row in rows]
+
+
+@db.transactional
+def google_clear_needs_ack(tx: db.SQLTransaction, payment_token: str) -> None:
+    """Clear the acknowledgement obligation for every row of `payment_token` (a token is acknowledged as
+    a whole, so all its billing-cycle rows clear together)."""
+    db.query(
+        tx.conn, '''UPDATE google_play_payment_details SET needs_ack = FALSE WHERE payment_token = %s''', payment_token
+    )
 
 
 def _get_date_group_expr_sql(column: str, period: ReportPeriod) -> str:

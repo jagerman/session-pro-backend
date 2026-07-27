@@ -479,6 +479,83 @@ def test_google_process_notification_message(monkeypatch, pg_database):
             assert backend.has_user_error(conn, base.PaymentProvider.GooglePlayStore, 'tok-e') is True
 
 
+def test_google_ack_sweep(monkeypatch, pg_database):
+    # The mule's needs_ack sweep is the SOLE Google purchase-acker (notification handling only records the
+    # obligation). Cover its three outcomes: a clean ack clears the flag; an ack that FAILS but that Google
+    # already considers acknowledged (we acked then crashed before clearing) clears via the authoritative
+    # acknowledgement_state; a genuinely failing ack leaves the flag set to retry next sweep.
+    dsn = pg_database()
+    monkeypatch.setattr(base, 'DB_URL', dsn)  # the sweep opens its own connection via base.DB_URL
+    pool = backend.bootstrap_db(database_url=dsn)
+    assert pool
+
+    class _AckedDetails:
+        acknowledgement_state = google_play.types.SubscriptionsV2AcknowledgementState.ACKNOWLEDGED
+
+    def seed(conn, token, needs_ack):
+        tx = base.PaymentProviderTransaction()
+        tx.provider = base.PaymentProvider.GooglePlayStore
+        tx.google_payment_token = token
+        tx.google_order_id = os.urandom(backend.BLAKE2B_DIGEST_SIZE).hex()
+        err = base.ErrorSink()
+        backend.add_unredeemed_payment(
+            conn,
+            payment_tx=tx,
+            plan=base.ProPlan.OneMonth,
+            purchased_at=base.EPOCH,
+            expires_at=base.EPOCH,
+            platform_refund_expires_at=base.EPOCH,
+            platform_obfuscated_account_id=os.urandom(32),
+            err=err,
+            needs_ack=needs_ack,
+        )
+        assert not err.msg_list, err.msg_list
+
+    def flag(conn, token):
+        return db.query_one(conn, 'SELECT needs_ack FROM google_play_payment_details WHERE payment_token = %s', token)[
+            0
+        ]
+
+    tok_ok = os.urandom(32).hex()
+    tok_crashed = os.urandom(32).hex()
+    tok_fail = os.urandom(32).hex()
+    tok_already = os.urandom(32).hex()
+
+    with db.connection(pool) as conn:
+        # Each case seeds its token TRUE just before running the sweep, so the sweep (which processes all
+        # currently-TRUE tokens) only sees this case's token — no cross-case interference, no re-seeding.
+
+        # (1) Ack succeeds -> flag cleared. A FALSE row (already acknowledged at registration) is never
+        #     even selected by the sweep.
+        seed(conn, tok_already, needs_ack=False)
+        seed(conn, tok_ok, needs_ack=True)
+        monkeypatch.setattr('providers.google_play.api.subscription_v1_acknowledge', lambda purchase_token, err: None)
+        google_play.notifications._sweep_pending_acks()
+        assert flag(conn, tok_ok) is False
+        assert flag(conn, tok_already) is False
+
+        # (2) Ack FAILS but Google reports it already ACKNOWLEDGED (acked-then-crashed) -> cleared via the
+        #     authoritative acknowledgement_state fetch.
+        seed(conn, tok_crashed, needs_ack=True)
+        monkeypatch.setattr(
+            'providers.google_play.api.subscription_v1_acknowledge',
+            lambda purchase_token, err: err.msg_list.append('ack boom'),
+        )
+        monkeypatch.setattr(
+            'providers.google_play.api.fetch_subscription_v2_details', lambda pkg, token, err: _AckedDetails()
+        )
+        google_play.notifications._sweep_pending_acks()
+        assert flag(conn, tok_crashed) is False
+
+        # (3) Ack FAILS and Google does NOT confirm acknowledged (fetch returns nothing) -> flag stays set
+        #     for the next sweep. (ack stub from case 2 still in effect.)
+        seed(conn, tok_fail, needs_ack=True)
+        monkeypatch.setattr('providers.google_play.api.fetch_subscription_v2_details', lambda pkg, token, err: None)
+        google_play.notifications._sweep_pending_acks()
+        assert flag(conn, tok_fail) is True
+    pool.close()
+
+
 def test_migrations_bootstrap_and_idempotency(pg_database):
     # bootstrap_db runs the schema/ migrations; every migration file should be recorded, the globals
     # rows seeded exactly once, and a second pass must be a clean no-op (nothing re-run or duplicated).
