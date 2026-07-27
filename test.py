@@ -556,6 +556,51 @@ def test_google_ack_sweep(monkeypatch, pg_database):
     pool.close()
 
 
+def test_reconcile_pending_payments(pg_database):
+    # reconcile_pending_payments claims ALL unredeemed Google/Apple payments bound to a master key (the
+    # store-attested account id IS a function of the key), links them, and refreshes entitlement -- and
+    # touches nothing, in particular creates NO user row, for a key with no payments.
+    pool = backend.bootstrap_db(database_url=pg_database())
+    assert pool
+
+    master = nacl.signing.SigningKey.generate()
+    other = nacl.signing.SigningKey.generate()
+    now = base.round_datetime_to_next_day(datetime.datetime.now(datetime.timezone.utc))
+
+    def seed_google(conn, master_vk):
+        tx = base.PaymentProviderTransaction()
+        tx.provider = base.PaymentProvider.GooglePlayStore
+        tx.google_payment_token = os.urandom(backend.BLAKE2B_DIGEST_SIZE).hex()
+        tx.google_order_id = os.urandom(backend.BLAKE2B_DIGEST_SIZE).hex()
+        err = base.ErrorSink()
+        backend.add_unredeemed_payment(
+            conn,
+            payment_tx=tx,
+            plan=base.ProPlan.OneMonth,
+            purchased_at=now,
+            expires_at=now + datetime.timedelta(days=30),
+            platform_refund_expires_at=base.EPOCH,
+            platform_obfuscated_account_id=bytes(master_vk),
+            err=err,
+        )
+        assert not err.msg_list, err.msg_list
+
+    with db.connection(pool) as conn:
+        # Two unredeemed Google payments for the same key (e.g. a device offline across a renewal).
+        seed_google(conn, master.verify_key)
+        seed_google(conn, master.verify_key)
+
+        assert backend.reconcile_pending_payments(conn, master.verify_key, redeemed_at=now) == 2  # claim-ALL
+        assert backend.get_user(conn, master.verify_key).found  # user created + entitled
+        # Idempotent: nothing left unredeemed.
+        assert backend.reconcile_pending_payments(conn, master.verify_key, redeemed_at=now) == 0
+
+        # A key with no payments claims nothing AND must not spawn a user row.
+        assert backend.reconcile_pending_payments(conn, other.verify_key, redeemed_at=now) == 0
+        assert not backend.get_user(conn, other.verify_key).found
+    pool.close()
+
+
 def test_migrations_bootstrap_and_idempotency(pg_database):
     # bootstrap_db runs the schema/ migrations; every migration file should be recorded, the globals
     # rows seeded exactly once, and a second pass must be a clean no-op (nothing re-run or duplicated).

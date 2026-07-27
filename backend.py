@@ -1389,6 +1389,57 @@ def redeem_payment(
     return result
 
 
+@db.transactional
+def reconcile_pending_payments(
+    tx: db.SQLTransaction, master_pkey: nacl.signing.VerifyKey, redeemed_at: datetime.datetime
+) -> int:
+    """Redeem every unredeemed, unrevoked Google/Apple payment bound to `master_pkey`, link the claimed
+    payments to the user, refresh entitlement, and return how many were newly claimed.
+
+    The stores attest the account identifier AS a function of the master key — Google's
+    obfuscatedAccountId is the pubkey verbatim, Apple's appAccountToken is uuid_from_master_pk(pubkey) —
+    so holding the key IS the claim; there's no separate client-supplied token to match. This is the
+    reconcile step every master-key-authenticated endpoint runs up front, so a payment the mule has
+    already registered gets bound to its owner on the owner's next request, whichever endpoint that is.
+
+    Claim-all: a key legitimately accumulates several unredeemed payments (e.g. a device offline across a
+    couple of renewals). A no-match is not an error and touches nothing — in particular NO user row is
+    created for a key with no payments, so a signed-but-payment-less status probe can't spawn users."""
+    from providers import app_store
+
+    def claim(detail_table: str, account_column: str, account_value: bytes | str) -> list[int]:
+        # detail_table/account_column are module-internal literals (never request data), so interpolating
+        # them is safe; the account value is always a bound parameter.
+        rows = db.query(
+            tx.conn,
+            f'''
+            UPDATE payments
+            SET    redeemed_at = %(redeemed_at)s
+            WHERE  id IN (SELECT payment_id FROM {detail_table} WHERE {account_column} = %(account)s)
+              AND  redeemed_at IS NULL AND revoked_at IS NULL
+            RETURNING id
+            ''',
+            redeemed_at=redeemed_at,
+            account=account_value,
+        )
+        return [row[0] for row in rows.fetchall()]
+
+    claimed = claim('google_play_payment_details', 'obfuscated_account_id', bytes(master_pkey))
+    claimed += claim(
+        'app_store_payment_details', 'app_account_token', app_store.uuid_from_master_pk(bytes(master_pkey))
+    )
+    if not claimed:
+        return 0
+
+    # master_pkey lives only in `users`: ensure the identity row (+ its generation) exists, link the
+    # just-claimed payments to it, then refresh entitlement (reuses the current generation — a redeem
+    # never rolls it, so the client's revocation_tag is untouched).
+    user_id = get_or_create_user_and_generation(tx, master_pkey, issued_at=redeemed_at)[0]
+    db.query(tx.conn, 'UPDATE payments SET user_id = %(user_id)s WHERE id = ANY(%(ids)s)', user_id=user_id, ids=claimed)
+    _ensure_active_generation(tx, master_pkey, issued_at=redeemed_at)
+    return len(claimed)
+
+
 def verify_payment_provider_tx(payment_tx: base.PaymentProviderTransaction, err: base.ErrorSink):
     base.verify_payment_provider(payment_tx.provider, err)
     match payment_tx.provider:
