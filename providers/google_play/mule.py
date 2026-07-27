@@ -1,13 +1,15 @@
 '''
-Maintenance mule for the Session Pro Backend. Run as a uWSGI mule (`mule = mule:run` in the vassal ini)
-so the Google Pub/Sub notification subscriber runs in exactly ONE process — a single consumer, off the
-request workers.
+Maintenance mule for the Google Play provider. Run as a uWSGI mule
+(`mule = providers.google_play.mule:run` in the vassal ini) so the Google Pub/Sub notification
+subscriber runs in exactly ONE process — a single consumer, off the request workers. This mule is
+deliberately Google-specific: another provider that needs a background consumer gets its OWN mule
+(uWSGI supports any number), so a stall in one provider's subscriber can't hold up another's.
 
 The periodic DB prune is NOT here: a mule cannot register uWSGI signals/timers, so it runs on worker 1
 via a `@timer(target='worker1')` in main.py instead.
 
-`run()` executes in the mule *post-fork*, so all Google/gRPC state is constructed here, never at module
-import in the master.
+`run()` executes in the mule *post-fork*. gRPC's fork-hostile background threads are still constructed
+lazily inside the subscriber thread (see notifications.thread_entry_point), never at import in the master.
 '''
 
 import atexit
@@ -18,6 +20,8 @@ import threading
 import base
 import backend
 import config
+
+from . import api, notifications
 
 log = logging.getLogger('PRO')
 
@@ -50,22 +54,18 @@ def run() -> None:
         threading.Event().wait()
         return
 
-    # Import the Google provider only when enabled — disabled means nothing of it loads (keeps grpcio
-    # out of the mule until here, post-fork). DO NOT hoist to module scope.
-    from providers import google_play
-
-    google_play.log.handlers.clear()
-    google_play.log.addHandler(handler)
+    notifications.log.handlers.clear()
+    notifications.log.addHandler(handler)
     if base.PROVIDER_TESTING_ENV:
-        base.DEFAULT_GOOGLE_GRACE_PERIOD = base.timedelta_from_ms(google_play.api.testing_grace_period_duration_ms)
-    context = google_play.start_subscriber(
+        base.DEFAULT_GOOGLE_GRACE_PERIOD = base.timedelta_from_ms(api.testing_grace_period_duration_ms)
+    context = notifications.start_subscriber(
         cloud_project_id=parsed.google_cloud_project_id,
         package_name=parsed.google_package_name,
         cloud_subscription_name=parsed.google_cloud_subscription_name,
         subscription_product_id=parsed.google_subscription_product_id,
         app_credentials_path=parsed.google_cloud_app_credentials_path,
     )
-    atexit.register(google_play.stop_subscriber, context)
+    atexit.register(notifications.stop_subscriber, context)
     log.info('Maintenance mule: Google subscriber started')
 
     # Keep the mule alive by blocking on the subscriber thread — no sleep loop. If that thread ever
