@@ -2425,6 +2425,12 @@ def generate_pro_proof(
     )
 
     with db.transaction(conn) as tx:
+        # Reconcile first: claim any payment the mule has already registered for this key but that hasn't
+        # been redeemed yet, so a client's post-purchase proof request binds it right here — no separate
+        # redeem call. A no-op when there's nothing new. Then build the proof from the current entitlement
+        # (build_current_entitlement_proof raises the truthful "no Pro" slug if there's still nothing, which
+        # the client treats as "not yet — retry").
+        reconcile_pending_payments(tx, master_pkey, redeemed_at=to_redeemed_at(request_at))
         return build_current_entitlement_proof(tx, master_pkey, rotating_pkey, request_at, signing_key)
 
 

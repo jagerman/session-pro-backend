@@ -601,6 +601,56 @@ def test_reconcile_pending_payments(pg_database):
     pool.close()
 
 
+def test_generate_pro_proof_auto_redeems(pg_database):
+    # The reflow core: a proof request reconciles first, so a payment the mule registered (unredeemed) is
+    # bound AND proven on the client's proof call -- no separate /add_pro_payment redeem step.
+    pool = backend.bootstrap_db(database_url=pg_database())
+    assert pool
+    backend_key = nacl.signing.SigningKey.generate()
+    master_key = nacl.signing.SigningKey.generate()
+    rotating_key = nacl.signing.SigningKey.generate()
+    now = base.round_datetime_to_next_day(datetime.datetime.now(datetime.timezone.utc))
+
+    with db.connection(pool) as conn:
+        # A mule-registered, unredeemed Google payment bound to the master key.
+        seed_tx = base.PaymentProviderTransaction()
+        seed_tx.provider = base.PaymentProvider.GooglePlayStore
+        seed_tx.google_payment_token = os.urandom(backend.BLAKE2B_DIGEST_SIZE).hex()
+        seed_tx.google_order_id = os.urandom(backend.BLAKE2B_DIGEST_SIZE).hex()
+        err = base.ErrorSink()
+        backend.add_unredeemed_payment(
+            conn,
+            payment_tx=seed_tx,
+            plan=base.ProPlan.OneMonth,
+            purchased_at=now,
+            expires_at=now + datetime.timedelta(days=30),
+            platform_refund_expires_at=base.EPOCH,
+            platform_obfuscated_account_id=bytes(master_key.verify_key),
+            err=err,
+        )
+        assert not err.msg_list, err.msg_list
+        assert len(backend.get_unredeemed_payments_list(conn)) == 1
+
+        # Proof request with NO explicit redeem -> auto-redeems + returns a valid proof.
+        hash_to_sign = backend.make_generate_pro_proof_message(
+            master_pkey=master_key.verify_key, rotating_pkey=rotating_key.verify_key, request_at=now
+        )
+        proof = backend.generate_pro_proof(
+            conn=conn,
+            signing_key=backend_key,
+            master_pkey=master_key.verify_key,
+            rotating_pkey=rotating_key.verify_key,
+            request_at=now,
+            master_sig=bytes(master_key.sign(hash_to_sign).signature),
+            rotating_sig=bytes(rotating_key.sign(hash_to_sign).signature),
+        )
+        # The proof verifies against the backend key, and the payment is now redeemed.
+        proof_hash = backend.build_proof_message(proof.revocation_tag, proof.rotating_pkey, proof.expires_at)
+        backend_key.verify_key.verify(smessage=proof_hash, signature=proof.sig)
+        assert not backend.get_unredeemed_payments_list(conn)
+    pool.close()
+
+
 def test_migrations_bootstrap_and_idempotency(pg_database):
     # bootstrap_db runs the schema/ migrations; every migration file should be recorded, the globals
     # rows seeded exactly once, and a second pass must be a clean no-op (nothing re-run or duplicated).
