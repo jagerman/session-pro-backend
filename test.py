@@ -651,6 +651,35 @@ def test_generate_pro_proof_auto_redeems(pg_database):
     pool.close()
 
 
+def test_grant_rangeproof(pg_database):
+    # Admin/CLI Rangeproof grant: create an already-redeemed payment linked to a master key and return a
+    # proof -- no voucher, no client claim step.
+    pool = backend.bootstrap_db(database_url=pg_database())
+    assert pool
+    backend_key = nacl.signing.SigningKey.generate()
+    master_key = nacl.signing.SigningKey.generate()
+    rotating_key = nacl.signing.SigningKey.generate()
+    now = base.round_datetime_to_next_day(datetime.datetime.now(datetime.timezone.utc))
+
+    with db.connection(pool) as conn:
+        assert not backend.get_user(conn, master_key.verify_key).found
+        proof = backend.grant_rangeproof(
+            conn,
+            master_pkey=master_key.verify_key,
+            rotating_pkey=rotating_key.verify_key,
+            signing_key=backend_key,
+            request_at=now,
+            redeemed_at=now,
+            plan=base.ProPlan.OneMonth,
+            expires_at=now + datetime.timedelta(days=30),
+        )
+        # The proof verifies against the backend key, and the key is now an entitled user.
+        proof_hash = backend.build_proof_message(proof.revocation_tag, proof.rotating_pkey, proof.expires_at)
+        backend_key.verify_key.verify(smessage=proof_hash, signature=proof.sig)
+        assert backend.get_user(conn, master_key.verify_key).found
+    pool.close()
+
+
 def test_migrations_bootstrap_and_idempotency(pg_database):
     # bootstrap_db runs the schema/ migrations; every migration file should be recorded, the globals
     # rows seeded exactly once, and a second pass must be a clean no-op (nothing re-run or duplicated).

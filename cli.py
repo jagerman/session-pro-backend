@@ -762,14 +762,25 @@ def cmd_voucher(args: argparse.Namespace) -> int:
         print(f"ERROR: {e}", file=sys.stderr)
         return 1
 
+    # Load the backend signing key from disk (not stored in the DB) before opening the transaction.
+    if not config.backend_key_path:
+        print("ERROR: No backend signing key configured ([base] backend_key_path)", file=sys.stderr)
+        return 1
+    try:
+        backend_key = backend.load_backend_signing_key(config.backend_key_path)
+    except Exception as e:
+        print(f"ERROR: Failed to load backend signing key: {e}", file=sys.stderr)
+        return 1
+
     try:
         with db.open_database(config.db_url) as engine:
             with db.connection(engine) as conn:
                 with db.transaction(conn) as tx:
                     request_at = base.datetime_from_unix_ms(int(time.time() * 1000))
 
-                    # Step 1: mint the payment, unredeemed (shared with the /dev/add_payment route).
-                    print(f'\nStep 1: Creating unredeemed {provider.value} payment...')
+                    # Step 1: mint the payment and redeem it (shared with the /dev/add_payment route).
+                    # Redemption registers the entitlement (user row + generation) without minting a proof.
+                    print(f'\nStep 1: Minting and redeeming {provider.value} payment...')
                     minted = minting.mint_payment(
                         tx,
                         master_pkey=master_pkey,
@@ -777,44 +788,24 @@ def cmd_voucher(args: argparse.Namespace) -> int:
                         plan=plan,
                         now=request_at,
                         duration=duration,
-                        redeem=False,
+                        redeem=True,
                     )
-                    print(f"Success: Unredeemed payment created (payment_id: {minted.payment_id})")
+                    print(f"Success: payment redeemed (payment_id: {minted.payment_id})")
 
-                    # Load the backend signing key from disk. It is not stored in the DB.
-                    if not config.backend_key_path:
-                        print("ERROR: No backend signing key configured ([base] backend_key_path)", file=sys.stderr)
-                        return 1
-                    else:
-                        try:
-                            backend_key = backend.load_backend_signing_key(config.backend_key_path)
-                        except Exception as e:
-                            print(f"ERROR: Failed to load backend signing key: {e}", file=sys.stderr)
-                            return 1
-
-                    # Step 2: Redeem the payment via add_pro_payment (raises on failure → caught below).
-                    print('\nStep 2: Redeeming payment and generating pro proof...')
-                    redeem_result = backend.add_pro_payment(
+                    # Step 2: build the proof over the now-active entitlement.
+                    print('\nStep 2: Generating pro proof...')
+                    proof = backend.build_current_entitlement_proof(
                         tx,
-                        signing_key=backend_key,
-                        request_at=request_at,
-                        redeemed_at=backend.to_redeemed_at(request_at),
-                        master_pkey=master_pkey,
-                        rotating_pkey=rotating_pkey,
-                        payment_tx=backend.UserPaymentTransaction(
-                            provider=provider,
-                            apple_tx_id=minted.payment_tx.apple_tx_id,
-                            rangeproof_order_id=minted.payment_tx.rangeproof_order_id,
-                            google_payment_token=minted.payment_tx.google_payment_token,
-                            google_order_id=minted.payment_tx.google_order_id,
-                            payment_id=minted.payment_id,
-                        ),
+                        master_pkey,
+                        rotating_pkey,
+                        request_at,
+                        backend_key,
                     )
 
-                    print("Success: Payment redeemed and pro proof generated")
+                    print(f"Success: {provider.value} payment granted and pro proof generated")
                     print('\nProof Details:')
-                    print(f'  Expiry: {base.readable(redeem_result.proof.expires_at)}')
-                    print(f'  Revocation Tag: {redeem_result.proof.revocation_tag.hex()}')
+                    print(f'  Expiry: {base.readable(proof.expires_at)}')
+                    print(f'  Revocation Tag: {proof.revocation_tag.hex()}')
 
                     return 0
 

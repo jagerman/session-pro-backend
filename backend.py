@@ -11,6 +11,7 @@ import logging
 import enum
 import csv
 import io
+import uuid
 
 import base
 import db
@@ -2422,6 +2423,62 @@ def generate_pro_proof(
         # the client treats as "not yet — retry").
         reconcile_pending_payments(tx, master_pkey, redeemed_at=to_redeemed_at(request_at))
         return build_current_entitlement_proof(tx, master_pkey, rotating_pkey, request_at, signing_key)
+
+
+@db.transactional
+def grant_rangeproof(
+    tx: db.SQLTransaction,
+    master_pkey: nacl.signing.VerifyKey,
+    rotating_pkey: nacl.signing.VerifyKey,
+    signing_key: nacl.signing.SigningKey,
+    request_at: datetime.datetime,
+    redeemed_at: datetime.datetime,
+    plan: base.ProPlan,
+    expires_at: datetime.datetime,
+) -> ProSubscriptionProof:
+    """Directly grant a Rangeproof (dev-house) Pro payment to `master_pkey` and return the proof.
+    Admin/CLI only: there is no client-facing voucher flow — a real one-time-use voucher, with a client
+    claim path, is future work. `rangeproof_payment_details.order_id` here is an internal unique row id,
+    not a voucher; we create the payment already redeemed and linked to the key, then build the proof."""
+    order_id = str(uuid.uuid4())
+    err = base.ErrorSink()
+    payment_tx = base.PaymentProviderTransaction()
+    payment_tx.provider = base.PaymentProvider.Rangeproof
+    payment_tx.rangeproof_order_id = order_id
+    add_unredeemed_payment(
+        tx,
+        payment_tx=payment_tx,
+        plan=plan,
+        expires_at=expires_at,
+        purchased_at=redeemed_at,
+        platform_refund_expires_at=base.EPOCH,
+        platform_obfuscated_account_id=b'',
+        err=err,
+    )
+    if err.has():
+        raise base.ServerError(f'Failed to create rangeproof payment: {err.build()}')
+
+    row_result = db.query(
+        tx.conn,
+        '''
+        UPDATE payments
+        SET    redeemed_at = %(redeemed_at)s
+        WHERE  id IN (SELECT payment_id FROM rangeproof_payment_details WHERE order_id = %(order_id)s)
+          AND  redeemed_at IS NULL AND revoked_at IS NULL
+        RETURNING id
+        ''',
+        redeemed_at=redeemed_at,
+        order_id=order_id,
+    )
+    redeemed_ids = [row[0] for row in row_result.fetchall()]
+    assert len(redeemed_ids) == 1, 'the rangeproof payment we just created must redeem exactly once'
+
+    user_id = get_or_create_user_and_generation(tx, master_pkey, issued_at=redeemed_at)[0]
+    db.query(
+        tx.conn, 'UPDATE payments SET user_id = %(user_id)s WHERE id = ANY(%(ids)s)', user_id=user_id, ids=redeemed_ids
+    )
+    _ensure_active_generation(tx, master_pkey, issued_at=redeemed_at)
+    return build_current_entitlement_proof(tx, master_pkey, rotating_pkey, request_at, signing_key)
 
 
 def expire_payments_revocations_and_users(conn: psycopg.Connection, now: datetime.datetime) -> ExpireResult:
