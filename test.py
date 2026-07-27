@@ -522,7 +522,7 @@ def test_status_endpoint(pg_database):
             assert isinstance(result['timestamp'], int), result
 
         # (a) Direct GET
-        response = ctx.flask_client.get(server.FLASK_ROUTE_STATUS)
+        response = ctx.flask_client.get('/status')
         assert response.status_code == 200
         body = response.get_json()
         assert body['status'] == 'ok', body
@@ -535,10 +535,7 @@ def test_status_endpoint(pg_database):
             our_x25519_skey=our_x25519_skey, server_x25519_pkey=server_x25519_skey.public_key
         )
         onion_request = onion_req.make_request_v4(
-            our_x25519_pkey=our_x25519_skey.public_key,
-            shared_key=shared_key,
-            endpoint=server.FLASK_ROUTE_STATUS,
-            request_body={},
+            our_x25519_pkey=our_x25519_skey.public_key, shared_key=shared_key, endpoint='/status', request_body={}
         )
         response = ctx.flask_client.post(onion_req.ROUTE_OXEN_V4_LSRPC, data=onion_request)
         onion_response = onion_req.make_response_v4(shared_key=shared_key, encrypted_response=response.data)
@@ -1419,7 +1416,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
     onion_request = onion_req.make_request_v4(
         our_x25519_pkey=our_x25519_skey.public_key,
         shared_key=shared_key,
-        endpoint=server.FLASK_ROUTE_GET_PRO_STATUS,
+        endpoint='/get_pro_status',
         request_body=request_body,
     )
 
@@ -1460,7 +1457,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
     onion_request = onion_req.make_request_v4(
         our_x25519_pkey=our_x25519_skey.public_key,
         shared_key=shared_key,
-        endpoint=server.FLASK_ROUTE_ADD_PRO_PAYMENT,
+        endpoint='/add_pro_payment',
         request_body={
             'master_pkey': bytes(master_key.verify_key).hex(),
             'rotating_pkey': bytes(rotating_key.verify_key).hex(),
@@ -1545,7 +1542,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
     onion_request = onion_req.make_request_v4(
         our_x25519_pkey=our_x25519_skey.public_key,
         shared_key=shared_key,
-        endpoint=server.FLASK_ROUTE_GENERATE_PRO_PROOF,
+        endpoint='/generate_pro_proof',
         request_body=request_body,
     )
 
@@ -1647,7 +1644,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
     onion_request = onion_req.make_request_v4(
         our_x25519_pkey=our_x25519_skey.public_key,
         shared_key=shared_key,
-        endpoint=server.FLASK_ROUTE_ADD_PRO_PAYMENT,
+        endpoint='/add_pro_payment',
         request_body=request_body,
     )
 
@@ -1708,7 +1705,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
     onion_request = onion_req.make_request_v4(
         our_x25519_pkey=our_x25519_skey.public_key,
         shared_key=shared_key,
-        endpoint=server.FLASK_ROUTE_GET_PRO_REVOCATIONS,
+        endpoint='/get_pro_revocations',
         request_body=request_body,
     )
 
@@ -1773,7 +1770,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
     onion_request = onion_req.make_request_v4(
         our_x25519_pkey=our_x25519_skey.public_key,
         shared_key=shared_key,
-        endpoint=server.FLASK_ROUTE_GET_PRO_REVOCATIONS,
+        endpoint='/get_pro_revocations',
         request_body=request_body,
     )
 
@@ -1823,7 +1820,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
     onion_request = onion_req.make_request_v4(
         our_x25519_pkey=our_x25519_skey.public_key,
         shared_key=shared_key,
-        endpoint=server.FLASK_ROUTE_GET_PRO_REVOCATIONS,
+        endpoint='/get_pro_revocations',
         request_body={'ticket': curr_revocation_ticket},
     )
 
@@ -1875,7 +1872,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
     onion_request = onion_req.make_request_v4(
         our_x25519_pkey=our_x25519_skey.public_key,
         shared_key=shared_key,
-        endpoint=server.FLASK_ROUTE_GET_PRO_STATUS,
+        endpoint='/get_pro_status',
         request_body=request_body,
     )
 
@@ -1911,7 +1908,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
     onion_request = onion_req.make_request_v4(
         our_x25519_pkey=our_x25519_skey.public_key,
         shared_key=shared_key,
-        endpoint=server.FLASK_ROUTE_GET_PRO_STATUS,
+        endpoint='/get_pro_status',
         request_body={
             'master_pkey': bytes(master_key.verify_key).hex(),
             'master_sig': bytes(master_key.sign(hash_to_sign).signature).hex(),
@@ -1941,7 +1938,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
     onion_request = onion_req.make_request_v4(
         our_x25519_pkey=our_x25519_skey.public_key,
         shared_key=shared_key,
-        endpoint=server.FLASK_ROUTE_GET_PRO_STATUS,
+        endpoint='/get_pro_status',
         request_body={
             'master_pkey': bytes(master_key.verify_key).hex(),
             'master_sig': bytes(master_key.sign(hash_to_sign).signature).hex(),
@@ -1977,7 +1974,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
         onion_request = onion_req.make_request_v4(
             our_x25519_pkey=our_x25519_skey.public_key,
             shared_key=shared_key,
-            endpoint=server.FLASK_ROUTE_GET_PAYMENT_DETAILS,
+            endpoint='/get_payment_details',
             request_body={
                 'master_pkey': bytes(master_key.verify_key).hex(),
                 'master_sig': bytes(master_key.sign(hash_to_sign).signature).hex(),
@@ -2027,7 +2024,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
     bad_onion = onion_req.make_request_v4(
         our_x25519_pkey=our_x25519_skey.public_key,
         shared_key=shared_key,
-        endpoint=server.FLASK_ROUTE_GET_PAYMENT_DETAILS,
+        endpoint='/get_payment_details',
         request_body={
             'master_pkey': bytes(master_key.verify_key).hex(),
             'master_sig': bytes(master_key.sign(bad_hash).signature).hex(),
@@ -2157,7 +2154,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
     onion_request = onion_req.make_request_v4(
         our_x25519_pkey=our_x25519_skey.public_key,
         shared_key=shared_key,
-        endpoint=server.FLASK_ROUTE_GENERATE_PRO_PROOF,
+        endpoint='/generate_pro_proof',
         request_body=request_body,
     )
 
@@ -2208,7 +2205,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
     onion_request = onion_req.make_request_v4(
         our_x25519_pkey=our_x25519_skey.public_key,
         shared_key=shared_key,
-        endpoint=server.FLASK_ROUTE_ADD_PRO_PAYMENT,
+        endpoint='/add_pro_payment',
         request_body={
             'master_pkey': bytes(master_key.verify_key).hex(),
             'rotating_pkey': bytes(rotating_key.verify_key).hex(),
@@ -2238,7 +2235,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
     onion_request = onion_req.make_request_v4(
         our_x25519_pkey=our_x25519_skey.public_key,
         shared_key=shared_key,
-        endpoint=server.FLASK_ROUTE_SET_PAYMENT_REFUND_REQUESTED,
+        endpoint='/set_payment_refund_requested',
         request_body=request_body,
     )
 
@@ -2284,7 +2281,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
     onion_request = onion_req.make_request_v4(
         our_x25519_pkey=our_x25519_skey.public_key,
         shared_key=shared_key,
-        endpoint=server.FLASK_ROUTE_SET_PAYMENT_REFUND_REQUESTED,
+        endpoint='/set_payment_refund_requested',
         request_body=request_body,
     )
 
@@ -2618,7 +2615,7 @@ def test_platform_apple(pg_database):
 
         # NOTE: POST and get response
         response = test.flask_client.post(
-            server.FLASK_ROUTE_ADD_PRO_PAYMENT,
+            '/add_pro_payment',
             json={
                 'master_pkey': bytes(master_key.verify_key).hex(),
                 'rotating_pkey': bytes(rotating_key.verify_key).hex(),
@@ -3851,7 +3848,7 @@ def test_platform_apple(pg_database):
 
         # NOTE: POST and get response
         response = test.flask_client.post(
-            server.FLASK_ROUTE_ADD_PRO_PAYMENT,
+            '/add_pro_payment',
             json={
                 'master_pkey': bytes(master_key.verify_key).hex(),
                 'rotating_pkey': bytes(rotating_key.verify_key).hex(),
@@ -4576,7 +4573,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             'ts': ts,
         }
         server.time_now = lambda: unix_ts_ms / 1000.0
-        response = ctx.flask_client.post(server.FLASK_ROUTE_GET_PRO_STATUS, json=request_body)
+        response = ctx.flask_client.post('/get_pro_status', json=request_body)
         server.time_now = lambda: time.time()
         response_json = response.json
         assert response_json is not None
@@ -4600,7 +4597,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             'before': before,
         }
         server.time_now = lambda: unix_ts_ms / 1000.0
-        response = ctx.flask_client.post(server.FLASK_ROUTE_GET_PAYMENT_DETAILS, json=request_body)
+        response = ctx.flask_client.post('/get_payment_details', json=request_body)
         server.time_now = lambda: time.time()
         response_json = response.json
         assert response_json is not None
@@ -4626,7 +4623,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
         }
 
         server.time_now = lambda: tx.event_ms / 1000.0
-        ctx.flask_client.post(server.FLASK_ROUTE_ADD_PRO_PAYMENT, json=request_body)
+        ctx.flask_client.post('/add_pro_payment', json=request_body)
         server.time_now = lambda: time.time()
 
         return base.unix_ms_from_datetime(base.round_datetime_to_next_day(base.datetime_from_unix_ms(tx.event_ms)))
