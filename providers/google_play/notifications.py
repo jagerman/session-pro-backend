@@ -19,6 +19,8 @@ import collections.abc
 from google.oauth2 import service_account
 
 import googleapiclient.discovery
+import google_auth_httplib2
+import httplib2
 
 import backend
 import base
@@ -112,7 +114,12 @@ def init(
         api.credentials = service_account.Credentials.from_service_account_file(
             app_credentials_path, scopes=['https://www.googleapis.com/auth/androidpublisher']
         )
-        api.publisher_service = googleapiclient.discovery.build('androidpublisher', 'v3', credentials=api.credentials)
+        # Bound every Play API call with a socket timeout. googleapiclient's default httplib2 transport
+        # has NO timeout, so a hung Google request would block the mule's single-threaded pull loop
+        # indefinitely (there's no harakiri leash on the mule like there is on the request workers). 15s
+        # is plenty; a timeout just fails the call, and the mule retries — nothing it does is time-critical.
+        authed_http = google_auth_httplib2.AuthorizedHttp(api.credentials, http=httplib2.Http(timeout=15))
+        api.publisher_service = googleapiclient.discovery.build('androidpublisher', 'v3', http=authed_http)
 
     api.package_name = package_name
     api.subscription_product_id = subscription_product_id
