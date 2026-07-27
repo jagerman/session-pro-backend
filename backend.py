@@ -1957,27 +1957,17 @@ def add_unredeemed_payment(
                 # before the deadline we are eligible to auto-redeem this payment and assign it to the
                 # previous known master public key.
                 if purchased_at <= auto_redeem_deadline_at:
-                    add_pro_payment_user_tx = UserPaymentTransaction()
-                    add_pro_payment_user_tx.provider = payment_tx.provider
-                    add_pro_payment_user_tx.apple_tx_id = payment_tx.apple_tx_id
-                    add_pro_payment_user_tx.google_payment_token = payment_tx.google_payment_token
-                    add_pro_payment_user_tx.google_order_id = payment_tx.google_order_id
-
-                    # A failed auto-redeem is swallowed: the user can still claim the payment manually
-                    # later, and propagating the failure to the platform layers (google/apple) would stall
-                    # them unnecessarily. The savepoint keeps a failed redeem from poisoning the outer
+                    # The renewal we just registered carries the same store account-id as the prior
+                    # payment (obfuscatedAccountId / appAccountToken are stable across a subscription), so
+                    # reconcile binds it to the master key we found — same as any other pending payment.
+                    #
+                    # A failed auto-redeem is swallowed: the user can still claim the payment later, and
+                    # propagating the failure to the platform layers (google/apple) would stall them
+                    # unnecessarily. The savepoint keeps a failed redeem from poisoning the outer
                     # transaction; we log it for internal visibility.
                     try:
                         with tx.conn.transaction():
-                            redeem_payment(
-                                tx,
-                                master_pkey=master_pkey,
-                                rotating_pkey=None,
-                                signing_key=None,
-                                request_at=purchased_at,
-                                redeemed_at=to_redeemed_at(purchased_at),
-                                payment_tx=add_pro_payment_user_tx,
-                            )
+                            reconcile_pending_payments(tx, master_pkey, redeemed_at=to_redeemed_at(purchased_at))
                     except base.ApiError as e:
                         log.error(
                             f'Failed to auto-redeem a payment we witnessed from. '
