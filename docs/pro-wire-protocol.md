@@ -7,6 +7,11 @@
 > The format is **not frozen** until Pro launches (no client can validate a real proof yet — the
 > backend signing pubkey isn't finalized). Until then, fix it here and both sides implement to it. It
 > freezes at launch.
+>
+> **Out of scope: the `/dev/*` routes.** `dev_routes.py` serves unauthenticated test-only endpoints
+> that mint payments with no payment provider involved. They are not part of this spec, no client
+> implements them, and they only exist on an instance explicitly started with `dev_endpoints` (which
+> in turn requires `provider_dry_run`). Nothing here applies to them.
 
 ## 1. Primitives & conventions
 

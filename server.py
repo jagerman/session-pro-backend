@@ -47,7 +47,7 @@ class UserProStatus(enum.StrEnum):
 
 
 # Keys stored in the flask app config dictionary that can be retrieved within
-# a request to get the path to the SQLite DB to load and use for that request.
+# a request to get the PostgreSQL DSN to connect to for that request.
 
 FLASK_CONFIG_DB_URL_KEY = 'session_pro_backend_db_url'
 
@@ -112,7 +112,9 @@ def get_db(flask_app: flask.Flask) -> collections.abc.Iterator[psycopg_pool.Conn
         yield engine
 
 
-def init(testing_mode: bool, database_url: str, backend_key: nacl.signing.SigningKey) -> flask.Flask:
+def init(
+    testing_mode: bool, database_url: str, backend_key: nacl.signing.SigningKey, dev_endpoints: bool = False
+) -> flask.Flask:
     result = flask.Flask(__name__)
     result.config['TESTING'] = testing_mode
     result.config[FLASK_CONFIG_DB_URL_KEY] = database_url
@@ -120,6 +122,16 @@ def init(testing_mode: bool, database_url: str, backend_key: nacl.signing.Signin
     result.config[onion_req.FLASK_CONFIG_ONION_REQ_X25519_SKEY] = backend_key.to_curve25519_private_key()
     result.register_blueprint(flask_blueprint)
     result.register_blueprint(onion_req.flask_blueprint_v4)
+
+    # NOTE: The /dev/* routes forge payments with no provider and no signature. Import AND register them
+    # only when explicitly enabled — a disabled instance never even loads the module, so the routes cannot
+    # exist by accident. config.parse_args additionally refuses to start if this is on without
+    # provider_dry_run, and scripts/nginx/pro-backend.conf.example deliberately omits /dev from its
+    # allowlist so a real deployment 404s them at the proxy regardless. DO NOT hoist this import.
+    if dev_endpoints:
+        import dev_routes
+
+        result.register_blueprint(dev_routes.flask_blueprint)
     return result
 
 

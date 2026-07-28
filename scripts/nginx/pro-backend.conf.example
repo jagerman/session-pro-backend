@@ -16,7 +16,9 @@ server {
     listen [::]:80;
     server_name @PRO_DOMAIN@;
 
-    # Deny everything by default; only the known API endpoints are proxied through.
+    # Deny everything by default; only the known API endpoints are proxied through. Note the allowlist
+    # below deliberately omits the test-only /dev/* routes (dev_routes.py), so even a host that somehow
+    # had dev_endpoints enabled would 404 them here. Do not add them.
     location / {
         return 404;
     }

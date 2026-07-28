@@ -1,0 +1,25 @@
+# Pro subscriptions granted at container boot, one account per row. Whitespace-separated:
+#
+#   <master_pkey>  <provider>  <plan>  [duration_s]
+#
+#   master_pkey   64-char hex Ed25519 *master Pro* public key of the recipient. This is a public
+#                 identifier derived from the account seed and cannot be reversed to it, so it is safe
+#                 to commit. It is NOT the 05… Session ID.
+#   provider      rangeproof | google_play | app_store. rangeproof is a real out-of-band grant;
+#                 the other two mint a payment the store never saw, for exercising the per-provider
+#                 code paths. All three require nothing from Apple/Google under provider_dry_run.
+#   plan          1M | 3M | 12M
+#   duration_s    optional; overrides the plan's nominal length. Useful for expiry tests.
+#
+# Blank lines and #-comments are ignored. A row is SKIPPED if the account already has an unexpired
+# subscription, so restarting the stack does not stack up duplicate payments.
+#
+# For grants during a test run, prefer the dev endpoint — no restart needed:
+#
+#   curl -X POST http://localhost:8090/dev/add_payment -H 'Content-Type: application/json' \
+#        -d '{"master_pkey":"<64-hex>","provider":"google_play","plan":"12M"}'
+#
+# Examples (uncomment and replace with your own QA accounts):
+# cf1079a5e0eb0ffc9397fbdf16d1eb96e91f06d35935d1d40d13f0a124a0cbe5  google_play  12M
+# cf1079a5e0eb0ffc9397fbdf16d1eb96e91f06d35935d1d40d13f0a124a0cbe5  app_store    1M    3600
+# cf1079a5e0eb0ffc9397fbdf16d1eb96e91f06d35935d1d40d13f0a124a0cbe5  rangeproof   3M

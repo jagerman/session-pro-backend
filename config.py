@@ -47,6 +47,8 @@ class ParsedArgs:
     provider_testing_env: bool = False
     provider_dry_run: bool = False
 
+    dev_endpoints: bool = False
+
     session_webhooks: list[SessionWebhook] = dataclasses.field(default_factory=list)
 
     apple_key_id: str = ''
@@ -95,6 +97,8 @@ def parse_args() -> ParsedArgs:
 
         result.provider_testing_env = base_section.getboolean(option='provider_testing_env', fallback=False)
         result.provider_dry_run = base_section.getboolean(option='provider_dry_run', fallback=False)
+
+        result.dev_endpoints = base_section.getboolean(option='dev_endpoints', fallback=False)
 
         webhook_index = 0
         while True:
@@ -168,6 +172,17 @@ def parse_args() -> ParsedArgs:
         'SESH_PRO_BACKEND_PROVIDER_TESTING_ENV', result.provider_testing_env
     )
     result.provider_dry_run = base.os_get_boolean_env('SESH_PRO_BACKEND_PROVIDER_DRY_RUN', result.provider_dry_run)
+    result.dev_endpoints = base.os_get_boolean_env('SESH_PRO_BACKEND_DEV_ENDPOINTS', result.dev_endpoints)
+
+    # NOTE: The dev endpoints forge payments out of thin air — no provider, no signature, no payment.
+    # They are only ever safe on a throwaway instance, so they are hard-wired to provider_dry_run: an
+    # instance that can still reach Apple/Google is, by definition, not throwaway. Refusing to start is
+    # deliberate — a warning would be ignored, and the failure mode here is "anyone can mint Pro".
+    if result.dev_endpoints and not result.provider_dry_run:
+        errors.append(
+            'dev_endpoints was enabled but provider_dry_run is not set. The dev endpoints mint payments'
+            ' with no payment provider involved and MUST NOT run on an instance with live provider egress'
+        )
 
     if result.with_provider_app_store:
         if len(result.apple_key_id) == 0:

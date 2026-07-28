@@ -157,6 +157,11 @@ def entry_point() -> flask.Flask:
             )
         if parsed_args.provider_dry_run:
             startup_log += '    provider_dry_run ENABLED: all payment-provider egress is stubbed (NO FOR PRODUCTION)\n'
+        if parsed_args.dev_endpoints:
+            startup_log += (
+                '    dev_endpoints ENABLED: /dev/* routes are live and will mint Pro subscriptions for'
+                ' ANY unauthenticated caller (NOT FOR PRODUCTION)\n'
+            )
         if parsed_args.with_provider_app_store:
             label = 'Sandbox' if parsed_args.apple_sandbox_env else 'Production'
             startup_log += f'    Platform: {label} Apple iOS App Store notification handling enabled\n'
@@ -171,7 +176,12 @@ def entry_point() -> flask.Flask:
             handler.emit_text(f'Starting up instance: {startup_log}')
 
         # NOTE: Add flask to our global logger
-        result: flask.Flask = server.init(testing_mode=False, database_url=parsed_args.db_url, backend_key=backend_key)
+        result: flask.Flask = server.init(
+            testing_mode=False,
+            database_url=parsed_args.db_url,
+            backend_key=backend_key,
+            dev_endpoints=parsed_args.dev_endpoints,
+        )
         # Flask lazily attaches its own default_handler to app.logger the first time it's accessed
         # (the addHandler below triggers that); remove it so app records aren't emitted twice — once
         # in Flask's format and once in ours.
