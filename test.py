@@ -512,9 +512,9 @@ def test_google_ack_sweep(monkeypatch, pg_database):
         assert not err.msg_list, err.msg_list
 
     def flag(conn, token):
-        return db.query_one(conn, 'SELECT needs_ack FROM google_play_payment_details WHERE payment_token = %s', token)[
-            0
-        ]
+        return db.query_scalar(
+            conn, 'SELECT needs_ack FROM google_play_payment_details WHERE payment_token = %s', token
+        )
 
     tok_ok = os.urandom(32).hex()
     tok_crashed = os.urandom(32).hex()
