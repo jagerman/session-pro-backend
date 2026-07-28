@@ -1153,6 +1153,51 @@ def _redeem_payment_for_user(
         _ensure_active_generation(tx, master_pkey, issued_at=redeemed_at)
 
 
+def redeem_minted_payment(
+    tx: db.SQLTransaction,
+    master_pkey: nacl.signing.VerifyKey,
+    payment_tx: base.PaymentProviderTransaction,
+    redeemed_at: datetime.datetime,
+) -> None:
+    """Redeem ONE just-minted payment and bind it to master_pkey's user (creating the user + generation
+    if needed), matched by the payment's OWN store identifier. This is the shared redeem for the minting
+    path — the CLI `voucher` command and the `/dev/add_payment` route (see minting.py). Distinct from the
+    two client-facing redeems: unlike reconcile_pending_payments it claims exactly the one minted payment
+    rather than everything sharing the account-id, and unlike _redeem_payment_for_user it creates the user
+    and also handles Rangeproof, which has no store account-id to reconcile against."""
+    if payment_tx.provider == base.PaymentProvider.GooglePlayStore:
+        detail_where = 'google_play_payment_details WHERE payment_token = %(token)s AND order_id = %(order_id)s'
+        params: dict[str, typing.Any] = {
+            'token': payment_tx.google_payment_token,
+            'order_id': payment_tx.google_order_id,
+        }
+    elif payment_tx.provider == base.PaymentProvider.iOSAppStore:
+        detail_where = 'app_store_payment_details WHERE tx_id = %(tx_id)s'
+        params = {'tx_id': payment_tx.apple_tx_id}
+    elif payment_tx.provider == base.PaymentProvider.Rangeproof:
+        detail_where = 'rangeproof_payment_details WHERE order_id = %(order_id)s'
+        params = {'order_id': payment_tx.rangeproof_order_id}
+    else:
+        raise base.ServerError(f'Cannot redeem a minted payment for provider: {payment_tx.provider}')
+
+    user_id = get_or_create_user_and_generation(tx, master_pkey, issued_at=redeemed_at)[0]
+    row_result = db.query(
+        tx.conn,
+        f'''
+        UPDATE payments
+        SET    redeemed_at = %(redeemed_at)s, user_id = %(user_id)s
+        WHERE  id IN (SELECT payment_id FROM {detail_where})
+          AND  redeemed_at IS NULL AND revoked_at IS NULL
+        RETURNING id
+        ''',
+        redeemed_at=redeemed_at,
+        user_id=user_id,
+        **params,
+    )
+    assert len(row_result.fetchall()) == 1, 'a freshly-minted payment must redeem exactly once'
+    _ensure_active_generation(tx, master_pkey, issued_at=redeemed_at)
+
+
 def verify_payment_provider_tx(payment_tx: base.PaymentProviderTransaction, err: base.ErrorSink):
     base.verify_payment_provider(payment_tx.provider, err)
     match payment_tx.provider:

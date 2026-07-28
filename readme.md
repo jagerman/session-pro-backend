@@ -275,9 +275,11 @@ for its own proof through the normal `generate_pro_proof` route with its own rot
 the intended shape for a device test: park the device on the buy-Pro screen, POST the above, let the
 device refresh.
 
-Pass `"redeem": false` to stop at an *unredeemed* payment and get its `payment_id` back — hand that
-to a client and it can claim the payment through the real `add_pro_payment` route, exercising the
-client's own redeem path. `"duration": <seconds>` overrides the plan length for expiry tests.
+Pass `"redeem": false` (Google/Apple only) to stop at an *unredeemed* payment. The payment carries the
+master-derived account-id, so the account holder's next authenticated request (`generate_pro_proof` /
+`get_pro_status`) reconciles it automatically — exercising the client's own reconcile-on-touch path,
+the closest thing to a real store purchase. `"duration": <seconds>` overrides the plan length for expiry
+tests.
 
 To have accounts already entitled before anything starts, list them in `docker/vouchers.tsv`; the
 entrypoint applies each row on boot and skips accounts that already have an active subscription.

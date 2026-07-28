@@ -710,8 +710,9 @@ def cmd_voucher(args: argparse.Namespace) -> int:
     """Handle voucher command - mints a payment for the chosen provider and auto-redeems it."""
     config = require_config(args)
 
-    # A google_play voucher's redeem consults Google (see backend.add_pro_payment); with dry-run on
-    # that is stubbed. The CLI has to propagate the flag itself — nothing else sets it in this process.
+    # Synthetic non-Rangeproof payments are only permitted on a throwaway (provider_dry_run) instance —
+    # enforced below. Propagate the flag into this CLI process (nothing else sets it here) so any
+    # dry-run-gated provider egress stays stubbed.
     base.PROVIDER_DRY_RUN = config.provider_dry_run
 
     # Parse master public key
@@ -726,11 +727,12 @@ def cmd_voucher(args: argparse.Namespace) -> int:
 
     provider = base.PaymentProvider(args.provider)
     if provider != base.PaymentProvider.Rangeproof and not config.provider_dry_run:
-        # A minted google_play/app_store payment is fiction as far as the provider is concerned, so its
-        # redeem must never be allowed to talk to one. Rangeproof has no provider to talk to.
+        # A minted google_play/app_store payment is fiction as far as the store is concerned, so it must
+        # only ever be created on a throwaway instance. Rangeproof is a genuine out-of-band dev-house
+        # grant with no store behind it, so it needs no such guard.
         print(
             f"ERROR: --provider {provider.value} requires provider_dry_run to be enabled "
-            f"(the payment is synthetic and its redeem must not reach the provider)",
+            f"(the payment is synthetic and must not be minted on a live instance)",
             file=sys.stderr,
         )
         return 1
@@ -795,11 +797,7 @@ def cmd_voucher(args: argparse.Namespace) -> int:
                     # Step 2: build the proof over the now-active entitlement.
                     print('\nStep 2: Generating pro proof...')
                     proof = backend.build_current_entitlement_proof(
-                        tx,
-                        master_pkey,
-                        rotating_pkey,
-                        request_at,
-                        backend_key,
+                        tx, master_pkey, rotating_pkey, request_at, backend_key
                     )
 
                     print(f"Success: {provider.value} payment granted and pro proof generated")
