@@ -13,9 +13,9 @@ Overview
   The authoritative wire/proof format — endpoints, signed-message layouts, response shapes, and the
   revocation list — is documented in docs/pro-wire-protocol.md.
 
-  Endpoints served here: add_pro_payment, generate_pro_proof, get_pro_revocations, get_pro_status,
-  get_payment_details, set_payment_refund_requested, status, apple_notifications_v2 (Apple webhook),
-  oxen/v4/lsrpc (onion transport).
+  Endpoints served here: generate_pro_proof, get_pro_revocations, get_pro_status, get_payment_details,
+  set_payment_refund_requested, status, apple_notifications_v2 (Apple webhook), oxen/v4/lsrpc (onion
+  transport).
 '''
 
 import collections.abc
@@ -140,59 +140,6 @@ def status():
             'signing_pubkey': bytes(backend_key.verify_key).hex(),
         }
     )
-
-
-@flask_blueprint.route('/add_pro_payment', methods=['POST'])
-def add_pro_payment():
-    # Extract + validate request fields (each raises FailError(invalid_request) on the first bad field).
-    get_json = get_json_from_flask_request(flask.request)
-    master_pkey = base.json_dict_require_str(get_json, 'master_pkey')
-    rotating_pkey = base.json_dict_require_str(get_json, 'rotating_pkey')
-    master_sig = base.json_dict_require_str(get_json, 'master_sig')
-    rotating_sig = base.json_dict_require_str(get_json, 'rotating_sig')
-    payment_tx = base.json_dict_require_obj(get_json, 'payment_tx')
-    payment_provider = base.json_dict_require_str(payment_tx, 'provider')
-    base.verify_payment_provider(payment_provider=payment_provider)
-
-    user_payment = backend.UserPaymentTransaction()
-    user_payment.provider = base.PaymentProvider(payment_provider)
-    # One opaque `payment_id` (§3.5): hashed verbatim, then split into the backend's typed fields for DB
-    # lookup. The wire/hash never sees the provider-specific sub-fields.
-    user_payment.payment_id = base.json_dict_require_str(payment_tx, 'payment_id')
-    if user_payment.provider == base.PaymentProvider.Rangeproof:
-        # Rangeproof grants are written directly to the DB; a client can't claim one via this route.
-        raise base.FailError('Bad payment provider given')
-    backend.apply_payment_id_to_tx(user_payment)
-
-    master_pkey_bytes = base.hex_to_bytes(
-        hex=master_pkey, label='Master public key', hex_len=nacl.bindings.crypto_sign_PUBLICKEYBYTES * 2
-    )
-    rotating_pkey_bytes = base.hex_to_bytes(
-        hex=rotating_pkey, label='Rotating public key', hex_len=nacl.bindings.crypto_sign_PUBLICKEYBYTES * 2
-    )
-    master_sig_bytes = base.hex_to_bytes(
-        hex=master_sig, label='Master key signature', hex_len=nacl.bindings.crypto_sign_BYTES * 2
-    )
-    rotating_sig_bytes = base.hex_to_bytes(
-        hex=rotating_sig, label='Rotating key signature', hex_len=nacl.bindings.crypto_sign_BYTES * 2
-    )
-
-    # Submit the payment to the DB (raises FailError(bad_signature/unknown_payment/…) or ServerError).
-    with get_db(flask.current_app) as engine:
-        with db.connection(engine) as conn:
-            request_at = base.datetime_from_unix_ms(int(time_now() * 1000))
-            redeemed_payment = backend.verify_and_add_pro_payment(
-                conn=conn,
-                signing_key=flask.current_app.config[FLASK_CONFIG_BACKEND_SKEY_KEY],
-                request_at=request_at,
-                redeemed_at=backend.to_redeemed_at(request_at),
-                master_pkey=nacl.signing.VerifyKey(master_pkey_bytes),
-                rotating_pkey=nacl.signing.VerifyKey(rotating_pkey_bytes),
-                payment_tx=user_payment,
-                master_sig=master_sig_bytes,
-                rotating_sig=rotating_sig_bytes,
-            )
-            return make_success_response(dict_result=redeemed_payment.proof.to_dict())
 
 
 @flask_blueprint.route('/generate_pro_proof', methods=['POST'])
@@ -376,6 +323,9 @@ def get_pro_status():
     with get_db(flask.current_app) as engine:
         with db.connection(engine) as conn:
             with db.transaction(conn) as tx:
+                # Bind any payment the mule has registered for this key but that isn't yet redeemed, so a
+                # status check right after purchase reflects it. No-op when there's nothing new.
+                backend.reconcile_pending_payments(tx, master_pkey_nacl, redeemed_at=backend.to_redeemed_at(request_at))
                 error_report = int(backend.has_user_error_from_master_pkey(tx, master_pkey_nacl))
                 user = backend.get_user(tx.conn, master_pkey_nacl)
                 if user.found:
@@ -458,6 +408,9 @@ def get_payment_details():
     with get_db(flask.current_app) as engine:
         with db.connection(engine) as conn:
             with db.transaction(conn) as tx:
+                # Bind any mule-registered-but-unredeemed payment for this key first, so a details check
+                # right after purchase includes it (only redeemed payments are user-scoped/visible below).
+                backend.reconcile_pending_payments(tx, master_pkey_nacl, redeemed_at=backend.to_redeemed_at(request_at))
                 # One keyset page, newest-first. Each item's status is derived against the *request*
                 # clock `ts` (signed, anti-replay-bounded to ≈now), never a second time.time() read.
                 # The query is user-scoped and only redeemed payments carry a user_id, so unredeemed
