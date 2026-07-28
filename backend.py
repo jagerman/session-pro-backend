@@ -196,11 +196,6 @@ class UserPaymentTransaction:
     rangeproof_order_id: str = ''
     google_payment_token: str = ''
     google_order_id: str = ''
-    # The opaque wire `payment_id` (§3.5), hashed verbatim. On ingress it is the exact bytes the client
-    # sent (then split into the typed fields above for DB lookup); when the backend builds a request it
-    # is derived from the typed fields. Kept as its own field so the signed hash is byte-identical to
-    # what the client signed, never a lossy re-join of the split fields.
-    payment_id: str = ''
 
 
 # Google folds its two identifiers into one opaque `payment_id` as `token | order_id`, split once on the
@@ -216,8 +211,8 @@ def encode_payment_id(
     apple_tx_id: str = '',
     rangeproof_order_id: str = '',
 ) -> str:
-    # Encode a payment's provider-specific identifier(s) into the single opaque wire `payment_id`
-    # (§3.5). The backend owns this encoding; the client treats the result as opaque bytes.
+    # Fold a payment's provider-specific identifier(s) into the single opaque `payment_id` returned on
+    # get_payment_details items (§5.2). The backend owns this encoding; clients treat it as opaque.
     match provider:
         case base.PaymentProvider.GooglePlayStore:
             return f'{google_payment_token}{GOOGLE_PAYMENT_ID_DELIMITER}{google_order_id}'
@@ -227,30 +222,6 @@ def encode_payment_id(
             return rangeproof_order_id
         case _:
             return ''
-
-
-def payment_id_from_user_tx(tx: UserPaymentTransaction) -> str:
-    return encode_payment_id(
-        tx.provider,
-        google_payment_token=tx.google_payment_token,
-        google_order_id=tx.google_order_id,
-        apple_tx_id=tx.apple_tx_id,
-        rangeproof_order_id=tx.rangeproof_order_id,
-    )
-
-
-def apply_payment_id_to_tx(tx: UserPaymentTransaction) -> None:
-    # Split the opaque wire `payment_id` back into the backend's typed fields for DB lookup (§3.5).
-    # A new provider only needs a new case here; the wire/hash never learn a payment has sub-fields.
-    match tx.provider:
-        case base.PaymentProvider.GooglePlayStore:
-            tx.google_payment_token, _, tx.google_order_id = tx.payment_id.partition(GOOGLE_PAYMENT_ID_DELIMITER)
-        case base.PaymentProvider.iOSAppStore:
-            tx.apple_tx_id = tx.payment_id
-        case base.PaymentProvider.Rangeproof:
-            tx.rangeproof_order_id = tx.payment_id
-        case _:
-            pass
 
 
 @dataclasses.dataclass
@@ -283,7 +254,7 @@ class PaymentRow:
 
 
 def payment_id_from_payment_row(row: PaymentRow) -> str:
-    # Egress: fold a stored payment's typed columns back into the opaque wire `payment_id` (§3.5).
+    # Egress: fold a stored payment's typed columns back into the opaque `payment_id` (§5.2).
     return encode_payment_id(
         row.payment_provider,
         google_payment_token=row.google_payment_token,
@@ -438,7 +409,7 @@ def make_get_payment_details_message(
 # --- get-payment-details keyset pagination cursor ------------------------------------------------
 # Seek pagination keys on the payment's surrogate id, but that id is a global identity sequence, so
 # handing the raw value to the client would leak system-wide payment volume/ordering (the same reason
-# `payment_id` is opaque, §3.5). So we hand back the boundary id sealed in an XChaCha20-Poly1305 token
+# `payment_id` is opaque, §5.2). So we hand back the boundary id sealed in an XChaCha20-Poly1305 token
 # the client echoes verbatim. The key is derived from the backend signing key via a domain-separated
 # BLAKE2b — no separate secret to provision; rotating the signing key just invalidates outstanding
 # cursors (harmless — the client re-fetches from the newest page). The master_pkey is the AEAD

@@ -265,7 +265,7 @@ def _payment_item_wire(
 ) -> dict[str, str | int | float | bool]:
     # Wire seconds (wire spec §1/§5): integer everywhere the backend computes/rounds the value; the two
     # upstream provider event instants — `purchased_ts` and `revoked_ts` — are floats carrying the
-    # provider's sub-second precision. `payment_id` is the single opaque value (§3.5, Q10).
+    # provider's sub-second precision. `payment_id` is the single opaque value (§5.2, Q10).
     return {
         'status': backend.derive_payment_status(payment, request_at).value,
         'plan': payment.plan.value,

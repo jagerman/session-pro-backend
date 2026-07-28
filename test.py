@@ -4479,7 +4479,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
     """
 
     def get_pro_status(user_ctx: TestUserCtx, ctx: TestingContext, unix_ts_ms: int) -> base.JSONObject:
-        ts = unix_ts_ms // 1000  # wire nonce is integer seconds (wire spec §3.4)
+        ts = unix_ts_ms // 1000  # wire nonce is integer seconds (wire spec §1.1)
         hash_to_sign = backend.make_get_pro_status_message(
             master_pkey=user_ctx.master_key.verify_key, request_at=base.datetime_from_unix_seconds(ts)
         )
@@ -4498,7 +4498,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
     def get_payment_details(
         user_ctx: TestUserCtx, ctx: TestingContext, unix_ts_ms: int, limit: int, before: str = ''
     ) -> base.JSONObject:
-        ts = unix_ts_ms // 1000  # wire nonce is integer seconds (wire spec §3.4)
+        ts = unix_ts_ms // 1000  # wire nonce is integer seconds (wire spec §1.1)
         hash_to_sign = backend.make_get_payment_details_message(
             master_pkey=user_ctx.master_key.verify_key,
             request_at=base.datetime_from_unix_seconds(ts),
@@ -4678,7 +4678,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
         item_status = base.json_dict_require_str_coerce_to_enum(item, "status", base.PaymentStatus, err)
         assert not err.has()
         assert item_expiry_ts == to_s(tx.expires_at), res_latest
-        # Google `payment_id` is the opaque `token|order_id` composite (§3.5).
+        # Google `payment_id` is the opaque `token|order_id` composite (backend-owned; §5.2).
         assert item_payment_id == f'{tx.purchase_token}|{tx.order_id}'
         assert item_grace_duration == base.seconds_from_timedelta(grace_duration)
         assert item_payment_provider == base.PaymentProvider.GooglePlayStore
