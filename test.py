@@ -680,6 +680,56 @@ def test_grant_rangeproof(pg_database):
     pool.close()
 
 
+def test_renewal_binds_by_identifier_not_account_id(pg_database):
+    # The renewal auto-redeem binds a payment to its owner by the payment's OWN store identifier (via the
+    # subscription-continuity linkage), NOT the master-key-derived account-id -- so the mule never matches
+    # on the appAccountToken UUID. Prove it: bind a payment whose stored account-id belongs to a DIFFERENT
+    # key. reconcile (account-id) can't claim it; the direct bind does.
+    pool = backend.bootstrap_db(database_url=pg_database())
+    assert pool
+    owner = nacl.signing.SigningKey.generate()  # the payment's stored account-id
+    binder = nacl.signing.SigningKey.generate()  # who we actually bind it to
+    now = base.round_datetime_to_next_day(datetime.datetime.now(datetime.timezone.utc))
+
+    def seed_google(conn, account_id_key):
+        tx = base.PaymentProviderTransaction()
+        tx.provider = base.PaymentProvider.GooglePlayStore
+        tx.google_payment_token = os.urandom(backend.BLAKE2B_DIGEST_SIZE).hex()
+        tx.google_order_id = os.urandom(backend.BLAKE2B_DIGEST_SIZE).hex()
+        err = base.ErrorSink()
+        backend.add_unredeemed_payment(
+            conn,
+            payment_tx=tx,
+            plan=base.ProPlan.OneMonth,
+            purchased_at=now,
+            expires_at=now + datetime.timedelta(days=30),
+            platform_refund_expires_at=base.EPOCH,
+            platform_obfuscated_account_id=bytes(account_id_key.verify_key),
+            err=err,
+        )
+        assert not err.msg_list, err.msg_list
+        return tx
+
+    with db.connection(pool) as conn:
+        # binder gets a user + entitlement the normal way.
+        seed_google(conn, binder)
+        assert backend.reconcile_pending_payments(conn, binder.verify_key, redeemed_at=now) == 1
+        assert backend.get_user(conn, binder.verify_key).found
+
+        # A payment whose stored account-id is `owner`'s key, not binder's.
+        foreign = seed_google(conn, owner)
+        # reconcile(binder) can't claim it — the account-id doesn't match binder's key.
+        assert backend.reconcile_pending_payments(conn, binder.verify_key, redeemed_at=now) == 0
+        # The direct bind binds it to binder by its own token, ignoring the account-id.
+        with db.transaction(conn) as tx:
+            backend._redeem_payment_for_user(tx, binder.verify_key, foreign, redeemed_at=now)
+
+        # Everything is redeemed, and it went to binder (owner never became a user).
+        assert not backend.get_unredeemed_payments_list(conn)
+        assert not backend.get_user(conn, owner.verify_key).found
+    pool.close()
+
+
 def test_migrations_bootstrap_and_idempotency(pg_database):
     # bootstrap_db runs the schema/ migrations; every migration file should be recorded, the globals
     # rows seeded exactly once, and a second pass must be a clean no-op (nothing re-run or duplicated).

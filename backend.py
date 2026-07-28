@@ -1441,6 +1441,53 @@ def reconcile_pending_payments(
     return len(claimed)
 
 
+def _redeem_payment_for_user(
+    tx: db.SQLTransaction,
+    master_pkey: nacl.signing.VerifyKey,
+    payment_tx: base.PaymentProviderTransaction,
+    redeemed_at: datetime.datetime,
+) -> None:
+    """Redeem ONE specific payment and link it to master_pkey's (already-existing) user, matched by the
+    payment's OWN store identifier — Google (payment_token, order_id) / Apple tx_id — NOT by the
+    master-key-derived account-id.
+
+    Used by the renewal auto-redeem, where the owner was resolved from the store's subscription-continuity
+    linkage (payment_token / original_tx_id → a prior, securely-bound payment). That linkage is the
+    authority, so we deliberately never touch the appAccountToken UUID: the mule stays out of UUID matching
+    entirely, so a (vanishingly unlikely) 122-bit appAccountToken collision can never make a renewal bind a
+    stranger's payment. The account-id match stays confined to the client path, where the caller is the
+    owner and "the new payer is the next to claim their own UUID" holds."""
+    if payment_tx.provider == base.PaymentProvider.GooglePlayStore:
+        detail_where = 'google_play_payment_details WHERE payment_token = %(token)s AND order_id = %(order_id)s'
+        params: dict[str, typing.Any] = {
+            'token': payment_tx.google_payment_token,
+            'order_id': payment_tx.google_order_id,
+        }
+    elif payment_tx.provider == base.PaymentProvider.iOSAppStore:
+        detail_where = 'app_store_payment_details WHERE tx_id = %(tx_id)s'
+        params = {'tx_id': payment_tx.apple_tx_id}
+    else:
+        return
+
+    row_result = db.query(
+        tx.conn,
+        f'''
+        UPDATE payments
+        SET    redeemed_at = %(redeemed_at)s,
+               user_id     = (SELECT id FROM users WHERE master_pkey = %(master_pkey)s)
+        WHERE  id IN (SELECT payment_id FROM {detail_where})
+          AND  redeemed_at IS NULL AND revoked_at IS NULL
+        RETURNING id
+        ''',
+        redeemed_at=redeemed_at,
+        master_pkey=bytes(master_pkey),
+        **params,
+    )
+    if row_result.fetchall():
+        # Only refresh entitlement if we actually redeemed something (it may already be redeemed).
+        _ensure_active_generation(tx, master_pkey, issued_at=redeemed_at)
+
+
 def verify_payment_provider_tx(payment_tx: base.PaymentProviderTransaction, err: base.ErrorSink):
     base.verify_payment_provider(payment_tx.provider, err)
     match payment_tx.provider:
@@ -1958,9 +2005,11 @@ def add_unredeemed_payment(
                 # before the deadline we are eligible to auto-redeem this payment and assign it to the
                 # previous known master public key.
                 if purchased_at <= auto_redeem_deadline_at:
-                    # The renewal we just registered carries the same store account-id as the prior
-                    # payment (obfuscatedAccountId / appAccountToken are stable across a subscription), so
-                    # reconcile binds it to the master key we found — same as any other pending payment.
+                    # Bind THIS renewal to the owner we just resolved from the store's subscription
+                    # continuity, matched by the renewal's own identifier — NOT the master-key-derived
+                    # account-id. We already hold the full master key, so there's no need to route through
+                    # the appAccountToken UUID, and deliberately not doing so keeps a mule-side renewal from
+                    # ever claiming a stranger's payment on a (vanishingly unlikely) 122-bit UUID collision.
                     #
                     # A failed auto-redeem is swallowed: the user can still claim the payment later, and
                     # propagating the failure to the platform layers (google/apple) would stall them
@@ -1968,7 +2017,9 @@ def add_unredeemed_payment(
                     # transaction; we log it for internal visibility.
                     try:
                         with tx.conn.transaction():
-                            reconcile_pending_payments(tx, master_pkey, redeemed_at=to_redeemed_at(purchased_at))
+                            _redeem_payment_for_user(
+                                tx, master_pkey, payment_tx, redeemed_at=to_redeemed_at(purchased_at)
+                            )
                     except base.ApiError as e:
                         log.error(
                             f'Failed to auto-redeem a payment we witnessed from. '
