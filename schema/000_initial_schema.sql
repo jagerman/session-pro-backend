@@ -15,9 +15,7 @@ CREATE TABLE IF NOT EXISTS users (
     current_generation_id        BIGINT      NOT NULL,
     expires_at                   TIMESTAMPTZ NOT NULL,
     grace_period                 INTERVAL    NOT NULL DEFAULT '0'::interval,
-    auto_renewing                BOOLEAN     NOT NULL DEFAULT FALSE,
-    -- NULL = no refund requested.
-    refund_requested_at          TIMESTAMPTZ
+    auto_renewing                BOOLEAN     NOT NULL DEFAULT FALSE
     -- (No account-id columns here: the provider account ids are pure functions of master_pkey — see
     -- {google,apple}_obfuscated_account_id_from_master_pkey — and are stored on `payments` only, where
     -- they serve as the auto-redeem lookup key. Persisting them on the user row was redundant.)
@@ -58,10 +56,7 @@ CREATE TABLE IF NOT EXISTS payments (
     expires_at                        TIMESTAMPTZ NOT     NULL,
     grace_period                      INTERVAL    NOT NULL DEFAULT '0'::interval,
     platform_refund_expires_at        TIMESTAMPTZ NOT     NULL,
-    revoked_at                        TIMESTAMPTZ,                    -- NOT NULL once revoked
-
-    -- NULL = no refund requested.
-    refund_requested_at               TIMESTAMPTZ
+    revoked_at                        TIMESTAMPTZ                     -- NOT NULL once revoked
 
     -- Provider-specific identifiers do NOT live here — they're in the per-provider *_payment_details
     -- tables below (one row, keyed by payment_id, in exactly the table matching payment_provider). That

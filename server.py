@@ -14,8 +14,7 @@ Overview
   revocation list — is documented in docs/pro-wire-protocol.md.
 
   Endpoints served here: generate_pro_proof, get_pro_revocations, get_pro_status, get_payment_details,
-  set_payment_refund_requested, status, apple_notifications_v2 (Apple webhook), oxen/v4/lsrpc (onion
-  transport).
+  status, apple_notifications_v2 (Apple webhook), oxen/v4/lsrpc (onion transport).
 '''
 
 import collections.abc
@@ -280,9 +279,6 @@ def _payment_item_wire(
         ),
         'platform_refund_expiry_ts': base.unix_seconds_from_datetime(payment.platform_refund_expires_at),
         'revoked_ts': base.unix_seconds_float_from_datetime(payment.revoked_at) if payment.revoked_at else 0.0,
-        'refund_requested_ts': (
-            base.unix_seconds_from_datetime(payment.refund_requested_at) if payment.refund_requested_at else 0
-        ),
         'payment_id': backend.payment_id_from_payment_row(payment),
     }
 
@@ -316,7 +312,6 @@ def get_pro_status():
     auto_renewing = False
     expiry_ts = 0
     grace_period_duration = 0
-    refund_requested_ts = 0
     error_report = 0
     latest_payment: dict[str, str | int | float | bool] | None = None
 
@@ -333,9 +328,6 @@ def get_pro_status():
                     # Egress: user datetimes/timedelta → integer-seconds wire values (day-aligned, exact).
                     expiry_ts = base.unix_seconds_from_datetime(user.expires_at)
                     grace_period_duration = base.seconds_from_timedelta(user.grace_period)
-                    refund_requested_ts = (
-                        base.unix_seconds_from_datetime(user.refund_requested_at) if user.refund_requested_at else 0
-                    )
 
                     # Status decided against the *request* clock (signed, anti-replay-bounded to ≈now) —
                     # the same clock the latest item's derived status uses, never a second time.time().
@@ -352,7 +344,6 @@ def get_pro_status():
             'user_status': user_pro_status.value,
             'auto_renewing': auto_renewing,
             'expiry_ts': expiry_ts,
-            'refund_requested_ts': refund_requested_ts,
             'grace_period_duration': grace_period_duration if auto_renewing else 0,
             'error_report': error_report,
             'latest_payment': latest_payment,
@@ -426,68 +417,3 @@ def get_payment_details():
         next_cursor = backend.encrypt_payment_cursor(cursor_key, master_pkey_nacl, page[-1].id)
 
     return make_success_response({'payments_total': payments_total, 'items': items, 'next_cursor': next_cursor})
-
-
-@flask_blueprint.route('/set_payment_refund_requested', methods=['POST'])
-def set_payment_refund_requested():
-    # Extract + validate request fields (each raises FailError(invalid_request) on the first bad field).
-    get_json = get_json_from_flask_request(flask.request)
-    master_pkey = base.json_dict_require_str(get_json, 'master_pkey')
-    master_sig = base.json_dict_require_str(get_json, 'master_sig')
-    payment_tx = base.json_dict_require_obj(get_json, 'payment_tx')
-    ts = base.json_dict_require_int(get_json, 'ts')
-    refund_requested_ts = base.json_dict_require_int(get_json, 'refund_requested_ts')
-    payment_provider = base.json_dict_require_str(payment_tx, 'provider')
-
-    master_pkey_bytes = base.hex_to_bytes(
-        hex=master_pkey, label='Master public key', hex_len=nacl.bindings.crypto_sign_PUBLICKEYBYTES * 2
-    )
-    master_sig_bytes = base.hex_to_bytes(
-        hex=master_sig, label='Master key signature', hex_len=nacl.bindings.crypto_sign_BYTES * 2
-    )
-
-    user_payment = backend.UserPaymentTransaction()
-    user_payment.provider = base.PaymentProvider(payment_provider)
-    # One opaque `payment_id` (§3.5), hashed verbatim then split into the typed fields for DB lookup.
-    user_payment.payment_id = base.json_dict_require_str(payment_tx, 'payment_id')
-    if user_payment.provider == base.PaymentProvider.iOSAppStore:
-        backend.apply_payment_id_to_tx(user_payment)
-    else:
-        # Google refunds are executed out-of-band (their web portal) with no in-app notification, so
-        # unlike Apple we can't tell the request is legitimate — this route is disabled for non-Apple.
-        raise base.FailError('Bad payment provider given')
-
-    # Timestamp anti-replay window (wire nonce is integer seconds, §3.3). Out of window → stale_request.
-    request_at = base.datetime_from_unix_seconds(ts)
-    refund_requested_at = base.datetime_from_unix_seconds(refund_requested_ts)
-    now = base.datetime_from_unix_ms(int(time_now() * 1000))
-    if abs(now - request_at) >= base.DEFAULT_TIMESTAMP_TOLERANCE:
-        raise base.FailError(
-            f'Timestamp is outside the tolerance window, delta was {abs(now - request_at)}',
-            code=base.ErrorCode.stale_request,
-        )
-
-    # Validate the signature.
-    master_pkey_nacl = nacl.signing.VerifyKey(master_pkey_bytes)
-    hash_to_verify: bytes = backend.make_set_payment_refund_requested_message(
-        master_pkey=master_pkey_nacl,
-        request_at=request_at,
-        refund_requested_at=refund_requested_at,
-        payment_tx=user_payment,
-    )
-    try:
-        master_pkey_nacl.verify(smessage=hash_to_verify, signature=master_sig_bytes)
-    except Exception:
-        raise base.FailError('Signature failed to be verified', code=base.ErrorCode.bad_signature)
-
-    updated: bool = False
-    with get_db(flask.current_app) as engine:
-        with db.connection(engine) as conn:
-            # Wire `0` means "clear the refund request" → NULL internally (the hash above still used the
-            # literal wire value the client signed).
-            updated = backend.set_refund_requested(
-                conn, payment_tx=user_payment, refund_requested_at=refund_requested_at if refund_requested_ts else None
-            )
-
-            result = make_success_response(dict_result={'updated': updated})
-            return result

@@ -243,7 +243,6 @@ class ErrorCode(enum.StrEnum):
     invalid_request = 'invalid_request'  # fail:  malformed/missing/wrong-type field, bad hex, bad provider
     bad_signature = 'bad_signature'  # fail:  a request signature failed to verify
     stale_request = 'stale_request'  # fail:  request timestamp outside the replay-tolerance window
-    unknown_payment = 'unknown_payment'  # fail:  no payment matching those provider ids for this user
     # NB: `subscription_expired`, NOT `expired` — the error_code vocabulary is deliberately DISJOINT from
     # get-details `user_status` {never,active,expired}, so no token identifies two different fields.
     subscription_expired = 'subscription_expired'  # fail:  the user's entitlement has lapsed

@@ -28,20 +28,11 @@ log = logging.Logger("BACKEND")
 DOMAIN_SIZE = 16
 GENERATE_PROOF_DOMAIN = b'ProGenerateProof'
 BUILD_PROOF_DOMAIN = b'ProProof_v0_____'  # version lives IN the domain prefix (Q12), not a byte/field
-ADD_PRO_PAYMENT_DOMAIN = b'ProAddPayment___'
-SET_PAYMENT_REFUND_REQUESTED_DOMAIN = b'ProSetRefundReq_'
 GET_PAYMENT_DETAILS_DOMAIN = b'ProGetPayDetails'
 GET_PRO_STATUS_DOMAIN = b'ProGetProStatus_'
 assert all(
     len(p) == DOMAIN_SIZE
-    for p in (
-        GENERATE_PROOF_DOMAIN,
-        BUILD_PROOF_DOMAIN,
-        ADD_PRO_PAYMENT_DOMAIN,
-        SET_PAYMENT_REFUND_REQUESTED_DOMAIN,
-        GET_PAYMENT_DETAILS_DOMAIN,
-        GET_PRO_STATUS_DOMAIN,
-    )
+    for p in (GENERATE_PROOF_DOMAIN, BUILD_PROOF_DOMAIN, GET_PAYMENT_DETAILS_DOMAIN, GET_PRO_STATUS_DOMAIN)
 )
 
 # Explicit column list for payments table queries. Rows are read with `db.dict_row` and unpacked by
@@ -71,7 +62,6 @@ PAYMENTS_COLUMNS = ", ".join(
         "gd.payment_token AS google_payment_token",
         "gd.order_id AS google_order_id",
         "rd.order_id AS rangeproof_order_id",
-        "p.refund_requested_at",
         "gd.obfuscated_account_id AS google_obfuscated_account_id",
         "ad.app_account_token AS apple_app_account_token",
     )
@@ -91,16 +81,7 @@ PAYMENTS_FROM = " LEFT JOIN ".join(
 # current generation's `token` (the proof's revocation_tag); it's an INNER JOIN because
 # users.current_generation_id is NOT NULL, so every user always has a current generation.
 USERS_COLUMNS = ", ".join(
-    (
-        "u.id",
-        "u.master_pkey",
-        "u.current_generation_id",
-        "g.token",
-        "u.expires_at",
-        "u.grace_period",
-        "u.auto_renewing",
-        "u.refund_requested_at",
-    )
+    ("u.id", "u.master_pkey", "u.current_generation_id", "g.token", "u.expires_at", "u.grace_period", "u.auto_renewing")
 )
 USERS_FROM = "users u JOIN generations g ON g.id = u.current_generation_id"
 
@@ -133,7 +114,6 @@ class ReportRow:
     plan_1m: int
     plan_3m: int
     plan_12m: int
-    refunds_initiated: int
     revoked: int
     cancelled: int
 
@@ -186,12 +166,10 @@ class LookupUserExpiry:
     # `None` expiry = "no such payment found yet". Durations default to zero.
     expiry_from_redeemed: datetime.datetime | None = None
     grace_from_redeemed: datetime.timedelta = datetime.timedelta(0)
-    refund_requested_from_redeemed: datetime.datetime | None = None
     auto_renewing_from_redeemed: bool = False
 
     best_expiry: datetime.datetime | None = None
     best_grace: datetime.timedelta = datetime.timedelta(0)
-    best_refund_requested: datetime.datetime | None = None
     best_auto_renewing: bool = False
 
 
@@ -299,7 +277,6 @@ class PaymentRow:
     apple: AppleTransaction = dataclasses.field(default_factory=AppleTransaction)
     google_payment_token: str = ''
     google_order_id: str = ''
-    refund_requested_at: datetime.datetime | None = None
     rangeproof_order_id: str = ''
     google_obfuscated_account_id: bytes | None = None
     apple_app_account_token: str | None = None
@@ -326,7 +303,6 @@ class UserRow:
     expires_at: datetime.datetime = base.EPOCH
     grace_period: datetime.timedelta = datetime.timedelta(0)
     auto_renewing: bool = False
-    refund_requested_at: datetime.datetime | None = None
 
 
 @dataclasses.dataclass
@@ -449,22 +425,6 @@ def signed_message(domain: bytes, *fields: nacl.signing.VerifyKey | bytes | date
     return bytes(out)
 
 
-def make_set_payment_refund_requested_message(
-    master_pkey: nacl.signing.VerifyKey,
-    request_at: datetime.datetime,
-    refund_requested_at: datetime.datetime,
-    payment_tx: UserPaymentTransaction,
-) -> bytes:
-    return signed_message(
-        SET_PAYMENT_REFUND_REQUESTED_DOMAIN,
-        master_pkey,
-        request_at,
-        refund_requested_at,
-        payment_tx.provider.value,
-        payment_tx.payment_id,
-    )
-
-
 def make_get_pro_status_message(master_pkey: nacl.signing.VerifyKey, request_at: datetime.datetime) -> bytes:
     return signed_message(GET_PRO_STATUS_DOMAIN, master_pkey, request_at)
 
@@ -538,7 +498,6 @@ def payment_row_from_dict(row: dict[str, typing.Any]) -> PaymentRow:
     result.google_payment_token = str(row['google_payment_token']) if row['google_payment_token'] else ''
     result.google_order_id = str(row['google_order_id']) if row['google_order_id'] else ''
     result.rangeproof_order_id = str(row['rangeproof_order_id']) if row['rangeproof_order_id'] else ''
-    result.refund_requested_at = row['refund_requested_at']  # NULL = none requested
     result.google_obfuscated_account_id = (
         bytes(row['google_obfuscated_account_id']) if row['google_obfuscated_account_id'] is not None else None
     )
@@ -649,7 +608,6 @@ def user_row_from_dict(row: dict[str, typing.Any]) -> UserRow:
         expires_at=row['expires_at'],
         grace_period=row['grace_period'],
         auto_renewing=bool(row['auto_renewing']),
-        refund_requested_at=row['refund_requested_at'],
     )
 
 
@@ -877,13 +835,12 @@ def _update_user_expiry_grace_and_renew_flag_from_payment_list(
         '''
         UPDATE users
         SET    expires_at = %(expiry)s, grace_period = %(grace)s,
-               auto_renewing = %(renewing)s, refund_requested_at = %(refund)s
+               auto_renewing = %(renewing)s
         WHERE  master_pkey = %(pkey)s
     ''',
         expiry=lookup.best_expiry,
         grace=lookup.best_grace,
         renewing=lookup.best_auto_renewing,
-        refund=lookup.best_refund_requested,
         pkey=master_pkey_bytes,
     )
 
@@ -1259,7 +1216,7 @@ def _lookup_user_expiry(tx: db.SQLTransaction, master_pkey: nacl.signing.VerifyK
     result_set = db.query(
         tx.conn,
         '''
-        SELECT    p.expires_at, p.grace_period, p.auto_renewing, p.redeemed_at, p.refund_requested_at,
+        SELECT    p.expires_at, p.grace_period, p.auto_renewing, p.redeemed_at,
                   p.payment_provider, ad.original_tx_id, gd.order_id, rd.order_id, p.revoked_at
         FROM      payments p
                   LEFT JOIN app_store_payment_details ad      ON ad.payment_id = p.id
@@ -1286,7 +1243,6 @@ def _lookup_user_expiry(tx: db.SQLTransaction, master_pkey: nacl.signing.VerifyK
             grace_period,
             auto_renewing,
             redeemed_at,
-            refund_requested_at,
             payment_provider,
             apple_original_tx_id,
             google_order_id,
@@ -1374,13 +1330,11 @@ def _lookup_user_expiry(tx: db.SQLTransaction, master_pkey: nacl.signing.VerifyK
         if is_redeemed and (best_wo_grace_from_redeemed is None or expires_at > best_wo_grace_from_redeemed):
             result.expiry_from_redeemed = payment_expires_at
             result.grace_from_redeemed = grace
-            result.refund_requested_from_redeemed = refund_requested_at
             result.auto_renewing_from_redeemed = bool(auto_renewing)
 
         if best_wo_grace is None or expires_at > best_wo_grace:
             result.best_expiry = payment_expires_at
             result.best_grace = grace
-            result.best_refund_requested = refund_requested_at
             result.best_auto_renewing = bool(auto_renewing)
     return result
 
@@ -1598,7 +1552,6 @@ def add_unredeemed_payment(
                 'platform_refund_expires_at': platform_refund_expires_at,
                 'purchased_at': purchased_at,
                 'auto_renewing': True,  # on by default until Google notifies otherwise
-                'refund_requested_at': None,
             },
             detail_table='google_play_payment_details',
             detail={
@@ -1627,7 +1580,6 @@ def add_unredeemed_payment(
                 'platform_refund_expires_at': platform_refund_expires_at,
                 'purchased_at': purchased_at,
                 'auto_renewing': True,  # on by default until Apple notifies otherwise
-                'refund_requested_at': None,
             },
             detail_table='app_store_payment_details',
             detail={
@@ -1650,7 +1602,6 @@ def add_unredeemed_payment(
                 'platform_refund_expires_at': platform_refund_expires_at,
                 'purchased_at': purchased_at,
                 'auto_renewing': False,  # Rangeproof vouchers never auto-renew
-                'refund_requested_at': None,
             },
             detail_table='rangeproof_payment_details',
             detail={'order_id': payment_tx.rangeproof_order_id},
@@ -1871,8 +1822,7 @@ def _ensure_active_generation(
         SET    current_generation_id        = %(gen_id)s,
                expires_at                   = %(expiry)s,
                grace_period                 = %(grace)s,
-               auto_renewing                = %(auto_renewing)s,
-               refund_requested_at          = %(refund_ts)s
+               auto_renewing                = %(auto_renewing)s
         WHERE  id = %(user_id)s
     ''',
         gen_id=result.generation_id,
@@ -1880,7 +1830,6 @@ def _ensure_active_generation(
         expiry=lookup.best_expiry,
         grace=lookup.best_grace,
         auto_renewing=lookup.best_auto_renewing,
-        refund_ts=lookup.best_refund_requested,
     )
     result.grace_period = lookup.best_grace
 
@@ -2325,81 +2274,6 @@ def get_payment(
 
 
 @db.transactional
-def set_refund_requested(
-    tx: db.SQLTransaction, payment_tx: UserPaymentTransaction, refund_requested_at: datetime.datetime | None
-) -> bool:
-    rows: db.Result | None = None
-    if payment_tx.provider == base.PaymentProvider.Rangeproof or payment_tx.provider == base.PaymentProvider.Nil:
-        return False
-
-    if payment_tx.provider == base.PaymentProvider.GooglePlayStore:
-        rows = db.query(
-            tx.conn,
-            '''
-            UPDATE payments
-            SET    refund_requested_at = %(ts)s
-            WHERE  id IN (SELECT payment_id FROM google_play_payment_details
-                            WHERE payment_token = %(token)s AND order_id = %(order_id)s)
-        ''',
-            ts=refund_requested_at,
-            token=payment_tx.google_payment_token,
-            order_id=payment_tx.google_order_id,
-        )
-    elif payment_tx.provider == base.PaymentProvider.iOSAppStore:
-        rows = db.query(
-            tx.conn,
-            '''
-            UPDATE payments
-            SET    refund_requested_at = %(ts)s
-            WHERE  id IN (SELECT payment_id FROM app_store_payment_details WHERE tx_id = %(tx_id)s)
-        ''',
-            ts=refund_requested_at,
-            tx_id=payment_tx.apple_tx_id,
-        )
-
-    assert rows and (rows.rowcount == 0 or rows.rowcount == 1)
-    success = rows.rowcount > 0
-
-    # If the refund timestamp has been set, immediately refresh the user's row.
-    #
-    # When a client hits /get_payment_details, that endpoint uses the user's row which caches the
-    # "best" payment that should be used to entitle a user to pro. Hence if their refund
-    # timestamp changes for that best payment, that metadata that is cached in the user details
-    # must be updated.
-    if success:
-        row = None
-        if payment_tx.provider == base.PaymentProvider.GooglePlayStore:
-            row = db.query_one(
-                tx.conn,
-                '''
-                SELECT u.master_pkey
-                FROM   payments p JOIN users u ON u.id = p.user_id
-                       JOIN google_play_payment_details gd ON gd.payment_id = p.id
-                WHERE  gd.payment_token = %(token)s AND gd.order_id = %(order_id)s
-            ''',
-                token=payment_tx.google_payment_token,
-                order_id=payment_tx.google_order_id,
-            )
-        elif payment_tx.provider == base.PaymentProvider.iOSAppStore:
-            row = db.query_one(
-                tx.conn,
-                '''
-                SELECT u.master_pkey
-                FROM   payments p JOIN users u ON u.id = p.user_id
-                       JOIN app_store_payment_details ad ON ad.payment_id = p.id
-                WHERE  ad.tx_id = %s
-            ''',
-                payment_tx.apple_tx_id,
-            )
-
-        if row:
-            master_pkey = nacl.signing.VerifyKey(bytes(row[0]))
-            _update_user_expiry_grace_and_renew_flag_from_payment_list(tx, master_pkey)
-
-    return success
-
-
-@db.transactional
 def apple_add_notification_uuid(tx: db.SQLTransaction, uuid: str, expires_at: datetime.datetime):
     # uuid is the PRIMARY KEY; DO NOTHING keeps this idempotent (and crash-free) if the caller's
     # prior existence check raced with a concurrent insert of the same notification.
@@ -2650,13 +2524,6 @@ def generate_report_rows(conn: psycopg.Connection, period: ReportPeriod, limit: 
             tx_conn=tx.conn, period=period, date_column="purchased_at", where_clause="purchased_at IS NOT NULL"
         )
 
-        refunds_initiated: dict[str, int] = fetch_counts(
-            tx_conn=tx.conn,
-            period=period,
-            date_column="refund_requested_at",
-            where_clause="refund_requested_at IS NOT NULL",
-        )
-
         revocations: dict[str, int] = fetch_counts(
             tx_conn=tx.conn, period=period, date_column="revoked_at", where_clause="revoked_at IS NOT NULL"
         )
@@ -2671,13 +2538,7 @@ def generate_report_rows(conn: psycopg.Connection, period: ReportPeriod, limit: 
         active_users: dict[str, int] = fetch_active_users(tx.conn, period)
 
         all_periods: set[str] = set()
-        for key_list in [
-            new_subs.keys(),
-            refunds_initiated.keys(),
-            revocations.keys(),
-            cancelled.keys(),
-            active_users.keys(),
-        ]:
+        for key_list in [new_subs.keys(), revocations.keys(), cancelled.keys(), active_users.keys()]:
             for it in key_list:
                 all_periods.add(it)
 
@@ -2695,7 +2556,6 @@ def generate_report_rows(conn: psycopg.Connection, period: ReportPeriod, limit: 
                     plan_1m=plan_1m.get(it, 0),
                     plan_3m=plan_3m.get(it, 0),
                     plan_12m=plan_12m.get(it, 0),
-                    refunds_initiated=refunds_initiated.get(it, 0),
                     revoked=revocations.get(it, 0),
                     cancelled=cancelled.get(it, 0),
                 )
@@ -2722,7 +2582,6 @@ def generate_report_str(period: ReportPeriod, data: list[ReportRow], type: Repor
         Section("Plan 1m", 10),
         Section("Plan 3m", 10),
         Section("Plan 12m", 10),
-        Section("Refunds Initiated", 20),
         Section("Revoked", 10),
         Section("Cancelling", 12),
     ]
@@ -2801,11 +2660,6 @@ def generate_report_str(period: ReportPeriod, data: list[ReportRow], type: Repor
                 part_section = sections[len(human_parts)]
                 padding = part_section.width
                 align = '<' if part_section.align_left else '>'
-                human_parts.append(f"{row.refunds_initiated:20}")
-
-                part_section = sections[len(human_parts)]
-                padding = part_section.width
-                align = '<' if part_section.align_left else '>'
                 human_parts.append(f"{row.revoked:{align}{padding}}")
 
                 part_section = sections[len(human_parts)]
@@ -2832,7 +2686,6 @@ def generate_report_str(period: ReportPeriod, data: list[ReportRow], type: Repor
                     row.plan_1m,
                     row.plan_3m,
                     row.plan_12m,
-                    row.refunds_initiated,
                     row.revoked,
                     row.cancelled,
                 ]
