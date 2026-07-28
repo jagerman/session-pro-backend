@@ -1,0 +1,59 @@
+# Containerised Session Pro Backend for local dev and QA: the backend plus a throwaway PostgreSQL.
+#
+#   cd docker && docker compose up --build
+#
+# NOT the production deployment — that is scripts/deploy.sh. This stack exists to put accounts into a
+# Pro state for testing, so it runs with all payment-provider egress stubbed (`provider_dry_run`) and
+# the /dev routes enabled. Subscriptions can be minted for any of the three providers, and no Apple or
+# Google credentials are involved at any point; there is deliberately no way to enable a live provider
+# here. Use scripts/deploy.sh if you need to test the real Apple/Google integrations.
+#
+# Published on :8090 so it is reachable from the host at http://<host>:8090 and from other containers
+# (or host-networked service nodes making the onion-request exit call) at the same address.
+#
+# Requires Docker Compose v2.20+ (`include` is used by the devnet parent compose).
+services:
+  # Dedicated PostgreSQL: db.py is raw psycopg 3 and speaks only PostgreSQL. Deliberately no named
+  # volume — recreating the container gives a clean database, which is what a reproducible QA run
+  # wants. The credentials are fixed and public precisely because nothing here is worth protecting.
+  pro-backend-db:
+    image: postgres:17-alpine
+    container_name: sesh-net-pro-db
+    environment:
+      POSTGRES_USER: pro-backend
+      POSTGRES_PASSWORD: devnet
+      POSTGRES_DB: session_pro
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U pro-backend -d session_pro']
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  pro-backend:
+    build:
+      # The repo root, not this directory — the Dockerfile copies the application source.
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: sesh-net-pro-backend
+    container_name: sesh-net-pro-backend
+    depends_on:
+      pro-backend-db:
+        condition: service_healthy
+    ports:
+      - '8090:80'
+    restart: unless-stopped
+    volumes:
+      # Declarative Pro grants applied on boot; mounted so it can be edited without a rebuild.
+      - ./vouchers.tsv:/etc/session-pro-backend/vouchers.tsv:ro
+    environment:
+      SESH_PRO_BACKEND_DB_URL: postgresql://pro-backend:devnet@pro-backend-db:5432/session_pro
+      # Stubs ALL payment-provider egress: outbound mutations become no-ops and gating reads return
+      # synthetic success. Load-bearing, not a convenience — a minted google_play payment's redeem
+      # would otherwise try to reach Google. The backend refuses to start with the dev endpoints on
+      # while this is off, so leave both at their defaults.
+      SESH_PRO_BACKEND_PROVIDER_DRY_RUN: ${SESH_PRO_BACKEND_PROVIDER_DRY_RUN:-1}
+      # Enables POST /dev/add_payment, which mints a Pro subscription for any unauthenticated caller.
+      # NEVER set this on a real instance.
+      SESH_PRO_BACKEND_DEV_ENDPOINTS: ${SESH_PRO_BACKEND_DEV_ENDPOINTS:-1}
+      PRO_VOUCHERS_FILE: /etc/session-pro-backend/vouchers.tsv

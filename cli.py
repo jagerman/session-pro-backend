@@ -13,18 +13,19 @@ import pathlib
 import sys
 import time
 import typing
-import uuid
 
 import nacl.signing
 
 import base
 import backend
 import db
+import minting
 
 # Epilog definitions
 BRIEF_EPILOG = """
 QUICK START EXAMPLES (all commands require --config):
-  voucher                     --master-pkey <hex> --plan <1M|3M|12M> [--rotating-pkey <hex>] [--duration <s>]
+  voucher                     --master-pkey <hex> --plan <1M|3M|12M>
+                              [--provider <p>] [--rotating-pkey <hex>] [--duration <s>]
   user-error set              <provider>:<payment-id>=<true|false>[,...]
   user-error delete           <provider>:<payment-id>[,...]
   google-notification handle  <msgid>[,...]
@@ -98,8 +99,9 @@ COMMAND FORMATS DETAILED:
       python cli.py --config config.ini user-error delete "1:abc123token"
       python cli.py --config config.ini user-error delete "1:token1,1:token2,2:apple1"
 
-  voucher --config <ini> --master-pkey <hex> --plan <1M|3M|12M> [--rotating-pkey <hex>] [--duration <s>]
-    Create a Rangeproof voucher payment and auto-redeem it. This is an admin command for granting
+  voucher --config <ini> --master-pkey <hex> --plan <1M|3M|12M>
+          [--provider <p>] [--rotating-pkey <hex>] [--duration <s>]
+    Create a voucher payment and auto-redeem it. This is an admin command for granting
     promotional or complimentary Session Pro subscriptions directly in the database.
 
     Required:
@@ -108,6 +110,9 @@ COMMAND FORMATS DETAILED:
       --plan <1M|3M|12M>      Subscription plan duration
 
     Optional:
+      --provider <p>          rangeproof (default) | google_play | app_store. The non-rangeproof
+                              providers mint a payment the store never saw, for testing the
+                              per-provider code paths, and require provider_dry_run
       --rotating-pkey <hex>   64-char hex rotating public key (generates new if omitted)
       --duration <s>          Override duration in seconds
 
@@ -115,6 +120,7 @@ COMMAND FORMATS DETAILED:
       python cli.py voucher --config config.ini --master-pkey abcdef... --plan 1M
       python cli.py voucher --config config.ini --master-pkey abcdef... --plan 3M --rotating-pkey fedcba...
       python cli.py voucher --config config.ini --master-pkey abcdef... --plan 12M --duration 5
+      python cli.py voucher --config config.ini --master-pkey abcdef... --plan 1M --provider google_play
 
   google-notification handle "<message_id>[,...]" (requires --config)
     A ',' delimited string of message IDs to instruct the DB to mark the specified rows as handled
@@ -292,6 +298,7 @@ class CLIConfig:
     db_url: str = ''
     backend_key_path: str = ''
     log_path: str = ''
+    provider_dry_run: bool = False
 
 
 def _fail_config(reason: str) -> typing.NoReturn:
@@ -322,10 +329,12 @@ def require_config(args: argparse.Namespace) -> CLIConfig:
     result.db_url = base_section.get('db_url', '')
     result.backend_key_path = base_section.get('backend_key_path', '')
     result.log_path = base_section.get('log_path', '')
+    result.provider_dry_run = base_section.getboolean('provider_dry_run', fallback=False)
 
     # Allow environment variable override
     result.db_url = os.getenv('SESH_PRO_BACKEND_DB_URL', result.db_url)
     result.backend_key_path = os.getenv('SESH_PRO_BACKEND_KEY_PATH', result.backend_key_path)
+    result.provider_dry_run = base.os_get_boolean_env('SESH_PRO_BACKEND_PROVIDER_DRY_RUN', result.provider_dry_run)
 
     if not result.db_url:
         print("ERROR: No database URL configured in config file", file=sys.stderr)
@@ -698,8 +707,12 @@ def cmd_report_generate(args: argparse.Namespace) -> int:
 
 
 def cmd_voucher(args: argparse.Namespace) -> int:
-    """Handle voucher command - creates Rangeproof voucher and auto-redeems it."""
+    """Handle voucher command - mints a payment for the chosen provider and auto-redeems it."""
     config = require_config(args)
+
+    # A google_play voucher's redeem consults Google (see backend.add_pro_payment); with dry-run on
+    # that is stubbed. The CLI has to propagate the flag itself — nothing else sets it in this process.
+    base.PROVIDER_DRY_RUN = config.provider_dry_run
 
     # Parse master public key
     try:
@@ -709,6 +722,17 @@ def cmd_voucher(args: argparse.Namespace) -> int:
         master_pkey = nacl.signing.VerifyKey(bytes.fromhex(master_pkey_hex))
     except Exception as e:
         print(f"ERROR: Failed to parse master public key: {e}", file=sys.stderr)
+        return 1
+
+    provider = base.PaymentProvider(args.provider)
+    if provider != base.PaymentProvider.Rangeproof and not config.provider_dry_run:
+        # A minted google_play/app_store payment is fiction as far as the provider is concerned, so its
+        # redeem must never be allowed to talk to one. Rangeproof has no provider to talk to.
+        print(
+            f"ERROR: --provider {provider.value} requires provider_dry_run to be enabled "
+            f"(the payment is synthetic and its redeem must not reach the provider)",
+            file=sys.stderr,
+        )
         return 1
 
     # Handle rotating key
@@ -730,60 +754,32 @@ def cmd_voucher(args: argparse.Namespace) -> int:
         print(f'Generated Rotating SKey: {bytes(rotating_skey).hex()}')
         print(f'Generated Rotating PKey: {bytes(rotating_pkey).hex()}')
 
-    rangeproof_order_id = str(uuid.uuid4())
-    print(f'Generated Rangeproof Order ID: {rangeproof_order_id}')
-
-    # Map plan to enum and calculate duration
-    plan_map = {'1M': base.ProPlan.OneMonth, '3M': base.ProPlan.ThreeMonth, '12M': base.ProPlan.TwelveMonth}
-    plan = plan_map[args.plan]
-
-    # Calculate plan duration in milliseconds
-    if args.duration:
-        duration_ms = args.duration * 1000
-    else:
-        if plan == base.ProPlan.OneMonth:
-            duration_ms = 30 * base.SECONDS_IN_DAY * 1000
-        elif plan == base.ProPlan.ThreeMonth:
-            duration_ms = 90 * base.SECONDS_IN_DAY * 1000
-        else:  # TwelveMonth
-            duration_ms = 365 * base.SECONDS_IN_DAY * 1000
-
-    # Create payment transaction
-    payment_tx = base.PaymentProviderTransaction(
-        provider=base.PaymentProvider.Rangeproof, rangeproof_order_id=rangeproof_order_id
-    )
+    plan = minting.plan_from_label(args.plan)
+    assert plan is not None, f'argparse restricts --plan to the known labels, got {args.plan}'
+    try:
+        duration = minting.duration_from_seconds(args.duration)
+    except base.FailError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 1
 
     try:
         with db.open_database(config.db_url) as engine:
             with db.connection(engine) as conn:
                 with db.transaction(conn) as tx:
-                    unix_ts_ms = int(time.time() * 1000)
-                    request_at = base.datetime_from_unix_ms(unix_ts_ms)
-                    expires_at = base.datetime_from_unix_ms(unix_ts_ms + duration_ms)
-                    purchased_at = request_at
+                    request_at = base.datetime_from_unix_ms(int(time.time() * 1000))
 
-                    # Step 1: Add unredeemed payment
-                    print('\nStep 1: Creating unredeemed Rangeproof payment...')
-                    err = base.ErrorSink()
-                    backend.add_unredeemed_payment(
+                    # Step 1: mint the payment, unredeemed (shared with the /dev/add_payment route).
+                    print(f'\nStep 1: Creating unredeemed {provider.value} payment...')
+                    minted = minting.mint_payment(
                         tx,
-                        payment_tx=payment_tx,
+                        master_pkey=master_pkey,
+                        provider=provider,
                         plan=plan,
-                        expires_at=expires_at,
-                        purchased_at=purchased_at,
-                        platform_refund_expires_at=base.EPOCH,
-                        platform_obfuscated_account_id=b'',
-                        err=err,
+                        now=request_at,
+                        duration=duration,
+                        redeem=False,
                     )
-
-                    if err.has():
-                        print(
-                            "ERROR: Failed to create unredeemed payment:\n  " + "\n  ".join(err.msg_list),
-                            file=sys.stderr,
-                        )
-                        return 1
-
-                    print("Success: Unredeemed payment created")
+                    print(f"Success: Unredeemed payment created (payment_id: {minted.payment_id})")
 
                     # Load the backend signing key from disk. It is not stored in the DB.
                     if not config.backend_key_path:
@@ -806,7 +802,12 @@ def cmd_voucher(args: argparse.Namespace) -> int:
                         master_pkey=master_pkey,
                         rotating_pkey=rotating_pkey,
                         payment_tx=backend.UserPaymentTransaction(
-                            provider=base.PaymentProvider.Rangeproof, rangeproof_order_id=rangeproof_order_id
+                            provider=provider,
+                            apple_tx_id=minted.payment_tx.apple_tx_id,
+                            rangeproof_order_id=minted.payment_tx.rangeproof_order_id,
+                            google_payment_token=minted.payment_tx.google_payment_token,
+                            google_order_id=minted.payment_tx.google_order_id,
+                            payment_id=minted.payment_id,
                         ),
                     )
 
@@ -843,11 +844,22 @@ def main() -> int:
 
     subparsers = parser.add_subparsers(dest='command', help='Available commands')
 
-    # Voucher command (creates Rangeproof voucher and auto-redeems it)
-    voucher_parser = subparsers.add_parser('voucher', help='Create a Rangeproof voucher payment (requires --config)')
+    # Voucher command (mints a payment for the chosen provider and auto-redeems it)
+    voucher_parser = subparsers.add_parser('voucher', help='Create a voucher payment (requires --config)')
     voucher_parser.add_argument('--master-pkey', required=True, help='64-char hex master public key of the recipient')
     voucher_parser.add_argument(
         '--plan', required=True, choices=['1M', '3M', '12M'], help='Subscription plan (1M/3M/12M)'
+    )
+    voucher_parser.add_argument(
+        '--provider',
+        default=base.PaymentProvider.Rangeproof.value,
+        choices=[
+            base.PaymentProvider.Rangeproof.value,
+            base.PaymentProvider.GooglePlayStore.value,
+            base.PaymentProvider.iOSAppStore.value,
+        ],
+        help='Payment provider to attribute the voucher to (default: rangeproof). google_play and '
+        'app_store mint a synthetic payment the provider never saw, so they require provider_dry_run',
     )
     voucher_parser.add_argument('--rotating-pkey', help='64-char hex rotating public key (generates new if omitted)')
     voucher_parser.add_argument('--duration', type=int, help='Override duration in seconds')

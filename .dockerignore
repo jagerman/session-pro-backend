@@ -1,0 +1,25 @@
+# Build context is the repo root (see docker/Dockerfile). Keep out anything the image does not need,
+# so an unrelated local file cannot bust the COPY layer's cache or leak into the image.
+#
+# NOTE: docker/ itself must stay in the context — the Dockerfile copies docker/entrypoint.sh from it.
+
+.git
+.gitignore
+.dockerignore
+
+__pycache__
+**/__pycache__
+*.py[cod]
+.mypy_cache
+.pytest_cache
+
+# Local runtime droppings (mirrors .gitignore). key_ed25519 is deliberately NOT excluded: the
+# Dockerfile picks it up if present, so you can bake your own signing key instead of the default.
+data
+backend.db
+*.log
+*.ini
+!mypy.ini
+
+.idea
+.vscode
