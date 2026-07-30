@@ -23,7 +23,7 @@ import urllib.request
 # NOTE: Constants
 # Backend software version, reported by the /status health endpoint. Bump on release; there is no other
 # version marker in the system (the wire/proof formats are versioned separately — see the wire spec).
-BACKEND_VERSION: str = '0.2.0'
+BACKEND_VERSION: str = '0.3.0'
 SECONDS_IN_DAY: int = 60 * 60 * 24
 MILLISECONDS_IN_DAY: int = 60 * 60 * 24 * 1000
 MILLISECONDS_IN_MONTH: int = MILLISECONDS_IN_DAY * 30
@@ -43,6 +43,19 @@ SECONDS_IN_YEAR: int = SECONDS_IN_DAY * 365
 # It is a protocol constant, not merely a server-side check: the backend's revocation-skip math
 # (revoke_payments_by_id_internal) depends on the same skew bound, so both must read this one value.
 DEFAULT_TIMESTAMP_TOLERANCE: datetime.timedelta = datetime.timedelta(seconds=70)
+
+# --- Revocation-list timings (wire spec §4). ---
+# How long after we RECORD a revocation peers begin rejecting proofs carrying its tag. Anchored to our
+# processing instant, never to the store's `revocationDate`: a stale notification (a backlog drained after
+# an outage) would otherwise arrive with the delay already elapsed, so peers would enforce before the
+# revoked sender could possibly have learnt of it — exactly the compose-then-truncate gap this delay
+# exists to prevent. 26 h = the 24 h client poll cadence (`retry_in`) + 2 h of slack for a client that
+# missed a poll (e.g. because *we* were down).
+REVOCATION_EFFECTIVE_DELAY: datetime.timedelta = datetime.timedelta(hours=26)
+# How long a revocation entry is kept (by clients, and by our own served list). Must be at least the
+# maximum proof lifetime so an entry is never dropped while a proof carrying its tag could still verify
+# (asserted below, once the proof-expiry shape is defined).
+REVOCATION_RETAIN_FOR: datetime.timedelta = datetime.timedelta(days=31)
 
 # Every instant in this codebase is a tz-aware UTC `datetime` and every duration a `timedelta`. Integer
 # epochs live ONLY in the converters below, at two kinds of boundary with distinct units:
@@ -92,6 +105,16 @@ def seconds_from_timedelta(value: datetime.timedelta) -> int:
     return value // datetime.timedelta(seconds=1)
 
 
+def utc_now() -> datetime.datetime:
+    '''The backend's own wall clock, as a tz-aware UTC instant.
+
+    Deliberately distinct from the provider-supplied instants that ride inside a store notification
+    (`revocationDate`, `event_ts_ms`, ...): this answers "when did *we* handle it", which is what a
+    broadcast anchor must key off. Funnelled through one function so a test can pin it.
+    '''
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
 def unix_seconds_float_from_datetime(value: datetime.datetime) -> float:
     # Fractional UNIX seconds (true division) — preserves the sub-second precision of an upstream
     # provider instant on the wire. ONLY for the enumerated float display fields (wire spec §1); never
@@ -131,6 +154,66 @@ PROVIDER_TESTING_ENV = False
 # It does NOT fabricate payments — a real witnessed payment must still exist — so it is not a "grant
 # arbitrary Pro" backdoor; worst-case misuse breaks real subscriptions, it does not mint entitlements.
 PROVIDER_DRY_RUN = False
+
+
+@dataclasses.dataclass(frozen=True)
+class ProofExpiryShape:
+    '''The three quantities that decide how far ahead a proof certifies. A proof issued at `request_at`
+    against an account whose true (grace-inclusive) entitlement ends at `true` expires at
+
+        round_up_onto_grid( min(request_at + clamp, true) + renewal_lead )
+
+    where the grid is that account's private daily one: `{ UTC midnight + offset + k * grid }`, with
+    `offset` the stored `users.proof_expiry_offset` — a uniform draw in [0, grid) re-drawn every time the
+    account's true expiry moves. Protocol values (the proof builder, the revocation-skip math and the
+    served revocation list all key off them); see `backend._build_proof_clamped_expiry_time` for the
+    reasoning behind each.
+    '''
+
+    clamp: datetime.timedelta  # rolling cap: how far ahead a proof may reach while the sub outlives it
+    renewal_lead: datetime.timedelta  # keeps a renewing client's attempt on the far side of `true`
+    grid: datetime.timedelta  # expiry grid period; the per-account offset spans exactly one of these
+
+    @property
+    def offset_range(self) -> int:
+        '''Exclusive upper bound on `users.proof_expiry_offset`, in seconds.'''
+        return seconds_from_timedelta(self.grid)
+
+    @property
+    def max_proof_lifetime(self) -> datetime.timedelta:
+        '''Strict upper bound on how far past its request instant a proof can reach. Not attained (the
+        round-up adds strictly less than `grid`), so it is safe as an inclusive bound.'''
+        return self.clamp + self.renewal_lead + self.grid
+
+
+# The real-world shape. `clamp` is 29 d rather than 30 so that the whole expression stays just over 30 d.
+PROOF_EXPIRY_SHAPE: ProofExpiryShape = ProofExpiryShape(
+    clamp=datetime.timedelta(days=29), renewal_lead=datetime.timedelta(seconds=3660), grid=datetime.timedelta(days=1)
+)
+
+# The same shape scaled to the compressed clock a provider testing environment runs on (Google's license
+# testers get a "day" that lasts 10 s — see round_datetime_to_next_day_with_provider_testing_support). Left
+# uncompressed, a ten-second test subscription would be handed a proof valid for a real day and a bit,
+# which makes expiry unobservable in QA; scaled, the arms and the over-provision keep their proportions so
+# a compressed run exercises the same behaviour. `renewal_lead` becomes a nominal one second: the real
+# value encodes a client renewing an hour ahead, which is a client behaviour that does not compress and is
+# meaningless against a ten-second subscription. Unlike the day-rounding helper this is not conditioned on
+# the payment provider — the grid is per ACCOUNT, and an account can hold payments from several — which is
+# harmless because the flag is only ever set in a dedicated test deployment.
+PROVIDER_TESTING_PROOF_EXPIRY_SHAPE: ProofExpiryShape = ProofExpiryShape(
+    clamp=datetime.timedelta(seconds=290),  # 29 compressed days
+    renewal_lead=datetime.timedelta(seconds=1),
+    grid=datetime.timedelta(seconds=10),  # one compressed day
+)
+
+
+def proof_expiry_shape() -> ProofExpiryShape:
+    '''Read at call time, never captured in a constant: PROVIDER_TESTING_ENV is set during startup (and
+    swapped in and out by tests), so a value frozen at import would be the wrong one.'''
+    return PROVIDER_TESTING_PROOF_EXPIRY_SHAPE if PROVIDER_TESTING_ENV else PROOF_EXPIRY_SHAPE
+
+
+assert REVOCATION_RETAIN_FOR >= PROOF_EXPIRY_SHAPE.max_proof_lifetime
 
 # NOTE: Restricted type-set, JSON obviously supports much more than this, but
 # our use-case only needs a small subset of it as of current so KISS.
@@ -455,6 +538,22 @@ def round_datetime_to_next_day(value: datetime.datetime) -> datetime.datetime:
     # `(ms + DAY-1)//DAY*DAY` ceil semantics).
     start = round_datetime_to_start_of_day(value)
     return start if start == value else start + datetime.timedelta(days=1)
+
+
+def round_datetime_up_onto_offset_grid(
+    value: datetime.datetime, period: datetime.timedelta, offset_seconds: int
+) -> datetime.datetime:
+    '''Ceil `value` onto the grid `{ EPOCH + offset_seconds + k * period }`.
+
+    EPOCH is itself a UTC midnight, so with a one-day period this is "the next UTC midnight shifted by
+    `offset_seconds`" — the per-account proof-expiry grid (see ProofExpiryShape). A value already exactly on
+    the grid stays put, matching round_datetime_to_next_day. `offset_seconds` is reduced modulo the period
+    so an offset drawn against a wider period (a database written before the period changed) still names a
+    real grid point. The result is always a whole second, since both the origin and the period are.
+    '''
+    origin = EPOCH + datetime.timedelta(seconds=offset_seconds % seconds_from_timedelta(period))
+    units = -((-(value - origin)) // period)  # ceil-divide the timedelta
+    return origin + units * period
 
 
 def format_bytes(size: int):

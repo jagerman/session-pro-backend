@@ -34,8 +34,9 @@
     last**, so it is never followed by a separator and the parse stays unambiguous even if it contained one.
 - **Time quantities:** **UNIX-epoch seconds** everywhere (never milliseconds), for both timestamps and
   durations. Almost every value is a JSON **integer**: every expiry, every duration, and anything the
-  backend computes or rounds lands on a whole second (Session Pro expiries are day-aligned, never
-  sub-second). The **only** exception is a short, explicitly-enumerated set of **upstream provider event
+  backend computes or rounds lands on a whole second (the proof's `expiry_ts` is rounded onto a
+  whole-second grid — §2.3 — and a store-supplied expiry surfaced as an integer field is floored to the
+  second). The **only** exception is a short, explicitly-enumerated set of **upstream provider event
   instants** — currently `purchased_ts` (provider purchase time) and `revoked_ts` (provider revocation
   time) — emitted as JSON **floats** so the provider's sub-second precision survives; the fractional part
   is just the sub-second remainder, still seconds. (A binary64 float resolves current-era timestamps to
@@ -110,7 +111,8 @@ verified offline**; it carries **no user identity**.
 { "version": 0,                   // plaintext; selects the domain prefix (see below). NOT hashed.
   "revocation_tag": "<64 hex>",   // opaque 32-byte value; see §2.1
   "rotating_pkey":  "<64 hex>",   // Ed25519 public key the proof entitles
-  "expiry_ts": <int>,             // seconds; PROOF validity (clamped, rolling ≤30d) — NOT the sub end
+  "expiry_ts": <int>,             // seconds; PROOF validity (clamped, rolling ~30d) — NOT the sub end;
+                                  //   see §2.3 before reading anything into its value
   "sig": "<128 hex>",             // Ed25519 over the message below (§1.1)
   "account_expiry_ts": <int> }    // advisory, UNSIGNED; see §2.2
 ```
@@ -149,10 +151,34 @@ The account's **true entitlement end** in integer seconds — the same value `ge
 `expiry_ts` (grace-inclusive). It is **not** part of the signed message `M` and carries no signature of
 its own: a verifier reconstructs `M` from `version`/`revocation_tag`/`rotating_pkey`/`expiry_ts` only and
 MUST NOT feed `account_expiry_ts` into that check. It is **distinct from the proof's `expiry_ts`**, which
-is the clamped, rolling (≤30 d) proof-validity window; `account_expiry_ts` is the subscription horizon
+is the clamped, rolling (~30 d) proof-validity window; `account_expiry_ts` is the subscription horizon
 and may be far later. It rides on the proof response so a proof fetch also refreshes the client's cached
 expiry; treat it as display state, not an entitlement authority (the signed proof + revocation list are
 authoritative).
+
+`expiry_ts ≤ account_expiry_ts` always holds. In the final stretch of a subscription the proof's expiry
+overtakes the true entitlement end (§2.3), and there `account_expiry_ts` reports the proof's expiry rather
+than the true end — so it is exact everywhere except that closing window, where it reads up to ~25 h
+generous. The `subscription_expired` failure (§5.1) carries the true, now-past end instead.
+
+### 2.3 `expiry_ts` (proof validity)
+The proof's own validity window, and **nothing else**. It is the earlier of the subscription end and a
+rolling ~30 d cap, plus a **deliberate over-provision of up to ~25 h**, rounded up onto a **random,
+per-account grid** (one grid point every 24 h, at an offset the backend re-draws each billing cycle).
+Consequences for a verifier or a client:
+
+- **Never day-aligned, and never treated as one.** A verifier checks `expiry_ts` against its clock, full
+  stop; it must not round, truncate to a day, or reconstruct any boundary from it.
+- **Do not read the value as information.** Its time-of-day is a random per-account draw, and two accounts
+  on identical plans have unrelated `expiry_ts` values. It is not the subscription end (that's
+  `account_expiry_ts`), not the renewal instant, and not a plan-tier indicator.
+- **Clients renew one hour before `expiry_ts`.** That lead is fixed by agreement with the backend, which
+  sizes the over-provision around it: **renewing earlier than 1 h requires a coordinated backend change**,
+  or a renewal request can land before the store has had its last chance to report the renewal and be
+  answered `subscription_expired` on a subscription that is in fact renewing.
+- **Expect the value to be stable, then step.** Two of a user's devices asking within the same grid period
+  receive the same `expiry_ts`; while the cap is in force it steps by exactly 24 h per period rather than
+  sliding with the request, and once the subscription end comes into range it stops moving at all.
 
 ## 3. Signed requests (signed by the user's master key)
 
@@ -196,10 +222,14 @@ last-seen `ticket`; the backend returns the full list only if the ticket advance
 ```
 { "ticket":     <int64>,   // int64 type; VALUE stays « 2^53, so a JSON number (see §1)
   "retry_in":   <int>,     // recommended poll interval / throttle (seconds)
-  "retain_for": <int>,     // seconds a client should keep each entry after seeing it (≈ the max
+  "retain_for": <int>,     // seconds a client should keep each entry after seeing it (≥ the max
                            //   proof-validity window, ~30d). Sent, not hardcoded, so it can vary.
   "items": [ { "revocation_tag": "<64 hex>",
-               "effective_ts":   <int> },   // start rejecting matching proofs at/after this
+               "effective_ts":   <int> },   // start rejecting matching proofs at/after this; always
+                                            //   comfortably more than retry_in ahead of when the
+                                            //   backend recorded the revocation, so the revoked
+                                            //   sender polls and sees its own tag first. Enforce it
+                                            //   as given — never earlier.
              ... ] }        // empty if caller's ticket == current ticket
 }
 ```

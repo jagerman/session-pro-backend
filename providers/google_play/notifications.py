@@ -861,9 +861,10 @@ def handle_subscription_notification(
                         payment_provider=tx_payment.provider, at=base.datetime_from_unix_ms(tx_event.event_ts_ms)
                     )
 
-                    # NOTE: expires_at in the db is not rounded, but the proof's themselves have an
-                    # expiry timestamp rounded to the end of the UTC day. So we only actually want to revoke
-                    # proofs that aren't going to self-expire by the end of the day.
+                    # NOTE: A payment at or past the end of the current day is expiring anyway, so it isn't
+                    # worth an entry in the revocation list every client fetches. Mirrors the day-boundary
+                    # early-out in backend.revoke_payments_by_id_internal — see the note there for the
+                    # bounded window an outstanding proof can outlive it by.
                     if rounded_expiry_at > rounded_event_at:
                         backend.add_google_revocation(
                             tx,

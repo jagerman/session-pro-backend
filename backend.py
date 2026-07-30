@@ -81,7 +81,16 @@ PAYMENTS_FROM = " LEFT JOIN ".join(
 # current generation's `token` (the proof's revocation_tag); it's an INNER JOIN because
 # users.current_generation_id is NOT NULL, so every user always has a current generation.
 USERS_COLUMNS = ", ".join(
-    ("u.id", "u.master_pkey", "u.current_generation_id", "g.token", "u.expires_at", "u.grace_period", "u.auto_renewing")
+    (
+        "u.id",
+        "u.master_pkey",
+        "u.current_generation_id",
+        "g.token",
+        "u.expires_at",
+        "u.grace_period",
+        "u.auto_renewing",
+        "u.proof_expiry_offset",
+    )
 )
 USERS_FROM = "users u JOIN generations g ON g.id = u.current_generation_id"
 
@@ -145,9 +154,11 @@ class ProSubscriptionProof:
     # message is revocation_tag ‖ rotating_pkey ‖ expires_at). Populated by
     # build_current_entitlement_proof from the SAME DB snapshot that produced the proof, so a proof
     # fetch also hands the client its current subscription horizon in one response. This is the TRUE
-    # entitlement end (grace-inclusive, matching what get_pro_status reports) and is deliberately
-    # distinct from `expires_at` above, which is the rolling, clamped (~30 d) proof validity — never
-    # conflate the two. Display state only; the signed proof + revocation list remain authoritative.
+    # entitlement end (grace-inclusive, matching what get_pro_status reports), except in the closing
+    # window where the proof's over-provision runs past it and it reads back the proof's own expiry so
+    # that `expires_at <= account_expires_at` always holds. Deliberately distinct from `expires_at`
+    # above, which is the rolling, clamped (~30 d) proof validity — never conflate the two.
+    # Display state only; the signed proof + revocation list remain authoritative.
     # Left at the default on any proof built without a user context (none today). ---
     account_expires_at: datetime.datetime = base.EPOCH
 
@@ -164,7 +175,8 @@ class ProSubscriptionProof:
             "version": self.version,
             "revocation_tag": self.revocation_tag.hex(),
             "rotating_pkey": bytes(self.rotating_pkey).hex(),
-            # Proof expiry is day-aligned, so integer seconds is exact (wire spec §2).
+            # Whole seconds by construction — a store expiry (µs-capable) only reaches here through
+            # _build_proof_clamped_expiry_time, and the signed message needs an exact integer (wire §2).
             "expiry_ts": base.unix_seconds_from_datetime(self.expires_at),
             "sig": self.sig.hex(),
             # Advisory, UNSIGNED (see field comment): the account's true entitlement end, distinct from
@@ -287,6 +299,9 @@ class UserRow:
     expires_at: datetime.datetime = base.EPOCH
     grace_period: datetime.timedelta = datetime.timedelta(0)
     auto_renewing: bool = False
+    # This account's private proof-expiry grid: expiries land on `UTC midnight + this + k * one day`.
+    # Re-drawn whenever `expires_at` moves. See new_proof_expiry_offset / _build_proof_clamped_expiry_time.
+    proof_expiry_offset: int = 0
 
 
 @dataclasses.dataclass
@@ -592,6 +607,7 @@ def user_row_from_dict(row: dict[str, typing.Any]) -> UserRow:
         expires_at=row['expires_at'],
         grace_period=row['grace_period'],
         auto_renewing=bool(row['auto_renewing']),
+        proof_expiry_offset=row['proof_expiry_offset'],
     )
 
 
@@ -805,6 +821,34 @@ def verify_db(conn: psycopg.Connection, err: base.ErrorSink) -> bool:
     return result
 
 
+def new_proof_expiry_offset() -> int:
+    '''Draw a fresh per-account proof-expiry offset: uniform seconds spanning exactly one expiry grid
+    period (a day, in production).
+
+    Two properties are load-bearing, both for the same reason — an observer reads the offset off any proof
+    and is trying to work backwards from it (see `_build_proof_clamped_expiry_time` for what the offset
+    buys, and `schema/003_proof_expiry_offset.sql` for why it is stored and re-drawn per cycle):
+    UNPREDICTABLE, so it must come from the CSPRNG and never from the clock or the account key; and
+    UNIFORM over the full period, since a skew re-clusters the expiry times the offset exists to scatter.
+    '''
+    # Reducing a 64-bit draw modulo the period leaves a bias of ~1 part in 10^15 — far below any skew that
+    # could cluster anything, so it is accepted rather than rejection-sampled away.
+    return int.from_bytes(nacl.utils.random(8), 'big') % base.proof_expiry_shape().offset_range
+
+
+# Re-draw `users.proof_expiry_offset` exactly when the account's true expiry MOVES. Both users of this
+# clause set expires_at from the payment list, so "moved" is the honest trigger for a new subscription
+# cycle: it covers a redeem, a renewal, a stacked purchase and a revocation, and skips a no-op refresh (a
+# flag-only touch, a re-reconcile that claims nothing). That precision matters in both directions — never
+# re-drawing against a fixed anniversary instant would leave a stable per-account fingerprint, while
+# re-drawing on every touch would hand an observer repeated samples of the same true expiry, whose minimum
+# converges straight back onto it.
+_REDRAW_OFFSET_IF_EXPIRY_MOVED = (
+    "proof_expiry_offset = CASE WHEN expires_at IS DISTINCT FROM %(expiry)s"
+    " THEN %(proof_random_offset)s ELSE proof_expiry_offset END"
+)
+
+
 @db.transactional
 def _update_user_expiry_grace_and_renew_flag_from_payment_list(
     tx: db.SQLTransaction, master_pkey: nacl.signing.VerifyKey
@@ -816,15 +860,17 @@ def _update_user_expiry_grace_and_renew_flag_from_payment_list(
     # NOTE: We have the latest expiry value, now update the user
     db.query(
         tx.conn,
-        '''
+        f'''
         UPDATE users
         SET    expires_at = %(expiry)s, grace_period = %(grace)s,
-               auto_renewing = %(renewing)s
+               auto_renewing = %(renewing)s,
+               {_REDRAW_OFFSET_IF_EXPIRY_MOVED}
         WHERE  master_pkey = %(pkey)s
     ''',
         expiry=lookup.best_expiry,
         grace=lookup.best_grace,
         renewing=lookup.best_auto_renewing,
+        proof_random_offset=new_proof_expiry_offset(),
         pkey=master_pkey_bytes,
     )
 
@@ -859,12 +905,14 @@ def revoke_payments_by_id_internal(tx: db.SQLTransaction, rows: typing.Any, revo
 
     revoke_at_next_day = round_datetime_to_next_day_with_provider_testing_support(base.PaymentProvider.Nil, revoke_at)
 
-    # The furthest into the future any outstanding proof can certify: a proof clamps its expiry to
-    # round_up_day(request_at + 30d) (_build_proof_clamped_expiry_time) and request_at is only accepted
-    # within DEFAULT_TIMESTAMP_TOLERANCE of the server clock, so no live proof reaches beyond this
-    # relative to the revoke instant.
-    max_outstanding_proof_expiry = base.round_datetime_to_next_day(
-        revoke_at + base.DEFAULT_TIMESTAMP_TOLERANCE + datetime.timedelta(days=30)
+    # The furthest into the future any outstanding proof can certify: a proof reaches at most
+    # `max_proof_lifetime` past its request instant (_build_proof_clamped_expiry_time) and a request_at is
+    # only accepted within DEFAULT_TIMESTAMP_TOLERANCE of the server clock, so no proof issued up to the
+    # revoke instant reaches beyond this. Anchoring to `revoke_at` assumes we process the refund promptly: a
+    # notification that reaches us late — a backlog drained after an outage — leaves any proof issued in the
+    # interim outside this bound.
+    max_outstanding_proof_expiry = (
+        revoke_at + base.DEFAULT_TIMESTAMP_TOLERANCE + base.proof_expiry_shape().max_proof_lifetime
     )
 
     for it in master_pkey_dict:
@@ -875,9 +923,12 @@ def revoke_payments_by_id_internal(tx: db.SQLTransaction, rows: typing.Any, revo
         master_pkey = nacl.signing.VerifyKey(it)
         _update_user_expiry_grace_and_renew_flag_from_payment_list(tx, master_pkey)
 
-        # NOTE: expires_at in the db is not rounded, but the proof's themselves have an
-        # expiry timestamp rounded to the end of the UTC day. So we only actually want to revoke
-        # proofs that aren't going to self-expire by the end of the day.
+        # NOTE: A payment at or past the end of the current day is on its way out anyway, so revoking it is
+        # not worth an entry in the (network-costly, every-client-fetches-it) revocation list. A proof built
+        # against such a payment can reach the renewal lead plus a whole grid period (≤ ~25 h) past that
+        # boundary, so an outstanding proof for a nearly-expired, then-refunded payment can outlive this
+        # early-out by that much. Accepted: it takes a refund of the account's *longest* payment inside that
+        # payment's final day, and the outcome is bounded extra Pro on an entitlement that was ending anyway.
         #
         # For different platforms in their testing environments, they have different timespans
         # for a day, for example in Google 1 day is 10s. We handle that explicitly here.
@@ -885,12 +936,12 @@ def revoke_payments_by_id_internal(tx: db.SQLTransaction, rows: typing.Any, revo
         if expires_at <= revoke_at_next_day:
             continue
 
-        # Item 4: even when the revoked payment's own proof would outlive the day boundary, a broadcast
-        # revocation + generation roll is only needed if the refund drops the user's *remaining*
-        # entitlement below something an outstanding proof already certifies. If enough paid time
-        # survives the refund (aggregate expiry at or beyond the furthest a live proof can reach) every
-        # outstanding proof stays honest, so we skip the revocation entirely. The revocation list is
-        # fetched by every client, so keeping it minimal is the point.
+        # Even when the revoked payment's own proof would outlive the day boundary, a broadcast revocation
+        # + generation roll is only needed if the refund drops the user's *remaining* entitlement below
+        # something an outstanding proof already certifies. If enough paid time survives the refund
+        # (aggregate expiry at or beyond the furthest a live proof can reach) every outstanding proof stays
+        # honest, so we skip the revocation entirely. The revocation list is fetched by every client, so
+        # keeping it minimal is the point.
         post_refund_expiry = _lookup_user_expiry(tx, master_pkey).best_expiry
         if post_refund_expiry is not None and post_refund_expiry >= max_outstanding_proof_expiry:
             continue
@@ -1794,14 +1845,17 @@ def get_or_create_user_and_generation(
     won = db.query_one(
         tx.conn,
         '''
-        INSERT INTO users (id, master_pkey, current_generation_id, expires_at)
-        VALUES            (%(id)s, %(master_pkey)s, %(gen_id)s, to_timestamp(0))
+        INSERT INTO users (id, master_pkey, current_generation_id, expires_at, proof_expiry_offset)
+        VALUES            (%(id)s, %(master_pkey)s, %(gen_id)s, to_timestamp(0), %(proof_expiry_offset)s)
         ON CONFLICT (master_pkey) DO NOTHING
         RETURNING id
     ''',
         id=user_id,
         master_pkey=master_pkey_bytes,
         gen_id=gen_id,
+        # A seed value only: the placeholder expiry above is immediately overwritten by
+        # _ensure_active_generation, and that write re-draws the offset along with it.
+        proof_expiry_offset=new_proof_expiry_offset(),
     )
     if won is None:
         # Lost a concurrent create — re-read the winner (our pre-allocated ids simply go unused).
@@ -1822,7 +1876,7 @@ def _ensure_active_generation(
     tx: db.SQLTransaction, master_pkey: nacl.signing.VerifyKey, issued_at: datetime.datetime
 ) -> AllocatedGenID:
     # Refresh the user's top-level entitlement fields from their current best payment, and settle which
-    # generation they're on. A generation is an EPOCH, not a per-payment value (item 3): REUSE the user's
+    # generation they're on. A generation is an EPOCH, not a per-payment value: REUSE the user's
     # current generation across payments — stacking, renewals, auto-redeem, natural-lapse reactivation — so
     # the revocation_tag stays stable (no per-payment revocation-list churn, no subscription-cadence leak).
     # Mint a FRESH generation only when the current one is REVOKED (reusing it would mint proofs born
@@ -1846,12 +1900,13 @@ def _ensure_active_generation(
 
     db.query(
         tx.conn,
-        '''
+        f'''
         UPDATE users
         SET    current_generation_id        = %(gen_id)s,
                expires_at                   = %(expiry)s,
                grace_period                 = %(grace)s,
-               auto_renewing                = %(auto_renewing)s
+               auto_renewing                = %(auto_renewing)s,
+               {_REDRAW_OFFSET_IF_EXPIRY_MOVED}
         WHERE  id = %(user_id)s
     ''',
         gen_id=result.generation_id,
@@ -1859,6 +1914,7 @@ def _ensure_active_generation(
         expiry=lookup.best_expiry,
         grace=lookup.best_grace,
         auto_renewing=lookup.best_auto_renewing,
+        proof_random_offset=new_proof_expiry_offset(),
     )
     result.grace_period = lookup.best_grace
 
@@ -1881,14 +1937,54 @@ def build_proof_message(
 
 
 def _build_proof_clamped_expiry_time(
-    request_at: datetime.datetime, proposed_expires_at: datetime.datetime
+    request_at: datetime.datetime, proposed_expires_at: datetime.datetime, proof_expiry_offset: int
 ) -> datetime.datetime:
-    # NOTE: Clamp the expiry time of the proof to 1 month and also make it land on the day boundary
-    # to reduce metadata leakage. If it's less than 1 month then just take the value verbatim as
-    # their subscription is coming to a close.
-    clamped_expires_at = base.round_datetime_to_next_day(request_at + datetime.timedelta(days=30))
-    result = min(clamped_expires_at, proposed_expires_at)
-    return result
+    '''How far ahead a proof issued at `request_at` certifies, given the account's true (grace-inclusive)
+    entitlement end and its stored per-account offset:
+
+        round_up_onto_grid( min(request_at + clamp, true) + renewal_lead )
+
+    where the grid is this account's own, `{ UTC midnight + proof_expiry_offset + k * one day }`.
+
+    Clamp, pad, then round up. Two arms come out of the `min`: while the subscription still has more than
+    the clamp left the expiry SLIDES with the request (a rolling ~30 d proof lifetime, so a lost or leaked
+    proof self-expires); as the subscription end comes into range the expiry PINS near it.
+
+    The round-up onto the grid is what makes both arms safe to publish. Landing on a grid point means the
+    expiry is constant for a whole period and then steps by exactly one: two of a user's devices asking at
+    different moments in the same period get identical proofs, and the value carries only which period the
+    request fell in, never the instant.
+
+    * The offset (uniform over one period, re-drawn each cycle) is what stops the pinned expiry from BEING
+      the account's exact true expiry, which would otherwise publish the precise purchase/renewal instant
+      as a stable time-of-day fingerprint and, via midnight-vs-not, the plan cadence — all readable by any
+      conversation partner. It equally stops clients herding into one minute at renewal time, which is what
+      any deterministic expiry (a plain day boundary, or the plan anniversary) does. An observer can read
+      the offset straight off the wire (`expiry_ts` modulo the period) but gains nothing by it: `true` is
+      still only pinned to within one period, and the offset is a random per-cycle value, less identifying
+      than the `revocation_tag` already in the proof. Note the rounding only ever goes UP — pulling an
+      expiry DOWN onto a boundary would advertise an end up to a period BEFORE the entitlement really
+      ends, and the renewal payment may well not have arrived by then.
+    * `renewal_lead` (1 h 1 min) keeps a renewing client's attempt on the correct side of `true`. A client
+      starts renewing one hour before its proof expires, so the attempt lands no earlier than
+      `min(...) + 60 s` — at least a minute past `true` in the pinned arm, since rounding up only pushes it
+      later — and `true` is grace-inclusive, i.e. the last instant an upstream store might still notify us
+      of the renewal. The 60 s absorbs a client clock running up to a minute fast so it still cannot fire
+      early. This is a LOCKED PAIR with the client's one-hour lead: a client that renews earlier needs a
+      matching change here, or its attempts start landing before the renewal can have resolved.
+
+    The cost is over-provisioning: an account is honoured for up to one period past `true + renewal_lead`.
+    That is deliberate (it also buffers a late store notification), and the per-cycle re-draw keeps the luck
+    from settling on the same accounts. `shape.max_proof_lifetime` bounds the resulting proof lifetime.
+    '''
+    shape = base.proof_expiry_shape()
+    # The stored column's own range (a day — the schema CHECK), NOT the current shape's: a database written
+    # before the shape changed still holds day-wide offsets, which the grid helper reduces modulo the period.
+    assert 0 <= proof_expiry_offset < base.PROOF_EXPIRY_SHAPE.offset_range
+    clamped_expires_at = min(request_at + shape.clamp, proposed_expires_at)
+    return base.round_datetime_up_onto_offset_grid(
+        clamped_expires_at + shape.renewal_lead, period=shape.grid, offset_seconds=proof_expiry_offset
+    )
 
 
 def build_proof(
@@ -1969,16 +2065,28 @@ def revoke_master_pkey_proofs_and_allocate_new_gen_id(
     # Revoke the user's current generation (terminal): sets revoked_at, which blocks every proof issued
     # under that generation and (via the trigger) bumps the revocation ticket. The `revoked_at IS NULL`
     # guard makes a double-revoke a no-op rather than tripping the terminal-immutability trigger.
+    #
+    # `revoked_at` is stamped with OUR clock, read here, and is deliberately NOT `created_at` and NOT a
+    # parameter. The served list turns this stamp into `effective_ts = revoked_at +
+    # REVOCATION_EFFECTIVE_DELAY`, so it must mean "when we recorded the revocation", never "when the store
+    # says the refund happened": a notification we process late (a backlog drained after an outage carries
+    # refunds dated hours or days back) would otherwise be broadcast already-effective, and peers would
+    # start rejecting the sender's proof before the sender could possibly have polled and learnt of it —
+    # precisely the compose-then-truncate gap the delay exists to close. Reading the clock at the single
+    # write site, rather than taking it from the caller, is what makes that unrepresentable: every caller
+    # here holds a provider timestamp, and one passed in by mistake looks exactly like a correct argument.
+    # `created_at` is the entitlement-side revoke instant (and the new generation's issued_at below);
+    # `payments.revoked_at` likewise keeps the store's own date — the user really was entitled until then.
     db.query(
         tx.conn,
         '''
         UPDATE generations
-        SET    revoked_at = %(created_at)s
+        SET    revoked_at = %(recorded_at)s
         WHERE  id = (SELECT current_generation_id FROM users WHERE master_pkey = %(master_pkey)s)
           AND  revoked_at IS NULL
     ''',
         master_pkey=bytes(master_pkey),
-        created_at=created_at,
+        recorded_at=base.utc_now(),
     )
 
     # If the user still has usable payments, roll them onto a fresh generation for subsequent proofs.
@@ -2023,8 +2131,15 @@ def build_current_entitlement_proof(
         raise base.FailError(f'User {bytes(master_pkey).hex()} payment has been revoked', code=base.ErrorCode.revoked)
 
     proof_expires_at = _build_proof_clamped_expiry_time(
-        request_at=request_at, proposed_expires_at=get_user.user.expires_at
+        request_at=request_at,
+        proposed_expires_at=get_user.user.expires_at,
+        proof_expiry_offset=get_user.user.proof_expiry_offset,
     )
+    # The expiry we are willing to certify is the honest cut-off, so a lapsed account keeps getting proofs
+    # (all with this same, stable expiry — the offset only moves when the true expiry does) until the
+    # over-provision above genuinely runs out, up to ~25 h past its true expiry. That is the same
+    # over-provision every live account gets, granted no further, and it keeps us consistent with the
+    # `account_expiry_ts` we already handed the client.
     if request_at > proof_expires_at:
         payment_expires_at = (
             get_user.user.expires_at - get_user.user.grace_period
@@ -2049,7 +2164,14 @@ def build_current_entitlement_proof(
     )
     # Advisory (unsigned) account entitlement end, from this same snapshot — the client's true
     # subscription horizon, distinct from the clamped proof expiry above.
-    proof.account_expires_at = get_user.user.expires_at
+    #
+    # `max` so `expiry_ts <= account_expiry_ts` holds by construction rather than by luck. Everywhere the
+    # proof is still clamped (all of a long plan's life) this is exactly the true expiry, which is what the
+    # owner should see. It only reads back the proof's own expiry in the closing window where the
+    # over-provision pushes the proof past the true end — and there the two agree, to within the ≤25 h we
+    # are honouring anyway, so the client is never told its subscription ended before a proof we signed
+    # stops verifying.
+    proof.account_expires_at = max(get_user.user.expires_at, proof.expires_at)
     return proof
 
 

@@ -113,25 +113,40 @@ Keep this in sync with the code — it describes real branches, not intentions.
 
 Deliberate trade-offs, not bugs or dormant handlers. Recorded so they aren't rediscovered as surprises.
 
-### Proof expiry-value metadata channel (privacy; accepted 2026-07-20)
+### Proof expiry-value metadata channel (privacy; accepted 2026-07-20, narrowed 2026-07-30)
 
 Proofs ride on the user's messages, so a conversation partner or group member — who already knows the
 sender — can read the proof's `expiry_ts`. **Short-plan** proofs hug a near-term *pinned* entitlement
-expiry, while **long-plan** proofs sit at a *sliding* `now + 30 d` (the proof-lifetime cap). The two are
-distinguishable regardless of the generation/`revocation_tag` fix, so an observer can infer roughly which
-plan tier a user is on.
+expiry, while **long-plan** proofs sit at a *sliding* cap. The two are distinguishable regardless of the
+generation/`revocation_tag` fix, so an observer can infer roughly which plan tier a user is on.
 
-- **Not fixed by rounding.** The daily round-up granularity is the wrong lever: coarsening to weekly
-  doesn't change slide-vs-pin and buys up to 7 days of exploitable overhang (free Pro past cancellation
-  for end-of-term users; it also widens item-4's revocation-skip margin from 1 day to 7).
-- **The only real lever is the cap length.** A shorter proof-lifetime cap shrinks the window in which a
-  short-plan user reveals a pinned date — at the cost of more refresh traffic and worse offline
+**The sharp part of this channel is now closed.** A proof expiry used to sit on the account's exact true
+expiry once pinned, publishing (a) the precise purchase/renewal instant, hence a stable per-account
+time-of-day fingerprint, and (b) the plan cadence, since a monthly auto-renewal pinned to a non-midnight
+instant while a longer plan pinned to midnight. `expiry_ts` is now rounded up onto a **random per-account
+grid** (one point every 24 h, re-drawn each billing cycle), so no exact instant, no persistent
+time-of-day, and no midnight-vs-not tell survives. That grid also spreads renewal traffic, which a
+deterministic expiry — the plan anniversary, or a plain UTC-midnight boundary — would herd into one minute.
+
+**What remains** is the coarse slide-vs-pin shape: an observer still sees the expiry stop stepping and
+settle as the subscription end comes into range, so they learn the sender is within ~29 d of their term
+end, and can bound the true expiry to within ~25 h. Don't oversell the fix as more than that.
+
+- **Not fixed by coarsening the grid.** A weekly grid doesn't change slide-vs-pin and buys up to 7 days of
+  exploitable overhang (free Pro past cancellation for end-of-term users; it also widens item-4's
+  revocation-skip margin from 1 day to 7).
+- **The only real lever left is the cap length.** A shorter proof-lifetime cap shrinks the window in which
+  a short-plan user reveals a pinned date — at the cost of more refresh traffic and worse offline
   resilience. Judged not worth it.
-- **Decision: accept as a known limitation.**
+- **The grid offset itself is readable** (`expiry_ts` modulo 24 h) and that's fine: it is a uniform random
+  per-cycle value that leaves the true expiry bounded to the same ~24 h window either way, and it is less
+  identifying than the per-generation `revocation_tag` already in the proof. Because a revocation moves the
+  true expiry, the offset re-draws in the same moment the tag rolls, so it adds no cross-roll linkage.
+- **Decision: accept the residual slide-vs-pin shape as a known limitation.**
 
 Note the *distinct* subscription-**cadence** leak (an observer watching how often the `revocation_tag`
 changes to infer renewal frequency) **was** closed — items 1+3 make the tag stable for the whole
-subscription lifetime, verified by item 5. Only this expiry-value channel remains. **Binding-revocation
-observability** (the tag necessarily changes on a revocation) is likewise intrinsic and accepted.
+subscription lifetime, verified by item 5. **Binding-revocation observability** (the tag necessarily
+changes on a revocation) is likewise intrinsic and accepted.
 
-*(Ref: `docs/refactor-plan.md` Phase-3 item 6.)*
+*(Ref: `docs/refactor-plan.md` Phase-3 item 6; wire spec §2.3.)*

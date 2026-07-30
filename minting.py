@@ -25,8 +25,10 @@ import db
 @dataclasses.dataclass
 class MintedPayment:
     payment_tx: base.PaymentProviderTransaction = dataclasses.field(default_factory=base.PaymentProviderTransaction)
-    # The opaque wire `payment_id` (§3.5) for the minted transaction, so a caller can hand it to a client
-    # that then claims the payment through the real add_pro_payment route.
+    # The opaque wire `payment_id` (§5.2) for the minted transaction: what a caller reports back so the
+    # payment can be identified afterwards (e.g. looked up through get_payment_details). Nothing claims a
+    # payment BY this id — redemption is implicit, so an unredeemed minted payment is bound by the account
+    # holder's next authenticated request.
     payment_id: str = ''
     plan: base.ProPlan = base.ProPlan.Nil
     expires_at: datetime.datetime = base.EPOCH
