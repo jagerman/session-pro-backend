@@ -254,7 +254,7 @@ Non-`ok` responses carry two fields:
 | `invalid_request` | fail | malformed JSON, missing/wrong-type field, bad hex, out-of-range value, unsupported/disabled provider. A correct client never sees this. |
 | `bad_signature` | fail | a request signature failed to verify. A correct client never sees this. |
 | `stale_request` | fail | request timestamp outside the replay-tolerance window. The client may re-fetch server time (`/status`) and retry. |
-| `subscription_expired` | fail | the user's entitlement has lapsed → "renew" CTA. (Named to stay disjoint from `user_status: expired` — §5.2 — so no token belongs to two fields.) |
+| `subscription_expired` | fail | the user's entitlement has lapsed → "renew" CTA. (Named to stay disjoint from `user_status: expired` — §5.2 — so no token belongs to two fields.) A `subscription_expired` fail on `generate_pro_proof` additionally carries a top-level **`account_expiry_ts`** (the now-past account entitlement end, §2.2) so the client can refresh its cached horizon without a separate `get_pro_status`; other slugs do not. |
 | `not_subscribed` | fail | no entitlement on record (never subscribed, or pruned after long inactivity) → "subscribe" CTA. |
 | `revoked` | fail | the user's current entitlement was revoked. Treat as `subscription_expired` (renew) on clients today; the distinct slug is reserved for a future revoked-specific flow. |
 | `internal_error` | error | backend fault; not the client's doing. |

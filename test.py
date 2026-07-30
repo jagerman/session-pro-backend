@@ -718,6 +718,42 @@ def test_proof_reports_account_expiry(pg_database):
     pool.close()
 
 
+def test_expired_proof_fail_carries_account_expiry(pg_database):
+    # A proof request against a lapsed entitlement fails with subscription_expired AND carries the
+    # account's (now-past) expiry as account_expiry_ts on the error, so the client can refresh its cached
+    # horizon without a separate get_pro_status.
+    pool = backend.bootstrap_db(database_url=pg_database())
+    assert pool
+    backend_key = nacl.signing.SigningKey.generate()
+    master_key = nacl.signing.SigningKey.generate()
+    rotating_key = nacl.signing.SigningKey.generate()
+    granted_at = base.round_datetime_to_next_day(datetime.datetime.now(datetime.timezone.utc))
+    account_expiry = granted_at + datetime.timedelta(hours=1)
+
+    with db.connection(pool) as conn:
+        # Grant a short entitlement (valid at grant time).
+        backend.grant_rangeproof(
+            conn,
+            master_pkey=master_key.verify_key,
+            rotating_pkey=rotating_key.verify_key,
+            signing_key=backend_key,
+            request_at=granted_at,
+            redeemed_at=granted_at,
+            plan=base.ProPlan.OneMonth,
+            expires_at=account_expiry,
+        )
+        # Ask for a proof from AFTER it lapsed -> subscription_expired, with the past expiry attached.
+        request_at = account_expiry + datetime.timedelta(hours=1)
+        with db.transaction(conn) as tx:
+            with pytest.raises(base.FailError) as excinfo:
+                backend.build_current_entitlement_proof(
+                    tx, master_key.verify_key, rotating_key.verify_key, request_at, backend_key
+                )
+        assert excinfo.value.code == base.ErrorCode.subscription_expired
+        assert excinfo.value.data == {'account_expiry_ts': base.unix_seconds_from_datetime(account_expiry)}
+    pool.close()
+
+
 def test_renewal_binds_by_identifier_not_account_id(pg_database):
     # The renewal auto-redeem binds a payment to its owner by the payment's OWN store identifier (via the
     # subscription-continuity linkage), NOT the master-key-derived account-id -- so the mule never matches

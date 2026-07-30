@@ -258,9 +258,13 @@ class ApiError(Exception):
     wire_status: str = 'error'
     default_code: ErrorCode = ErrorCode.internal_error
 
-    def __init__(self, message: str, code: ErrorCode | None = None):
+    def __init__(self, message: str, code: ErrorCode | None = None, data: dict[str, typing.Any] | None = None):
         super().__init__(message)
         self.code: ErrorCode = code if code is not None else self.default_code
+        # Optional extra top-level fields the error handler merges into the response envelope alongside
+        # {status, error_code, error} — e.g. a subscription_expired fail carrying `account_expiry_ts` so
+        # the client can refresh its cached horizon without a separate get_pro_status. Empty by default.
+        self.data: dict[str, typing.Any] = data if data is not None else {}
 
 
 class FailError(ApiError):

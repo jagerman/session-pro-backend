@@ -81,7 +81,10 @@ def handle_api_error(e: base.ApiError) -> flask.Response:
     # the response envelope (wire spec §5). It fires inside Flask's dispatch — including the onion
     # subrequest's full_dispatch_request — so the envelope is produced in-band and onion-wrapped normally.
     # HTTP stays 200 (the envelope `status` is authoritative; make_subrequest warns on any non-200).
-    return flask.jsonify({'status': e.wire_status, 'error_code': e.code.value, 'error': str(e)})
+    envelope: dict[str, typing.Any] = {'status': e.wire_status, 'error_code': e.code.value, 'error': str(e)}
+    # Optional extra fields carried on the error (e.g. account_expiry_ts on a subscription_expired fail).
+    envelope.update(e.data)
+    return flask.jsonify(envelope)
 
 
 def get_json_from_flask_request(request: flask.Request) -> dict[str, typing.Any]:

@@ -2035,6 +2035,10 @@ def build_current_entitlement_proof(
             f'User {bytes(master_pkey).hex()} entitlement expired at {base.readable(get_user.user.expires_at)} '
             f'({base.readable(payment_expires_at)} + {get_user.user.grace_period})',
             code=base.ErrorCode.subscription_expired,
+            # Advisory, same as the success path: carry the (now-past) account entitlement end so the
+            # client can refresh its cached horizon without a separate get_pro_status. Only on this slug —
+            # not_subscribed has no expiry, and revoked is a distinct state (its expiry may be future).
+            data={'account_expiry_ts': base.unix_seconds_from_datetime(get_user.user.expires_at)},
         )
 
     proof = build_proof(
