@@ -141,6 +141,16 @@ class ProSubscriptionProof:
     expires_at: datetime.datetime = base.EPOCH
     sig: bytes = b''
 
+    # --- Advisory account-entitlement value: NOT signed and NOT part of the proof message (the signed
+    # message is revocation_tag ‖ rotating_pkey ‖ expires_at). Populated by
+    # build_current_entitlement_proof from the SAME DB snapshot that produced the proof, so a proof
+    # fetch also hands the client its current subscription horizon in one response. This is the TRUE
+    # entitlement end (grace-inclusive, matching what get_pro_status reports) and is deliberately
+    # distinct from `expires_at` above, which is the rolling, clamped (~30 d) proof validity — never
+    # conflate the two. Display state only; the signed proof + revocation list remain authoritative.
+    # Left at the default on any proof built without a user context (none today). ---
+    account_expires_at: datetime.datetime = base.EPOCH
+
     def to_dict(self) -> dict[str, str | int]:
         # `version` is a PLAINTEXT field, deliberately NOT bound into the signature (Q12). It is the
         # external indicator a verifier reads to pick the domain prefix + layout it must use to
@@ -157,6 +167,9 @@ class ProSubscriptionProof:
             # Proof expiry is day-aligned, so integer seconds is exact (wire spec §2).
             "expiry_ts": base.unix_seconds_from_datetime(self.expires_at),
             "sig": self.sig.hex(),
+            # Advisory, UNSIGNED (see field comment): the account's true entitlement end, distinct from
+            # the clamped proof `expiry_ts` above. Lets a proof fetch refresh the client's cached expiry.
+            "account_expiry_ts": base.unix_seconds_from_datetime(self.account_expires_at),
         }
         return result
 
@@ -2024,12 +2037,16 @@ def build_current_entitlement_proof(
             code=base.ErrorCode.subscription_expired,
         )
 
-    return build_proof(
+    proof = build_proof(
         revocation_tag=get_user.user.token,
         rotating_pkey=rotating_pkey,
         expires_at=proof_expires_at,
         signing_key=signing_key,
     )
+    # Advisory (unsigned) account entitlement end, from this same snapshot — the client's true
+    # subscription horizon, distinct from the clamped proof expiry above.
+    proof.account_expires_at = get_user.user.expires_at
+    return proof
 
 
 def generate_pro_proof(

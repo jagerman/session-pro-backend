@@ -680,6 +680,44 @@ def test_grant_rangeproof(pg_database):
     pool.close()
 
 
+def test_proof_reports_account_expiry(pg_database):
+    # A proof response carries account_expiry_ts -- the account's TRUE entitlement end -- distinct from
+    # the proof's clamped (~30d) validity window. Grant a 12-month entitlement: the proof caps at ~30d
+    # while account_expires_at reports the full year, and account_expiry_ts is NOT in the signed message.
+    pool = backend.bootstrap_db(database_url=pg_database())
+    assert pool
+    backend_key = nacl.signing.SigningKey.generate()
+    master_key = nacl.signing.SigningKey.generate()
+    rotating_key = nacl.signing.SigningKey.generate()
+    now = base.round_datetime_to_next_day(datetime.datetime.now(datetime.timezone.utc))
+    account_expiry = now + datetime.timedelta(days=365)
+
+    with db.connection(pool) as conn:
+        proof = backend.grant_rangeproof(
+            conn,
+            master_pkey=master_key.verify_key,
+            rotating_pkey=rotating_key.verify_key,
+            signing_key=backend_key,
+            request_at=now,
+            redeemed_at=now,
+            plan=base.ProPlan.TwelveMonth,
+            expires_at=account_expiry,
+        )
+        # Proof validity clamps to ~30 days; the account entitlement runs the full year.
+        assert proof.expires_at == base.round_datetime_to_next_day(now + datetime.timedelta(days=30))
+        assert proof.account_expires_at == account_expiry
+        assert proof.expires_at < proof.account_expires_at
+
+        wire = proof.to_dict()
+        assert wire['account_expiry_ts'] == base.unix_seconds_from_datetime(account_expiry)
+        assert wire['expiry_ts'] != wire['account_expiry_ts']
+
+        # account_expiry_ts is advisory: it is NOT part of the signed message the verifier reconstructs.
+        proof_hash = backend.build_proof_message(proof.revocation_tag, proof.rotating_pkey, proof.expires_at)
+        backend_key.verify_key.verify(smessage=proof_hash, signature=proof.sig)
+    pool.close()
+
+
 def test_renewal_binds_by_identifier_not_account_id(pg_database):
     # The renewal auto-redeem binds a payment to its owner by the payment's OWN store identifier (via the
     # subscription-continuity linkage), NOT the master-key-derived account-id -- so the mule never matches

@@ -110,8 +110,9 @@ verified offline**; it carries **no user identity**.
 { "version": 0,                   // plaintext; selects the domain prefix (see below). NOT hashed.
   "revocation_tag": "<64 hex>",   // opaque 32-byte value; see §2.1
   "rotating_pkey":  "<64 hex>",   // Ed25519 public key the proof entitles
-  "expiry_ts": <int>,             // seconds; entitlement valid until this instant
-  "sig": "<128 hex>" }            // Ed25519 over the message below (§1.1)
+  "expiry_ts": <int>,             // seconds; PROOF validity (clamped, rolling ≤30d) — NOT the sub end
+  "sig": "<128 hex>",             // Ed25519 over the message below (§1.1)
+  "account_expiry_ts": <int> }    // advisory, UNSIGNED; see §2.2
 ```
 `version` is a **plaintext data element**, deliberately **not** a byte in the signed message (§1).
 Verification is a mapping from the transmitted **data → (domain prefix, message)**: the verifier reads
@@ -142,6 +143,16 @@ A per-**generation** opaque **random 32-byte value** (a generation = one epoch o
 entitlement). Clients treat it as an **opaque blob compared for equality** against revocation-list
 entries — nothing derives or interprets it: it is not a hash of anything the client can or should
 compute, just an opaque stored random value.
+
+### 2.2 `account_expiry_ts` (advisory, unsigned)
+The account's **true entitlement end** in integer seconds — the same value `get_pro_status` reports as
+`expiry_ts` (grace-inclusive). It is **not** part of the signed message `M` and carries no signature of
+its own: a verifier reconstructs `M` from `version`/`revocation_tag`/`rotating_pkey`/`expiry_ts` only and
+MUST NOT feed `account_expiry_ts` into that check. It is **distinct from the proof's `expiry_ts`**, which
+is the clamped, rolling (≤30 d) proof-validity window; `account_expiry_ts` is the subscription horizon
+and may be far later. It rides on the proof response so a proof fetch also refreshes the client's cached
+expiry; treat it as display state, not an entitlement authority (the signed proof + revocation list are
+authoritative).
 
 ## 3. Signed requests (signed by the user's master key)
 
