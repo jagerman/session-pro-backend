@@ -26,10 +26,8 @@ import contextlib
 import dataclasses
 import datetime
 import functools
-import logging
 import pendulum
 import threading
-import traceback
 import typing
 
 import psycopg
@@ -263,11 +261,3 @@ def query_scalar(conn: psycopg.Connection, sql: str, *args: typing.Any, **kwargs
     row = query(conn, sql, *args, **kwargs).fetchone()
     assert row is not None, 'query_scalar: expected exactly one row, got none'
     return row[0]
-
-
-def run_and_log_errors(callback: typing.Callable[[], typing.Any], log: logging.Logger, error_prefix: str) -> None:
-    """Run `callback`, logging (and swallowing) any exception under `error_prefix`."""
-    try:
-        callback()
-    except Exception:
-        log.error(f"{error_prefix}. Error was: {traceback.format_exc()}")
