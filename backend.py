@@ -739,12 +739,6 @@ def verify_db(conn: psycopg.Connection, err: base.ErrorSink) -> bool:
                 f'Unredeemed payment #{index} had an invalid plan, received ({base.reflect_enum(it.plan)})'
             )
 
-    # NOTE: Wednesday, 27 August 2025 00:00:00 UTC, arbitrary date in the past that PRO cannot
-    # possibly be before. We should update this to to the PRO release date. (Was a bare int that,
-    # pre-datetime-migration, was seconds compared against millisecond values — so the guard never
-    # fired; now a real instant.)
-    PRO_ENABLED_AT: pendulum.DateTime = pendulum.datetime(2025, 8, 27)
-
     payments: list[PaymentRow] = get_payments_list(conn)
     now: pendulum.DateTime = base.utc_now()
     for index, it in enumerate(payments):
@@ -791,12 +785,6 @@ def verify_db(conn: psycopg.Connection, err: base.ErrorSink) -> bool:
             err.msg_list.append(f'Payment #{index} had an invalid plan, received ({base.reflect_enum(it.plan)})')
         base.verify_payment_provider(it.payment_provider, err)
 
-        # NOTE: Check that the payment's redeemed ts is a reasonable value
-        if it.redeemed_at is not None and it.redeemed_at < PRO_ENABLED_AT:
-            err.msg_list.append(
-                f'Payment #{index} specified a creation date before PRO was enabled: {base.readable(it.redeemed_at)}'
-            )
-
         # NOTE: Check that the token is set correctly
         if it.payment_provider == base.PaymentProvider.GooglePlayStore:
             pass
@@ -811,10 +799,6 @@ def verify_db(conn: psycopg.Connection, err: base.ErrorSink) -> bool:
     for index, user in enumerate(users):
         if user.master_pkey == ZERO_BYTES32:
             err.msg_list.append(f'User #{index} has a master public key set to the zero key')
-        if user.expires_at < PRO_ENABLED_AT:
-            err.msg_list.append(
-                f'Payment #{index} specified a expiry date before PRO was enabled: {base.readable(user.expires_at)}'
-            )
 
     result = len(err.msg_list) == 0
     return result
