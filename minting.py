@@ -150,6 +150,9 @@ def mint_payment(
         platform_obfuscated_account_id=platform_obfuscated_account_id,
         err=err,
         credit_remaining=length,
+        # A minted payment is one-shot by construction: nothing will renew it, and no notification will
+        # arrive to correct the claim if we said otherwise.
+        auto_renewing=False,
     )
     if err.has():
         raise base.ServerError(f'Failed to mint payment: {err.build()}')

@@ -1710,10 +1710,18 @@ def add_unredeemed_payment(
     err: base.ErrorSink,
     needs_ack: bool = False,
     credit_remaining: pendulum.Duration | None = None,
+    auto_renewing: bool = True,
 ):
-    """Record a payment nobody has claimed yet. `credit_remaining` marks the row as a one-shot CREDIT with
-    that much length left to give (see schema/004): a store subscription leaves it None, since its
-    `expires_at` already states an absolute paid-through instant."""
+    """Record a payment nobody has claimed yet.
+
+    `credit_remaining` marks the row as a one-shot CREDIT with that much length left to give (see
+    schema/004): a store subscription leaves it None, since its `expires_at` already states an absolute
+    paid-through instant.
+
+    `auto_renewing` comes from the caller because only the caller knows. It is not derivable from the
+    provider (a store sells both renewing subscriptions and one-time products) nor from whether the payment
+    is a credit (a one-time store product is neither renewing nor a credit). The default suits the
+    auto-renewing subscriptions that are all any provider registers today; anything else must say so."""
 
     if log.getEffectiveLevel() <= logging.INFO:
         payment_tx_label = payment_provider_tx_log_label_safe(payment_tx)
@@ -1742,7 +1750,7 @@ def add_unredeemed_payment(
                 'expires_at': expires_at,
                 'platform_refund_expires_at': platform_refund_expires_at,
                 'purchased_at': purchased_at,
-                'auto_renewing': True,  # on by default until Google notifies otherwise
+                'auto_renewing': auto_renewing,
                 'credit_remaining': credit_remaining,
             },
             detail_table='google_play_payment_details',
@@ -1771,7 +1779,7 @@ def add_unredeemed_payment(
                 'expires_at': expires_at,
                 'platform_refund_expires_at': platform_refund_expires_at,
                 'purchased_at': purchased_at,
-                'auto_renewing': True,  # on by default until Apple notifies otherwise
+                'auto_renewing': auto_renewing,
                 'credit_remaining': credit_remaining,
             },
             detail_table='app_store_payment_details',
@@ -1794,7 +1802,7 @@ def add_unredeemed_payment(
                 'expires_at': expires_at,
                 'platform_refund_expires_at': platform_refund_expires_at,
                 'purchased_at': purchased_at,
-                'auto_renewing': False,  # Rangeproof vouchers never auto-renew
+                'auto_renewing': auto_renewing,
                 'credit_remaining': credit_remaining,
             },
             detail_table='rangeproof_payment_details',

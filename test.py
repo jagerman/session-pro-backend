@@ -1426,6 +1426,49 @@ def test_credit_does_not_make_a_subscriber_look_non_renewing(pg_database):
     pool.close()
 
 
+def test_minted_credit_never_claims_to_renew(pg_database):
+    # `auto_renewing` is a fact about the payment that only the caller registering it knows. It is not
+    # derivable from the provider (a store sells renewing subscriptions AND one-time products) nor from
+    # whether the payment is a credit (a one-time store product is neither renewing nor a credit), so
+    # mint_payment states it. Otherwise a payment imitating a store shape inherits that shape's
+    # renewing-by-default and reports an expired account as still auto-renewing, forever, with no
+    # notification coming to correct it.
+    pool = backend.bootstrap_db(database_url=pg_database())
+    assert pool
+    with db.connection() as conn:
+        T = base.round_datetime_to_next_day(base.utc_now())
+        for provider in (
+            base.PaymentProvider.Rangeproof,
+            base.PaymentProvider.GooglePlayStore,
+            base.PaymentProvider.iOSAppStore,
+        ):
+            master_key = nacl.signing.SigningKey.generate()
+            with db.transaction(conn) as tx:
+                minted = minting.mint_payment(
+                    tx,
+                    master_pkey=master_key.verify_key,
+                    provider=provider,
+                    plan=base.ProPlan.OneMonth,
+                    now=T,
+                    duration=10 * base.DAY,
+                )
+            assert minted.redeemed, provider
+            renewing = db.query_scalar(
+                conn,
+                '''SELECT p.auto_renewing FROM payments p JOIN users u ON u.id = p.user_id
+                   WHERE u.master_pkey = %s''',
+                bytes(master_key.verify_key),
+            )
+            assert renewing is False, provider
+            assert backend.get_user(conn, master_key.verify_key).auto_renewing is False, provider
+
+        # A real store purchase is still renewing by default, which is what the credit check must not break.
+        f = _CreditFixture(conn, T)
+        f.subscribe(expires_at=T + 30 * base.DAY)
+        assert backend.get_user(conn, f.pkey).auto_renewing is True
+    pool.close()
+
+
 def test_credit_sub_day_length(pg_database):
     # The --dev-duration-ms path: a credit shorter than the drain interval is the same arithmetic.
     pool = backend.bootstrap_db(database_url=pg_database())
