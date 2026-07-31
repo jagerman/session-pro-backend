@@ -1,12 +1,12 @@
 '''
-Maintenance mule for the Google Play provider. Run as a uWSGI mule
+Subscriber mule for the Google Play provider. Run as a uWSGI mule
 (`mule = providers.google_play.mule:run` in the vassal ini) so the Google Pub/Sub notification
 subscriber runs in exactly ONE process — a single consumer, off the request workers. This mule is
 deliberately Google-specific: another provider that needs a background consumer gets its OWN mule
 (uWSGI supports any number), so a stall in one provider's subscriber can't hold up another's.
 
-The periodic DB prune is NOT here: a mule cannot register uWSGI signals/timers, so it runs on worker 1
-via a `@timer(target='worker1')` in main.py instead.
+Periodic housekeeping (the DB prune, the Apple catch-up) is NOT here either: it lives in its own
+maintenance mule (maintenance.py), for the same reason — a wedged subscriber must not stop the prune.
 
 `run()` executes in the mule *post-fork*. gRPC's fork-hostile background threads are still constructed
 lazily inside the subscriber thread (see notifications.thread_entry_point), never at import in the master.

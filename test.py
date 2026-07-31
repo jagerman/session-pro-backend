@@ -26,6 +26,7 @@ import pathlib
 import pendulum
 import pytest
 import re
+import threading
 import time
 import werkzeug
 import dataclasses
@@ -42,6 +43,7 @@ import backend
 import base
 import cli
 import config
+import maintenance
 import migrations
 import server
 from providers import app_store
@@ -313,6 +315,38 @@ def test_apple_catchup_isolates_a_bad_notification(monkeypatch, pg_database):
         app_store.catchup_on_missed_notifications(core=core, sql_conn=conn, now=later)
         assert base.datetime_from_unix_ms(requested[1].startDate) == at - app_store.NOTIFICATION_HISTORY_OVERLAP
     pool.close()
+
+
+def test_maintenance_loop_runs_due_tasks_and_survives_a_raising_one():
+    # The mule has no harakiri leash, so the loop must treat its tasks as independent: one that raises is
+    # logged and left behind, never allowed to take the loop (or the tasks after it) down with it. A task
+    # that isn't due yet is skipped without running -- checked BEFORE the task that stops the loop, so a
+    # skip can't be confused with the loop having already exited.
+    calls: list[str] = []
+    stop = threading.Event()
+
+    def boom() -> None:
+        calls.append('boom')
+        raise RuntimeError('task blew up')
+
+    def not_due() -> None:
+        calls.append('not-due')
+
+    def stopper() -> None:
+        calls.append('stopper')
+        stop.set()  # one pass over the task list is all this test needs
+
+    tasks = [
+        maintenance.Task(name='boom', interval_s=0.0, run=boom),
+        maintenance.Task(name='not-due', interval_s=3600.0, run=not_due, last_run_s=time.monotonic()),
+        maintenance.Task(name='stopper', interval_s=0.0, run=stopper),
+    ]
+    maintenance.loop(tasks, stop)
+
+    assert calls == ['boom', 'stopper']
+    # The raiser's last_run_s still advanced, so a permanently failing task backs off to its interval
+    # instead of re-running every tick.
+    assert tasks[0].last_run_s is not None
 
 
 def test_dry_run_backup_rotation():
