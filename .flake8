@@ -8,7 +8,9 @@ max-line-length = 120
 extend-ignore = E203, W503
 # Don't lint the vendored third-party tree or the venv (matches mypy.ini / pyproject.toml).
 extend-exclude = .venv, vendor
-# test.py is dominated by opaque fixture strings (provider tokens, 64-char hex keys) with no meaningful
-# wrap point, so waive E501 there only; every other check still applies to it.
+# These two carry recorded provider payloads -- signed JWTs, 64-char hex keys, opaque store tokens -- with
+# no meaningful wrap point, so E501 is waived for them alone. Every other check still applies to them, and
+# every check including E501 applies to the rest of the suite.
 per-file-ignores =
-    test.py: E501
+    tests/test_google.py: E501
+    tests/test_apple.py: E501

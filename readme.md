@@ -57,8 +57,11 @@ which have been applied. See `schema/README`.
 - `dev_routes.py`: The `/dev/*` routes that mint Pro subscriptions with no payment
 provider involved. Refuses to serve unless `provider_dry_run` is also set.
 
-- `test.py`: Holds the unit tests implemented via pytest (`conftest.py` supplies
-the throwaway PostgreSQL each test runs against).
+- `tests/`: The pytest suite, split by area (`test_google.py`, `test_apple.py`,
+`test_credits.py`, `test_proofs.py`, `test_payments.py`, `test_server.py`,
+`test_maintenance.py`, `test_cli_config.py`, `test_base.py`), with the shared
+Flask/DB scaffolding in `tests/helpers.py`. `conftest.py` at the repo root
+supplies the throwaway PostgreSQL each test runs against.
 
 - `docs/`: Design and operational docs. **`docs/limitations.md` — payment-provider limitations and the
   store-config invariants they depend on; READ IT before enabling any new Google Play Console / App Store
@@ -200,7 +203,7 @@ python -m flask --app main run --debug
 SESH_PRO_BACKEND_DB_URL=postgresql:///session_pro python -m flask --app main run --debug --port 8888
 
 # Run the tests (with printing test names and test output to stdout enabled)
-python -m pytest test.py --verbose --capture=no
+python -m pytest tests --verbose --capture=no
 
 # For running in production we use UWSGI which run multiple instances of the
 # Flask app with process lifecycle management, the following command is

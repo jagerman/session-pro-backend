@@ -83,8 +83,8 @@ local py_pipeline(name, deps=[], commands=[], stf_repo=false) = {
   // Debian ships everything the suite needs except the Apple/Google SDKs (pip) — including
   // python3-session-util from the Session repo (vendor/onion_req.py imports it). postgresql provides
   // the initdb/pg_ctl binaries conftest.py boots its throwaway cluster with; initdb refuses to run as
-  // root, so run the suite as an unprivileged user. Our test file is `test.py`, which pytest's default
-  // discovery skips, so name it explicitly.
+  // root, so run the suite as an unprivileged user. The suite lives in `tests/`; naming it keeps the run
+  // to the suite rather than whatever else default discovery might pick up.
   py_pipeline('test',
               stf_repo=true,
               deps=['python3-pytest', 'python3-pip', 'python3-session-util', 'postgresql'] + app_deb_deps,
@@ -92,6 +92,6 @@ local py_pipeline(name, deps=[], commands=[], stf_repo=false) = {
                 pip_global + ' pytest-postgresql',
                 'useradd -m ci',
                 'chown -R ci:ci .',
-                "su ci -c 'python3 -m pytest -q test.py'",
+                "su ci -c 'python3 -m pytest -q tests'",
               ]),
 ]
