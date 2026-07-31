@@ -45,13 +45,17 @@ SECONDS_IN_YEAR: int = SECONDS_IN_DAY * 365
 DEFAULT_TIMESTAMP_TOLERANCE: datetime.timedelta = datetime.timedelta(seconds=70)
 
 # --- Revocation-list timings (wire spec §4). ---
+# The re-poll cadence we recommend to clients, served as the list's `retry_in`. It bounds how long a
+# client can go without seeing a new entry, so REVOCATION_EFFECTIVE_DELAY below is derived from it.
+REVOCATION_POLL_INTERVAL: datetime.timedelta = datetime.timedelta(days=1)
 # How long after we RECORD a revocation peers begin rejecting proofs carrying its tag. Anchored to our
 # processing instant, never to the store's `revocationDate`: a stale notification (a backlog drained after
 # an outage) would otherwise arrive with the delay already elapsed, so peers would enforce before the
 # revoked sender could possibly have learnt of it — exactly the compose-then-truncate gap this delay
-# exists to prevent. 26 h = the 24 h client poll cadence (`retry_in`) + 2 h of slack for a client that
-# missed a poll (e.g. because *we* were down).
-REVOCATION_EFFECTIVE_DELAY: datetime.timedelta = datetime.timedelta(hours=26)
+# exists to prevent. One poll interval is the floor (a client that polls on schedule sees the entry inside
+# it), and the margin on top covers a poll that lands while we are down: it can be retried and still beat
+# the deadline.
+REVOCATION_EFFECTIVE_DELAY: datetime.timedelta = REVOCATION_POLL_INTERVAL + datetime.timedelta(hours=2)
 # How long a revocation entry is kept (by clients, and by our own served list). Must be at least the
 # maximum proof lifetime so an entry is never dropped while a proof carrying its tag could still verify
 # (asserted below, once the proof-expiry shape is defined).

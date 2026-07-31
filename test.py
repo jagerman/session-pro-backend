@@ -2275,7 +2275,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
     result_retry_in = base.json_dict_require_int(d=result_json, key='retry_in', err=err)
     assert not err.msg_list, '{err.msg_list}'
     assert result_ticket == 0
-    assert result_retry_in == base.SECONDS_IN_DAY
+    assert result_retry_in == base.seconds_from_timedelta(base.REVOCATION_POLL_INTERVAL)
     curr_revocation_ticket = result_ticket
 
     # Check that the server returned an empty revocation list, we no longer revoke the old
@@ -2342,7 +2342,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
     assert not err.msg_list, '{err.msg_list}'
     # The non-cutting refund produced NO revocation entry, so the ticket is unchanged.
     assert result_ticket == 0
-    assert result_retry_in == base.SECONDS_IN_DAY
+    assert result_retry_in == base.seconds_from_timedelta(base.REVOCATION_POLL_INTERVAL)
     assert result_retain_for == base.seconds_from_timedelta(base.REVOCATION_RETAIN_FOR)
     curr_revocation_ticket = result_ticket
     assert not result_items
@@ -2392,7 +2392,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
     assert not err.msg_list, '{err.msg_list}'
     # The non-cutting refund above created no revocation entry, so the ticket is still 0.
     assert result_ticket == 0, f'Response was: {json.dumps(response_json, indent=2)}'
-    assert result_retry_in == base.SECONDS_IN_DAY
+    assert result_retry_in == base.seconds_from_timedelta(base.REVOCATION_POLL_INTERVAL)
     assert result_retain_for == base.seconds_from_timedelta(base.REVOCATION_RETAIN_FOR)
 
     # List should be empty because we passed in the newest revocation

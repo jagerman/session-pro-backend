@@ -197,7 +197,7 @@ def get_pro_revocations():
     get_json = get_json_from_flask_request(flask.request)
     ticket: int = base.json_dict_require_int(get_json, 'ticket')
 
-    RETRY_IN = base.SECONDS_IN_DAY
+    RETRY_IN = base.seconds_from_timedelta(base.REVOCATION_POLL_INTERVAL)
     # List-level window (≥ the max proof validity) after which a client drops a seen entry from its
     # in-memory revocation list (wire spec §4). Memory-only aging: a dropped entry can't reactivate
     # anything, so this has no correctness dependence.
@@ -222,8 +222,8 @@ def get_pro_revocations():
                         token, revoked_at = row
                         # `revoked_at` is when the BACKEND recorded the revocation (not the store's own
                         # refund date — see revoke_master_pkey_proofs_and_allocate_new_gen_id), so this
-                        # delay is always fully ahead of the client that has to learn of it. Its own
-                        # constant, not `retry_in`: that one is a poll-cadence hint, this one is the
+                        # delay is always fully ahead of the client that has to learn of it. Derived from
+                        # `retry_in` but deliberately larger: that one is a poll-cadence hint, this is the
                         # guarantee that a revoked sender sees its tag before peers start rejecting it.
                         effective_at = revoked_at + base.REVOCATION_EFFECTIVE_DELAY
                         # Per-entry wire shape (spec §4): revocation_tag + effective_ts only.
