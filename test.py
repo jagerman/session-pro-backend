@@ -1882,6 +1882,74 @@ def test_revocation_cutting_refund_rolls_generation(monkeypatch, pg_database):
         db_engine.close()
 
 
+def test_revocation_skips_broadcast_when_an_unclaimed_payment_survives(pg_database):
+    """The mirror of the cutting refund: the account keeps a live payment the mule registered but the owner
+    has not claimed yet, so the refund must NOT broadcast. `_lookup_user_expiry` is user-scoped and a
+    user_id exists only on a redeemed payment, so that survivor is invisible to the "is a broadcast
+    necessary" check unless the revoke path reconciles first -- and broadcasting would revoke every
+    outstanding proof and cost an entry in the list every client fetches, for an account whose paid
+    coverage never actually lapsed."""
+    err = base.ErrorSink()
+    db_engine: psycopg_pool.ConnectionPool | None = backend.bootstrap_db(database_url=pg_database())
+    assert db_engine
+
+    backend_key = nacl.signing.SigningKey.generate()
+    master_key = nacl.signing.SigningKey.generate()
+    rotating_key = nacl.signing.SigningKey.generate()
+    now = base.utc_now()
+    redeemed_at = base.round_datetime_to_next_day(now)
+
+    db_conn = db_engine.getconn()
+
+    def seed(expires_at: pendulum.DateTime) -> str:
+        seed_tx = base.PaymentProviderTransaction()
+        seed_tx.provider = base.PaymentProvider.GooglePlayStore
+        seed_tx.google_payment_token = os.urandom(backend.BLAKE2B_DIGEST_SIZE).hex()
+        seed_tx.google_order_id = 'DEV.' + os.urandom(backend.BLAKE2B_DIGEST_SIZE).hex()
+        backend.add_unredeemed_payment(
+            db_conn,
+            payment_tx=seed_tx,
+            plan=base.ProPlan.OneMonth,
+            purchased_at=now,
+            expires_at=expires_at,
+            platform_refund_expires_at=base.EPOCH,
+            platform_obfuscated_account_id=bytes(master_key.verify_key),
+            err=err,
+        )
+        assert not err.msg_list, err.msg_list
+        return seed_tx.google_payment_token
+
+    try:
+        # Claim a payment first, so the account has a user, a generation and an outstanding proof.
+        refunded_token = seed(redeemed_at + 30 * base.DAY)
+        _redeem_and_prove(db_conn, backend_key, master_key, rotating_key, now)
+
+        # A second, longer payment then arrives from the store. The owner has made no request since, so it
+        # is registered-but-unclaimed. Far enough out that it alone keeps every outstanding proof honest.
+        seed(redeemed_at + 200 * base.DAY)
+
+        with db.transaction(db_conn) as tx:
+            before = backend.get_user_and_payments(tx, master_key.verify_key).user
+
+        with db.transaction(db_conn) as tx:
+            assert backend.add_google_revocation(tx, google_payment_token=refunded_token, revoke_at=now, err=err)
+            assert not err.msg_list, err.msg_list
+
+        with db.transaction(db_conn) as tx:
+            after = backend.get_user_and_payments(tx, master_key.verify_key).user
+            assert after.current_generation_id == before.current_generation_id
+            assert after.token == before.token
+            assert not backend.is_generation_revoked(tx.conn, after.current_generation_id, now)
+        assert backend.get_revocations_list(db_conn) == []
+
+        # The survivor was bound on the way through, so it is what the account's entitlement now rests on.
+        assert not backend.get_unredeemed_payments_list(db_conn)
+        assert after.expires_at == redeemed_at + 200 * base.DAY
+    finally:
+        db_engine.putconn(db_conn)
+        db_engine.close()
+
+
 def test_apple_refund_reversal_reinstates_and_rolls_generation(pg_database):
     """REFUND_REVERSED: Apple undoes a refund it previously granted, so we must reinstate what the original
     REFUND revoked. A full refund revokes the only payment -> no entitlement -> the user's generation is

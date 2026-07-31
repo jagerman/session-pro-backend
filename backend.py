@@ -907,11 +907,23 @@ def revoke_payments_by_id_internal(tx: db.SQLTransaction, rows: typing.Any, revo
     )
 
     for it in master_pkey_dict:
+        master_pkey = nacl.signing.VerifyKey(it)
+
+        # Bind any payment the mule has registered for this key that the owner has not claimed yet, BEFORE
+        # judging below whether this refund needs broadcasting. `_lookup_user_expiry` is user-scoped and a
+        # user_id is set only at redemption, so an unclaimed-but-live survivor is invisible to that judgement:
+        # we would broadcast a revocation, and revoke every outstanding proof, for an account whose paid
+        # coverage never actually lapsed. Claim-all and idempotent — the same bind the owner's next request
+        # performs, just early. Deliberately AFTER the revoke UPDATE above, since reconcile only claims rows
+        # with `revoked_at IS NULL` and so can never claim the payment being revoked. Stamped with OUR clock,
+        # never `revoke_at`: the store's refund date can be days old (same reasoning as
+        # revoke_master_pkey_proofs_and_allocate_new_gen_id below).
+        reconcile_pending_payments(tx, master_pkey, redeemed_at=to_redeemed_at(base.utc_now()))
+
         # NOTE: For each user we revoked a payment for, we have modified their 'auto_renewing' value
         # on the payment, we need to go and update their user row to track the, new, next best
         # expiry time so that the backend knows the new time-frame in which the user is allowed to
         # generate a Session Pro proof (now that one or more of their payments get revoked)
-        master_pkey = nacl.signing.VerifyKey(it)
         _update_user_expiry_grace_and_renew_flag_from_payment_list(tx, master_pkey)
 
         # NOTE: A payment at or past the end of the current day is on its way out anyway, so revoking it is
