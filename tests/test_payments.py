@@ -41,8 +41,8 @@ def test_reconcile_pending_payments(pg_database):
             payment_tx=tx,
             plan=base.ProPlan.OneMonth,
             purchased_at=now,
-            expires_at=now + 30 * base.DAY,
-            platform_refund_expires_at=base.EPOCH,
+            expiry_at=now + 30 * base.DAY,
+            platform_refund_expiry_at=base.EPOCH,
             platform_obfuscated_account_id=bytes(master_vk),
             err=err,
         )
@@ -86,8 +86,8 @@ def test_generate_pro_proof_auto_redeems(pg_database):
             payment_tx=seed_tx,
             plan=base.ProPlan.OneMonth,
             purchased_at=now,
-            expires_at=now + 30 * base.DAY,
-            platform_refund_expires_at=base.EPOCH,
+            expiry_at=now + 30 * base.DAY,
+            platform_refund_expiry_at=base.EPOCH,
             platform_obfuscated_account_id=bytes(master_key.verify_key),
             err=err,
         )
@@ -108,7 +108,7 @@ def test_generate_pro_proof_auto_redeems(pg_database):
             rotating_sig=bytes(rotating_key.sign(hash_to_sign).signature),
         )
         # The proof verifies against the backend key, and the payment is now redeemed.
-        proof_hash = backend.build_proof_message(proof.revocation_tag, proof.rotating_pkey, proof.expires_at)
+        proof_hash = backend.build_proof_message(proof.revocation_tag, proof.rotating_pkey, proof.expiry_at)
         backend_key.verify_key.verify(smessage=proof_hash, signature=proof.sig)
         assert not backend.get_unredeemed_payments_list(conn)
     pool.close()
@@ -143,8 +143,8 @@ def test_provider_dry_run_redeems_google_without_egress(monkeypatch, pg_database
             payment_tx=seed_tx,
             plan=base.ProPlan.OneMonth,
             purchased_at=now,
-            expires_at=redeemed_at + 30 * base.DAY,
-            platform_refund_expires_at=base.EPOCH,
+            expiry_at=redeemed_at + 30 * base.DAY,
+            platform_refund_expiry_at=base.EPOCH,
             platform_obfuscated_account_id=bytes(master_key.verify_key),
             err=err,
         )
@@ -190,7 +190,7 @@ def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_d
         plan: base.ProPlan = base.ProPlan.Nil
         proof: backend.ProSubscriptionProof = dataclasses.field(default_factory=backend.ProSubscriptionProof)
         payment_provider: base.PaymentProvider = base.PaymentProvider.Nil
-        expires_at: pendulum.DateTime = base.EPOCH
+        expiry_at: pendulum.DateTime = base.EPOCH
         grace_period: pendulum.Duration = pendulum.duration()
 
     scenarios: list[Scenario] = [
@@ -198,7 +198,7 @@ def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_d
             google_payment_token=os.urandom(backend.BLAKE2B_DIGEST_SIZE).hex(),
             google_order_id='DEV.' + os.urandom(backend.BLAKE2B_DIGEST_SIZE).hex(),
             plan=base.ProPlan.OneMonth,
-            expires_at=redeemed_at + 30 * base.DAY,
+            expiry_at=redeemed_at + 30 * base.DAY,
             grace_period=pendulum.duration(),
             payment_provider=base.PaymentProvider.GooglePlayStore,
         ),
@@ -206,7 +206,7 @@ def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_d
             google_payment_token=os.urandom(backend.BLAKE2B_DIGEST_SIZE).hex(),
             google_order_id='DEV.' + os.urandom(backend.BLAKE2B_DIGEST_SIZE).hex(),
             plan=base.ProPlan.TwelveMonth,
-            expires_at=redeemed_at + 31 * base.DAY,
+            expiry_at=redeemed_at + 31 * base.DAY,
             grace_period=pendulum.duration(),
             payment_provider=base.PaymentProvider.GooglePlayStore,
         ),
@@ -227,8 +227,8 @@ def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_d
             payment_tx=payment_tx,
             plan=it.plan,
             purchased_at=now,
-            expires_at=it.expires_at,
-            platform_refund_expires_at=base.EPOCH,
+            expiry_at=it.expiry_at,
+            platform_refund_expiry_at=base.EPOCH,
             platform_obfuscated_account_id=bytes(master_key.verify_key),
             err=err,
         )
@@ -239,7 +239,7 @@ def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_d
         assert unredeemed_payment_list[0].payment_provider == it.payment_provider
         assert unredeemed_payment_list[0].purchased_at == now
         assert unredeemed_payment_list[0].redeemed_at is None
-        assert unredeemed_payment_list[0].expires_at == it.expires_at
+        assert unredeemed_payment_list[0].expiry_at == it.expiry_at
         assert unredeemed_payment_list[0].revoked_at is None
         assert unredeemed_payment_list[0].google_payment_token == it.google_payment_token
         assert unredeemed_payment_list[0].google_order_id == it.google_order_id
@@ -284,7 +284,7 @@ def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_d
     assert user_list[0].current_generation_id == gen_ids[0]
     assert len(user_list[0].token) == backend.BLAKE2B_DIGEST_SIZE
     assert user_list[0].token == scenarios[1].proof.revocation_tag
-    assert user_list[0].expires_at == scenarios[1].expires_at
+    assert user_list[0].expiry_at == scenarios[1].expiry_at
 
     payment_list: list[backend.PaymentRow] = backend.get_payments_list(db_conn)
     assert len(payment_list) == 2
@@ -295,7 +295,7 @@ def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_d
     assert payment_list[0].payment_provider == scenarios[0].payment_provider
     assert payment_list[0].auto_renewing
     assert payment_list[0].redeemed_at == redeemed_at
-    assert payment_list[0].expires_at == scenarios[0].expires_at
+    assert payment_list[0].expiry_at == scenarios[0].expiry_at
     assert payment_list[0].revoked_at is None
     assert payment_list[0].google_payment_token == scenarios[0].google_payment_token
     assert payment_list[0].google_order_id == scenarios[0].google_order_id
@@ -310,7 +310,7 @@ def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_d
     assert payment_list[1].payment_provider == scenarios[1].payment_provider
     assert payment_list[1].auto_renewing
     assert payment_list[1].redeemed_at == redeemed_at
-    assert payment_list[1].expires_at == scenarios[1].expires_at
+    assert payment_list[1].expiry_at == scenarios[1].expiry_at
     assert payment_list[1].revoked_at is None
     assert payment_list[1].google_payment_token == scenarios[1].google_payment_token
     assert payment_list[1].google_order_id == scenarios[1].google_order_id
@@ -321,8 +321,8 @@ def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_d
     revocation_list: list[backend.RevocationRow] = backend.get_revocations_list(db_conn)
     assert not revocation_list
 
-    backend.delete_expired_apple_notification_uuids(db_conn, now=scenarios[0].expires_at)
-    backend.delete_expired_google_notifications(db_conn, now=scenarios[0].expires_at)
+    backend.delete_expired_apple_notification_uuids(db_conn, now=scenarios[0].expiry_at)
+    backend.delete_expired_google_notifications(db_conn, now=scenarios[0].expiry_at)
 
     # NOTE: Update the latest payments grace period but set auto-renewing off
     payment_tx = base.PaymentProviderTransaction()
@@ -345,7 +345,7 @@ def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_d
     assert payment_list[0].payment_provider == scenarios[0].payment_provider
     assert payment_list[0].auto_renewing
     assert payment_list[0].redeemed_at == redeemed_at
-    assert payment_list[0].expires_at == scenarios[0].expires_at
+    assert payment_list[0].expiry_at == scenarios[0].expiry_at
     assert payment_list[0].grace_period == scenarios[0].grace_period
     assert payment_list[0].revoked_at is None
     assert payment_list[0].google_payment_token == scenarios[0].google_payment_token
@@ -361,7 +361,7 @@ def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_d
     assert payment_list[1].payment_provider == scenarios[1].payment_provider
     assert not payment_list[1].auto_renewing
     assert payment_list[1].redeemed_at == redeemed_at
-    assert payment_list[1].expires_at == scenarios[1].expires_at
+    assert payment_list[1].expiry_at == scenarios[1].expiry_at
     assert payment_list[1].grace_period == new_grace_period
     assert payment_list[1].revoked_at is None
     assert payment_list[1].google_payment_token == scenarios[1].google_payment_token
@@ -394,7 +394,7 @@ def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_d
             google_payment_token=auto_redeem_google_payment_token,
             google_order_id='DEV.' + os.urandom(backend.BLAKE2B_DIGEST_SIZE).hex(),
             plan=base.ProPlan.OneMonth,
-            expires_at=redeemed_at + 30 * base.DAY,
+            expiry_at=redeemed_at + 30 * base.DAY,
             grace_period=pendulum.duration(),
             payment_provider=base.PaymentProvider.GooglePlayStore,
         ),
@@ -402,7 +402,7 @@ def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_d
             google_payment_token=auto_redeem_google_payment_token,
             google_order_id='DEV.' + os.urandom(backend.BLAKE2B_DIGEST_SIZE).hex(),
             plan=base.ProPlan.TwelveMonth,
-            expires_at=redeemed_at + 31 * base.DAY,
+            expiry_at=redeemed_at + 31 * base.DAY,
             grace_period=pendulum.duration(),
             payment_provider=base.PaymentProvider.GooglePlayStore,
         ),
@@ -421,8 +421,8 @@ def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_d
             payment_tx=payment_tx,
             plan=it.plan,
             purchased_at=now,
-            expires_at=it.expires_at,
-            platform_refund_expires_at=base.EPOCH,
+            expiry_at=it.expiry_at,
+            platform_refund_expiry_at=base.EPOCH,
             platform_obfuscated_account_id=bytes(auto_redeem_user_master_key.verify_key),
             err=err,
         )
@@ -504,7 +504,7 @@ def test_revocation_effective_ts_is_anchored_to_processing_time(monkeypatch, pg_
     monkeypatch.setattr(base, 'utc_now', lambda: recorded_at)
     stale_revoke_at = recorded_at - 5 * base.DAY  # as if we had been down for five days
 
-    def seed_google(conn, expires_at):
+    def seed_google(conn, expiry_at):
         tx = base.PaymentProviderTransaction()
         tx.provider = base.PaymentProvider.GooglePlayStore
         tx.google_payment_token = os.urandom(backend.BLAKE2B_DIGEST_SIZE).hex()
@@ -514,8 +514,8 @@ def test_revocation_effective_ts_is_anchored_to_processing_time(monkeypatch, pg_
             payment_tx=tx,
             plan=base.ProPlan.OneMonth,
             purchased_at=recorded_at,
-            expires_at=expires_at,
-            platform_refund_expires_at=base.EPOCH,
+            expiry_at=expiry_at,
+            platform_refund_expiry_at=base.EPOCH,
             platform_obfuscated_account_id=bytes(master_key.verify_key),
             err=err,
         )
@@ -580,8 +580,8 @@ def test_renewal_binds_by_identifier_not_account_id(pg_database):
             payment_tx=tx,
             plan=base.ProPlan.OneMonth,
             purchased_at=now,
-            expires_at=now + 30 * base.DAY,
-            platform_refund_expires_at=base.EPOCH,
+            expiry_at=now + 30 * base.DAY,
+            platform_refund_expiry_at=base.EPOCH,
             platform_obfuscated_account_id=bytes(account_id_key.verify_key),
             err=err,
         )
@@ -633,7 +633,7 @@ def test_revocation_cutting_refund_rolls_generation(monkeypatch, pg_database):
 
     db_conn = db_engine.getconn()
 
-    def seed_and_redeem(expires_at: pendulum.DateTime) -> str:
+    def seed_and_redeem(expiry_at: pendulum.DateTime) -> str:
         seed_tx = base.PaymentProviderTransaction()
         seed_tx.provider = base.PaymentProvider.GooglePlayStore
         seed_tx.google_payment_token = os.urandom(backend.BLAKE2B_DIGEST_SIZE).hex()
@@ -643,8 +643,8 @@ def test_revocation_cutting_refund_rolls_generation(monkeypatch, pg_database):
             payment_tx=seed_tx,
             plan=base.ProPlan.OneMonth,
             purchased_at=now,
-            expires_at=expires_at,
-            platform_refund_expires_at=base.EPOCH,
+            expiry_at=expiry_at,
+            platform_refund_expiry_at=base.EPOCH,
             platform_obfuscated_account_id=bytes(master_key.verify_key),
             err=err,
         )
@@ -699,7 +699,7 @@ def test_revocation_skips_broadcast_when_an_unclaimed_payment_survives(pg_databa
 
     db_conn = db_engine.getconn()
 
-    def seed(expires_at: pendulum.DateTime) -> str:
+    def seed(expiry_at: pendulum.DateTime) -> str:
         seed_tx = base.PaymentProviderTransaction()
         seed_tx.provider = base.PaymentProvider.GooglePlayStore
         seed_tx.google_payment_token = os.urandom(backend.BLAKE2B_DIGEST_SIZE).hex()
@@ -709,8 +709,8 @@ def test_revocation_skips_broadcast_when_an_unclaimed_payment_survives(pg_databa
             payment_tx=seed_tx,
             plan=base.ProPlan.OneMonth,
             purchased_at=now,
-            expires_at=expires_at,
-            platform_refund_expires_at=base.EPOCH,
+            expiry_at=expiry_at,
+            platform_refund_expiry_at=base.EPOCH,
             platform_obfuscated_account_id=bytes(master_key.verify_key),
             err=err,
         )
@@ -742,7 +742,7 @@ def test_revocation_skips_broadcast_when_an_unclaimed_payment_survives(pg_databa
 
         # The survivor was bound on the way through, so it is what the account's entitlement now rests on.
         assert not backend.get_unredeemed_payments_list(db_conn)
-        assert after.expires_at == redeemed_at + 200 * base.DAY
+        assert after.expiry_at == redeemed_at + 200 * base.DAY
     finally:
         db_engine.putconn(db_conn)
         db_engine.close()
@@ -771,8 +771,8 @@ def test_payment_binding_rejects_mismatched_master_key(pg_database):
                 payment_tx=seed_tx,
                 plan=base.ProPlan.OneMonth,
                 purchased_at=now,
-                expires_at=redeemed_at + 30 * base.DAY,
-                platform_refund_expires_at=base.EPOCH,
+                expiry_at=redeemed_at + 30 * base.DAY,
+                platform_refund_expiry_at=base.EPOCH,
                 platform_obfuscated_account_id=owner_tag,
                 err=err,
             )

@@ -41,7 +41,7 @@ def derived_status(payment: backend.PaymentRow, at: pendulum.DateTime | None = N
     These assertions check the *latched* facts — redeemed / revoked — which do not depend on the
     observation time (revoked short-circuits; purchase is always before expiry), so by default we
     observe at the payment's purchase instant. Pass `at` to probe the one time-relative boundary,
-    expiry, explicitly (e.g. `payment.expires_at` to assert Expired)."""
+    expiry, explicitly (e.g. `payment.expiry_at` to assert Expired)."""
     return backend.derive_payment_status(payment, payment.purchased_at if at is None else at)
 
 
@@ -135,8 +135,8 @@ def _redeem_and_prove(conn, backend_key, master_key, rotating_key, request_at):
     )
 
 
-def _grant_and_get_offset(conn, backend_key, master_key, rotating_key, granted_at, expires_at, plan=None):
-    """Grant a voucher entitlement ending at `expires_at` and return the account's proof-expiry offset."""
+def _grant_and_get_offset(conn, backend_key, master_key, rotating_key, granted_at, expiry_at, plan=None):
+    """Grant a voucher entitlement ending at `expiry_at` and return the account's proof-expiry offset."""
     backend.grant_voucher(
         conn,
         master_pkey=master_key.verify_key,
@@ -145,7 +145,7 @@ def _grant_and_get_offset(conn, backend_key, master_key, rotating_key, granted_a
         request_at=granted_at,
         redeemed_at=granted_at,
         plan=plan if plan is not None else base.ProPlan.OneMonth,
-        expires_at=expires_at,
+        expiry_at=expiry_at,
     )
     return backend.get_user(conn, master_key.verify_key).proof_expiry_offset
 
@@ -193,7 +193,7 @@ class _CreditFixture:
 
     def subscribe(
         self,
-        expires_at: pendulum.DateTime,
+        expiry_at: pendulum.DateTime,
         purchased_at: pendulum.DateTime | None = None,
         auto_renewing: bool = True,
         grace: pendulum.Duration | None = None,
@@ -210,8 +210,8 @@ class _CreditFixture:
             payment_tx=tx_ids,
             plan=base.ProPlan.OneMonth,
             purchased_at=purchased,
-            expires_at=expires_at,
-            platform_refund_expires_at=base.EPOCH,
+            expiry_at=expiry_at,
+            platform_refund_expiry_at=base.EPOCH,
             platform_obfuscated_account_id=bytes(self.pkey),
             err=err,
         )
@@ -233,11 +233,11 @@ class _CreditFixture:
         )
 
     def expiry(self) -> pendulum.DateTime:
-        return backend.get_user(self.conn, self.pkey).expires_at
+        return backend.get_user(self.conn, self.pkey).expiry_at
 
     def checkpoint(self) -> pendulum.DateTime | None:
         return db.query_scalar(
-            self.conn, 'SELECT credits_drained_through FROM users WHERE master_pkey = %s', bytes(self.pkey)
+            self.conn, 'SELECT credits_checkpoint_at FROM users WHERE master_pkey = %s', bytes(self.pkey)
         )
 
     def remaining(self, payment_id: int) -> pendulum.Duration:

@@ -1,6 +1,6 @@
 -- One-shot "credit" payments (vouchers, and anything else minted rather than witnessed at a store).
 --
--- A store subscription states an absolute paid-through instant, so `expires_at` is the whole story and
+-- A store subscription states an absolute paid-through instant, so `expiry_at` is the whole story and
 -- these columns stay NULL/unused for it. A credit carries a *length* instead of an innate end, so it
 -- stacks on top of whatever coverage the account already has: it is consumed only while nothing else
 -- covers the account, and what remains extends the account's expiry.
@@ -24,6 +24,6 @@ ALTER TABLE payments ADD CONSTRAINT payments_credit_remaining_non_negative
 -- for free. It must NEVER mean "currently covered by a subscription" — a covered account holding a live
 -- credit stays non-NULL and is visited (charging nothing), or nothing would notice when its subscription
 -- later lapsed and the credit would stop draining.
-ALTER TABLE users ADD COLUMN IF NOT EXISTS credits_drained_through TIMESTAMPTZ;
-CREATE INDEX IF NOT EXISTS users_credits_drained_through_idx
-    ON users (credits_drained_through) WHERE credits_drained_through IS NOT NULL;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS credits_checkpoint_at TIMESTAMPTZ;
+CREATE INDEX IF NOT EXISTS users_credits_checkpoint_at_idx
+    ON users (credits_checkpoint_at) WHERE credits_checkpoint_at IS NOT NULL;

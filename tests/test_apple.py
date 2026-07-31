@@ -151,9 +151,9 @@ def test_apple_grace_period_stores_duration_not_absolute_date(pg_database):
                 conn,
                 payment_tx=payment_tx,
                 plan=base.ProPlan.OneMonth,
-                expires_at=base.datetime_from_unix_ms(expires_ms),
+                expiry_at=base.datetime_from_unix_ms(expires_ms),
                 purchased_at=base.datetime_from_unix_ms(expires_ms - (30 * base.MILLISECONDS_IN_DAY)),
-                platform_refund_expires_at=base.datetime_from_unix_ms(expires_ms),
+                platform_refund_expiry_at=base.datetime_from_unix_ms(expires_ms),
                 platform_obfuscated_account_id='',
                 err=err,
             )
@@ -190,7 +190,7 @@ def test_apple_grace_period_stores_duration_not_absolute_date(pg_database):
             assert len(payment_list) == 1
             assert payment_list[0].grace_period == base.duration_from_ms(grace_len_ms)
             # and `expiry + grace` resolves to exactly gracePeriodExpiresDate (the absolute instant).
-            assert payment_list[0].expires_at + payment_list[0].grace_period == base.datetime_from_unix_ms(
+            assert payment_list[0].expiry_at + payment_list[0].grace_period == base.datetime_from_unix_ms(
                 renewal_info.gracePeriodExpiresDate
             )
 
@@ -212,7 +212,7 @@ def test_apple_refund_reversal_reinstates_and_rolls_generation(pg_database):
     redeemed_at = base.round_datetime_to_next_day(now)
     original_tx = os.urandom(8).hex()
     tx_id = os.urandom(8).hex()
-    expires_at = redeemed_at + 90 * base.DAY
+    expiry_at = redeemed_at + 90 * base.DAY
 
     db_conn = db_engine.getconn()
     try:
@@ -227,8 +227,8 @@ def test_apple_refund_reversal_reinstates_and_rolls_generation(pg_database):
             payment_tx=seed_tx,
             plan=base.ProPlan.OneMonth,
             purchased_at=now,
-            expires_at=expires_at,
-            platform_refund_expires_at=base.EPOCH,
+            expiry_at=expiry_at,
+            platform_refund_expiry_at=base.EPOCH,
             platform_obfuscated_account_id=app_store.uuid_from_master_pk(bytes(master_key.verify_key)),
             err=err,
         )
@@ -241,7 +241,7 @@ def test_apple_refund_reversal_reinstates_and_rolls_generation(pg_database):
         gen_before, token_before, expiry_before = (
             user_before.current_generation_id,
             user_before.token,
-            user_before.expires_at,
+            user_before.expiry_at,
         )
 
         # Full refund: revokes the only payment -> generation revoked, stays current (nothing to roll onto).
@@ -261,7 +261,7 @@ def test_apple_refund_reversal_reinstates_and_rolls_generation(pg_database):
             )
         with db.transaction(db_conn) as tx:
             reinstated = backend.get_user_and_payments(tx, master_key.verify_key).user
-            assert reinstated.expires_at == expiry_before  # original window restored, not extended
+            assert reinstated.expiry_at == expiry_before  # original window restored, not extended
             assert reinstated.current_generation_id != gen_before  # rolled onto a fresh generation
             assert reinstated.token != token_before
             assert not backend.is_generation_revoked(tx.conn, reinstated.current_generation_id, now)
@@ -277,7 +277,7 @@ def test_apple_refund_reversal_reinstates_and_rolls_generation(pg_database):
         with db.transaction(db_conn) as tx:
             again = backend.get_user_and_payments(tx, master_key.verify_key).user
             assert again.current_generation_id == gen_after
-            assert again.expires_at == expiry_before
+            assert again.expiry_at == expiry_before
     finally:
         db_engine.putconn(db_conn)
         db_engine.close()
@@ -551,9 +551,9 @@ def test_platform_apple(pg_database):
             assert unredeemed_list[0].auto_renewing
             assert unredeemed_list[0].purchased_at == base.datetime_from_unix_ms(tx_info.purchaseDate)
             assert unredeemed_list[0].redeemed_at is None
-            assert unredeemed_list[0].expires_at == base.datetime_from_unix_ms(tx_info.expiresDate)
+            assert unredeemed_list[0].expiry_at == base.datetime_from_unix_ms(tx_info.expiresDate)
             assert unredeemed_list[0].grace_period == base.DEFAULT_APPLE_GRACE_PERIOD
-            assert unredeemed_list[0].platform_refund_expires_at == base.datetime_from_unix_ms(tx_info.expiresDate)
+            assert unredeemed_list[0].platform_refund_expiry_at == base.datetime_from_unix_ms(tx_info.expiresDate)
             assert unredeemed_list[0].revoked_at is None
         assert unredeemed_list[0].apple.original_tx_id == tx_info.originalTransactionId
         assert unredeemed_list[0].apple.tx_id == tx_info.transactionId
@@ -676,9 +676,9 @@ def test_platform_apple(pg_database):
             assert not payment_list[0].auto_renewing
             assert payment_list[0].purchased_at == base.datetime_from_unix_ms(tx_info.purchaseDate)
             assert payment_list[0].redeemed_at is None
-            assert payment_list[0].expires_at == base.datetime_from_unix_ms(tx_info.expiresDate)
+            assert payment_list[0].expiry_at == base.datetime_from_unix_ms(tx_info.expiresDate)
             assert payment_list[0].grace_period == base.DEFAULT_APPLE_GRACE_PERIOD
-            assert payment_list[0].platform_refund_expires_at == base.datetime_from_unix_ms(tx_info.expiresDate)
+            assert payment_list[0].platform_refund_expiry_at == base.datetime_from_unix_ms(tx_info.expiresDate)
             assert payment_list[0].revoked_at is None
         assert payment_list[0].apple.original_tx_id == tx_info.originalTransactionId
         assert payment_list[0].apple.tx_id == tx_info.transactionId
@@ -803,9 +803,9 @@ def test_platform_apple(pg_database):
             assert payment_list[0].payment_provider == base.PaymentProvider.iOSAppStore
             assert payment_list[0].purchased_at == base.datetime_from_unix_ms(tx_info.purchaseDate)
             assert payment_list[0].redeemed_at is None
-            assert payment_list[0].expires_at == base.datetime_from_unix_ms(tx_info.expiresDate)
+            assert payment_list[0].expiry_at == base.datetime_from_unix_ms(tx_info.expiresDate)
             assert payment_list[0].grace_period == base.DEFAULT_APPLE_GRACE_PERIOD
-            assert payment_list[0].platform_refund_expires_at == base.datetime_from_unix_ms(tx_info.expiresDate)
+            assert payment_list[0].platform_refund_expiry_at == base.datetime_from_unix_ms(tx_info.expiresDate)
             assert payment_list[0].revoked_at is None
             assert payment_list[0].apple.original_tx_id == tx_info.originalTransactionId
             assert payment_list[0].apple.tx_id == tx_info.transactionId
@@ -813,7 +813,7 @@ def test_platform_apple(pg_database):
 
         # NOTE: Run the housekeeping sweep at an instant past the payment's expiry
         with test.connection() as conn:
-            past_expiry = payment_list[0].expires_at + pendulum.duration(milliseconds=1)
+            past_expiry = payment_list[0].expiry_at + pendulum.duration(milliseconds=1)
             backend.delete_expired_apple_notification_uuids(conn, now=past_expiry)
             backend.delete_expired_google_notifications(conn, now=past_expiry)
 
@@ -826,9 +826,9 @@ def test_platform_apple(pg_database):
             assert payment_list[0].payment_provider == base.PaymentProvider.iOSAppStore
             assert payment_list[0].purchased_at == base.datetime_from_unix_ms(tx_info.purchaseDate)
             assert payment_list[0].redeemed_at is None
-            assert payment_list[0].expires_at == base.datetime_from_unix_ms(tx_info.expiresDate)
+            assert payment_list[0].expiry_at == base.datetime_from_unix_ms(tx_info.expiresDate)
             assert payment_list[0].grace_period == base.DEFAULT_APPLE_GRACE_PERIOD
-            assert payment_list[0].platform_refund_expires_at == base.datetime_from_unix_ms(tx_info.expiresDate)
+            assert payment_list[0].platform_refund_expiry_at == base.datetime_from_unix_ms(tx_info.expiresDate)
             assert payment_list[0].revoked_at is None
             assert payment_list[0].apple.original_tx_id == tx_info.originalTransactionId
             assert payment_list[0].apple.tx_id == tx_info.transactionId
@@ -1568,11 +1568,11 @@ def test_platform_apple(pg_database):
             e00_sub_to_3_months_tx_info.purchaseDate
         )
         assert unredeemed_payment_list[0].redeemed_at is None
-        assert unredeemed_payment_list[0].expires_at == base.datetime_from_unix_ms(
+        assert unredeemed_payment_list[0].expiry_at == base.datetime_from_unix_ms(
             e00_sub_to_3_months_tx_info.expiresDate
         )
         assert unredeemed_payment_list[0].grace_period == base.DEFAULT_APPLE_GRACE_PERIOD
-        assert unredeemed_payment_list[0].platform_refund_expires_at == base.datetime_from_unix_ms(
+        assert unredeemed_payment_list[0].platform_refund_expiry_at == base.datetime_from_unix_ms(
             e00_sub_to_3_months_tx_info.expiresDate
         )
         assert unredeemed_payment_list[0].revoked_at is None
@@ -1599,9 +1599,9 @@ def test_platform_apple(pg_database):
         assert payment_list[0].auto_renewing
         assert payment_list[0].purchased_at == base.datetime_from_unix_ms(e00_sub_to_3_months_tx_info.purchaseDate)
         assert payment_list[0].redeemed_at is not None
-        assert payment_list[0].expires_at == base.datetime_from_unix_ms(e00_sub_to_3_months_tx_info.expiresDate)
+        assert payment_list[0].expiry_at == base.datetime_from_unix_ms(e00_sub_to_3_months_tx_info.expiresDate)
         assert payment_list[0].grace_period == base.DEFAULT_APPLE_GRACE_PERIOD
-        assert payment_list[0].platform_refund_expires_at == base.datetime_from_unix_ms(
+        assert payment_list[0].platform_refund_expiry_at == base.datetime_from_unix_ms(
             e00_sub_to_3_months_tx_info.expiresDate
         )
         assert payment_list[0].revoked_at is None
@@ -1636,9 +1636,9 @@ def test_platform_apple(pg_database):
             assert not payment_list[0].auto_renewing
             assert payment_list[0].purchased_at == base.datetime_from_unix_ms(e00_sub_to_3_months_tx_info.purchaseDate)
             assert payment_list[0].redeemed_at is not None
-            assert payment_list[0].expires_at == base.datetime_from_unix_ms(e00_sub_to_3_months_tx_info.expiresDate)
+            assert payment_list[0].expiry_at == base.datetime_from_unix_ms(e00_sub_to_3_months_tx_info.expiresDate)
             assert payment_list[0].grace_period == base.DEFAULT_APPLE_GRACE_PERIOD
-            assert payment_list[0].platform_refund_expires_at == base.datetime_from_unix_ms(
+            assert payment_list[0].platform_refund_expiry_at == base.datetime_from_unix_ms(
                 e00_sub_to_3_months_tx_info.expiresDate
             )
             assert payment_list[0].revoked_at == base.datetime_from_unix_ms(e01_upgrade_to_1wk_tx_info.purchaseDate)
@@ -1674,9 +1674,9 @@ def test_platform_apple(pg_database):
             assert payment_list[1].redeemed_at == backend.to_redeemed_at(
                 base.datetime_from_unix_ms(e01_upgrade_to_1wk_tx_info.purchaseDate)
             )
-            assert payment_list[1].expires_at == base.datetime_from_unix_ms(e01_upgrade_to_1wk_tx_info.expiresDate)
+            assert payment_list[1].expiry_at == base.datetime_from_unix_ms(e01_upgrade_to_1wk_tx_info.expiresDate)
             assert payment_list[1].grace_period == base.DEFAULT_APPLE_GRACE_PERIOD
-            assert payment_list[1].platform_refund_expires_at == base.datetime_from_unix_ms(
+            assert payment_list[1].platform_refund_expiry_at == base.datetime_from_unix_ms(
                 e01_upgrade_to_1wk_tx_info.expiresDate
             )
             assert payment_list[1].revoked_at is None
@@ -1729,9 +1729,9 @@ def test_platform_apple(pg_database):
             assert payment_list[-1].redeemed_at == backend.to_redeemed_at(
                 base.datetime_from_unix_ms(e01_upgrade_to_1wk_tx_info.purchaseDate)
             )
-            assert payment_list[-1].expires_at == base.datetime_from_unix_ms(e01_upgrade_to_1wk_tx_info.expiresDate)
+            assert payment_list[-1].expiry_at == base.datetime_from_unix_ms(e01_upgrade_to_1wk_tx_info.expiresDate)
             assert payment_list[-1].grace_period == base.DEFAULT_APPLE_GRACE_PERIOD
-            assert payment_list[-1].platform_refund_expires_at == base.datetime_from_unix_ms(
+            assert payment_list[-1].platform_refund_expiry_at == base.datetime_from_unix_ms(
                 e01_upgrade_to_1wk_tx_info.expiresDate
             )
             assert payment_list[-1].revoked_at is None
@@ -1760,9 +1760,9 @@ def test_platform_apple(pg_database):
             assert not payment_list[0].auto_renewing
             assert payment_list[0].purchased_at == base.datetime_from_unix_ms(e00_sub_to_3_months_tx_info.purchaseDate)
             assert payment_list[0].redeemed_at is not None
-            assert payment_list[0].expires_at == base.datetime_from_unix_ms(e00_sub_to_3_months_tx_info.expiresDate)
+            assert payment_list[0].expiry_at == base.datetime_from_unix_ms(e00_sub_to_3_months_tx_info.expiresDate)
             assert payment_list[0].grace_period == base.DEFAULT_APPLE_GRACE_PERIOD
-            assert payment_list[0].platform_refund_expires_at == base.datetime_from_unix_ms(
+            assert payment_list[0].platform_refund_expiry_at == base.datetime_from_unix_ms(
                 e00_sub_to_3_months_tx_info.expiresDate
             )
             assert payment_list[0].revoked_at == base.datetime_from_unix_ms(e01_upgrade_to_1wk_tx_info.purchaseDate)
@@ -1785,9 +1785,9 @@ def test_platform_apple(pg_database):
             assert payment_list[-1].redeemed_at == backend.to_redeemed_at(
                 base.datetime_from_unix_ms(e01_upgrade_to_1wk_tx_info.purchaseDate)
             )
-            assert payment_list[-1].expires_at == base.datetime_from_unix_ms(e01_upgrade_to_1wk_tx_info.expiresDate)
+            assert payment_list[-1].expiry_at == base.datetime_from_unix_ms(e01_upgrade_to_1wk_tx_info.expiresDate)
             assert payment_list[-1].grace_period == base.DEFAULT_APPLE_GRACE_PERIOD
-            assert payment_list[-1].platform_refund_expires_at == base.datetime_from_unix_ms(
+            assert payment_list[-1].platform_refund_expiry_at == base.datetime_from_unix_ms(
                 e01_upgrade_to_1wk_tx_info.expiresDate
             )
             assert payment_list[-1].revoked_at is None
@@ -1835,9 +1835,9 @@ def test_platform_apple(pg_database):
             assert payment_list[-1].redeemed_at == backend.to_redeemed_at(
                 base.datetime_from_unix_ms(e01_upgrade_to_1wk_tx_info.purchaseDate)
             )
-            assert payment_list[-1].expires_at == base.datetime_from_unix_ms(e01_upgrade_to_1wk_tx_info.expiresDate)
+            assert payment_list[-1].expiry_at == base.datetime_from_unix_ms(e01_upgrade_to_1wk_tx_info.expiresDate)
             assert payment_list[-1].grace_period == base.DEFAULT_APPLE_GRACE_PERIOD
-            assert payment_list[-1].platform_refund_expires_at == base.datetime_from_unix_ms(
+            assert payment_list[-1].platform_refund_expiry_at == base.datetime_from_unix_ms(
                 e01_upgrade_to_1wk_tx_info.expiresDate
             )
             assert payment_list[-1].revoked_at is None

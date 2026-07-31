@@ -186,7 +186,7 @@ def require_field(field: typing.Any, msg: str, err: base.ErrorSink | None) -> bo
     return result
 
 
-def get_platform_refund_expires_at(tx: AppleJWSTransactionDecodedPayload) -> pendulum.DateTime:
+def get_platform_refund_expiry_at(tx: AppleJWSTransactionDecodedPayload) -> pendulum.DateTime:
     # TODO: It's unclear from the Apple documentation whether or not there is a deadline that a user
     # has to submit a refund request directly through Apple. There are some various off-hand
     # comments on the internet that state this is 90 days but cannot be corroborated on the actual
@@ -406,15 +406,15 @@ def handle_notification_tx(
                 payment_tx = payment_tx_from_apple_jws_transaction(tx, err)
                 pro_plan = pro_plan_from_product_id(tx.productId, err)
 
-                expires_at = base.datetime_from_unix_ms(tx.expiresDate)
+                expiry_at = base.datetime_from_unix_ms(tx.expiresDate)
                 purchased_at = base.datetime_from_unix_ms(tx.purchaseDate)
-                platform_refund_expires_at = get_platform_refund_expires_at(tx)
+                platform_refund_expiry_at = get_platform_refund_expiry_at(tx)
                 auto_renewing = True
 
                 if log.getEffectiveLevel() <= logging.DEBUG:
-                    expiry = base.readable(expires_at)
+                    expiry = base.readable(expiry_at)
                     unredeemed = base.readable(purchased_at)
-                    refund = base.readable(platform_refund_expires_at)
+                    refund = base.readable(platform_refund_expiry_at)
                     log.debug(
                         f'{notif_type} for {payment_tx_id_label(payment_tx)}: '
                         f'New payment (expiry/unredeemed/refund expiry) ts = {expiry}/{unredeemed}/{refund}, '
@@ -433,8 +433,8 @@ def handle_notification_tx(
                         payment_tx=payment_tx,
                         plan=pro_plan,
                         purchased_at=purchased_at,
-                        platform_refund_expires_at=platform_refund_expires_at,
-                        expires_at=expires_at,
+                        platform_refund_expiry_at=platform_refund_expiry_at,
+                        expiry_at=expiry_at,
                         platform_obfuscated_account_id=platform_obfuscated_account_id,
                         err=err,
                     )
@@ -556,15 +556,15 @@ def handle_notification_tx(
                         # We lookup the latest payment for the original transaction ID and cancel
                         # that
 
-                        expires_at = base.datetime_from_unix_ms(tx.expiresDate)
+                        expiry_at = base.datetime_from_unix_ms(tx.expiresDate)
                         purchased_at = base.datetime_from_unix_ms(tx.purchaseDate)
-                        platform_refund_expires_at = get_platform_refund_expires_at(tx)
+                        platform_refund_expiry_at = get_platform_refund_expiry_at(tx)
                         auto_renewing = True
                         revoke_at = base.datetime_from_unix_ms(tx.purchaseDate)
                         if log.getEffectiveLevel() <= logging.DEBUG:
-                            expiry = base.readable(expires_at)
+                            expiry = base.readable(expiry_at)
                             unredeemed = base.readable(purchased_at)
-                            refund = base.readable(platform_refund_expires_at)
+                            refund = base.readable(platform_refund_expiry_at)
                             revoke = base.readable(base.datetime_from_unix_ms(tx.purchaseDate))
                             log.debug(
                                 f'{notif_type}+UPGRADE for {payment_tx_id_label(payment_tx)}: '
@@ -592,9 +592,9 @@ def handle_notification_tx(
                                 sql_tx,
                                 payment_tx=payment_tx,
                                 plan=pro_plan,
-                                expires_at=expires_at,
+                                expiry_at=expiry_at,
                                 purchased_at=purchased_at,
-                                platform_refund_expires_at=platform_refund_expires_at,
+                                platform_refund_expiry_at=platform_refund_expiry_at,
                                 platform_obfuscated_account_id=platform_obfuscated_account_id,
                                 err=err,
                             )
@@ -679,13 +679,13 @@ def handle_notification_tx(
                 if not decoded_notification.body.subtype:
                     # NOTE: User is redeeming an offer to start(?) a sub. Submit the payment
                     purchased_at = base.datetime_from_unix_ms(tx.purchaseDate)
-                    platform_refund_expires_at = get_platform_refund_expires_at(tx)
-                    expires_at = base.datetime_from_unix_ms(tx.expiresDate)
+                    platform_refund_expiry_at = get_platform_refund_expiry_at(tx)
+                    expiry_at = base.datetime_from_unix_ms(tx.expiresDate)
 
                     if log.getEffectiveLevel() <= logging.DEBUG:
-                        expiry = base.readable(expires_at)
+                        expiry = base.readable(expiry_at)
                         unredeemed = base.readable(purchased_at)
-                        refund = base.readable(platform_refund_expires_at)
+                        refund = base.readable(platform_refund_expiry_at)
                         log.debug(
                             f'{notif_type} for {payment_tx_id_label(payment_tx)}: '
                             f'New payment (unredeemed/refund expiry/expiry) ts = ({unredeemed}/{refund}/{expiry})'
@@ -699,9 +699,9 @@ def handle_notification_tx(
                         sql_tx,
                         payment_tx=payment_tx,
                         plan=pro_plan,
-                        expires_at=base.datetime_from_unix_ms(tx.expiresDate),
+                        expiry_at=base.datetime_from_unix_ms(tx.expiresDate),
                         purchased_at=base.datetime_from_unix_ms(tx.purchaseDate),
-                        platform_refund_expires_at=platform_refund_expires_at,
+                        platform_refund_expiry_at=platform_refund_expiry_at,
                         platform_obfuscated_account_id=platform_obfuscated_account_id,
                         err=err,
                     )
@@ -724,16 +724,16 @@ def handle_notification_tx(
                     # payment and issue a new one.
                     sql_tx.cancel = True
                     auto_renewing = True
-                    expires_at = base.datetime_from_unix_ms(tx.expiresDate)
+                    expiry_at = base.datetime_from_unix_ms(tx.expiresDate)
                     purchased_at = base.datetime_from_unix_ms(tx.purchaseDate)
-                    platform_refund_expires_at = get_platform_refund_expires_at(tx)
+                    platform_refund_expiry_at = get_platform_refund_expiry_at(tx)
                     revoke_at = base.datetime_from_unix_ms(tx.purchaseDate)
 
                     if log.getEffectiveLevel() <= logging.DEBUG:
-                        expiry = base.readable(expires_at)
+                        expiry = base.readable(expiry_at)
                         unredeemed = base.readable(purchased_at)
                         revoke = base.readable(base.datetime_from_unix_ms(tx.purchaseDate))
-                        refund = base.readable(platform_refund_expires_at)
+                        refund = base.readable(platform_refund_expiry_at)
                         log.debug(
                             f'{notif_type}+UPGRADE for {payment_tx_id_label(payment_tx)}: '
                             f'Revoking (orig TX id) at = {revoke}, '
@@ -757,9 +757,9 @@ def handle_notification_tx(
                             sql_tx,
                             payment_tx=payment_tx,
                             plan=pro_plan,
-                            expires_at=expires_at,
+                            expiry_at=expiry_at,
                             purchased_at=purchased_at,
-                            platform_refund_expires_at=platform_refund_expires_at,
+                            platform_refund_expiry_at=platform_refund_expiry_at,
                             platform_obfuscated_account_id=platform_obfuscated_account_id,
                             err=err,
                         )

@@ -686,9 +686,9 @@ def handle_subscription_notification(
                         tx,
                         payment_tx=tx_payment,
                         plan=tx_event.pro_plan,
-                        expires_at=base.datetime_from_unix_ms(tx_event.expiry_time.unix_milliseconds),
+                        expiry_at=base.datetime_from_unix_ms(tx_event.expiry_time.unix_milliseconds),
                         purchased_at=base.datetime_from_unix_ms(tx_event.event_ts_ms),
-                        platform_refund_expires_at=base.datetime_from_unix_ms(
+                        platform_refund_expiry_at=base.datetime_from_unix_ms(
                             tx_event.event_ts_ms + api.refund_deadline_duration_ms
                         ),
                         platform_obfuscated_account_id=obfuscated_external_account_id,
@@ -743,9 +743,9 @@ def handle_subscription_notification(
                         tx,
                         payment_tx=tx_payment,
                         plan=tx_event.pro_plan,
-                        expires_at=base.datetime_from_unix_ms(tx_event.expiry_time.unix_milliseconds),
+                        expiry_at=base.datetime_from_unix_ms(tx_event.expiry_time.unix_milliseconds),
                         purchased_at=base.datetime_from_unix_ms(tx_event.event_ts_ms),
-                        platform_refund_expires_at=base.datetime_from_unix_ms(
+                        platform_refund_expiry_at=base.datetime_from_unix_ms(
                             tx_event.event_ts_ms + api.refund_deadline_duration_ms
                         ),
                         platform_obfuscated_account_id=obfuscated_external_account_id,
@@ -836,7 +836,7 @@ def handle_subscription_notification(
                 if not err.has():
                     assert payment is not None
                     rounded_expiry_at = backend.round_datetime_to_next_day_with_provider_testing_support(
-                        payment_provider=tx_payment.provider, at=payment.expires_at
+                        payment_provider=tx_payment.provider, at=payment.expiry_at
                     )
                     rounded_event_at = backend.round_datetime_to_next_day_with_provider_testing_support(
                         payment_provider=tx_payment.provider, at=base.datetime_from_unix_ms(tx_event.event_ts_ms)

@@ -120,7 +120,7 @@ if [ -f "$VOUCHERS_FILE" ]; then
         fi
 
         already=$(psql "$DB_URL" -tAc \
-            "SELECT 1 FROM users WHERE master_pkey = decode('$pkey', 'hex') AND expires_at > now()" \
+            "SELECT 1 FROM users WHERE master_pkey = decode('$pkey', 'hex') AND expiry_at > now()" \
             2>/dev/null || true)
         if [ "$already" = "1" ]; then
             echo "pro-backend entrypoint: voucher skipped, ${pkey:0:8}… already has an active subscription"

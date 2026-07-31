@@ -22,7 +22,7 @@ from tests.helpers import TestingContext, _grant_and_get_offset, _prove_at
 def test_proof_reports_account_expiry(pg_database):
     # A proof response carries account_expiry_ts -- the account's TRUE entitlement end -- distinct from
     # the proof's clamped (~30d) validity window. Grant a 12-month entitlement: the proof caps at ~30d
-    # while account_expires_at reports the full year, and account_expiry_ts is NOT in the signed message.
+    # while account_expiry_at reports the full year, and account_expiry_ts is NOT in the signed message.
     pool = backend.bootstrap_db(database_url=pg_database())
     assert pool
     backend_key = nacl.signing.SigningKey.generate()
@@ -40,25 +40,25 @@ def test_proof_reports_account_expiry(pg_database):
             request_at=now,
             redeemed_at=now,
             plan=base.ProPlan.TwelveMonth,
-            expires_at=account_expiry,
+            expiry_at=account_expiry,
         )
         # Proof validity rides the rolling clamp (~30 days); the account entitlement runs the full year, so
         # account_expiry_ts is the TRUE expiry exactly -- max() only ever reads back the proof's own expiry
         # in the closing window where the over-provision overtakes the true end, which is nowhere near here.
         shape = base.proof_expiry_shape()
         offset = backend.get_user(conn, master_key.verify_key).proof_expiry_offset
-        assert proof.expires_at == base.round_datetime_up_onto_offset_grid(
+        assert proof.expiry_at == base.round_datetime_up_onto_offset_grid(
             now + shape.clamp + shape.renewal_lead, period=shape.grid, offset_seconds=offset
         )
-        assert proof.account_expires_at == account_expiry
-        assert proof.expires_at < proof.account_expires_at
+        assert proof.account_expiry_at == account_expiry
+        assert proof.expiry_at < proof.account_expiry_at
 
         wire = proof.to_dict()
         assert wire['account_expiry_ts'] == base.unix_seconds_from_datetime(account_expiry)
         assert wire['expiry_ts'] != wire['account_expiry_ts']
 
         # account_expiry_ts is advisory: it is NOT part of the signed message the verifier reconstructs.
-        proof_hash = backend.build_proof_message(proof.revocation_tag, proof.rotating_pkey, proof.expires_at)
+        proof_hash = backend.build_proof_message(proof.revocation_tag, proof.rotating_pkey, proof.expiry_at)
         backend_key.verify_key.verify(smessage=proof_hash, signature=proof.sig)
     pool.close()
 
@@ -85,7 +85,7 @@ def test_expired_proof_fail_carries_account_expiry(pg_database):
             request_at=granted_at,
             redeemed_at=granted_at,
             plan=base.ProPlan.OneMonth,
-            expires_at=account_expiry,
+            expiry_at=account_expiry,
         )
         # Ask for a proof from after the entitlement AND its proof over-provision are spent (the offset
         # buys up to a day past the true expiry, so an hour later is not yet lapsed as far as proofs go --
@@ -177,7 +177,7 @@ def test_proof_is_identical_for_requests_in_the_same_grid_period(pg_database):
             _prove_at(conn, backend_key, master_key, rotating_key, first_at + pendulum.duration(seconds=delay))
             for delay in (0, 1, 7, 59, 299)
         ]
-        assert proofs[0].expires_at == target
+        assert proofs[0].expiry_at == target
         # Byte-identical on the wire: same expiry AND the same signature over it, so two devices cannot be
         # told apart by their proofs and neither has to prefer one over the other.
         assert all(proof.to_dict() == proofs[0].to_dict() for proof in proofs)
@@ -186,13 +186,13 @@ def test_proof_is_identical_for_requests_in_the_same_grid_period(pg_database):
         latest = target - shape.clamp - shape.renewal_lead
         assert _prove_at(conn, backend_key, master_key, rotating_key, latest).to_dict() == proofs[0].to_dict()
         stepped = _prove_at(conn, backend_key, master_key, rotating_key, latest + pendulum.duration(seconds=1))
-        assert stepped.expires_at == target + shape.grid
+        assert stepped.expiry_at == target + shape.grid
 
         # The grid belongs to the ACCOUNT, not to a key: a different rotating key gets the same expiry, just
         # a different signature over it.
         other_rotating_key = nacl.signing.SigningKey.generate()
         other = _prove_at(conn, backend_key, master_key, other_rotating_key, first_at)
-        assert other.expires_at == proofs[0].expires_at
+        assert other.expiry_at == proofs[0].expiry_at
         assert other.sig != proofs[0].sig
     pool.close()
 
@@ -202,7 +202,7 @@ def test_proof_expiry_offset_redraws_only_when_true_expiry_moves(monkeypatch, pg
     # re-drawing on a refresh that changes nothing would hand an observer repeated samples against one true
     # expiry, and the minimum of those samples converges straight back onto it; never re-drawing would leave
     # a fixed expiry time-of-day (a stable fingerprint) and let the same accounts perpetually collect the
-    # offset's bonus Pro. So: re-draw exactly when `users.expires_at` moves.
+    # offset's bonus Pro. So: re-draw exactly when `users.expiry_at` moves.
     draws = itertools.count(1)
     monkeypatch.setattr(backend, 'new_proof_expiry_offset', lambda: next(draws))
 
@@ -217,7 +217,7 @@ def test_proof_expiry_offset_redraws_only_when_true_expiry_moves(monkeypatch, pg
         offset = _grant_and_get_offset(conn, backend_key, master_key, rotating_key, now, now + 30 * base.DAY)
 
         # A refresh from the same payment list recomputes the same expiry -> the offset must NOT move. Called
-        # directly because it IS the clause under test: both writers of users.expires_at share it, and going
+        # directly because it IS the clause under test: both writers of users.expiry_at share it, and going
         # through a caller would only prove whichever path that caller happens to take.
         backend._update_user_expiry_grace_and_renew_flag_from_payment_list(conn, master_key.verify_key)
         assert backend.get_user(conn, master_key.verify_key).proof_expiry_offset == offset
@@ -231,7 +231,7 @@ def test_proof_expiry_offset_redraws_only_when_true_expiry_moves(monkeypatch, pg
             request_at=now,
             redeemed_at=now,
             plan=base.ProPlan.OneMonth,
-            expires_at=now + 60 * base.DAY,
+            expiry_at=now + 60 * base.DAY,
         )
         assert backend.get_user(conn, master_key.verify_key).proof_expiry_offset != offset
     pool.close()
@@ -258,7 +258,7 @@ def test_proof_expiry_lands_on_the_account_grid(pg_database):
         expiry = base.round_datetime_up_onto_offset_grid(
             now + shape.clamp + shape.renewal_lead, period=shape.grid, offset_seconds=offset
         )
-        assert _prove_at(conn, backend_key, sliding_key, rotating_key, now).expires_at == expiry
+        assert _prove_at(conn, backend_key, sliding_key, rotating_key, now).expiry_at == expiry
         # On the grid, hence an exact whole second (nothing sub-second reaches the signed message).
         assert (expiry - base.EPOCH) % shape.grid == pendulum.duration(seconds=offset)
 
@@ -266,9 +266,9 @@ def test_proof_expiry_lands_on_the_account_grid(pg_database):
         # exactly one period.
         latest = expiry - shape.clamp - shape.renewal_lead
         assert latest >= now
-        assert _prove_at(conn, backend_key, sliding_key, rotating_key, latest).expires_at == expiry
+        assert _prove_at(conn, backend_key, sliding_key, rotating_key, latest).expiry_at == expiry
         stepped = _prove_at(conn, backend_key, sliding_key, rotating_key, latest + pendulum.duration(seconds=1))
-        assert stepped.expires_at == expiry + shape.grid
+        assert stepped.expiry_at == expiry + shape.grid
 
         # Pinned arm: an entitlement inside the clamp, so the `min` takes the true expiry and the expiry
         # stops moving with the request entirely -- the same value however long the client waits.
@@ -278,9 +278,9 @@ def test_proof_expiry_lands_on_the_account_grid(pg_database):
         pinned = base.round_datetime_up_onto_offset_grid(
             true_expiry + shape.renewal_lead, period=shape.grid, offset_seconds=pinned_offset
         )
-        assert _prove_at(conn, backend_key, pinned_key, rotating_key, now).expires_at == pinned
+        assert _prove_at(conn, backend_key, pinned_key, rotating_key, now).expiry_at == pinned
         later = _prove_at(conn, backend_key, pinned_key, rotating_key, now + pendulum.duration(hours=13))
-        assert later.expires_at == pinned
+        assert later.expiry_at == pinned
         # The over-provision is bounded by the lead plus one period, and never rounds an expiry DOWN (which
         # would advertise an end before the entitlement's, with the renewal payment possibly not yet in).
         assert true_expiry + shape.renewal_lead <= pinned < true_expiry + shape.renewal_lead + shape.grid
@@ -310,11 +310,11 @@ def test_lapsed_account_keeps_proofs_through_the_over_provision(pg_database):
 
         # Past the true expiry but inside the over-provision: still served, and the expiry has not budged.
         lapsed = _prove_at(conn, backend_key, master_key, rotating_key, true_expiry + pendulum.duration(minutes=30))
-        assert lapsed.expires_at == expiry
+        assert lapsed.expiry_at == expiry
         # account_expiry_ts reads back the proof's expiry here (it is the later of the two), so the client is
         # never told its subscription ended while a proof we signed still verifies.
-        assert lapsed.account_expires_at == expiry
-        assert lapsed.expires_at <= lapsed.account_expires_at
+        assert lapsed.account_expiry_at == expiry
+        assert lapsed.expiry_at <= lapsed.account_expiry_at
 
         # Spent: now it lapses, reporting the TRUE expiry and never the over-provisioned one.
         with pytest.raises(base.FailError) as excinfo:

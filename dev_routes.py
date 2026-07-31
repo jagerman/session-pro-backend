@@ -99,7 +99,7 @@ def dev_add_payment() -> flask.Response:
 
     log.warning(
         f'DEV: minted a {minted.plan.value} {provider.value} payment '
-        f'(redeemed={minted.redeemed}, expiry={base.readable(minted.expires_at)}) for '
+        f'(redeemed={minted.redeemed}, expiry={base.readable(minted.expiry_at)}) for '
         f'{base.maybe_obfuscate_bytes(master_pkey_bytes)} — no payment provider was involved'
     )
 
@@ -107,7 +107,7 @@ def dev_add_payment() -> flask.Response:
         'provider': provider.value,
         'payment_id': minted.payment_id,
         'plan': minted.plan.value,
-        'expiry_ts': base.unix_seconds_from_datetime(minted.expires_at),
+        'expiry_ts': base.unix_seconds_from_datetime(minted.expiry_at),
         'redeemed': minted.redeemed,
     }
     return server.make_success_response(dict_result=result)

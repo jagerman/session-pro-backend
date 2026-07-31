@@ -65,8 +65,8 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
         payment_tx=payment_tx,
         plan=base.ProPlan.OneMonth,
         purchased_at=request_at,
-        expires_at=next_day_at + 90 * base.DAY,
-        platform_refund_expires_at=base.EPOCH,
+        expiry_at=next_day_at + 90 * base.DAY,
+        platform_refund_expiry_at=base.EPOCH,
         platform_obfuscated_account_id=bytes(master_key.verify_key),
         err=err,
     )
@@ -287,8 +287,8 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
         payment_tx=new_payment_tx,
         plan=base.ProPlan.OneMonth,
         purchased_at=request_at,
-        expires_at=request_at + 30 * base.DAY,
-        platform_refund_expires_at=base.EPOCH,
+        expiry_at=request_at + 30 * base.DAY,
+        platform_refund_expiry_at=base.EPOCH,
         platform_obfuscated_account_id=bytes(master_key.verify_key),
         err=err,
     )
@@ -716,7 +716,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
     # NOTE: Grab the latest expiring payment so that we have access to the payment details
     last_payment = backend.PaymentRow()
     for payment_it in backend.get_payments_list(db_conn):
-        if payment_it.expires_at > last_payment.expires_at:
+        if payment_it.expiry_at > last_payment.expiry_at:
             last_payment = payment_it
 
     # NOTE: Add a grace period
@@ -737,7 +737,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
     with db.transaction(db_conn) as tx:
         get_user = backend.get_user_and_payments(tx, master_key.verify_key)
         assert get_user.user.grace_period > pendulum.duration()
-        pro_proof_deadline_unix_ts_ms = base.unix_ms_from_datetime(get_user.user.expires_at)
+        pro_proof_deadline_unix_ts_ms = base.unix_ms_from_datetime(get_user.user.expiry_at)
 
     # NOTE: Try to generate a proof on the deadline timestamp (which includes grace), should be permitted
     unix_ts_ms = pro_proof_deadline_unix_ts_ms
@@ -758,7 +758,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
     )
 
     # NOTE: Check that the proof verifies
-    proof_hash = backend.build_proof_message(proof.revocation_tag, proof.rotating_pkey, proof.expires_at)
+    proof_hash = backend.build_proof_message(proof.revocation_tag, proof.rotating_pkey, proof.expiry_at)
     backend_key.verify_key.verify(smessage=proof_hash, signature=proof.sig)
 
     # NOTE: Generating a proof once the deadline AND the proof over-provision are both spent must fail —

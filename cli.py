@@ -540,8 +540,8 @@ def cmd_google_notification_list(args: argparse.Namespace) -> int:
 
                 print(f"Found {len(items)} unhandled google notifications:")
                 for index, item in enumerate(items):
-                    message_id, payload, expires_at = item
-                    expiry_str = base.readable(expires_at)
+                    message_id, payload, expiry_at = item
+                    expiry_str = base.readable(expiry_at)
                     print(f"  {index:02d} message_id={message_id}, expiry={expiry_str}")
 
                 return 0
@@ -593,7 +593,7 @@ def cmd_revoke_list(args: argparse.Namespace) -> int:
                         case base.PaymentProvider.SessionFoundation:
                             payment_id = f'{payment.stf_order_id}'
 
-                    if now >= payment.expires_at:
+                    if now >= payment.expiry_at:
                         continue
 
                     status_label = backend.derive_payment_status(payment, now).name
@@ -602,7 +602,7 @@ def cmd_revoke_list(args: argparse.Namespace) -> int:
                         f'Status={status_label}; '
                         f'Plan={plan_label}; '
                         f'Unredeemed={base.readable(payment.purchased_at)}; '
-                        f'Expiry={base.readable(payment.expires_at)};'
+                        f'Expiry={base.readable(payment.expiry_at)};'
                     )
                     eligible_count += 1
 
@@ -786,7 +786,7 @@ def cmd_voucher(args: argparse.Namespace) -> int:
 
                 print(f"Success: {provider.value} payment granted and pro proof generated")
                 print('\nProof Details:')
-                print(f'  Expiry: {base.readable(proof.expires_at)}')
+                print(f'  Expiry: {base.readable(proof.expiry_at)}')
                 print(f'  Revocation Tag: {proof.revocation_tag.hex()}')
 
                 return 0

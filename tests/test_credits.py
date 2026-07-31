@@ -37,7 +37,7 @@ def test_credit_stacks_on_a_live_subscription(pg_database):
     with db.connection() as conn:
         T = base.round_datetime_to_next_day(base.utc_now())
         f = _CreditFixture(conn, T)
-        f.subscribe(expires_at=T + 30 * base.DAY)
+        f.subscribe(expiry_at=T + 30 * base.DAY)
         assert f.expiry() == T + 30 * base.DAY
         f.mint(365 * base.DAY)
         assert f.expiry() == T + 30 * base.DAY + 365 * base.DAY
@@ -52,17 +52,17 @@ def test_credit_is_not_drained_or_absorbed_while_a_subscription_covers(pg_databa
     with db.connection() as conn:
         T = base.round_datetime_to_next_day(base.utc_now())
         f = _CreditFixture(conn, T)
-        f.subscribe(expires_at=T + 30 * base.DAY)
+        f.subscribe(expiry_at=T + 30 * base.DAY)
         credit = f.mint(30 * base.DAY)
 
         # Renewal cycles, each drained through while covered: nothing is charged, but the checkpoint keeps
         # advancing (otherwise the covered span would be charged later, once coverage ends).
-        f.subscribe(expires_at=T + 60 * base.DAY, purchased_at=T + 30 * base.DAY)
+        f.subscribe(expiry_at=T + 60 * base.DAY, purchased_at=T + 30 * base.DAY)
         assert f.drain(at=T + 31 * base.DAY) == 1
         assert f.remaining(credit) == 30 * base.DAY
         assert f.checkpoint() == T + 31 * base.DAY
 
-        f.subscribe(expires_at=T + 90 * base.DAY, purchased_at=T + 60 * base.DAY)
+        f.subscribe(expiry_at=T + 90 * base.DAY, purchased_at=T + 60 * base.DAY)
         assert f.drain(at=T + 61 * base.DAY) == 1
         assert f.remaining(credit) == 30 * base.DAY
 
@@ -79,7 +79,7 @@ def test_three_credits_stack_with_and_without_a_subscription(pg_database):
     with db.connection() as conn:
         T = base.round_datetime_to_next_day(base.utc_now())
         f = _CreditFixture(conn, T)
-        f.subscribe(expires_at=T + 30 * base.DAY)
+        f.subscribe(expiry_at=T + 30 * base.DAY)
         for _ in range(3):
             f.mint(30 * base.DAY)
         assert f.expiry() == T + 30 * base.DAY + 90 * base.DAY
@@ -101,7 +101,7 @@ def test_three_credits_stack_with_and_without_a_subscription(pg_database):
 
 
 def test_credit_only_account_actually_drains(pg_database):
-    # The trap: computing "is this account covered?" from users.expires_at would see the credit's own
+    # The trap: computing "is this account covered?" from users.expiry_at would see the credit's own
     # remaining length, report the account as covered, and protect the credit from ever being charged.
     pool = backend.bootstrap_db(database_url=pg_database())
     assert pool
@@ -109,7 +109,7 @@ def test_credit_only_account_actually_drains(pg_database):
         T = base.round_datetime_to_next_day(base.utc_now())
         f = _CreditFixture(conn, T)
         credit = f.mint(30 * base.DAY)
-        assert f.expiry() == T + 30 * base.DAY  # so users.expires_at IS in the future
+        assert f.expiry() == T + 30 * base.DAY  # so users.expiry_at IS in the future
 
         assert f.drain(at=T + 10 * base.DAY) == 1
         assert f.remaining(credit) == 20 * base.DAY
@@ -192,7 +192,7 @@ def test_credit_granted_while_covered_drains_only_after_the_lapse(pg_database):
     with db.connection() as conn:
         T = base.round_datetime_to_next_day(base.utc_now())
         f = _CreditFixture(conn, T)
-        f.subscribe(expires_at=T + 30 * base.DAY, auto_renewing=False)  # cancelled: covers to term end
+        f.subscribe(expiry_at=T + 30 * base.DAY, auto_renewing=False)  # cancelled: covers to term end
         credit = f.mint(10 * base.DAY)
         assert f.expiry() == T + 40 * base.DAY
 
@@ -219,7 +219,7 @@ def test_credit_sampled_coverage_charges_a_whole_late_span(pg_database):
     with db.connection() as conn:
         T = base.round_datetime_to_next_day(base.utc_now())
         f = _CreditFixture(conn, T)
-        f.subscribe(expires_at=T + 30 * base.DAY, auto_renewing=False)
+        f.subscribe(expiry_at=T + 30 * base.DAY, auto_renewing=False)
         credit = f.mint(30 * base.DAY)
 
         # One pass inside the term, then nothing for fifteen days -- the lapse falls in the middle of it.
@@ -257,7 +257,7 @@ def test_credit_dark_gap_charges_nobody_and_a_regrant_restarts_the_clock(pg_data
         assert f.expiry() == T + 130 * base.DAY
 
         # And a subscription bought later simply takes over as the better coverage.
-        f.subscribe(expires_at=T + 200 * base.DAY, purchased_at=T + 105 * base.DAY)
+        f.subscribe(expiry_at=T + 200 * base.DAY, purchased_at=T + 105 * base.DAY)
         assert f.expiry() == T + 200 * base.DAY + 25 * base.DAY
     pool.close()
 
@@ -319,12 +319,12 @@ def test_credit_expiry_obfuscation_is_not_perturbed_by_draining(pg_database):
         # ...and therefore a proof taken later carries the SAME published expiry: repeated sampling tells
         # an observer nothing beyond the first sample.
         later = _redeem_and_prove(conn, backend_key, f.master_key, rotating_key, T + 3 * base.DAY)
-        assert later.expires_at == first.expires_at
+        assert later.expiry_at == first.expiry_at
 
         # The published expiry is the grid point at or after the true one, never the true instant itself
         # unless the account's grid happens to land there.
-        assert first.expires_at >= expiry_before
-        assert first.expires_at - expiry_before < base.DAY
+        assert first.expiry_at >= expiry_before
+        assert first.expiry_at - expiry_before < base.DAY
     pool.close()
 
 
@@ -341,7 +341,7 @@ def test_credit_survives_a_refund_and_grant_order_is_irrelevant(pg_database):
 
         # Order A: refund lands, THEN the credit is granted.
         a = _CreditFixture(conn, T)
-        sub_a = a.subscribe(expires_at=T + 365 * base.DAY)
+        sub_a = a.subscribe(expiry_at=T + 365 * base.DAY)
         with db.transaction(conn) as tx:
             assert backend.add_google_revocation(
                 tx, google_payment_token=sub_a.google_payment_token, revoke_at=REFUND_AT, err=err
@@ -350,7 +350,7 @@ def test_credit_survives_a_refund_and_grant_order_is_irrelevant(pg_database):
 
         # Order B: the credit is granted first, THEN the refund lands.
         b = _CreditFixture(conn, T)
-        sub_b = b.subscribe(expires_at=T + 365 * base.DAY)
+        sub_b = b.subscribe(expiry_at=T + 365 * base.DAY)
         b.mint(365 * base.DAY, at=REFUND_AT)
         with db.transaction(conn) as tx:
             assert backend.add_google_revocation(
@@ -373,7 +373,7 @@ def test_revoking_a_credit_drops_exactly_its_remaining(pg_database):
     with db.connection() as conn:
         T = base.round_datetime_to_next_day(base.utc_now())
         f = _CreditFixture(conn, T)
-        f.subscribe(expires_at=T + 30 * base.DAY)
+        f.subscribe(expiry_at=T + 30 * base.DAY)
         keep = f.mint(10 * base.DAY)
         claw = f.mint(90 * base.DAY)
         assert f.expiry() == T + 130 * base.DAY
@@ -398,14 +398,14 @@ def test_credit_does_not_make_a_subscriber_look_non_renewing(pg_database):
     with db.connection() as conn:
         T = base.round_datetime_to_next_day(base.utc_now())
         f = _CreditFixture(conn, T)
-        f.subscribe(expires_at=T + 30 * base.DAY, grace=2 * base.DAY)
+        f.subscribe(expiry_at=T + 30 * base.DAY, grace=2 * base.DAY)
         f.mint(365 * base.DAY)
 
         user = backend.get_user(conn, f.pkey)
         assert user.auto_renewing is True
         assert user.grace_period == 2 * base.DAY
         # Coverage runs to the paid term plus grace, and only then does the credit's year begin.
-        assert user.expires_at == T + 32 * base.DAY + 365 * base.DAY
+        assert user.expiry_at == T + 32 * base.DAY + 365 * base.DAY
     pool.close()
 
 
@@ -447,7 +447,7 @@ def test_minted_credit_never_claims_to_renew(pg_database):
 
         # A real store purchase is still renewing by default, which is what the credit check must not break.
         f = _CreditFixture(conn, T)
-        f.subscribe(expires_at=T + 30 * base.DAY)
+        f.subscribe(expiry_at=T + 30 * base.DAY)
         assert backend.get_user(conn, f.pkey).auto_renewing is True
     pool.close()
 
@@ -490,10 +490,10 @@ def test_grant_voucher(pg_database):
             request_at=now,
             redeemed_at=now,
             plan=base.ProPlan.OneMonth,
-            expires_at=now + 30 * base.DAY,
+            expiry_at=now + 30 * base.DAY,
         )
         # The proof verifies against the backend key, and the key is now an entitled user.
-        proof_hash = backend.build_proof_message(proof.revocation_tag, proof.rotating_pkey, proof.expires_at)
+        proof_hash = backend.build_proof_message(proof.revocation_tag, proof.rotating_pkey, proof.expiry_at)
         backend_key.verify_key.verify(smessage=proof_hash, signature=proof.sig)
         assert backend.get_user(conn, master_key.verify_key).found
     pool.close()

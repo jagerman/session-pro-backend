@@ -51,9 +51,9 @@ PAYMENTS_COLUMNS = ", ".join(
         "p.auto_renewing",
         "p.purchased_at",
         "p.redeemed_at",
-        "p.expires_at",
+        "p.expiry_at",
         "p.grace_period",
-        "p.platform_refund_expires_at",
+        "p.platform_refund_expiry_at",
         "p.revoked_at",
         "ad.original_tx_id AS apple_original_tx_id",
         "ad.tx_id AS apple_tx_id",
@@ -85,7 +85,7 @@ USERS_COLUMNS = ", ".join(
         "u.master_pkey",
         "u.current_generation_id",
         "g.token",
-        "u.expires_at",
+        "u.expiry_at",
         "u.grace_period",
         "u.auto_renewing",
         "u.proof_expiry_offset",
@@ -137,20 +137,20 @@ class ProSubscriptionProof:
     version: int = 0
     revocation_tag: bytes = b''  # the generation's stored random 32-byte token
     rotating_pkey: nacl.signing.VerifyKey = nacl.signing.VerifyKey(ZERO_BYTES32)
-    expires_at: pendulum.DateTime = base.EPOCH
+    expiry_at: pendulum.DateTime = base.EPOCH
     sig: bytes = b''
 
     # --- Advisory account-entitlement value: NOT signed and NOT part of the proof message (the signed
-    # message is revocation_tag ‖ rotating_pkey ‖ expires_at). Populated by
+    # message is revocation_tag ‖ rotating_pkey ‖ expiry_at). Populated by
     # build_current_entitlement_proof from the SAME DB snapshot that produced the proof, so a proof
     # fetch also hands the client its current subscription horizon in one response. This is the TRUE
     # entitlement end (grace-inclusive, matching what get_pro_status reports), except in the closing
     # window where the proof's over-provision runs past it and it reads back the proof's own expiry so
-    # that `expires_at <= account_expires_at` always holds. Deliberately distinct from `expires_at`
+    # that `expiry_at <= account_expiry_at` always holds. Deliberately distinct from `expiry_at`
     # above, which is the rolling, clamped (~30 d) proof validity — never conflate the two.
     # Display state only; the signed proof + revocation list remain authoritative.
     # Left at the default on any proof built without a user context (none today). ---
-    account_expires_at: pendulum.DateTime = base.EPOCH
+    account_expiry_at: pendulum.DateTime = base.EPOCH
 
     def to_dict(self) -> dict[str, str | int]:
         # `version` is a PLAINTEXT field, deliberately NOT bound into the signature. It is the
@@ -167,11 +167,11 @@ class ProSubscriptionProof:
             "rotating_pkey": bytes(self.rotating_pkey).hex(),
             # Whole seconds by construction — a store expiry (µs-capable) only reaches here through
             # _build_proof_clamped_expiry_time, and the signed message needs an exact integer (wire §2).
-            "expiry_ts": base.unix_seconds_from_datetime(self.expires_at),
+            "expiry_ts": base.unix_seconds_from_datetime(self.expiry_at),
             "sig": self.sig.hex(),
             # Advisory, UNSIGNED (see field comment): the account's true entitlement end, distinct from
             # the clamped proof `expiry_ts` above. Lets a proof fetch refresh the client's cached expiry.
-            "account_expiry_ts": base.unix_seconds_from_datetime(self.account_expires_at),
+            "account_expiry_ts": base.unix_seconds_from_datetime(self.account_expiry_at),
         }
         return result
 
@@ -190,11 +190,11 @@ class LookupUserExpiry:
 
 AddRevocationIterator: typing.TypeAlias = tuple[
     int, bytes | None, pendulum.DateTime  # (row) id  # master_pkey
-]  # expires_at
+]  # expiry_at
 
 GoogleUnhandledNotificationIterator: typing.TypeAlias = tuple[
     str, str | None, pendulum.DateTime  # message_id (opaque string)  # payload
-]  # expires_at
+]  # expiry_at
 
 
 @dataclasses.dataclass
@@ -256,9 +256,9 @@ class PaymentRow:
     auto_renewing: bool = False
     purchased_at: pendulum.DateTime = base.EPOCH
     redeemed_at: pendulum.DateTime | None = None
-    expires_at: pendulum.DateTime = base.EPOCH
+    expiry_at: pendulum.DateTime = base.EPOCH
     grace_period: pendulum.Duration | None = None
-    platform_refund_expires_at: pendulum.DateTime = base.EPOCH
+    platform_refund_expiry_at: pendulum.DateTime = base.EPOCH
     revoked_at: pendulum.DateTime | None = None
     apple: AppleTransaction = dataclasses.field(default_factory=AppleTransaction)
     google_payment_token: str = ''
@@ -286,11 +286,11 @@ class UserRow:
     master_pkey: bytes | None = None
     current_generation_id: int = 0
     token: bytes = b''  # current generation's token (proof revocation_tag)
-    expires_at: pendulum.DateTime = base.EPOCH
+    expiry_at: pendulum.DateTime = base.EPOCH
     grace_period: pendulum.Duration = pendulum.duration()
     auto_renewing: bool = False
     # This account's private proof-expiry grid: expiries land on `UTC midnight + this + k * one day`.
-    # Re-drawn whenever `expires_at` moves. See new_proof_expiry_offset / _build_proof_clamped_expiry_time.
+    # Re-drawn whenever `expiry_at` moves. See new_proof_expiry_offset / _build_proof_clamped_expiry_time.
     proof_expiry_offset: int = 0
 
 
@@ -313,7 +313,7 @@ class RevocationRow:
 @dataclasses.dataclass
 class AllocatedGenID:
     found: bool = False
-    expires_at: pendulum.DateTime | None = None
+    expiry_at: pendulum.DateTime | None = None
     grace_period: pendulum.Duration = pendulum.duration()
     generation_id: int = 0
     token: bytes = b''
@@ -475,9 +475,9 @@ def payment_row_from_dict(row: dict[str, typing.Any]) -> PaymentRow:
     result.auto_renewing = bool(row['auto_renewing'])
     result.purchased_at = row['purchased_at']
     result.redeemed_at = row['redeemed_at']  # NULL until redeemed
-    result.expires_at = row['expires_at']
+    result.expiry_at = row['expiry_at']
     result.grace_period = row['grace_period']  # nullable
-    result.platform_refund_expires_at = row['platform_refund_expires_at']
+    result.platform_refund_expiry_at = row['platform_refund_expiry_at']
     result.revoked_at = row['revoked_at']  # NULL unless revoked
     result.apple.original_tx_id = str(row['apple_original_tx_id']) if row['apple_original_tx_id'] else ''
     result.apple.tx_id = str(row['apple_tx_id']) if row['apple_tx_id'] else ''
@@ -504,26 +504,26 @@ def derive_payment_status(payment: PaymentRow, now: pendulum.DateTime) -> base.P
     if payment.revoked_at is not None:
         return base.PaymentStatus.Revoked
     assert payment.redeemed_at is not None, 'an unclaimed payment has no status; test redeemed_at IS NULL'
-    if now >= payment.expires_at:
+    if now >= payment.expiry_at:
         return base.PaymentStatus.Expired
     return base.PaymentStatus.Redeemed
 
 
 def subscription_coverage_end(
-    expires_at: pendulum.DateTime, grace_period: pendulum.Duration | None, auto_renewing: bool
+    expiry_at: pendulum.DateTime, grace_period: pendulum.Duration | None, auto_renewing: bool
 ) -> pendulum.DateTime:
     """The instant a subscription payment stops covering the account: its paid-through expiry, plus the
     grace period only when a renewal is going to be attempted.
 
     Grace is the window after a renewal payment FAILS, so it exists only for an auto-renewing payment. A
     cancelled subscription still carries the grace value in its column while `auto_renewing` has gone
-    false and `expires_at` is untouched — it covers the account to the end of the paid term and not a
+    false and `expiry_at` is untouched — it covers the account to the end of the paid term and not a
     moment longer.
 
     Shared by the entitlement fold and the credit drain deliberately: if the two disagreed about when
     coverage ends, an account could be entitled while its credits drain, or hold protected credits while
     reading as expired."""
-    return expires_at + grace_period if (auto_renewing and grace_period is not None) else expires_at
+    return expiry_at + grace_period if (auto_renewing and grace_period is not None) else expiry_at
 
 
 @dataclasses.dataclass
@@ -663,7 +663,7 @@ def user_row_from_dict(row: dict[str, typing.Any]) -> UserRow:
         master_pkey=bytes(row['master_pkey']),
         current_generation_id=row['current_generation_id'],
         token=bytes(row['token']),
-        expires_at=row['expires_at'],
+        expiry_at=row['expiry_at'],
         grace_period=row['grace_period'],
         auto_renewing=bool(row['auto_renewing']),
         proof_expiry_offset=row['proof_expiry_offset'],
@@ -822,7 +822,7 @@ def verify_db(conn: psycopg.Connection, err: base.ErrorSink) -> bool:
             )
 
         # NOTE: Check mandatory fields or invariants given a particular TX status. Presence/absence
-        # is now modelled by NULL (redeemed_at / revoked_at), and expires_at is NOT NULL, so the old
+        # is now modelled by NULL (redeemed_at / revoked_at), and expiry_at is NOT NULL, so the old
         # "ts was 0" sentinel checks are gone — the schema enforces them.
         if it.redeemed_at is None and it.revoked_at is None:
             # Unclaimed: nothing identity-related should be set yet.
@@ -834,9 +834,9 @@ def verify_db(conn: psycopg.Connection, err: base.ErrorSink) -> bool:
 
         if it.revoked_at is None and it.redeemed_at is not None:
             # Redeemed (and not revoked): a redeemed payment must not have expired before it was redeemed.
-            if it.expires_at < it.redeemed_at:
+            if it.expiry_at < it.redeemed_at:
                 redeemed_date = it.redeemed_at.strftime('%Y-%m-%d')
-                expiry_date = it.expires_at.strftime('%Y-%m-%d')
+                expiry_date = it.expiry_at.strftime('%Y-%m-%d')
                 err.msg_list.append(
                     f'Payment #{index} was expired ({expiry_date}) before it was activated ({redeemed_date})'
                 )
@@ -881,14 +881,14 @@ def new_proof_expiry_offset() -> int:
 
 
 # Re-draw `users.proof_expiry_offset` exactly when the account's true expiry MOVES. Both users of this
-# clause set expires_at from the payment list, so "moved" is the honest trigger for a new subscription
+# clause set expiry_at from the payment list, so "moved" is the honest trigger for a new subscription
 # cycle: it covers a redeem, a renewal, a stacked purchase and a revocation, and skips a no-op refresh (a
 # flag-only touch, a re-reconcile that claims nothing). That precision matters in both directions — never
 # re-drawing against a fixed anniversary instant would leave a stable per-account fingerprint, while
 # re-drawing on every touch would hand an observer repeated samples of the same true expiry, whose minimum
 # converges straight back onto it.
 _REDRAW_OFFSET_IF_EXPIRY_MOVED = (
-    "proof_expiry_offset = CASE WHEN expires_at IS DISTINCT FROM %(expiry)s"
+    "proof_expiry_offset = CASE WHEN expiry_at IS DISTINCT FROM %(expiry)s"
     " THEN %(proof_random_offset)s ELSE proof_expiry_offset END"
 )
 
@@ -906,7 +906,7 @@ def _update_user_expiry_grace_and_renew_flag_from_payment_list(
         tx.conn,
         f'''
         UPDATE users
-        SET    expires_at = %(expiry)s, grace_period = %(grace)s,
+        SET    expiry_at = %(expiry)s, grace_period = %(grace)s,
                auto_renewing = %(renewing)s,
                {_REDRAW_OFFSET_IF_EXPIRY_MOVED}
         WHERE  master_pkey = %(pkey)s
@@ -925,7 +925,7 @@ def revoke_payments_by_id_internal(tx: db.SQLTransaction, rows: typing.Any, revo
     master_pkey_dict: dict[bytes, pendulum.DateTime] = {}
     for row in rows:
         result = True
-        id, master_pkey_raw, expires_at = row
+        id, master_pkey_raw, expiry_at = row
         master_pkey_bytes: bytes | None = bytes(master_pkey_raw) if master_pkey_raw is not None else None
 
         # NOTE: A payment will not have a master pkey associated with it if the user hasn't
@@ -933,7 +933,7 @@ def revoke_payments_by_id_internal(tx: db.SQLTransaction, rows: typing.Any, revo
         # 'revoked', this means that it can't be activated and so a master pkey cannot be set on it
         # after the fact as well.
         if master_pkey_bytes:
-            master_pkey_dict[master_pkey_bytes] = expires_at
+            master_pkey_dict[master_pkey_bytes] = expiry_at
 
         # NOTE: Mark the payment revoked (set revoked_at) unless it already is.
         db.query(
@@ -988,8 +988,8 @@ def revoke_payments_by_id_internal(tx: db.SQLTransaction, rows: typing.Any, revo
         #
         # For different platforms in their testing environments, they have different timespans
         # for a day, for example in Google 1 day is 10s. We handle that explicitly here.
-        expires_at = master_pkey_dict[it]
-        if expires_at <= revoke_at_next_day:
+        expiry_at = master_pkey_dict[it]
+        if expiry_at <= revoke_at_next_day:
             continue
 
         # Even when the revoked payment's own proof would outlive the day boundary, a broadcast revocation
@@ -1033,7 +1033,7 @@ def add_apple_revocation(
     rows_result = db.query(
         tx.conn,
         f'''
-    SELECT p.id, u.master_pkey, p.expires_at
+    SELECT p.id, u.master_pkey, p.expiry_at
     FROM   {PAYMENTS_FROM}
     WHERE  ad.original_tx_id = %(orig_tx)s;
     ''',
@@ -1069,7 +1069,7 @@ def reinstate_apple_payment(
     user's entitlement snapshot, and — only when their current generation is revoked AND the restored window
     is still live — move them onto a fresh generation (the old, already-broadcast token stays on the
     revocation list; it can't be un-broadcast). Un-revoking only clears revoked_at (revoke never touched
-    expires_at), so the ORIGINAL paid window is restored, never extended.
+    expiry_at), so the ORIGINAL paid window is restored, never extended.
 
     A reversal lands days-to-weeks after the refund, so the window has often already lapsed by the time it
     arrives — then there is nothing live to serve and no generation work to do (a later renewal settles the
@@ -1152,7 +1152,7 @@ def add_google_revocation(
     rows_result = db.query(
         tx.conn,
         f'''
-    SELECT p.id, u.master_pkey, p.expires_at
+    SELECT p.id, u.master_pkey, p.expiry_at
     FROM   {PAYMENTS_FROM}
     WHERE  gd.payment_token = %(token)s
     ''',
@@ -1352,9 +1352,9 @@ def _lookup_user_expiry(tx: db.SQLTransaction, master_pkey: nacl.signing.VerifyK
     result_set = db.query(
         tx.conn,
         '''
-        SELECT    p.expires_at, p.grace_period, p.auto_renewing, p.redeemed_at,
+        SELECT    p.expiry_at, p.grace_period, p.auto_renewing, p.redeemed_at,
                   p.payment_provider, ad.original_tx_id, gd.order_id, rd.order_id, p.revoked_at,
-                  p.credit_remaining, u.credits_drained_through
+                  p.credit_remaining, u.credits_checkpoint_at
         FROM      payments p
                   JOIN users u ON u.id = p.user_id
                   LEFT JOIN app_store_payment_details ad      ON ad.payment_id = p.id
@@ -1372,9 +1372,9 @@ def _lookup_user_expiry(tx: db.SQLTransaction, master_pkey: nacl.signing.VerifyK
     # the total by the same amount, and any recompute between passes — a payment registered, a redeem, a
     # revocation — lands on the same value instead of walking forward. An account with no payments has no
     # rows here, and therefore no credits either, so the absent checkpoint cannot matter.
-    credits_drained_through: pendulum.DateTime | None = None
+    credits_checkpoint_at: pendulum.DateTime | None = None
     # Live credits are summed, not maxed: each grants a length that stacks on top of coverage. Their own
-    # `expires_at` is a grant-time receipt value, so it is kept OUT of the max below — counting it there
+    # `expiry_at` is a grant-time receipt value, so it is kept OUT of the max below — counting it there
     # as well would credit the same length twice. A SPENT credit (remaining zero) does go through the max
     # like a subscription: its window is necessarily in the past by then, so it can only ever win when
     # nothing else covers the account, which is exactly when it is the truthful answer.
@@ -1391,7 +1391,7 @@ def _lookup_user_expiry(tx: db.SQLTransaction, master_pkey: nacl.signing.VerifyK
     for row in rows:
         # Order matches the SELECT above; unpacking fails loudly if the column count ever drifts.
         (
-            expires_at,
+            expiry_at,
             grace_period,
             auto_renewing,
             redeemed_at,
@@ -1401,7 +1401,7 @@ def _lookup_user_expiry(tx: db.SQLTransaction, master_pkey: nacl.signing.VerifyK
             stf_order_id,
             revoked_at,
             credit_remaining,
-            credits_drained_through,
+            credits_checkpoint_at,
         ) = row
         # grace_period is nullable; treat "absent" as zero for the entitlement arithmetic below.
         grace = grace_period if grace_period is not None else pendulum.duration()
@@ -1481,21 +1481,21 @@ def _lookup_user_expiry(tx: db.SQLTransaction, master_pkey: nacl.signing.VerifyK
         # not gate what expiry the user is *entitled* to, so no wall-clock enters here.
         if revoked_at is not None:
             assert not auto_renewing
-            payment_expires_at = revoked_at
-            expires_at = revoked_at
+            payment_expiry_at = revoked_at
+            expiry_at = revoked_at
         else:
-            payment_expires_at = expires_at + grace if auto_renewing else expires_at
+            payment_expiry_at = expiry_at + grace if auto_renewing else expiry_at
 
         # NOTE: A payment contributes to the "redeemed" entitlement iff it has been redeemed and not
         # revoked. (Expiry is deliberately excluded — see above.)
         is_redeemed = redeemed_at is not None and revoked_at is None
-        if is_redeemed and (best_wo_grace_from_redeemed is None or expires_at > best_wo_grace_from_redeemed):
-            result.expiry_from_redeemed = payment_expires_at
+        if is_redeemed and (best_wo_grace_from_redeemed is None or expiry_at > best_wo_grace_from_redeemed):
+            result.expiry_from_redeemed = payment_expiry_at
             result.grace_from_redeemed = grace
             result.auto_renewing_from_redeemed = bool(auto_renewing)
 
-        if best_wo_grace is None or expires_at > best_wo_grace:
-            result.best_expiry = payment_expires_at
+        if best_wo_grace is None or expiry_at > best_wo_grace:
+            result.best_expiry = payment_expiry_at
             result.best_grace = grace
             result.best_auto_renewing = bool(auto_renewing)
 
@@ -1504,7 +1504,7 @@ def _lookup_user_expiry(tx: db.SQLTransaction, master_pkey: nacl.signing.VerifyK
     # already charged against it). `best_grace`/`best_auto_renewing` stay attributed to the subscription
     # that won the max: a subscriber holding a voucher is still auto-renewing, whatever sets their expiry.
     if credit_total > pendulum.duration():
-        if credits_drained_through is None:
+        if credits_checkpoint_at is None:
             # The mint sets the checkpoint, and the drain clears it only once every credit is spent, so a
             # live credit with no checkpoint is a broken invariant. Anchor on the coverage we do know
             # about rather than silently answering with 1970, and make the noise visible.
@@ -1512,7 +1512,7 @@ def _lookup_user_expiry(tx: db.SQLTransaction, master_pkey: nacl.signing.VerifyK
                 f'Live credit with no drain checkpoint for {base.maybe_obfuscate_bytes(master_pkey)}: '
                 f'anchoring its remaining length on known coverage instead'
             )
-        anchor = credits_drained_through if credits_drained_through is not None else base.EPOCH
+        anchor = credits_checkpoint_at if credits_checkpoint_at is not None else base.EPOCH
         result.best_expiry = max(result.best_expiry, anchor) if result.best_expiry else anchor
         result.best_expiry += credit_total
         redeemed = result.expiry_from_redeemed
@@ -1697,9 +1697,9 @@ def add_unredeemed_payment(
     tx: db.SQLTransaction,
     payment_tx: base.PaymentProviderTransaction,
     plan: base.ProPlan,
-    expires_at: pendulum.DateTime,
+    expiry_at: pendulum.DateTime,
     purchased_at: pendulum.DateTime,
-    platform_refund_expires_at: pendulum.DateTime,
+    platform_refund_expiry_at: pendulum.DateTime,
     platform_obfuscated_account_id: bytes | str,
     err: base.ErrorSink,
     needs_ack: bool = False,
@@ -1709,7 +1709,7 @@ def add_unredeemed_payment(
     """Record a payment nobody has claimed yet.
 
     `credit_remaining` marks the row as a one-shot CREDIT with that much length left to give (see
-    schema/004): a store subscription leaves it None, since its `expires_at` already states an absolute
+    schema/004): a store subscription leaves it None, since its `expiry_at` already states an absolute
     paid-through instant.
 
     `auto_renewing` comes from the caller because only the caller knows. It is not derivable from the
@@ -1721,8 +1721,8 @@ def add_unredeemed_payment(
         payment_tx_label = payment_provider_tx_log_label_safe(payment_tx)
         log.info(
             f'Unredeemed payment (payment={payment_tx_label}, plan={plan.name}, '
-            f'expiry={base.readable(expires_at)}, unredeemed={base.readable(purchased_at)}, '
-            f'refund={base.readable(platform_refund_expires_at)})'
+            f'expiry={base.readable(expiry_at)}, unredeemed={base.readable(purchased_at)}, '
+            f'refund={base.readable(platform_refund_expiry_at)})'
         )
 
     verify_payment_provider_tx(payment_tx, err)
@@ -1741,8 +1741,8 @@ def add_unredeemed_payment(
             payment={
                 'plan': plan.value,
                 'payment_provider': payment_tx.provider.value,
-                'expires_at': expires_at,
-                'platform_refund_expires_at': platform_refund_expires_at,
+                'expiry_at': expiry_at,
+                'platform_refund_expiry_at': platform_refund_expiry_at,
                 'purchased_at': purchased_at,
                 'auto_renewing': auto_renewing,
                 'credit_remaining': credit_remaining,
@@ -1770,8 +1770,8 @@ def add_unredeemed_payment(
             payment={
                 'plan': plan.value,
                 'payment_provider': payment_tx.provider.value,
-                'expires_at': expires_at,
-                'platform_refund_expires_at': platform_refund_expires_at,
+                'expiry_at': expiry_at,
+                'platform_refund_expiry_at': platform_refund_expiry_at,
                 'purchased_at': purchased_at,
                 'auto_renewing': auto_renewing,
                 'credit_remaining': credit_remaining,
@@ -1793,8 +1793,8 @@ def add_unredeemed_payment(
             payment={
                 'plan': plan.value,
                 'payment_provider': payment_tx.provider.value,
-                'expires_at': expires_at,
-                'platform_refund_expires_at': platform_refund_expires_at,
+                'expiry_at': expiry_at,
+                'platform_refund_expiry_at': platform_refund_expiry_at,
                 'purchased_at': purchased_at,
                 'auto_renewing': auto_renewing,
                 'credit_remaining': credit_remaining,
@@ -1873,14 +1873,14 @@ def add_unredeemed_payment(
                     #   > improve recovery performance
                     #
                     # Source: https://support.google.com/googleplay/android-developer/answer/16631229
-                    auto_redeem_deadline_at = user.expires_at
+                    auto_redeem_deadline_at = user.expiry_at
                     if user.auto_renewing:
                         auto_redeem_deadline_at += 60 * base.DAY - user.grace_period
                 else:
                     assert payment_tx.provider == base.PaymentProvider.iOSAppStore
                     # NOTE: We don't currently configure a grace period/account hold period for Apple
                     # hnote the grace and account hold concept is merged together in Apple).
-                    auto_redeem_deadline_at = user.expires_at
+                    auto_redeem_deadline_at = user.expiry_at
                     if user.auto_renewing:
                         auto_redeem_deadline_at += user.grace_period
 
@@ -1965,7 +1965,7 @@ def get_or_create_user_and_generation(
     won = db.query_one(
         tx.conn,
         '''
-        INSERT INTO users (id, master_pkey, current_generation_id, expires_at, proof_expiry_offset)
+        INSERT INTO users (id, master_pkey, current_generation_id, expiry_at, proof_expiry_offset)
         VALUES            (%(id)s, %(master_pkey)s, %(gen_id)s, to_timestamp(0), %(proof_expiry_offset)s)
         ON CONFLICT (master_pkey) DO NOTHING
         RETURNING id
@@ -2013,8 +2013,8 @@ def _ensure_active_generation(
         tx.conn,
         '''
         UPDATE users
-        SET    credits_drained_through = %(at)s
-        WHERE  master_pkey = %(master_pkey)s AND credits_drained_through IS NULL
+        SET    credits_checkpoint_at = %(at)s
+        WHERE  master_pkey = %(master_pkey)s AND credits_checkpoint_at IS NULL
           AND  EXISTS (SELECT 1 FROM payments
                        WHERE user_id = users.id AND revoked_at IS NULL
                          AND credit_remaining > '0'::interval)
@@ -2025,7 +2025,7 @@ def _ensure_active_generation(
 
     result = AllocatedGenID()
     lookup: LookupUserExpiry = _lookup_user_expiry(tx, master_pkey)
-    result.expires_at = lookup.expiry_from_redeemed
+    result.expiry_at = lookup.expiry_from_redeemed
     if lookup.expiry_from_redeemed is None:
         return result  # no usable payment → nothing to allocate
 
@@ -2043,7 +2043,7 @@ def _ensure_active_generation(
         f'''
         UPDATE users
         SET    current_generation_id        = %(gen_id)s,
-               expires_at                   = %(expiry)s,
+               expiry_at                   = %(expiry)s,
                grace_period                 = %(grace)s,
                auto_renewing                = %(auto_renewing)s,
                {_REDRAW_OFFSET_IF_EXPIRY_MOVED}
@@ -2071,16 +2071,16 @@ def drain_due_credits(tx: db.SQLTransaction, now: pendulum.DateTime, stale_after
     what it should and a pass that runs twice charge nothing the second time. Coverage is sampled once,
     now: a subscription that lapsed part-way through the span is charged for the whole of it, and one that
     started part-way through is charged for none, each bounded by one interval and only at a genuine
-    coverage transition (a renewal is not one — `expires_at` moves before the old term lapses).
+    coverage transition (a renewal is not one — `expiry_at` moves before the old term lapses).
 
     SKIP LOCKED so a second runner, or an overlapping pass, cannot charge the same account twice."""
     due = db.query(
         tx.conn,
         '''
-        SELECT   id, master_pkey, credits_drained_through
+        SELECT   id, master_pkey, credits_checkpoint_at
         FROM     users
-        WHERE    credits_drained_through IS NOT NULL AND credits_drained_through < %(cutoff)s
-        ORDER BY credits_drained_through
+        WHERE    credits_checkpoint_at IS NOT NULL AND credits_checkpoint_at < %(cutoff)s
+        ORDER BY credits_checkpoint_at
         FOR UPDATE SKIP LOCKED
     ''',
         cutoff=now - stale_after,
@@ -2092,20 +2092,20 @@ def drain_due_credits(tx: db.SQLTransaction, now: pendulum.DateTime, stale_after
         master_pkey = nacl.signing.VerifyKey(bytes(master_pkey_raw))
 
         # Is a SUBSCRIPTION covering this account right now? Deliberately computed from the subscription
-        # rows and NOT from users.expires_at: that already includes the credits' own remaining length, so a
+        # rows and NOT from users.expiry_at: that already includes the credits' own remaining length, so a
         # credit would report the account as covered, protect itself from being charged, and never expire.
         coverage_rows = db.query(
             tx.conn,
             '''
-            SELECT expires_at, grace_period, auto_renewing
+            SELECT expiry_at, grace_period, auto_renewing
             FROM   payments
             WHERE  user_id = %(user_id)s AND revoked_at IS NULL AND credit_remaining IS NULL
         ''',
             user_id=user_id,
         )
         covered_now = any(
-            subscription_coverage_end(expires_at, grace_period, auto_renewing) > now
-            for expires_at, grace_period, auto_renewing in typing.cast(
+            subscription_coverage_end(expiry_at, grace_period, auto_renewing) > now
+            for expiry_at, grace_period, auto_renewing in typing.cast(
                 list[tuple[typing.Any, ...]], coverage_rows.fetchall()
             )
         )
@@ -2132,7 +2132,7 @@ def drain_due_credits(tx: db.SQLTransaction, now: pendulum.DateTime, stale_after
         drained = drain_credits(live, budget)
 
         # Walk the charges in consumption order so an emptied credit can be dated: its length ran out at the
-        # checkpoint plus everything charged up to and including it. `expires_at` is a receipt value for a
+        # checkpoint plus everything charged up to and including it. `expiry_at` is a receipt value for a
         # credit (unlike a subscription, where the store owns it), and this is the one thing that writes it
         # after the mint — so that a spent credit states when it really ran out rather than what it was
         # worth on the day it was granted.
@@ -2145,7 +2145,7 @@ def drain_due_credits(tx: db.SQLTransaction, now: pendulum.DateTime, stale_after
                 '''
                 UPDATE payments
                 SET    credit_remaining = %(remaining)s,
-                       expires_at       = COALESCE(%(emptied_at)s, expires_at)
+                       expiry_at       = COALESCE(%(emptied_at)s, expiry_at)
                 WHERE  id = %(payment_id)s
             ''',
                 remaining=new_remaining,
@@ -2159,7 +2159,7 @@ def drain_due_credits(tx: db.SQLTransaction, now: pendulum.DateTime, stale_after
         checkpoint_next = checkpoint + drained.spent if drained.exhausted else now
         db.query(
             tx.conn,
-            'UPDATE users SET credits_drained_through = %(at)s WHERE id = %(user_id)s',
+            'UPDATE users SET credits_checkpoint_at = %(at)s WHERE id = %(user_id)s',
             at=checkpoint_next,
             user_id=user_id,
         )
@@ -2170,7 +2170,7 @@ def drain_due_credits(tx: db.SQLTransaction, now: pendulum.DateTime, stale_after
         db.query(
             tx.conn,
             '''
-            UPDATE users SET credits_drained_through = NULL
+            UPDATE users SET credits_checkpoint_at = NULL
             WHERE  id = %(user_id)s
               AND  NOT EXISTS (SELECT 1 FROM payments
                                WHERE user_id = %(user_id)s AND revoked_at IS NULL
@@ -2191,14 +2191,14 @@ def make_generate_pro_proof_message(
 
 
 def build_proof_message(
-    revocation_tag: bytes, rotating_pkey: nacl.signing.VerifyKey, expires_at: pendulum.DateTime
+    revocation_tag: bytes, rotating_pkey: nacl.signing.VerifyKey, expiry_at: pendulum.DateTime
 ) -> bytes:
     '''The message the backend signs to certify a proof.'''
-    return signed_message(BUILD_PROOF_DOMAIN, revocation_tag, rotating_pkey, expires_at)
+    return signed_message(BUILD_PROOF_DOMAIN, revocation_tag, rotating_pkey, expiry_at)
 
 
 def _build_proof_clamped_expiry_time(
-    request_at: pendulum.DateTime, proposed_expires_at: pendulum.DateTime, proof_expiry_offset: int
+    request_at: pendulum.DateTime, proposed_expiry_at: pendulum.DateTime, proof_expiry_offset: int
 ) -> pendulum.DateTime:
     '''How far ahead a proof issued at `request_at` certifies, given the account's true (grace-inclusive)
     entitlement end and its stored per-account offset:
@@ -2242,16 +2242,16 @@ def _build_proof_clamped_expiry_time(
     # The stored column's own range (a day — the schema CHECK), NOT the current shape's: a database written
     # before the shape changed still holds day-wide offsets, which the grid helper reduces modulo the period.
     assert 0 <= proof_expiry_offset < base.PROOF_EXPIRY_SHAPE.offset_range
-    clamped_expires_at = min(request_at + shape.clamp, proposed_expires_at)
+    clamped_expiry_at = min(request_at + shape.clamp, proposed_expiry_at)
     return base.round_datetime_up_onto_offset_grid(
-        clamped_expires_at + shape.renewal_lead, period=shape.grid, offset_seconds=proof_expiry_offset
+        clamped_expiry_at + shape.renewal_lead, period=shape.grid, offset_seconds=proof_expiry_offset
     )
 
 
 def build_proof(
     revocation_tag: bytes,
     rotating_pkey: nacl.signing.VerifyKey,
-    expires_at: pendulum.DateTime,
+    expiry_at: pendulum.DateTime,
     signing_key: nacl.signing.SigningKey,
 ) -> ProSubscriptionProof:
     # The revocation_tag is the generation's stored random token, embedded verbatim (no hashing).
@@ -2259,10 +2259,10 @@ def build_proof(
     result: ProSubscriptionProof = ProSubscriptionProof()
     result.revocation_tag = revocation_tag
     result.rotating_pkey = rotating_pkey
-    result.expires_at = expires_at
+    result.expiry_at = expiry_at
 
     message: bytes = build_proof_message(
-        revocation_tag=result.revocation_tag, rotating_pkey=result.rotating_pkey, expires_at=result.expires_at
+        revocation_tag=result.revocation_tag, rotating_pkey=result.rotating_pkey, expiry_at=result.expiry_at
     )
     result.sig = signing_key.sign(message).signature
     return result
@@ -2391,9 +2391,9 @@ def build_current_entitlement_proof(
     if is_generation_revoked(tx.conn, get_user.user.current_generation_id, request_at):
         raise base.FailError(f'User {bytes(master_pkey).hex()} payment has been revoked', code=base.ErrorCode.revoked)
 
-    proof_expires_at = _build_proof_clamped_expiry_time(
+    proof_expiry_at = _build_proof_clamped_expiry_time(
         request_at=request_at,
-        proposed_expires_at=get_user.user.expires_at,
+        proposed_expiry_at=get_user.user.expiry_at,
         proof_expiry_offset=get_user.user.proof_expiry_offset,
     )
     # The expiry we are willing to certify is the honest cut-off, so a lapsed account keeps getting proofs
@@ -2401,26 +2401,26 @@ def build_current_entitlement_proof(
     # over-provision above genuinely runs out, up to ~25 h past its true expiry. That is the same
     # over-provision every live account gets, granted no further, and it keeps us consistent with the
     # `account_expiry_ts` we already handed the client.
-    if request_at > proof_expires_at:
-        payment_expires_at = (
-            get_user.user.expires_at - get_user.user.grace_period
+    if request_at > proof_expiry_at:
+        payment_expiry_at = (
+            get_user.user.expiry_at - get_user.user.grace_period
             if get_user.user.auto_renewing
-            else get_user.user.expires_at
+            else get_user.user.expiry_at
         )
         raise base.FailError(
-            f'User {bytes(master_pkey).hex()} entitlement expired at {base.readable(get_user.user.expires_at)} '
-            f'({base.readable(payment_expires_at)} + {get_user.user.grace_period})',
+            f'User {bytes(master_pkey).hex()} entitlement expired at {base.readable(get_user.user.expiry_at)} '
+            f'({base.readable(payment_expiry_at)} + {get_user.user.grace_period})',
             code=base.ErrorCode.subscription_expired,
             # Advisory, same as the success path: carry the (now-past) account entitlement end so the
             # client can refresh its cached horizon without a separate get_pro_status. Only on this slug —
             # not_subscribed has no expiry, and revoked is a distinct state (its expiry may be future).
-            data={'account_expiry_ts': base.unix_seconds_from_datetime(get_user.user.expires_at)},
+            data={'account_expiry_ts': base.unix_seconds_from_datetime(get_user.user.expiry_at)},
         )
 
     proof = build_proof(
         revocation_tag=get_user.user.token,
         rotating_pkey=rotating_pkey,
-        expires_at=proof_expires_at,
+        expiry_at=proof_expiry_at,
         signing_key=signing_key,
     )
     # Advisory (unsigned) account entitlement end, from this same snapshot — the client's true
@@ -2432,7 +2432,7 @@ def build_current_entitlement_proof(
     # over-provision pushes the proof past the true end — and there the two agree, to within the ≤25 h we
     # are honouring anyway, so the client is never told its subscription ended before a proof we signed
     # stops verifying.
-    proof.account_expires_at = max(get_user.user.expires_at, proof.expires_at)
+    proof.account_expiry_at = max(get_user.user.expiry_at, proof.expiry_at)
     return proof
 
 
@@ -2479,7 +2479,7 @@ def grant_voucher(
     request_at: pendulum.DateTime,
     redeemed_at: pendulum.DateTime,
     plan: base.ProPlan,
-    expires_at: pendulum.DateTime,
+    expiry_at: pendulum.DateTime,
 ) -> ProSubscriptionProof:
     """Directly grant a voucher — a Pro payment no store witnessed — to `master_pkey` and return the proof.
     Admin/CLI only: there is no client-facing voucher flow — a real one-time-use voucher, with a client
@@ -2494,9 +2494,9 @@ def grant_voucher(
         tx,
         payment_tx=payment_tx,
         plan=plan,
-        expires_at=expires_at,
+        expiry_at=expiry_at,
         purchased_at=redeemed_at,
-        platform_refund_expires_at=base.EPOCH,
+        platform_refund_expiry_at=base.EPOCH,
         platform_obfuscated_account_id=b'',
         err=err,
     )
@@ -2907,7 +2907,7 @@ def generate_report_rows(conn: psycopg.Connection, period: ReportPeriod, limit: 
                 SELECT COUNT(DISTINCT user_id) AS active
                 FROM payments
                 WHERE {end_ts} >= purchased_at
-                  AND {end_ts} <= expires_at
+                  AND {end_ts} <= expiry_at
                   AND revoked_at IS NULL
             """,
             )
@@ -2978,7 +2978,7 @@ def generate_report_rows(conn: psycopg.Connection, period: ReportPeriod, limit: 
         cancelled: dict[str, int] = fetch_counts(
             tx_conn=tx.conn,
             period=period,
-            date_column="expires_at",
+            date_column="expiry_at",
             where_clause="NOT auto_renewing AND revoked_at IS NULL",
         )
 
