@@ -506,15 +506,16 @@ def payment_row_from_dict(row: dict[str, typing.Any]) -> PaymentRow:
 def derive_payment_status(payment: PaymentRow, now: pendulum.DateTime) -> base.PaymentStatus:
     """Derive the single display status from a payment's timestamps against `now`.
 
-    `status` is not stored; it's computed with precedence revoked > expired > redeemed > unredeemed.
+    `status` is not stored; it's computed with precedence revoked > expired > redeemed. Only a payment
+    bound to a user has a status at all — an unclaimed one carries no user_id, so it never reaches a
+    user-scoped response; test `redeemed_at IS NULL` for that instead of asking for a status.
     """
     if payment.revoked_at is not None:
         return base.PaymentStatus.Revoked
+    assert payment.redeemed_at is not None, 'an unclaimed payment has no status; test redeemed_at IS NULL'
     if now >= payment.expires_at:
         return base.PaymentStatus.Expired
-    if payment.redeemed_at is not None:
-        return base.PaymentStatus.Redeemed
-    return base.PaymentStatus.Unredeemed
+    return base.PaymentStatus.Redeemed
 
 
 def get_unredeemed_payments_list(conn: psycopg.Connection) -> list[PaymentRow]:
@@ -740,21 +741,17 @@ def verify_db(conn: psycopg.Connection, err: base.ErrorSink) -> bool:
             )
 
     payments: list[PaymentRow] = get_payments_list(conn)
-    now: pendulum.DateTime = base.utc_now()
     for index, it in enumerate(payments):
-        # `status` is derived (not stored) — invariants are really per-fact, but we keep the
-        # per-status framing for readable diagnostics.
-        status = derive_payment_status(it, now)
         # NOTE: Check mandatory fields
         if it.plan == base.ProPlan.Nil:
             err.msg_list.append(
-                f'{status.name} payment #{index} plan is invalid. '
+                f'Payment #{index} plan is invalid. '
                 f'It should have been derived from the platform payment provider '
                 f'(e.g. by converting the unredeemedd plan ID to a plan)'
             )
         if it.payment_provider == base.PaymentProvider.Nil:
             err.msg_list.append(
-                f'{status.name} payment #{index} payment provider is set to {it.payment_provider.name} '
+                f'Payment #{index} payment provider is set to {it.payment_provider.name} '
                 f'but it should not be. '
                 f'It should have been set by the platform before added to the DB'
             )
@@ -763,10 +760,10 @@ def verify_db(conn: psycopg.Connection, err: base.ErrorSink) -> bool:
         # is now modelled by NULL (redeemed_at / revoked_at), and expires_at is NOT NULL, so the old
         # "ts was 0" sentinel checks are gone — the schema enforces them.
         if it.redeemed_at is None and it.revoked_at is None:
-            # Unredeemed: nothing identity-related should be set yet.
+            # Unclaimed: nothing identity-related should be set yet.
             if it.master_pkey is not None:
                 err.msg_list.append(
-                    f'{status.name} payment #{index} has a master pkey set but this pkey should not be set '
+                    f'Payment #{index} has a master pkey set but this pkey should not be set '
                     f'until it is redeemed (e.g. the user registers it)'
                 )
 
@@ -776,8 +773,7 @@ def verify_db(conn: psycopg.Connection, err: base.ErrorSink) -> bool:
                 redeemed_date = it.redeemed_at.strftime('%Y-%m-%d')
                 expiry_date = it.expires_at.strftime('%Y-%m-%d')
                 err.msg_list.append(
-                    f'{status.name} payment #{index} was expired ({expiry_date}) '
-                    f'before it was activated ({redeemed_date})'
+                    f'Payment #{index} was expired ({expiry_date}) before it was activated ({redeemed_date})'
                 )
 
         # NOTE: Verify the plan, it should always be set once it enters the DB..

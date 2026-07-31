@@ -282,9 +282,9 @@ class PaymentProviderTransaction:
 class PaymentStatus(enum.StrEnum):
     # A DERIVED display value (wire/logging), NOT a stored column — computed from a payment's
     # redeemed/revoked/expiry timestamps against a caller-supplied clock (see
-    # backend.derive_payment_status). Values are the wire `code`s (docs/pro-wire-protocol.md §1).
-    Nil = 'nil'
-    Unredeemed = 'unredeemed'
+    # backend.derive_payment_status). Values are the wire `code`s (docs/pro-wire-protocol.md §1), and
+    # only payments bound to a user have one: an unclaimed payment is the `redeemed_at IS NULL` fact,
+    # tested directly, never a status.
     Redeemed = 'redeemed'
     Expired = 'expired'
     Revoked = 'revoked'

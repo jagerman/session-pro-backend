@@ -273,14 +273,15 @@ def _payment_item_wire(
 ) -> dict[str, str | int | float | bool]:
     # Wire seconds (wire spec §1/§5): integer everywhere the backend computes/rounds the value; the two
     # upstream provider event instants — `purchased_ts` and `revoked_ts` — are floats carrying the
-    # provider's sub-second precision. `payment_id` is the single opaque value (§5.2).
+    # provider's sub-second precision. `payment_id` is the single opaque value (§5.2). Every item is a
+    # payment already bound to the requesting account: both callers page through
+    # backend.get_user_payments_page, which is user-scoped.
     return {
         'status': backend.derive_payment_status(payment, request_at).value,
         'plan': payment.plan.value,
         'payment_provider': payment.payment_provider.value,
         'auto_renewing': payment.auto_renewing,
         'purchased_ts': base.unix_seconds_float_from_datetime(payment.purchased_at),
-        'redeemed_ts': base.unix_seconds_from_datetime(payment.redeemed_at) if payment.redeemed_at else 0,
         'expiry_ts': base.unix_seconds_from_datetime(payment.expires_at),
         'grace_period_duration': (
             base.seconds_from_duration(payment.grace_period) if payment.grace_period is not None else 0
