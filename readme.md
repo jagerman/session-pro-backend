@@ -328,7 +328,7 @@ The `cli.py` tool provides a command-line to query and manipulate the database.
 # Voucher management (requires --config)
 python cli.py --config config.ini voucher --master-pkey 0xabcd... --plan 12M
 # google_play/app_store mint a payment the store never saw, for exercising the per-provider paths;
-# both need provider_dry_run. Omit --provider for the default, rangeproof.
+# both need provider_dry_run. Omit --provider for the default, stf.
 python cli.py --config config.ini voucher --master-pkey 0xabcd... --plan 1M --provider google_play
 
 # User error management (requires --config)

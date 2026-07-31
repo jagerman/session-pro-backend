@@ -60,7 +60,7 @@ PAYMENTS_COLUMNS = ", ".join(
         "ad.web_line_order_tx_id AS apple_web_line_order_tx_id",
         "gd.payment_token AS google_payment_token",
         "gd.order_id AS google_order_id",
-        "rd.order_id AS rangeproof_order_id",
+        "rd.order_id AS stf_order_id",
         "gd.obfuscated_account_id AS google_obfuscated_account_id",
         "ad.app_account_token AS apple_app_account_token",
     )
@@ -71,7 +71,7 @@ PAYMENTS_FROM = " LEFT JOIN ".join(
         "users u ON u.id  = p.user_id",
         "google_play_payment_details gd ON gd.payment_id = p.id",
         "app_store_payment_details ad ON ad.payment_id = p.id",
-        "rangeproof_payment_details rd ON rd.payment_id = p.id",
+        "stf_payment_details rd ON rd.payment_id = p.id",
     )
 )
 
@@ -118,7 +118,7 @@ class ReportRow:
     new_subs: int
     google: int
     apple: int
-    rangeproof: int
+    stf: int
     plan_1m: int
     plan_3m: int
     plan_12m: int
@@ -208,7 +208,7 @@ class UserError:
 class UserPaymentTransaction:
     provider: base.PaymentProvider = base.PaymentProvider.Nil
     apple_tx_id: str = ''
-    rangeproof_order_id: str = ''
+    stf_order_id: str = ''
     google_payment_token: str = ''
     google_order_id: str = ''
 
@@ -224,7 +224,7 @@ def encode_payment_id(
     google_payment_token: str = '',
     google_order_id: str = '',
     apple_tx_id: str = '',
-    rangeproof_order_id: str = '',
+    stf_order_id: str = '',
 ) -> str:
     # Fold a payment's provider-specific identifier(s) into the single opaque `payment_id` returned on
     # get_payment_details items (§5.2). The backend owns this encoding; clients treat it as opaque.
@@ -233,8 +233,8 @@ def encode_payment_id(
             return f'{google_payment_token}{GOOGLE_PAYMENT_ID_DELIMITER}{google_order_id}'
         case base.PaymentProvider.iOSAppStore:
             return apple_tx_id
-        case base.PaymentProvider.Rangeproof:
-            return rangeproof_order_id
+        case base.PaymentProvider.SessionFoundation:
+            return stf_order_id
         case _:
             return ''
 
@@ -263,7 +263,7 @@ class PaymentRow:
     apple: AppleTransaction = dataclasses.field(default_factory=AppleTransaction)
     google_payment_token: str = ''
     google_order_id: str = ''
-    rangeproof_order_id: str = ''
+    stf_order_id: str = ''
     google_obfuscated_account_id: bytes | None = None
     apple_app_account_token: str | None = None
 
@@ -275,7 +275,7 @@ def payment_id_from_payment_row(row: PaymentRow) -> str:
         google_payment_token=row.google_payment_token,
         google_order_id=row.google_order_id,
         apple_tx_id=row.apple.tx_id,
-        rangeproof_order_id=row.rangeproof_order_id,
+        stf_order_id=row.stf_order_id,
     )
 
 
@@ -356,8 +356,8 @@ def payment_provider_tx_log_label_safe(tx: base.PaymentProviderTransaction) -> s
             )
         case base.PaymentProvider.GooglePlayStore:
             ids = f'google=({base.maybe_obfuscate(tx.google_payment_token)}/{base.maybe_obfuscate(tx.google_order_id)})'
-        case base.PaymentProvider.Rangeproof:
-            ids = f'rangeproof={base.maybe_obfuscate(tx.rangeproof_order_id)}'
+        case base.PaymentProvider.SessionFoundation:
+            ids = f'stf={base.maybe_obfuscate(tx.stf_order_id)}'
         case _:
             ids = '(no provider ids)'
     return f'{tx.provider.name}, {ids}'
@@ -370,8 +370,8 @@ def user_payment_tx_to_safe_string(tx: UserPaymentTransaction) -> str:
             ids = f'apple={base.maybe_obfuscate(tx.apple_tx_id)}'
         case base.PaymentProvider.GooglePlayStore:
             ids = f'google=({base.maybe_obfuscate(tx.google_payment_token)}/{base.maybe_obfuscate(tx.google_order_id)})'
-        case base.PaymentProvider.Rangeproof:
-            ids = f'rangeproof={base.maybe_obfuscate(tx.rangeproof_order_id)}'
+        case base.PaymentProvider.SessionFoundation:
+            ids = f'stf={base.maybe_obfuscate(tx.stf_order_id)}'
         case _:
             ids = '(no provider ids)'
     return f'{tx.provider.name}, {ids}'
@@ -486,7 +486,7 @@ def payment_row_from_dict(row: dict[str, typing.Any]) -> PaymentRow:
     )
     result.google_payment_token = str(row['google_payment_token']) if row['google_payment_token'] else ''
     result.google_order_id = str(row['google_order_id']) if row['google_order_id'] else ''
-    result.rangeproof_order_id = str(row['rangeproof_order_id']) if row['rangeproof_order_id'] else ''
+    result.stf_order_id = str(row['stf_order_id']) if row['stf_order_id'] else ''
     result.google_obfuscated_account_id = (
         bytes(row['google_obfuscated_account_id']) if row['google_obfuscated_account_id'] is not None else None
     )
@@ -1284,7 +1284,7 @@ def redeem_minted_payment(
     path — the CLI `voucher` command and the `/dev/add_payment` route (see minting.py). Distinct from the
     two client-facing redeems: unlike reconcile_pending_payments it claims exactly the one minted payment
     rather than everything sharing the account-id, and unlike _redeem_payment_for_user it creates the user
-    and also handles Rangeproof, which has no store account-id to reconcile against."""
+    and also handles a directly granted payment, which has no store account-id to reconcile against."""
     if payment_tx.provider == base.PaymentProvider.GooglePlayStore:
         detail_where = 'google_play_payment_details WHERE payment_token = %(token)s AND order_id = %(order_id)s'
         params: dict[str, typing.Any] = {
@@ -1294,9 +1294,9 @@ def redeem_minted_payment(
     elif payment_tx.provider == base.PaymentProvider.iOSAppStore:
         detail_where = 'app_store_payment_details WHERE tx_id = %(tx_id)s'
         params = {'tx_id': payment_tx.apple_tx_id}
-    elif payment_tx.provider == base.PaymentProvider.Rangeproof:
-        detail_where = 'rangeproof_payment_details WHERE order_id = %(order_id)s'
-        params = {'order_id': payment_tx.rangeproof_order_id}
+    elif payment_tx.provider == base.PaymentProvider.SessionFoundation:
+        detail_where = 'stf_payment_details WHERE order_id = %(order_id)s'
+        params = {'order_id': payment_tx.stf_order_id}
     else:
         raise base.ServerError(f'Cannot redeem a minted payment for provider: {payment_tx.provider}')
 
@@ -1331,9 +1331,9 @@ def verify_payment_provider_tx(payment_tx: base.PaymentProviderTransaction, err:
                 err.msg_list.append('Apple TX ID was not set')
             if len(payment_tx.apple_original_tx_id) == 0:
                 err.msg_list.append('Apple original TX ID was not set')
-        case base.PaymentProvider.Rangeproof:
-            if len(payment_tx.rangeproof_order_id) == 0:
-                err.msg_list.append('Rangeproof order ID was not set')
+        case base.PaymentProvider.SessionFoundation:
+            if len(payment_tx.stf_order_id) == 0:
+                err.msg_list.append('Session Foundation order ID was not set')
         case base.PaymentProvider.Nil:
             err.msg_list.append('Payment provider was set invalidly to nil')
 
@@ -1359,7 +1359,7 @@ def _lookup_user_expiry(tx: db.SQLTransaction, master_pkey: nacl.signing.VerifyK
                   JOIN users u ON u.id = p.user_id
                   LEFT JOIN app_store_payment_details ad      ON ad.payment_id = p.id
                   LEFT JOIN google_play_payment_details gd     ON gd.payment_id = p.id
-                  LEFT JOIN rangeproof_payment_details rd ON rd.payment_id = p.id
+                  LEFT JOIN stf_payment_details rd ON rd.payment_id = p.id
         WHERE     u.master_pkey = %(master_pkey)s
         ORDER BY  p.id DESC
     ''',
@@ -1382,7 +1382,7 @@ def _lookup_user_expiry(tx: db.SQLTransaction, master_pkey: nacl.signing.VerifyK
 
     used_google_order_ids: list[str] = []
     used_apple_orig_tx_ids: set[int] = set()
-    used_rangeproof_order_ids: set[str] = set()
+    used_stf_order_ids: set[str] = set()
 
     # NOTE: Determine the user's latest expiry by enumerating all the payments and calculating
     # the expiry time (inclusive of the grace period if applicable)
@@ -1398,7 +1398,7 @@ def _lookup_user_expiry(tx: db.SQLTransaction, master_pkey: nacl.signing.VerifyK
             payment_provider,
             apple_original_tx_id,
             google_order_id,
-            rangeproof_order_id,
+            stf_order_id,
             revoked_at,
             credit_remaining,
             credits_drained_through,
@@ -1448,11 +1448,11 @@ def _lookup_user_expiry(tx: db.SQLTransaction, master_pkey: nacl.signing.VerifyK
                 seen_before = True
             else:
                 used_apple_orig_tx_ids.add(apple_original_tx_id)
-        elif payment_provider == base.PaymentProvider.Rangeproof.value:
-            if rangeproof_order_id in used_rangeproof_order_ids:
+        elif payment_provider == base.PaymentProvider.SessionFoundation.value:
+            if stf_order_id in used_stf_order_ids:
                 seen_before = True
             else:
-                used_rangeproof_order_ids.add(rangeproof_order_id)
+                used_stf_order_ids.add(stf_order_id)
         else:
             log.warning(
                 f"Unrecognised payment provider in {row} for {base.maybe_obfuscate_bytes(master_pkey)}: "
@@ -1604,17 +1604,17 @@ def update_payment_renewal_info(
                 **kwparams,
             )
 
-        case base.PaymentProvider.Rangeproof:
+        case base.PaymentProvider.SessionFoundation:
             result_set = db.query(
                 tx.conn,
                 f'''
                 UPDATE    payments
                 SET       {sql_set_fields}
-                WHERE     id IN (SELECT payment_id FROM rangeproof_payment_details
-                                   WHERE order_id = %(rangeproof_order_id)s)
+                WHERE     id IN (SELECT payment_id FROM stf_payment_details
+                                   WHERE order_id = %(stf_order_id)s)
                 RETURNING (SELECT master_pkey FROM users WHERE users.id = payments.user_id)
             ''',
-                rangeproof_order_id=payment_tx.rangeproof_order_id,
+                stf_order_id=payment_tx.stf_order_id,
                 **kwparams,
             )
 
@@ -1637,7 +1637,7 @@ def update_payment_renewal_info(
         elif payment_tx.provider == base.PaymentProvider.iOSAppStore:
             payment_id = payment_tx.apple_tx_id
         else:
-            payment_id = payment_tx.rangeproof_order_id
+            payment_id = payment_tx.stf_order_id
         err.msg_list.append(
             f'Updating payment TX failed, no matching payment found for '
             f'{payment_tx.provider.name} {base.maybe_obfuscate(payment_id)}'
@@ -1785,8 +1785,8 @@ def add_unredeemed_payment(
             },
             dedup_keys=['original_tx_id', 'tx_id', 'web_line_order_tx_id'],
         )
-    elif payment_tx.provider == base.PaymentProvider.Rangeproof:
-        # Insert IFF this rangeproof order id isn't already recorded. Dedup + atomicity come from the
+    elif payment_tx.provider == base.PaymentProvider.SessionFoundation:
+        # Insert IFF this stf order id isn't already recorded. Dedup + atomicity come from the
         # UNIQUE(order_id) constraint inside _insert_payment_row's CTE.
         _insert_payment_row(
             tx,
@@ -1799,8 +1799,8 @@ def add_unredeemed_payment(
                 'auto_renewing': auto_renewing,
                 'credit_remaining': credit_remaining,
             },
-            detail_table='rangeproof_payment_details',
-            detail={'order_id': payment_tx.rangeproof_order_id},
+            detail_table='stf_payment_details',
+            detail={'order_id': payment_tx.stf_order_id},
             dedup_keys=['order_id'],
         )
 
@@ -1848,11 +1848,11 @@ def add_unredeemed_payment(
         '''),
             payment_tx.apple_original_tx_id,
         )
-    elif payment_tx.provider == base.PaymentProvider.Rangeproof:
-        # TODO: There is currently no auto-redeeming for Rangeproof payments. These are currently
+    elif payment_tx.provider == base.PaymentProvider.SessionFoundation:
+        # TODO: There is currently no auto-redeeming for directly granted payments. These are currently
         # granted to a user directly by creating a voucher payment attributed under their master pro
         # public key. It would be possible to incorporate some UI in the clients to allow redeeming
-        # via an order ID. Rangeproof would then give the user the order ID that they have to redeem
+        # via an order ID. The issuer would then give the user the order ID that they have to redeem
         # in their client.
         pass
 
@@ -2378,7 +2378,7 @@ def build_current_entitlement_proof(
     signing_key: nacl.signing.SigningKey,
 ) -> ProSubscriptionProof:
     '''Sign a proof for the user's CURRENT entitlement using their existing generation token (NO roll).
-    Shared by generate_pro_proof and grant_rangeproof. Raises a FailError with the matching slug when
+    Shared by generate_pro_proof and grant_voucher. Raises a FailError with the matching slug when
     there is nothing to sign: `not_subscribed` (no user row), `revoked` (current generation revoked),
     `expired` (entitlement lapsed past the clamped proof window).'''
     get_user = get_user_and_payments(tx, master_pkey)
@@ -2471,7 +2471,7 @@ def generate_pro_proof(
 
 
 @db.transactional
-def grant_rangeproof(
+def grant_voucher(
     tx: db.SQLTransaction,
     master_pkey: nacl.signing.VerifyKey,
     rotating_pkey: nacl.signing.VerifyKey,
@@ -2481,15 +2481,15 @@ def grant_rangeproof(
     plan: base.ProPlan,
     expires_at: pendulum.DateTime,
 ) -> ProSubscriptionProof:
-    """Directly grant a Rangeproof (dev-house) Pro payment to `master_pkey` and return the proof.
+    """Directly grant a voucher — a Pro payment no store witnessed — to `master_pkey` and return the proof.
     Admin/CLI only: there is no client-facing voucher flow — a real one-time-use voucher, with a client
-    claim path, is future work. `rangeproof_payment_details.order_id` here is an internal unique row id,
+    claim path, is future work. `stf_payment_details.order_id` here is an internal unique row id,
     not a voucher; we create the payment already redeemed and linked to the key, then build the proof."""
     order_id = str(uuid.uuid4())
     err = base.ErrorSink()
     payment_tx = base.PaymentProviderTransaction()
-    payment_tx.provider = base.PaymentProvider.Rangeproof
-    payment_tx.rangeproof_order_id = order_id
+    payment_tx.provider = base.PaymentProvider.SessionFoundation
+    payment_tx.stf_order_id = order_id
     add_unredeemed_payment(
         tx,
         payment_tx=payment_tx,
@@ -2501,14 +2501,14 @@ def grant_rangeproof(
         err=err,
     )
     if err.has():
-        raise base.ServerError(f'Failed to create rangeproof payment: {err.build()}')
+        raise base.ServerError(f'Failed to create stf payment: {err.build()}')
 
     row_result = db.query(
         tx.conn,
         '''
         UPDATE payments
         SET    redeemed_at = %(redeemed_at)s
-        WHERE  id IN (SELECT payment_id FROM rangeproof_payment_details WHERE order_id = %(order_id)s)
+        WHERE  id IN (SELECT payment_id FROM stf_payment_details WHERE order_id = %(order_id)s)
           AND  redeemed_at IS NULL AND revoked_at IS NULL
         RETURNING id
         ''',
@@ -2516,7 +2516,7 @@ def grant_rangeproof(
         order_id=order_id,
     )
     redeemed_ids = [row[0] for row in row_result.fetchall()]
-    assert len(redeemed_ids) == 1, 'the rangeproof payment we just created must redeem exactly once'
+    assert len(redeemed_ids) == 1, 'the stf payment we just created must redeem exactly once'
 
     user_id = get_or_create_user_and_generation(tx, master_pkey, issued_at=redeemed_at)[0]
     db.query(
@@ -2582,7 +2582,7 @@ def delete_expired_google_notifications(conn: psycopg.Connection, now: pendulum.
 @db.transactional
 def add_user_error(tx: db.SQLTransaction, error: UserError, at: pendulum.DateTime):
     match error.provider:
-        case base.PaymentProvider.Rangeproof:
+        case base.PaymentProvider.SessionFoundation:
             pass
         case base.PaymentProvider.Nil:
             pass
@@ -2616,7 +2616,7 @@ def add_user_error(tx: db.SQLTransaction, error: UserError, at: pendulum.DateTim
 
 @db.transactional
 def has_user_error_from_master_pkey(tx: db.SQLTransaction, master_pkey: nacl.signing.VerifyKey) -> bool:
-    # NOTE: Rangeproof payments cannot have user errors
+    # NOTE: A directly granted payment has no provider notifications, so no user error can exist for it
     return bool(
         db.query_scalar(
             tx.conn,
@@ -2705,11 +2705,11 @@ def get_payment(
         record = result_set.fetchone()
         if record:
             result = payment_row_from_dict(record)
-    elif payment_tx.provider == base.PaymentProvider.Rangeproof:
+    elif payment_tx.provider == base.PaymentProvider.SessionFoundation:
         result_set = db.query(
             tx.conn,
             f'SELECT {PAYMENTS_COLUMNS} FROM {PAYMENTS_FROM} WHERE rd.order_id = %s',
-            payment_tx.rangeproof_order_id,
+            payment_tx.stf_order_id,
             row_factory=db.dict_row,
         )
 
@@ -2960,11 +2960,11 @@ def generate_report_rows(conn: psycopg.Connection, period: ReportPeriod, limit: 
             where_clause=f"payment_provider = '{base.PaymentProvider.iOSAppStore.value}'",
         )
 
-        rangeproof: dict[str, int] = fetch_counts(
+        stf: dict[str, int] = fetch_counts(
             tx_conn=tx.conn,
             period=period,
             date_column="purchased_at",
-            where_clause=f"payment_provider = '{base.PaymentProvider.Rangeproof.value}'",
+            where_clause=f"payment_provider = '{base.PaymentProvider.SessionFoundation.value}'",
         )
 
         new_subs: dict[str, int] = fetch_counts(
@@ -2999,7 +2999,7 @@ def generate_report_rows(conn: psycopg.Connection, period: ReportPeriod, limit: 
                     new_subs=new_subs.get(it, 0),
                     google=google.get(it, 0),
                     apple=apple.get(it, 0),
-                    rangeproof=rangeproof.get(it, 0),
+                    stf=stf.get(it, 0),
                     plan_1m=plan_1m.get(it, 0),
                     plan_3m=plan_3m.get(it, 0),
                     plan_12m=plan_12m.get(it, 0),
@@ -3025,7 +3025,7 @@ def generate_report_str(period: ReportPeriod, data: list[ReportRow], type: Repor
         Section("New Subs", 10),
         Section("Google", 8),
         Section("Apple", 7),
-        Section("Rangeproof", 12),
+        Section("Foundation", 12),
         Section("Plan 1m", 10),
         Section("Plan 3m", 10),
         Section("Plan 12m", 10),
@@ -3087,7 +3087,7 @@ def generate_report_str(period: ReportPeriod, data: list[ReportRow], type: Repor
                 part_section = sections[len(human_parts)]
                 padding = part_section.width
                 align = '<' if part_section.align_left else '>'
-                human_parts.append(f"{row.rangeproof:{align}{padding}}")
+                human_parts.append(f"{row.stf:{align}{padding}}")
 
                 part_section = sections[len(human_parts)]
                 padding = part_section.width
@@ -3129,7 +3129,7 @@ def generate_report_str(period: ReportPeriod, data: list[ReportRow], type: Repor
                     row.new_subs,
                     row.google,
                     row.apple,
-                    row.rangeproof,
+                    row.stf,
                     row.plan_1m,
                     row.plan_3m,
                     row.plan_12m,

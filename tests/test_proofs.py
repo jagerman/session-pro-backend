@@ -32,7 +32,7 @@ def test_proof_reports_account_expiry(pg_database):
     account_expiry = now + 365 * base.DAY
 
     with db.connection() as conn:
-        proof = backend.grant_rangeproof(
+        proof = backend.grant_voucher(
             conn,
             master_pkey=master_key.verify_key,
             rotating_pkey=rotating_key.verify_key,
@@ -77,7 +77,7 @@ def test_expired_proof_fail_carries_account_expiry(pg_database):
 
     with db.connection() as conn:
         # Grant a short entitlement (valid at grant time).
-        backend.grant_rangeproof(
+        backend.grant_voucher(
             conn,
             master_pkey=master_key.verify_key,
             rotating_pkey=rotating_key.verify_key,
@@ -223,7 +223,7 @@ def test_proof_expiry_offset_redraws_only_when_true_expiry_moves(monkeypatch, pg
         assert backend.get_user(conn, master_key.verify_key).proof_expiry_offset == offset
 
         # A new payment that extends the entitlement moves the true expiry -> new cycle, new offset.
-        backend.grant_rangeproof(
+        backend.grant_voucher(
             conn,
             master_pkey=master_key.verify_key,
             rotating_pkey=rotating_key.verify_key,

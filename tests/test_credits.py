@@ -421,7 +421,7 @@ def test_minted_credit_never_claims_to_renew(pg_database):
     with db.connection() as conn:
         T = base.round_datetime_to_next_day(base.utc_now())
         for provider in (
-            base.PaymentProvider.Rangeproof,
+            base.PaymentProvider.SessionFoundation,
             base.PaymentProvider.GooglePlayStore,
             base.PaymentProvider.iOSAppStore,
         ):
@@ -470,8 +470,8 @@ def test_credit_sub_day_length(pg_database):
     pool.close()
 
 
-def test_grant_rangeproof(pg_database):
-    # Admin/CLI Rangeproof grant: create an already-redeemed payment linked to a master key and return a
+def test_grant_voucher(pg_database):
+    # Admin/CLI voucher grant: create an already-redeemed payment linked to a master key and return a
     # proof -- no voucher, no client claim step.
     pool = backend.bootstrap_db(database_url=pg_database())
     assert pool
@@ -482,7 +482,7 @@ def test_grant_rangeproof(pg_database):
 
     with db.connection() as conn:
         assert not backend.get_user(conn, master_key.verify_key).found
-        proof = backend.grant_rangeproof(
+        proof = backend.grant_voucher(
             conn,
             master_pkey=master_key.verify_key,
             rotating_pkey=rotating_key.verify_key,

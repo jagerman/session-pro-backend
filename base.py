@@ -264,7 +264,7 @@ class PaymentProvider(enum.StrEnum):
     Nil = 'nil'
     GooglePlayStore = 'google_play'
     iOSAppStore = 'app_store'
-    Rangeproof = 'rangeproof'
+    SessionFoundation = 'stf'
 
 
 @dataclasses.dataclass
@@ -275,7 +275,7 @@ class PaymentProviderTransaction:
     apple_web_line_order_tx_id: str = ''
     google_payment_token: str = ''
     google_order_id: str = ''
-    rangeproof_order_id: str = ''
+    stf_order_id: str = ''
 
 
 class PaymentStatus(enum.StrEnum):
@@ -597,8 +597,8 @@ def payment_provider_tx_to_safe_string(tx: PaymentProviderTransaction) -> str:
             )
         case PaymentProvider.GooglePlayStore:
             detail = f"google=({maybe_obfuscate(tx.google_payment_token)}/{maybe_obfuscate(tx.google_order_id)})"
-        case PaymentProvider.Rangeproof:
-            detail = f"rangeproof={maybe_obfuscate(tx.rangeproof_order_id)}"
+        case PaymentProvider.SessionFoundation:
+            detail = f"stf={maybe_obfuscate(tx.stf_order_id)}"
         case _:
             detail = "(no provider ids)"
     return f"{tx.provider.name}, {detail}"

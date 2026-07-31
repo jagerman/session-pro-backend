@@ -43,12 +43,12 @@ def dev_add_payment() -> flask.Response:
 
     Request:
       master_pkey  64-hex Ed25519 master Pro public key of the recipient (required)
-      provider     "google_play" | "app_store" | "rangeproof" (required)
+      provider     "google_play" | "app_store" | "stf" (required)
       plan         "1M" | "3M" | "12M" — or the wire codes "1m"/"3m"/"1y" (required)
       duration     optional, seconds; overrides the plan's nominal length (short-expiry tests)
       redeem       optional, default true. False leaves the payment unredeemed and returns its
                    payment_id; for Google/Apple the account holder's next authenticated request
-                   (generate_pro_proof / get_pro_status) then reconciles it automatically. Rangeproof
+                   (generate_pro_proof / get_pro_status) then reconciles it automatically. A stf payment
                    has no store account-id, so leave redeem at its default for it.
     '''
     get_json = server.get_json_from_flask_request(flask.request)

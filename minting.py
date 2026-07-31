@@ -3,7 +3,7 @@ Minting payments that no payment provider ever witnessed.
 
 Deliberately a separate module from `backend.py` rather than functions on it: nothing on the normal
 request path imports this, so an ordinary instance never loads it. Only two callers pull it in —
-`cli.py voucher` (an operator granting a subscription out of band, which is what the Rangeproof
+`cli.py voucher` (an operator granting a subscription out of band, attributed to the Session Foundation
 provider exists for) and `dev_routes.py` (QA staging a Google/Apple subscription with no store
 involved, on an instance started with `dev_endpoints`). They share this one code path so the CLI and
 the dev route cannot drift apart.
@@ -96,7 +96,7 @@ def mint_payment(
     `redeem=False` stops after the unredeemed payment and hands back its `payment_id`. For Google/Apple
     the payment carries the master-derived account-id, so the account holder's next authenticated request
     (generate_pro_proof / get_pro_status) reconciles it automatically — the closest thing to a genuine
-    store purchase that can be staged locally. Rangeproof has no account-id, so an unredeemed Rangeproof
+    store purchase that can be staged locally. A directly granted payment has no account-id, so an unredeemed one
     payment is never auto-claimed; pass redeem=True for it.
     '''
     if plan == base.ProPlan.Nil:
@@ -125,8 +125,8 @@ def mint_payment(
             payment_tx.apple_original_tx_id = payment_tx.apple_tx_id
             payment_tx.apple_web_line_order_tx_id = str(uuid.uuid4().int)[:18]
             platform_obfuscated_account_id = app_store.uuid_from_master_pk(master_pkey_bytes)
-        case base.PaymentProvider.Rangeproof:
-            payment_tx.rangeproof_order_id = str(uuid.uuid4())
+        case base.PaymentProvider.SessionFoundation:
+            payment_tx.stf_order_id = str(uuid.uuid4())
             platform_obfuscated_account_id = b''
         case _:
             raise base.FailError(f'Cannot mint a payment for payment provider: {provider}')
@@ -164,7 +164,7 @@ def mint_payment(
             google_payment_token=payment_tx.google_payment_token,
             google_order_id=payment_tx.google_order_id,
             apple_tx_id=payment_tx.apple_tx_id,
-            rangeproof_order_id=payment_tx.rangeproof_order_id,
+            stf_order_id=payment_tx.stf_order_id,
         ),
         plan=plan,
         expires_at=expires_at,
@@ -173,7 +173,7 @@ def mint_payment(
     if redeem:
         # Register the entitlement (user row + generation) for the payment we just minted, WITHOUT
         # building a proof — the client requests one through generate_pro_proof with its own rotating
-        # key. Binds the exact minted payment by its own identifier, so Rangeproof (which has no store
+        # key. Binds the exact minted payment by its own identifier, so a directly granted payment (which has no store
         # account-id to reconcile against) is claimed too. No provider egress: the reflow moved Google's
         # purchase-acknowledgement to the mule, so redeeming here never reaches a store.
         backend.redeem_minted_payment(tx, master_pkey, payment_tx, backend.to_redeemed_at(now))

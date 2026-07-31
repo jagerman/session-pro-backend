@@ -109,7 +109,7 @@ COMMAND FORMATS DETAILED:
       --plan <1M|3M|12M>      Subscription plan duration
 
     Optional:
-      --provider <p>          rangeproof (default) | google_play | app_store. The non-rangeproof
+      --provider <p>          stf (default) | google_play | app_store. The two store
                               providers mint a payment the store never saw, for testing the
                               per-provider code paths, and require provider_dry_run
       --rotating-pkey <hex>   64-char hex rotating public key (generates new if omitted)
@@ -225,8 +225,8 @@ def parse_set_user_error_arg(arg: str) -> list[tuple[base.PaymentProvider, str, 
 
         if payment_provider == base.PaymentProvider.Nil:
             raise ValueError(f'Nil payment provider cannot be used for errors (item {item})')
-        if payment_provider == base.PaymentProvider.Rangeproof:
-            raise ValueError(f'Rangeproof payment provider does not support errors (item {item})')
+        if payment_provider == base.PaymentProvider.SessionFoundation:
+            raise ValueError(f'A directly granted payment has no notifications, so it cannot error (item {item})')
 
         set_flag = False
         if set_flag_str.lower() == 'true':
@@ -590,8 +590,8 @@ def cmd_revoke_list(args: argparse.Namespace) -> int:
                             payment_id = f'{payment.google_payment_token}-{payment.google_order_id}'
                         case base.PaymentProvider.iOSAppStore:
                             payment_id = f'{payment.apple.original_tx_id}'
-                        case base.PaymentProvider.Rangeproof:
-                            payment_id = f'{payment.rangeproof_order_id}'
+                        case base.PaymentProvider.SessionFoundation:
+                            payment_id = f'{payment.stf_order_id}'
 
                     if now >= payment.expires_at:
                         continue
@@ -697,7 +697,7 @@ def cmd_voucher(args: argparse.Namespace) -> int:
     """Handle voucher command - mints a payment for the chosen provider and auto-redeems it."""
     config = require_config(args)
 
-    # Synthetic non-Rangeproof payments are only permitted on a throwaway (provider_dry_run) instance —
+    # Synthetic STORE payments are only permitted on a throwaway (provider_dry_run) instance —
     # enforced below. Propagate the flag into this CLI process (nothing else sets it here) so any
     # dry-run-gated provider egress stays stubbed.
     base.PROVIDER_DRY_RUN = config.provider_dry_run
@@ -713,9 +713,9 @@ def cmd_voucher(args: argparse.Namespace) -> int:
         return 1
 
     provider = base.PaymentProvider(args.provider)
-    if provider != base.PaymentProvider.Rangeproof and not config.provider_dry_run:
+    if provider != base.PaymentProvider.SessionFoundation and not config.provider_dry_run:
         # A minted google_play/app_store payment is fiction as far as the store is concerned, so it must
-        # only ever be created on a throwaway instance. Rangeproof is a genuine out-of-band dev-house
+        # only ever be created on a throwaway instance. A Session Foundation grant is a genuine out-of-band
         # grant with no store behind it, so it needs no such guard.
         print(
             f"ERROR: --provider {provider.value} requires provider_dry_run to be enabled "
@@ -825,13 +825,13 @@ def main() -> int:
     )
     voucher_parser.add_argument(
         '--provider',
-        default=base.PaymentProvider.Rangeproof.value,
+        default=base.PaymentProvider.SessionFoundation.value,
         choices=[
-            base.PaymentProvider.Rangeproof.value,
+            base.PaymentProvider.SessionFoundation.value,
             base.PaymentProvider.GooglePlayStore.value,
             base.PaymentProvider.iOSAppStore.value,
         ],
-        help='Payment provider to attribute the voucher to (default: rangeproof). google_play and '
+        help='Payment provider to attribute the voucher to (default: stf). google_play and '
         'app_store mint a synthetic payment the provider never saw, so they require provider_dry_run',
     )
     voucher_parser.add_argument('--rotating-pkey', help='64-char hex rotating public key (generates new if omitted)')

@@ -136,8 +136,8 @@ def _redeem_and_prove(conn, backend_key, master_key, rotating_key, request_at):
 
 
 def _grant_and_get_offset(conn, backend_key, master_key, rotating_key, granted_at, expires_at, plan=None):
-    """Grant a Rangeproof entitlement ending at `expires_at` and return the account's proof-expiry offset."""
-    backend.grant_rangeproof(
+    """Grant a voucher entitlement ending at `expires_at` and return the account's proof-expiry offset."""
+    backend.grant_voucher(
         conn,
         master_pkey=master_key.verify_key,
         rotating_pkey=rotating_key.verify_key,
@@ -178,17 +178,17 @@ class _CreditFixture:
             minted = minting.mint_payment(
                 tx,
                 master_pkey=self.pkey,
-                provider=base.PaymentProvider.Rangeproof,
+                provider=base.PaymentProvider.SessionFoundation,
                 plan=base.ProPlan.OneMonth,
                 now=at if at is not None else self.now,
                 duration=length,
             )
         assert minted.redeemed
-        return self.payment_id_of(minted.payment_tx.rangeproof_order_id)
+        return self.payment_id_of(minted.payment_tx.stf_order_id)
 
-    def payment_id_of(self, rangeproof_order_id: str) -> int:
+    def payment_id_of(self, stf_order_id: str) -> int:
         return db.query_scalar(
-            self.conn, 'SELECT payment_id FROM rangeproof_payment_details WHERE order_id = %s', rangeproof_order_id
+            self.conn, 'SELECT payment_id FROM stf_payment_details WHERE order_id = %s', stf_order_id
         )
 
     def subscribe(

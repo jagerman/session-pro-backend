@@ -73,13 +73,13 @@ def test_cli_parse_helpers():
     with pytest.raises(ValueError):
         cli.parse_set_user_error_arg('nil:tok=true')  # Nil provider rejected
     with pytest.raises(ValueError):
-        cli.parse_set_user_error_arg('rangeproof:tok=true')  # Rangeproof has no errors
+        cli.parse_set_user_error_arg('stf:tok=true')  # a directly granted payment cannot error
 
     # parse_payment_id_list: "<provider>:<payment_id>", comma-separated.
     assert cli.parse_payment_id_list('') == []
-    assert cli.parse_payment_id_list('google_play:tok1, rangeproof:ord2') == [
+    assert cli.parse_payment_id_list('google_play:tok1, stf:ord2') == [
         (base.PaymentProvider.GooglePlayStore, 'tok1'),
-        (base.PaymentProvider.Rangeproof, 'ord2'),
+        (base.PaymentProvider.SessionFoundation, 'ord2'),
     ]
     with pytest.raises(ValueError):
         cli.parse_payment_id_list('missing-colon')
@@ -169,6 +169,11 @@ def test_migrations_bootstrap_and_idempotency(pg_database):
         applied = {row[0] for row in db.query(conn, 'SELECT name FROM migrations_applied')}
         assert applied == expected
         assert db.query_scalar(conn, 'SELECT COUNT(*) FROM globals') == 2
+
+        # The provider vocabulary a fresh database ends up with, after every migration that renames one.
+        # A rename that seeds the new code but leaves the old row behind is invisible to everything else.
+        codes = {row[0] for row in db.query(conn, 'SELECT code FROM payment_providers')}
+        assert codes == {p.value for p in base.PaymentProvider if p != base.PaymentProvider.Nil}, codes
 
         # Idempotent: re-running applies nothing new and does not duplicate the globals seed.
         migrations.apply_migrations(conn)
