@@ -155,6 +155,32 @@ def test_config_parse_args(monkeypatch):
     assert all('app_store' in m for m in excinfo.value.errors)
 
 
+def test_voucher_processing_window_config(tmp_path, monkeypatch):
+    # The one voucher knob an operator has: how stale an account's checkpoint must be before it is charged
+    # again. Defaults to a day, is read from the .INI, and a negative value is reported rather than accepted
+    # (it would make every account perpetually due). Zero is allowed on purpose: "every pass" is a
+    # legitimate thing to want in a test deployment.
+    for k in list(os.environ):
+        if k.startswith('SESH_PRO_BACKEND_'):
+            monkeypatch.delenv(k, raising=False)
+
+    assert config.parse_args().voucher_processing_window == base.DAY
+
+    def parse_with(value: str) -> config.ParsedArgs:
+        ini = tmp_path / f'w{value.strip("-")}.ini'
+        body = f'db_url = postgresql:///x\nbackend_key_path = /k\nvoucher_processing_window = {value}\n'
+        ini.write_text(f'[base]\n{body}')
+        monkeypatch.setenv('SESH_PRO_BACKEND_INI_PATH', str(ini))
+        return config.parse_args()
+
+    assert parse_with('43200').voucher_processing_window == base.duration_from_seconds(43200)
+    assert parse_with('0').voucher_processing_window == pendulum.duration()
+
+    with pytest.raises(config.ConfigError) as excinfo:
+        parse_with('-1')
+    assert any('voucher_processing_window' in m for m in excinfo.value.errors)
+
+
 def test_migrations_bootstrap_and_idempotency(pg_database):
     # bootstrap_db runs the schema/ migrations; every migration file should be recorded, the globals
     # rows seeded exactly once, and a second pass must be a clean no-op (nothing re-run or duplicated).

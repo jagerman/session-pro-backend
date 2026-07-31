@@ -109,6 +109,12 @@ with_provider_google_play         = false
 # issuing a revocation (which is an expensive operation).
 provider_testing_env         = false
 
+# How old an account's voucher checkpoint must be, in seconds, before the maintenance mule charges it
+# again (default 86400, i.e. 24h). This does not change how much is charged -- that is always the span
+# since the checkpoint, whenever the pass runs -- only how promptly a spent voucher stops entitling the
+# account, and how the write load is spread across the day.
+# voucher_processing_window = 86400
+
 # By default the backend is configured to strip personal-identifying information (PII) from the
 # logs. Enabling this preserves all information in logs. This should not be used in a
 # production use-case.
