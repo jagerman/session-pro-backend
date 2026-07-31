@@ -17,16 +17,13 @@ Overview
   status, apple_notifications_v2 (Apple webhook), oxen/v4/lsrpc (onion transport).
 '''
 
-import collections.abc
 import pendulum
-import contextlib
 import enum
 import flask
 import json
 import nacl.bindings
 import nacl.public
 import nacl.signing
-import psycopg_pool
 import time
 import typing
 import db
@@ -44,11 +41,6 @@ class UserProStatus(enum.StrEnum):
     Active = 'active'
     Expired = 'expired'
 
-
-# Keys stored in the flask app config dictionary that can be retrieved within
-# a request to get the PostgreSQL DSN to connect to for that request.
-
-FLASK_CONFIG_DB_URL_KEY = 'session_pro_backend_db_url'
 
 # The backend Ed25519 signing key (nacl.signing.SigningKey), loaded from disk at startup. Kept in
 # the flask config rather than the DB so it never touches the database (or its backups).
@@ -98,19 +90,12 @@ def get_json_from_flask_request(request: flask.Request) -> dict[str, typing.Any]
     return typing.cast(dict[str, typing.Any], json_dict)
 
 
-@contextlib.contextmanager
-def get_db(flask_app: flask.Flask) -> collections.abc.Iterator[psycopg_pool.ConnectionPool]:
-    database_url = typing.cast(str, flask_app.config[FLASK_CONFIG_DB_URL_KEY])
-    with db.open_database(database_url) as engine:
-        yield engine
-
-
 def init(
     testing_mode: bool, database_url: str, backend_key: nacl.signing.SigningKey, dev_endpoints: bool = False
 ) -> flask.Flask:
     result = flask.Flask(__name__)
     result.config['TESTING'] = testing_mode
-    result.config[FLASK_CONFIG_DB_URL_KEY] = database_url
+    db.set_dsn(database_url)
     result.config[FLASK_CONFIG_BACKEND_SKEY_KEY] = backend_key
     result.config[onion_req.FLASK_CONFIG_ONION_REQ_X25519_SKEY] = backend_key.to_curve25519_private_key()
     result.register_blueprint(flask_blueprint)
@@ -178,18 +163,17 @@ def generate_pro_proof() -> flask.Response:
         )
 
     # Request proof from the backend (raises FailError(bad_signature/revoked/expired/not_subscribed)).
-    with get_db(flask.current_app) as engine:
-        with db.connection(engine) as conn:
-            proof = backend.generate_pro_proof(
-                conn=conn,
-                signing_key=flask.current_app.config[FLASK_CONFIG_BACKEND_SKEY_KEY],
-                master_pkey=nacl.signing.VerifyKey(master_pkey_bytes),
-                rotating_pkey=nacl.signing.VerifyKey(rotating_pkey_bytes),
-                request_at=request_at,
-                master_sig=master_sig_bytes,
-                rotating_sig=rotating_sig_bytes,
-            )
-            return make_success_response(dict_result=proof.to_dict())
+    with db.connection() as conn:
+        proof = backend.generate_pro_proof(
+            conn=conn,
+            signing_key=flask.current_app.config[FLASK_CONFIG_BACKEND_SKEY_KEY],
+            master_pkey=nacl.signing.VerifyKey(master_pkey_bytes),
+            rotating_pkey=nacl.signing.VerifyKey(rotating_pkey_bytes),
+            request_at=request_at,
+            master_sig=master_sig_bytes,
+            rotating_sig=rotating_sig_bytes,
+        )
+        return make_success_response(dict_result=proof.to_dict())
 
 
 @flask_blueprint.route('/get_pro_revocations', methods=['POST'])
@@ -205,45 +189,44 @@ def get_pro_revocations():
     now = base.datetime_from_unix_ms(int(time_now() * 1000))
     revocation_items: list[dict[str, str | int]] = []
     revocation_ticket: int = 0
-    with get_db(flask.current_app) as engine:
-        with db.connection(engine) as conn:
-            with db.transaction(conn) as tx:
-                revocation_ticket = backend.get_revocation_ticket(tx.conn)
-                if ticket < revocation_ticket:
-                    # Served list = revoked generations still inside the retention window (`revoked_at >
-                    # now - retain_for`). Filtering by the window (rather than depending on a prune) keeps
-                    # the answer independent of whether housekeeping has run; the token IS the wire tag.
-                    retain_cutoff = now - pendulum.duration(seconds=RETAIN_FOR)
-                    for row in db.query(
-                        tx.conn,
-                        "SELECT token, revoked_at FROM generations WHERE revoked_at IS NOT NULL AND revoked_at > %s",
-                        retain_cutoff,
-                    ):
-                        token, revoked_at = row
-                        # `revoked_at` is when the BACKEND recorded the revocation (not the store's own
-                        # refund date — see revoke_master_pkey_proofs_and_allocate_new_gen_id), so this
-                        # delay is always fully ahead of the client that has to learn of it. Derived from
-                        # `retry_in` but deliberately larger: that one is a poll-cadence hint, this is the
-                        # guarantee that a revoked sender sees its tag before peers start rejecting it.
-                        effective_at = revoked_at + base.REVOCATION_EFFECTIVE_DELAY
-                        # Per-entry wire shape (spec §4): revocation_tag + effective_ts only.
-                        # Clients age entries out via the list-level retain_for below, not a per-entry expiry.
-                        revocation_items.append(
-                            {
-                                'revocation_tag': bytes(token).hex(),
-                                # Integer seconds: a computed instant (wire spec §1/§4).
-                                'effective_ts': base.unix_seconds_from_datetime(effective_at),
-                            }
-                        )
+    with db.connection() as conn:
+        with db.transaction(conn) as tx:
+            revocation_ticket = backend.get_revocation_ticket(tx.conn)
+            if ticket < revocation_ticket:
+                # Served list = revoked generations still inside the retention window (`revoked_at >
+                # now - retain_for`). Filtering by the window (rather than depending on a prune) keeps
+                # the answer independent of whether housekeeping has run; the token IS the wire tag.
+                retain_cutoff = now - pendulum.duration(seconds=RETAIN_FOR)
+                for row in db.query(
+                    tx.conn,
+                    "SELECT token, revoked_at FROM generations WHERE revoked_at IS NOT NULL AND revoked_at > %s",
+                    retain_cutoff,
+                ):
+                    token, revoked_at = row
+                    # `revoked_at` is when the BACKEND recorded the revocation (not the store's own
+                    # refund date — see revoke_master_pkey_proofs_and_allocate_new_gen_id), so this
+                    # delay is always fully ahead of the client that has to learn of it. Derived from
+                    # `retry_in` but deliberately larger: that one is a poll-cadence hint, this is the
+                    # guarantee that a revoked sender sees its tag before peers start rejecting it.
+                    effective_at = revoked_at + base.REVOCATION_EFFECTIVE_DELAY
+                    # Per-entry wire shape (spec §4): revocation_tag + effective_ts only.
+                    # Clients age entries out via the list-level retain_for below, not a per-entry expiry.
+                    revocation_items.append(
+                        {
+                            'revocation_tag': bytes(token).hex(),
+                            # Integer seconds: a computed instant (wire spec §1/§4).
+                            'effective_ts': base.unix_seconds_from_datetime(effective_at),
+                        }
+                    )
 
-            return make_success_response(
-                dict_result={
-                    'ticket': revocation_ticket,
-                    'items': revocation_items,
-                    'retry_in': RETRY_IN,
-                    'retain_for': RETAIN_FOR,
-                }
-            )
+        return make_success_response(
+            dict_result={
+                'ticket': revocation_ticket,
+                'items': revocation_items,
+                'retry_in': RETRY_IN,
+                'retain_for': RETAIN_FOR,
+            }
+        )
 
 
 MAX_PAYMENT_DETAILS_PAGE = 100  # server-side cap on a get-payment-details page (client `limit` is clamped)
@@ -323,31 +306,30 @@ def get_pro_status():
     error_report = 0
     latest_payment: dict[str, str | int | float | bool] | None = None
 
-    with get_db(flask.current_app) as engine:
-        with db.connection(engine) as conn:
-            with db.transaction(conn) as tx:
-                # Bind any payment the mule has registered for this key but that isn't yet redeemed, so a
-                # status check right after purchase reflects it. No-op when there's nothing new.
-                backend.reconcile_pending_payments(tx, master_pkey_nacl, redeemed_at=backend.to_redeemed_at(request_at))
-                error_report = int(backend.has_user_error_from_master_pkey(tx, master_pkey_nacl))
-                user = backend.get_user(tx.conn, master_pkey_nacl)
-                if user.found:
-                    auto_renewing = user.auto_renewing
-                    # Egress: user instants/durations → integer-seconds wire values. This is the account's
-                    # TRUE expiry, straight from the store, so any sub-second part is floored (wire spec §1)
-                    # — unlike the proof's expiry, which lands on a whole second by construction (§2.3).
-                    expiry_ts = base.unix_seconds_from_datetime(user.expires_at)
-                    grace_period_duration = base.seconds_from_duration(user.grace_period)
+    with db.connection() as conn:
+        with db.transaction(conn) as tx:
+            # Bind any payment the mule has registered for this key but that isn't yet redeemed, so a
+            # status check right after purchase reflects it. No-op when there's nothing new.
+            backend.reconcile_pending_payments(tx, master_pkey_nacl, redeemed_at=backend.to_redeemed_at(request_at))
+            error_report = int(backend.has_user_error_from_master_pkey(tx, master_pkey_nacl))
+            user = backend.get_user(tx.conn, master_pkey_nacl)
+            if user.found:
+                auto_renewing = user.auto_renewing
+                # Egress: user instants/durations → integer-seconds wire values. This is the account's
+                # TRUE expiry, straight from the store, so any sub-second part is floored (wire spec §1)
+                # — unlike the proof's expiry, which lands on a whole second by construction (§2.3).
+                expiry_ts = base.unix_seconds_from_datetime(user.expires_at)
+                grace_period_duration = base.seconds_from_duration(user.grace_period)
 
-                    # Status decided against the *request* clock (signed, anti-replay-bounded to ≈now) —
-                    # the same clock the latest item's derived status uses, never a second time.time().
-                    user_pro_status = UserProStatus.Active if request_at <= user.expires_at else UserProStatus.Expired
-                    if backend.is_generation_revoked(tx.conn, user.current_generation_id, request_at):
-                        user_pro_status = UserProStatus.Expired
+                # Status decided against the *request* clock (signed, anti-replay-bounded to ≈now) —
+                # the same clock the latest item's derived status uses, never a second time.time().
+                user_pro_status = UserProStatus.Active if request_at <= user.expires_at else UserProStatus.Expired
+                if backend.is_generation_revoked(tx.conn, user.current_generation_id, request_at):
+                    user_pro_status = UserProStatus.Expired
 
-                    page = backend.get_user_payments_page(tx, master_pkey_nacl, limit=1, before_id=None)
-                    if page:
-                        latest_payment = _payment_item_wire(page[0], request_at)
+                page = backend.get_user_payments_page(tx, master_pkey_nacl, limit=1, before_id=None)
+                if page:
+                    latest_payment = _payment_item_wire(page[0], request_at)
 
     return make_success_response(
         {
@@ -406,19 +388,18 @@ def get_payment_details():
 
     items: list[dict[str, str | int | float | bool]] = []
     payments_total = 0
-    with get_db(flask.current_app) as engine:
-        with db.connection(engine) as conn:
-            with db.transaction(conn) as tx:
-                # Bind any mule-registered-but-unredeemed payment for this key first, so a details check
-                # right after purchase includes it (only redeemed payments are user-scoped/visible below).
-                backend.reconcile_pending_payments(tx, master_pkey_nacl, redeemed_at=backend.to_redeemed_at(request_at))
-                # One keyset page, newest-first. Each item's status is derived against the *request*
-                # clock `ts` (signed, anti-replay-bounded to ≈now), never a second time.time() read.
-                # The query is user-scoped and only redeemed payments carry a user_id, so unredeemed
-                # rows (whose tokens are confidential until the user registers them) never appear.
-                page = backend.get_user_payments_page(tx, master_pkey_nacl, limit=limit, before_id=before_id)
-                payments_total = backend.get_user_payments_count(tx, master_pkey_nacl)
-                items = [_payment_item_wire(payment, request_at) for payment in page]
+    with db.connection() as conn:
+        with db.transaction(conn) as tx:
+            # Bind any mule-registered-but-unredeemed payment for this key first, so a details check
+            # right after purchase includes it (only redeemed payments are user-scoped/visible below).
+            backend.reconcile_pending_payments(tx, master_pkey_nacl, redeemed_at=backend.to_redeemed_at(request_at))
+            # One keyset page, newest-first. Each item's status is derived against the *request*
+            # clock `ts` (signed, anti-replay-bounded to ≈now), never a second time.time() read.
+            # The query is user-scoped and only redeemed payments carry a user_id, so unredeemed
+            # rows (whose tokens are confidential until the user registers them) never appear.
+            page = backend.get_user_payments_page(tx, master_pkey_nacl, limit=limit, before_id=before_id)
+            payments_total = backend.get_user_payments_count(tx, master_pkey_nacl)
+            items = [_payment_item_wire(payment, request_at) for payment in page]
 
     # A full page means there may be more: seal the oldest id on this page into a cursor so the next
     # request continues at id < that. A short (or empty) page is the end → no cursor.

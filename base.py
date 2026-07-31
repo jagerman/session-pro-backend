@@ -170,7 +170,6 @@ DEFAULT_APPLE_GRACE_PERIOD: pendulum.Duration = 1 * HOUR
 DEFAULT_GOOGLE_GRACE_PERIOD: pendulum.Duration = 1 * HOUR
 
 # NOTE: Global variables
-DB_URL = ''
 UNSAFE_LOGGING = False
 PROVIDER_TESTING_ENV = False
 # When set, every payment provider treats all of its OUTBOUND interactions as already-succeeded and

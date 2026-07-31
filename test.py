@@ -142,14 +142,15 @@ class TestingContext:
 
     @contextlib.contextmanager
     def connection(self) -> collections.abc.Iterator[psycopg.Connection]:
-        with db.connection(self.db_engine) as conn:
+        with db.connection() as conn:
             yield conn
 
 
 def test_db_instants_are_pendulum_and_arithmetic_is_exact(pg_database):
     # Postgres hands back timestamptz in the session's TimeZone, which is not UTC in general, so a loaded
     # instant can carry a zone that has DST transitions. Adding a span to one must move real elapsed time.
-    with db.open_database(pg_database()) as pool, db.connection(pool) as conn:
+    db.set_dsn(pg_database())
+    with db.connection() as conn:
         conn.execute("CREATE TABLE t (ts timestamptz NOT NULL, iv interval NOT NULL)")
         conn.execute("SET TIME ZONE 'America/Halifax'")  # spring-forward at 2026-03-08 02:00 local
         conn.execute("INSERT INTO t VALUES ('2026-03-08 01:59:59-04', '1 hour')")
@@ -572,7 +573,6 @@ def test_google_ack_sweep(monkeypatch, pg_database):
     # already considers acknowledged (we acked then crashed before clearing) clears via the authoritative
     # acknowledgement_state; a genuinely failing ack leaves the flag set to retry next sweep.
     dsn = pg_database()
-    monkeypatch.setattr(base, 'DB_URL', dsn)  # the sweep opens its own connection via base.DB_URL
     pool = backend.bootstrap_db(database_url=dsn)
     assert pool
 
@@ -608,7 +608,7 @@ def test_google_ack_sweep(monkeypatch, pg_database):
     tok_fail = os.urandom(32).hex()
     tok_already = os.urandom(32).hex()
 
-    with db.connection(pool) as conn:
+    with db.connection() as conn:
         # Each case seeds its token TRUE just before running the sweep, so the sweep (which processes all
         # currently-TRUE tokens) only sees this case's token — no cross-case interference, no re-seeding.
 
@@ -672,7 +672,7 @@ def test_reconcile_pending_payments(pg_database):
         )
         assert not err.msg_list, err.msg_list
 
-    with db.connection(pool) as conn:
+    with db.connection() as conn:
         # Two unredeemed Google payments for the same key (e.g. a device offline across a renewal).
         seed_google(conn, master.verify_key)
         seed_google(conn, master.verify_key)
@@ -698,7 +698,7 @@ def test_generate_pro_proof_auto_redeems(pg_database):
     rotating_key = nacl.signing.SigningKey.generate()
     now = base.round_datetime_to_next_day(base.utc_now())
 
-    with db.connection(pool) as conn:
+    with db.connection() as conn:
         # A mule-registered, unredeemed Google payment bound to the master key.
         seed_tx = base.PaymentProviderTransaction()
         seed_tx.provider = base.PaymentProvider.GooglePlayStore
@@ -748,7 +748,7 @@ def test_grant_rangeproof(pg_database):
     rotating_key = nacl.signing.SigningKey.generate()
     now = base.round_datetime_to_next_day(base.utc_now())
 
-    with db.connection(pool) as conn:
+    with db.connection() as conn:
         assert not backend.get_user(conn, master_key.verify_key).found
         proof = backend.grant_rangeproof(
             conn,
@@ -779,7 +779,7 @@ def test_proof_reports_account_expiry(pg_database):
     now = base.round_datetime_to_next_day(base.utc_now())
     account_expiry = now + 365 * base.DAY
 
-    with db.connection(pool) as conn:
+    with db.connection() as conn:
         proof = backend.grant_rangeproof(
             conn,
             master_pkey=master_key.verify_key,
@@ -823,7 +823,7 @@ def test_expired_proof_fail_carries_account_expiry(pg_database):
     granted_at = base.round_datetime_to_next_day(base.utc_now())
     account_expiry = granted_at + pendulum.duration(hours=1)
 
-    with db.connection(pool) as conn:
+    with db.connection() as conn:
         # Grant a short entitlement (valid at grant time).
         backend.grant_rangeproof(
             conn,
@@ -890,7 +890,7 @@ def test_proof_expiry_offset_is_random_per_account_and_per_cycle(pg_database):
     now = base.utc_now()
     shape = base.proof_expiry_shape()
 
-    with db.connection(pool) as conn:
+    with db.connection() as conn:
         across_accounts = [
             _grant_and_get_offset(
                 conn, backend_key, nacl.signing.SigningKey.generate(), rotating_key, now, now + 30 * base.DAY
@@ -926,7 +926,7 @@ def test_proof_is_identical_for_requests_in_the_same_grid_period(pg_database):
     now = base.utc_now()
     shape = base.proof_expiry_shape()
 
-    with db.connection(pool) as conn:
+    with db.connection() as conn:
         # A year-long plan, so every request below sits in the sliding arm where the expiry would otherwise
         # track the request instant -- the arm the grid has to collapse.
         offset = _grant_and_get_offset(
@@ -983,7 +983,7 @@ def test_proof_expiry_offset_redraws_only_when_true_expiry_moves(monkeypatch, pg
     rotating_key = nacl.signing.SigningKey.generate()
     now = base.utc_now()
 
-    with db.connection(pool) as conn:
+    with db.connection() as conn:
         offset = _grant_and_get_offset(conn, backend_key, master_key, rotating_key, now, now + 30 * base.DAY)
 
         # A refresh from the same payment list recomputes the same expiry -> the offset must NOT move. Called
@@ -1019,7 +1019,7 @@ def test_proof_expiry_lands_on_the_account_grid(pg_database):
     now = base.utc_now()
     shape = base.proof_expiry_shape()
 
-    with db.connection(pool) as conn:
+    with db.connection() as conn:
         # Sliding arm: a year-long plan, so the `min` always takes the clamp.
         sliding_key = nacl.signing.SigningKey.generate()
         offset = _grant_and_get_offset(
@@ -1071,7 +1071,7 @@ def test_lapsed_account_keeps_proofs_through_the_over_provision(pg_database):
     true_expiry = now + pendulum.duration(hours=1)
     shape = base.proof_expiry_shape()
 
-    with db.connection(pool) as conn:
+    with db.connection() as conn:
         offset = _grant_and_get_offset(conn, backend_key, master_key, rotating_key, now, true_expiry)
         expiry = base.round_datetime_up_onto_offset_grid(
             true_expiry + shape.renewal_lead, period=shape.grid, offset_seconds=offset
@@ -1127,7 +1127,7 @@ def test_revocation_effective_ts_is_anchored_to_processing_time(monkeypatch, pg_
         assert not err.msg_list, err.msg_list
         return tx
 
-    with db.connection(pool) as conn:
+    with db.connection() as conn:
         # Two payments so a surviving one keeps the account entitled: the refunded (longer) one is what a
         # live proof would have been clamped to, so revoking it really does need broadcasting.
         seed_google(conn, recorded_at + 3 * base.DAY)
@@ -1193,7 +1193,7 @@ def test_renewal_binds_by_identifier_not_account_id(pg_database):
         assert not err.msg_list, err.msg_list
         return tx
 
-    with db.connection(pool) as conn:
+    with db.connection() as conn:
         # binder gets a user + entitlement the normal way.
         seed_google(conn, binder)
         assert backend.reconcile_pending_payments(conn, binder.verify_key, redeemed_at=now) == 1
@@ -1223,7 +1223,7 @@ def test_migrations_bootstrap_and_idempotency(pg_database):
     pool = backend.bootstrap_db(database_url=pg_database())
     assert pool
 
-    with db.connection(pool) as conn:
+    with db.connection() as conn:
         applied = {row[0] for row in db.query(conn, 'SELECT name FROM migrations_applied')}
         assert applied == expected
         assert db.query_scalar(conn, 'SELECT COUNT(*) FROM globals') == 2
@@ -1291,7 +1291,7 @@ def test_stale_revocation_is_not_served(pg_database):
     RETAIN_FOR = base.seconds_from_duration(base.REVOCATION_RETAIN_FOR)
     now = base.datetime_from_unix_seconds(1_700_000_000)
     master_pkey = nacl.signing.SigningKey.generate().verify_key
-    with db.connection(pool) as conn:
+    with db.connection() as conn:
         # A user with two generations: one revoked recently (still inside the window) and one revoked
         # long ago (past the window). Neither prune has run, so both rows are still present.
         with db.transaction(conn) as tx:

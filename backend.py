@@ -715,12 +715,13 @@ def bootstrap_db(database_url: str) -> psycopg_pool.ConnectionPool:
     must NOT use this: it runs pre-fork, and a pool's worker threads inherited across fork() corrupt
     the children (see db.connect_one). The master migrates on a throwaway connection and lets each
     worker build its own pool post-fork."""
+    db.set_dsn(database_url)
     try:
-        pool = db.get_pool(database_url)
+        pool = db.pool()
     except Exception as e:
         raise RuntimeError(f'Failed to open/connect to DB at {database_url}: {e}') from e
 
-    with db.connection(pool) as conn:
+    with db.connection() as conn:
         migrate_schema(conn)
 
     return pool

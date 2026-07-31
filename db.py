@@ -1,19 +1,20 @@
 """
 PostgreSQL access layer (psycopg 3) for the Session Pro backend.
 
-Connections come from a per-DSN `psycopg_pool.ConnectionPool` (autocommit), created lazily
-on first use, cached by connection string, and closed at interpreter exit. A pool spawns
-background worker threads, so it must only ever be created AFTER `fork()`: each uWSGI worker
-and the mule build their own on first use, and one-shot work that runs in the pre-fork master
-(schema migration, startup reads) uses `connect_one` instead of a pool. The public shape
-mirrors the old SQLAlchemy layer so callers are unchanged:
+The DSN is recorded once at startup with `set_dsn`; everything after that takes its connections
+from one process-wide `psycopg_pool.ConnectionPool` (autocommit) built on first use. Nothing takes a
+DSN or a pool as an argument — there is only ever one database.
 
-    with db.open_database(dsn) as pool:      # process-wide pool for this DSN
-        with db.connection(pool) as conn:    # a pooled connection
-            with db.transaction(conn) as tx: # BEGIN ... COMMIT (or ROLLBACK on cancel)
-                db.query(tx.conn, 'UPDATE users SET status = %s WHERE master_pkey = %s', status, pkey)
-                if should_rollback:
-                    tx.cancel = True
+`set_dsn` deliberately does NOT create the pool. A pool spawns background worker threads, and it
+must only ever be created AFTER `fork()`: forking a multi-threaded process leaves the children's
+thread state corrupt. So each uWSGI worker and the mule build the pool lazily on first use, while
+one-shot work in the pre-fork master (schema migration, startup reads) uses `connect_one` instead.
+
+    with db.connection() as conn:            # a pooled connection
+        with db.transaction(conn) as tx:     # BEGIN ... COMMIT (or ROLLBACK on cancel)
+            db.query(tx.conn, 'UPDATE users SET status = %s WHERE master_pkey = %s', status, pkey)
+            if should_rollback:
+                tx.cancel = True
 
 Placeholders are psycopg's `%s` (positional) or `%(name)s` (named) — pick whichever
 keeps a given query readable; use `%(name)s` when a value repeats. Rows come back as
@@ -79,11 +80,11 @@ psycopg.adapters.register_loader("timestamptz", _PendulumTimestamptzBinaryLoader
 psycopg.adapters.register_loader("interval", _PendulumIntervalLoader)
 psycopg.adapters.register_loader("interval", _PendulumIntervalBinaryLoader)
 
-# Pools are cached by DSN: production drives a single DSN (so a single pool), while the
-# test suite spins up many throwaway databases (a pool each). The lock guards the cache;
-# the pools themselves are internally thread-safe.
-_pools: dict[str, psycopg_pool.ConnectionPool] = {}
-_pools_lock: threading.Lock = threading.Lock()
+# The one DSN, and the one pool built from it. The lock guards both; the pool itself is internally
+# thread-safe. `_pool` stays None until something actually needs a connection (see set_dsn).
+_dsn: str = ''
+_pool: psycopg_pool.ConnectionPool | None = None
+_pool_lock: threading.Lock = threading.Lock()
 
 
 def _make_pool(conninfo: str, *, min_size: int = 0, max_size: int = 16) -> psycopg_pool.ConnectionPool:
@@ -101,14 +102,32 @@ def _make_pool(conninfo: str, *, min_size: int = 0, max_size: int = 16) -> psyco
     return pool
 
 
-def get_pool(conninfo: str) -> psycopg_pool.ConnectionPool:
-    """Return the process-wide pool for `conninfo`, creating it on first use."""
-    with _pools_lock:
-        pool = _pools.get(conninfo)
-        if pool is None:
-            pool = _make_pool(conninfo)
-            _pools[conninfo] = pool
-        return pool
+def set_dsn(conninfo: str) -> None:
+    """Record the database every later `pool()`/`connection()` call uses.
+
+    Creates nothing: the pool must be built post-fork (see the module docstring), so it is left for
+    first use. Pointing this at a different database discards any pool already built for the old one,
+    which is what lets the test suite run each test against a throwaway database in one process."""
+    global _dsn, _pool
+    with _pool_lock:
+        if conninfo == _dsn:
+            return
+        _dsn, displaced, _pool = conninfo, _pool, None
+    if displaced is not None:
+        try:
+            displaced.close()  # its threads would otherwise outlive the last reference to it
+        except Exception:
+            pass  # e.g. a test database was already dropped out from under us
+
+
+def pool() -> psycopg_pool.ConnectionPool:
+    """The process-wide pool, built on first use."""
+    global _pool
+    with _pool_lock:
+        assert _dsn, 'db.set_dsn() must be called before the database is used'
+        if _pool is None:
+            _pool = _make_pool(_dsn)
+        return _pool
 
 
 def connect_one(conninfo: str) -> psycopg.Connection:
@@ -123,34 +142,24 @@ def connect_one(conninfo: str) -> psycopg.Connection:
     return psycopg.connect(conninfo, autocommit=True)
 
 
-def close_pools() -> None:
-    with _pools_lock:
-        pools = list(_pools.values())
-        _pools.clear()
-    for pool in pools:
+def close_pool() -> None:
+    global _pool
+    with _pool_lock:
+        closing, _pool = _pool, None
+    if closing is not None:
         try:
-            pool.close()
+            closing.close()
         except Exception:
             pass  # e.g. a test database was already dropped out from under us
 
 
-atexit.register(close_pools)
+atexit.register(close_pool)
 
 
 @contextlib.contextmanager
-def open_database(conninfo: str) -> collections.abc.Iterator[psycopg_pool.ConnectionPool]:
-    """Yield the process-wide pool for `conninfo`.
-
-    The pool outlives the `with` block (it is process-global and closed at exit); this
-    context manager exists to preserve the historical call shape, not to own lifetime.
-    """
-    yield get_pool(conninfo)
-
-
-@contextlib.contextmanager
-def connection(pool: psycopg_pool.ConnectionPool) -> collections.abc.Iterator[psycopg.Connection]:
-    """Check a connection out of `pool` for the duration of the block."""
-    with pool.connection() as conn:
+def connection() -> collections.abc.Iterator[psycopg.Connection]:
+    """Check a connection out of the pool for the duration of the block."""
+    with pool().connection() as conn:
         yield conn
 
 

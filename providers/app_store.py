@@ -1150,9 +1150,8 @@ def notifications_apple_app_connect_sandbox() -> flask.Response:
     # drop. Log it and abort 500 so Apple retries. (Handled/expected problems come back via `err` and 500 in
     # the err.has() block below; only an actual raise reaches here.)
     try:
-        with server.get_db(flask.current_app) as engine:
-            with db.connection(engine) as conn:
-                handle_notification(decoded_notification, conn, core.notification_retry_duration, err)
+        with db.connection() as conn:
+            handle_notification(decoded_notification, conn, core.notification_retry_duration, err)
     except Exception:
         log.error(f"Apple notification handling failed. Error was: {traceback.format_exc()}")
         flask.abort(500)
@@ -1166,11 +1165,8 @@ def notifications_apple_app_connect_sandbox() -> flask.Response:
                 apple_original_tx_id=decoded_notification.tx_info.originalTransactionId,
             )
 
-            with server.get_db(flask.current_app) as engine:
-                with db.connection(engine) as conn:
-                    backend.add_user_error(
-                        conn, error=user_error, at=base.datetime_from_unix_ms(int(time.time() * 1000))
-                    )
+            with db.connection() as conn:
+                backend.add_user_error(conn, error=user_error, at=base.datetime_from_unix_ms(int(time.time() * 1000)))
 
         # NOTE: Log and abort request
         log.error(

@@ -86,17 +86,16 @@ def dev_add_payment() -> flask.Response:
 
     now = base.datetime_from_unix_ms(int(server.time_now() * 1000))
 
-    with server.get_db(flask.current_app) as engine:
-        with db.connection(engine) as conn:
-            minted: minting.MintedPayment = minting.mint_payment(
-                conn,
-                master_pkey=nacl.signing.VerifyKey(master_pkey_bytes),
-                provider=provider,
-                plan=plan,
-                now=now,
-                duration=duration,
-                redeem=raw_redeem,
-            )
+    with db.connection() as conn:
+        minted: minting.MintedPayment = minting.mint_payment(
+            conn,
+            master_pkey=nacl.signing.VerifyKey(master_pkey_bytes),
+            provider=provider,
+            plan=plan,
+            now=now,
+            duration=duration,
+            redeem=raw_redeem,
+        )
 
     log.warning(
         f'DEV: minted a {minted.plan.value} {provider.value} payment '

@@ -45,7 +45,7 @@ def _periodic_cleanup(signum: int) -> None:
     # prune is idempotent, non-urgent housekeeping, so a delay is harmless.
     now = base.utc_now()
     try:
-        with db.connection(db.get_pool(base.DB_URL)) as conn:
+        with db.connection() as conn:
             result = backend.expire_payments_revocations_and_users(conn=conn, now=now)
         if result.success:
             log.info(
@@ -77,7 +77,7 @@ def entry_point() -> flask.Flask:
         log.error(f'Failed to startup, invalid configuration options:\n  {e}')
         sys.exit(1)
     base.UNSAFE_LOGGING = parsed_args.unsafe_logging
-    base.DB_URL = parsed_args.db_url
+    db.set_dsn(parsed_args.db_url)
     base.PROVIDER_TESTING_ENV = parsed_args.provider_testing_env
     base.PROVIDER_DRY_RUN = parsed_args.provider_dry_run
 
@@ -126,7 +126,7 @@ def entry_point() -> flask.Flask:
     # missed-notification catch-up), so it runs on a single throwaway connection, NEVER a pool: a
     # ConnectionPool opened here would spawn background worker threads, and forking a multi-threaded
     # process corrupts the children's thread state — a hard segfault when the pool is closed at reload
-    # (Python 3.13). Each worker/mule builds its own pool lazily, post-fork (server.get_db -> get_pool).
+    # (Python 3.13). Each worker/mule builds its own pool lazily, post-fork (db.connection -> db.pool).
     try:
         conn = db.connect_one(parsed_args.db_url)
     except Exception as e:
