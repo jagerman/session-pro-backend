@@ -133,7 +133,7 @@ settle as the subscription end comes into range, so they learn the sender is wit
 end, and can bound the true expiry to within ~25 h. Don't oversell the fix as more than that.
 
 - **Not fixed by coarsening the grid.** A weekly grid doesn't change slide-vs-pin and buys up to 7 days of
-  exploitable overhang (free Pro past cancellation for end-of-term users; it also widens item-4's
+  exploitable overhang (free Pro past cancellation for end-of-term users; it also widens the
   revocation-skip margin from 1 day to 7).
 - **The only real lever left is the cap length.** A shorter proof-lifetime cap shrinks the window in which
   a short-plan user reveals a pinned date — at the cost of more refresh traffic and worse offline
@@ -146,7 +146,7 @@ end, and can bound the true expiry to within ~25 h. Don't oversell the fix as mo
 
 Note the *distinct* subscription-**cadence** leak (an observer watching how often the `revocation_tag`
 changes to infer renewal frequency) **was** closed — items 1+3 make the tag stable for the whole
-subscription lifetime, verified by item 5. **Binding-revocation observability** (the tag necessarily
+subscription lifetime, and that is covered by a test. **Binding-revocation observability** (the tag necessarily
 changes on a revocation) is likewise intrinsic and accepted.
 
-*(Ref: `docs/refactor-plan.md` Phase-3 item 6; wire spec §2.3.)*
+*(Ref: wire spec §2.3.)*

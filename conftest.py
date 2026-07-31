@@ -1,4 +1,4 @@
-# conftest.py — ephemeral PostgreSQL for the test suite (item 8 groundwork).
+# conftest.py — ephemeral PostgreSQL for the test suite.
 #
 # pytest-postgresql boots a throwaway cluster and hands each test a *fresh database*.
 # The current SQLAlchemy layer already speaks postgresql://, so this lets the existing

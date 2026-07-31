@@ -61,7 +61,7 @@ REVOCATION_RETAIN_FOR: datetime.timedelta = datetime.timedelta(days=31)
 # epochs live ONLY in the converters below, at two kinds of boundary with distinct units:
 #   - MILLISECONDS: the payment providers (Apple/Google App Store APIs) genuinely speak ms, so their
 #     ingest/egress uses the `*_ms` pair.
-#   - SECONDS: our own wire + proof format is seconds (the wire spec's unit, item 5b), so every
+#   - SECONDS: our own wire + proof format is seconds (the wire spec's unit), so every
 #     client-facing boundary and every signed hash uses the `*_seconds` pair. Wire seconds are integer
 #     everywhere except two upstream provider event instants (`purchased_ts`, `revoked_ts`) that keep
 #     the provider's sub-second precision as a float via `unix_seconds_float_from_datetime` — see the

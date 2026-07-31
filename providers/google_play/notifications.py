@@ -420,9 +420,7 @@ def thread_entry_point(
                         message_data = json.loads(it.message.data)
                         published = base.readable(base.datetime_from_unix_ms(it.message.publish_time.ToMilliseconds()))
                         parse = parse_notification(message_data, err)
-                        message_id = (
-                            it.message.message_id
-                        )  # Pub/Sub ids are opaque strings — never int()-cast (item 11)
+                        message_id = it.message.message_id  # Pub/Sub ids are opaque strings — never int()-cast
                         if err.has():
                             log.warning(
                                 f'Discarding message #{index}: could not parse it '

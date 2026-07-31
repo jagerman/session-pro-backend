@@ -62,7 +62,7 @@
   far below 2^53 (it ticks only when a revocation is **added** — never on expiry/prune-removal, see §4), so it rides as a **number** — the int64 is
   a storage/type choice, not a value range. All `_ts` / `_duration` values likewise stay numbers
   (seconds ~1.7e9 « 2^53).
-- **Enums are transmitted as stable string `code`s, never integers** (backed by lookup tables — item 9;
+- **Enums are transmitted as stable string `code`s, never integers** (backed by lookup tables;
   the DB keeps a surrogate int `id`, but the wire *and the signed messages* use the `code`, so no magic
   number ever crosses the wire and new values are additive `INSERT`s):
   - `payment_provider`: `"google_play"`, `"app_store"`, `"rangeproof"`

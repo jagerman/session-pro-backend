@@ -24,10 +24,9 @@ BLAKE2B_DIGEST_SIZE = 32
 log = logging.Logger("BACKEND")
 # 16-byte domain-separation prefix on the signed MESSAGE (signatures are Ed25519 over the message
 # directly — no BLAKE2b, so this is a domain prefix, not a hash personalisation; see signed_message).
-# Kept at 16 bytes with the same values so the proof's version-selecting domain prefix (Q12) is unchanged.
 DOMAIN_SIZE = 16
 GENERATE_PROOF_DOMAIN = b'ProGenerateProof'
-BUILD_PROOF_DOMAIN = b'ProProof_v0_____'  # version lives IN the domain prefix (Q12), not a byte/field
+BUILD_PROOF_DOMAIN = b'ProProof_v0_____'  # the proof version lives IN the prefix, not in a signed field
 GET_PAYMENT_DETAILS_DOMAIN = b'ProGetPayDetails'
 GET_PRO_STATUS_DOMAIN = b'ProGetProStatus_'
 assert all(
@@ -163,7 +162,7 @@ class ProSubscriptionProof:
     account_expires_at: datetime.datetime = base.EPOCH
 
     def to_dict(self) -> dict[str, str | int]:
-        # `version` is a PLAINTEXT field, deliberately NOT bound into the signature (Q12). It is the
+        # `version` is a PLAINTEXT field, deliberately NOT bound into the signature. It is the
         # external indicator a verifier reads to pick the domain prefix + layout it must use to
         # reconstruct and check the signed message; v0's domain prefix is BUILD_PROOF_DOMAIN
         # (`ProProof_v0_____`). The version→domain-prefix map is per-version and arbitrary — a future
@@ -2352,7 +2351,7 @@ SELECT EXISTS (
 
 def has_user_error(conn: psycopg.Connection, payment_provider: base.PaymentProvider, payment_id: str) -> bool:
     # Single SELECT on the given connection (mid-tx callers pass tx.conn). payment_provider is a string
-    # code (item 9) — compared directly, NOT int()-cast (that was a latent crash on the CLI path).
+    # code (the lookup tables key on the code itself) — compared directly, never int()-cast.
     row = db.query_one(
         conn,
         'SELECT 1 FROM user_errors WHERE payment_id = %s AND payment_provider = %s',

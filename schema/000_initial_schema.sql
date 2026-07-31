@@ -67,7 +67,7 @@ CREATE TABLE IF NOT EXISTS payments (
 CREATE INDEX IF NOT EXISTS payments_user_id_idx    ON payments (user_id) WHERE user_id IS NOT NULL;  -- owner lookups + PAYMENTS_FROM join
 CREATE INDEX IF NOT EXISTS payments_expires_at_idx ON payments (expires_at);                         -- daily expiry sweep
 
--- Per-provider payment identifiers (item 15 follow-up). Exactly one of these has a row for a given
+-- Per-provider payment identifiers. Exactly one of these has a row for a given
 -- payment, in the table matching payments.payment_provider; payment_id is the PK *and* FK, so the 1:1 is
 -- structural and the detail row is pruned with its payment (ON DELETE CASCADE). Typed columns with real
 -- NOT NULLs replace the old sparse provider columns on `payments`.
@@ -153,13 +153,13 @@ CREATE TABLE IF NOT EXISTS apple_notification_uuid_history (
 );
 
 CREATE TABLE IF NOT EXISTS google_notification_history (
-    message_id        TEXT PRIMARY KEY,   -- Pub/Sub message id: opaque STRING, never a number (item 11)
+    message_id        TEXT PRIMARY KEY,   -- Pub/Sub message id: opaque STRING, never a number
     handled           BOOLEAN NOT NULL DEFAULT FALSE,
     payload           TEXT,
     expires_at        TIMESTAMPTZ NOT NULL
 );
 -- The startup drain reads `WHERE NOT handled`; a partial index keeps that off a full seq-scan as the
--- buffer grows (item 10).
+-- buffer grows.
 CREATE INDEX IF NOT EXISTS google_notification_history_unhandled ON google_notification_history (message_id) WHERE NOT handled;
 
 -- `payment_id` here is the provider's tx-id STRING (Apple original_tx_id / Google payment_token), NOT

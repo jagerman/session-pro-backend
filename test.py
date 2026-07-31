@@ -1430,7 +1430,7 @@ def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_d
         proof_2nd = _redeem_and_prove(db_conn, backend_key, master_key, rotating_key, now)
         assert len(proof_2nd.revocation_tag) == backend.BLAKE2B_DIGEST_SIZE
 
-    # Two payments stacked for one user → ONE generation, REUSED (item 3: a generation is an epoch, not a
+    # Two payments stacked for one user → ONE generation, REUSED (a generation is an epoch, not a
     # per-payment value — a redeem reuses the current generation rather than rolling, since neither payment
     # was revoked). So the revocation_tag is stable across the stack.
     gen_ids: list[int] = [
@@ -1443,7 +1443,7 @@ def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_d
     ]
     assert len(gen_ids) == 1
 
-    # Item 5 (privacy — subscription-cadence leak): the revocation_tag a group member observes on the
+    # Privacy (subscription-cadence leak): the revocation_tag a group member observes on the
     # user's proofs is STABLE across the stack. Both redeems produced proofs carrying the SAME tag (the
     # reused generation's token), so bump frequency can't leak the renewal cadence — the tag changes only
     # on a binding revocation (test_revocation_cutting_refund_rolls_generation).
@@ -1624,7 +1624,7 @@ def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_d
             payment_list = backend.get_payments_list(db_conn)
             assert len(payment_list) == 3
 
-            # Item 5 (privacy): capture the tag the manual redeem established. The proof carries it, and
+            # Privacy: capture the tag the manual redeem established. The proof carries it, and
             # the server-side auto-redeem below must leave it unchanged.
             with db.transaction(db_conn) as tx:
                 auto_redeem_tag_after_manual = backend.get_user_and_payments(
@@ -1657,7 +1657,7 @@ def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_d
             assert payments_list[3].auto_renewing
             assert payments_list[3].grace_period == auto_redeem_scenarios[1].grace_period
 
-            # Item 5 (privacy — cadence leak): the SERVER-SIDE auto-redeem (the exact renewal path that
+            # Privacy (cadence leak): the SERVER-SIDE auto-redeem (the exact renewal path that
             # used to roll the generation on every cycle) must NOT change the observable revocation_tag.
             with db.transaction(db_conn) as tx:
                 auto_redeem_tag_after_auto = backend.get_user_and_payments(
@@ -1667,7 +1667,7 @@ def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_d
 
 
 def test_revocation_cutting_refund_rolls_generation(monkeypatch, pg_database):
-    """Item 4 case 2: a refund that drops the user's remaining entitlement BELOW what an outstanding
+    """The CUTTING refund: one that drops the user's remaining entitlement BELOW what an outstanding
     proof can still certify (a proof's reach is clamped to ~30 days) must revoke the current generation
     and roll the user onto a fresh one for the reduced-but-still-standing entitlement. This is the middle
     case between the two already covered in test_server_add_payment_flow: a non-cutting refund that leaves
@@ -1710,7 +1710,7 @@ def test_revocation_cutting_refund_rolls_generation(monkeypatch, pg_database):
         return seed_tx.google_payment_token
 
     try:
-        # Two stacked payments on one (shared, item-3) generation: a long one we will refund and a short
+        # Two stacked payments on one shared generation: a long one we will refund and a short
         # survivor that leaves only ~5 days of entitlement — less than the ~30-day reach of a live proof.
         long_token = seed_and_redeem(redeemed_at + datetime.timedelta(days=90))
         seed_and_redeem(redeemed_at + datetime.timedelta(days=5))
@@ -1881,7 +1881,7 @@ def test_payment_binding_rejects_mismatched_master_key(pg_database):
 
 
 def test_bump_revocation_ticket(pg_database):
-    """Item 7: the manual DR bump (backing the `revoke bump-ticket` CLI command) advances the monotonic
+    """The manual DR bump (backing the `revoke bump-ticket` CLI command) advances the monotonic
     revocation ticket by the given amount and returns the new value. Used to recover after a DB restore
     from an older backup rolls the counter backward (see docs/deploy.md)."""
     db_engine: psycopg_pool.ConnectionPool | None = backend.bootstrap_db(database_url=pg_database())
@@ -2287,7 +2287,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
     db_conn = db_engine.getconn()
 
     # Capture the user's current generation. The manual revoke below targets only the shorter
-    # (30-day) payment while the original (~90-day) payment survives, so item 4 must SKIP the
+    # (30-day) payment while the original (~90-day) payment survives, so the revocation-skip must OMIT the
     # revocation entirely: the surviving entitlement still covers everything any outstanding proof
     # can certify (≤ 30 days of reach), so the generation must NOT roll and nothing must land on
     # the (network-costly) revocation list.
@@ -2340,7 +2340,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
     result_retry_in = base.json_dict_require_int(d=result_json, key='retry_in', err=err)
     result_retain_for = base.json_dict_require_int(d=result_json, key='retain_for', err=err)
     assert not err.msg_list, '{err.msg_list}'
-    # Item 4: the non-cutting refund produced NO revocation entry, so the ticket is unchanged.
+    # The non-cutting refund produced NO revocation entry, so the ticket is unchanged.
     assert result_ticket == 0
     assert result_retry_in == base.SECONDS_IN_DAY
     assert result_retain_for == base.seconds_from_timedelta(base.REVOCATION_RETAIN_FOR)
@@ -2390,7 +2390,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
     result_retry_in = base.json_dict_require_int(d=result_json, key='retry_in', err=err)
     result_retain_for = base.json_dict_require_int(d=result_json, key='retain_for', err=err)
     assert not err.msg_list, '{err.msg_list}'
-    # Item 4: the non-cutting refund above created no revocation entry, so the ticket is still 0.
+    # The non-cutting refund above created no revocation entry, so the ticket is still 0.
     assert result_ticket == 0, f'Response was: {json.dumps(response_json, indent=2)}'
     assert result_retry_in == base.SECONDS_IN_DAY
     assert result_retain_for == base.seconds_from_timedelta(base.REVOCATION_RETAIN_FOR)
@@ -5039,7 +5039,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             assert isinstance(user, backend.UserRow)
             assert user.master_pkey == bytes(user_ctx.master_key.verify_key)
             # The user points at a live current generation with a populated 32-byte token. We do NOT
-            # assert a generation count here: a generation is an epoch (item 3), reused across payments and
+            # assert a generation count here: a generation is an epoch, reused across payments and
             # rolled only on revocation, so the count is scenario-dependent, not one-per-payment. The
             # current generation must be one of the user's, and (for these non-revoked scenarios) live.
             user_gen_ids = {row[0] for row in db.query(conn, "SELECT id FROM generations WHERE user_id = %s", user.id)}
