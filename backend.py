@@ -509,6 +509,74 @@ def derive_payment_status(payment: PaymentRow, now: pendulum.DateTime) -> base.P
     return base.PaymentStatus.Redeemed
 
 
+def subscription_coverage_end(
+    expires_at: pendulum.DateTime, grace_period: pendulum.Duration | None, auto_renewing: bool
+) -> pendulum.DateTime:
+    """The instant a subscription payment stops covering the account: its paid-through expiry, plus the
+    grace period only when a renewal is going to be attempted.
+
+    Grace is the window after a renewal payment FAILS, so it exists only for an auto-renewing payment. A
+    cancelled subscription still carries the grace value in its column while `auto_renewing` has gone
+    false and `expires_at` is untouched — it covers the account to the end of the paid term and not a
+    moment longer.
+
+    Shared by the entitlement fold and the credit drain deliberately: if the two disagreed about when
+    coverage ends, an account could be entitled while its credits drain, or hold protected credits while
+    reading as expired."""
+    return expires_at + grace_period if (auto_renewing and grace_period is not None) else expires_at
+
+
+@dataclasses.dataclass
+class CreditToDrain:
+    """One live credit as the drain sees it: its row id and how much length it still has to give."""
+
+    payment_id: int
+    remaining: pendulum.Duration
+
+
+@dataclasses.dataclass
+class CreditDrainResult:
+    # (payment id, new remaining) for the rows that actually changed — nothing else needs writing.
+    updated: list[tuple[int, pendulum.Duration]] = dataclasses.field(default_factory=list)
+    # How much of the budget was actually charged. Less than the budget exactly when the credits ran out
+    # partway through the window, which is what lets the caller date that moment as `checkpoint + spent`.
+    spent: pendulum.Duration = dataclasses.field(default_factory=pendulum.duration)
+    # The budget outran the credits: every one of them is now zero and there was still time to charge.
+    exhausted: bool = False
+
+
+def drain_credits(credits: list[CreditToDrain], budget: pendulum.Duration) -> CreditDrainResult:
+    """Spend `budget` worth of uncovered time across `credits`, oldest first, and report what changed.
+
+    Pure: no clock, no database. The caller decides what `budget` is (the uncovered span since the
+    account's drain checkpoint, zero while a subscription covers it) and supplies the live credits in
+    consumption order; everything the caller must then write back is in the result.
+
+    Exactly one credit can be paying for any given moment, so the budget is spent down one credit at a
+    time, oldest first, and spills into the next only once the current one is empty.
+
+    Budget left over after the last credit is discarded rather than remembered: those were moments the
+    account simply had no entitlement, and there is nobody to charge for them."""
+    result = CreditDrainResult()
+    zero = pendulum.duration()
+    if budget <= zero:
+        return result
+
+    left = budget
+    for credit in credits:
+        if left <= zero:
+            break
+        charge = min(credit.remaining, left)
+        if charge <= zero:
+            continue
+        result.updated.append((credit.payment_id, credit.remaining - charge))
+        left -= charge
+
+    result.spent = budget - left
+    result.exhausted = left > zero and len(credits) > 0
+    return result
+
+
 def get_unredeemed_payments_list(conn: psycopg.Connection) -> list[PaymentRow]:
     result: list[PaymentRow] = []
     with db.transaction(conn):
@@ -1291,16 +1359,32 @@ def _lookup_user_expiry(tx: db.SQLTransaction, master_pkey: nacl.signing.VerifyK
         tx.conn,
         '''
         SELECT    p.expires_at, p.grace_period, p.auto_renewing, p.redeemed_at,
-                  p.payment_provider, ad.original_tx_id, gd.order_id, rd.order_id, p.revoked_at
+                  p.payment_provider, ad.original_tx_id, gd.order_id, rd.order_id, p.revoked_at,
+                  p.credit_remaining, u.credits_drained_through
         FROM      payments p
+                  JOIN users u ON u.id = p.user_id
                   LEFT JOIN app_store_payment_details ad      ON ad.payment_id = p.id
                   LEFT JOIN google_play_payment_details gd     ON gd.payment_id = p.id
                   LEFT JOIN rangeproof_payment_details rd ON rd.payment_id = p.id
-        WHERE     p.user_id = (SELECT id FROM users WHERE master_pkey = %(master_pkey)s)
+        WHERE     u.master_pkey = %(master_pkey)s
         ORDER BY  p.id DESC
     ''',
         master_pkey=bytes(master_pkey),
     )
+
+    # How far this account's credits have been drained; the same value on every row, carried along rather
+    # than fetched separately. The credit total below is added to THIS instant rather than to `now`, so the
+    # answer is a fixed instant: each drain pass advances the checkpoint by the span it charged and reduces
+    # the total by the same amount, and any recompute between passes — a payment registered, a redeem, a
+    # revocation — lands on the same value instead of walking forward. An account with no payments has no
+    # rows here, and therefore no credits either, so the absent checkpoint cannot matter.
+    credits_drained_through: pendulum.DateTime | None = None
+    # Live credits are summed, not maxed: each grants a length that stacks on top of coverage. Their own
+    # `expires_at` is a grant-time receipt value, so it is kept OUT of the max below — counting it there
+    # as well would credit the same length twice. A SPENT credit (remaining zero) does go through the max
+    # like a subscription: its window is necessarily in the past by then, so it can only ever win when
+    # nothing else covers the account, which is exactly when it is the truthful answer.
+    credit_total = pendulum.duration()
 
     used_google_order_ids: list[str] = []
     used_apple_orig_tx_ids: set[int] = set()
@@ -1322,9 +1406,19 @@ def _lookup_user_expiry(tx: db.SQLTransaction, master_pkey: nacl.signing.VerifyK
             google_order_id,
             rangeproof_order_id,
             revoked_at,
+            credit_remaining,
+            credits_drained_through,
         ) = row
         # grace_period is nullable; treat "absent" as zero for the entitlement arithmetic below.
         grace = grace_period if grace_period is not None else pendulum.duration()
+
+        # A live credit contributes its remaining length to the total and nothing to the max. A revoked
+        # one contributes neither: the revoke path zeroes it, and until it does, a clawed-back credit must
+        # not still be extending the account.
+        if credit_remaining is not None and credit_remaining > pendulum.duration():
+            if revoked_at is None:
+                credit_total += credit_remaining
+            continue
 
         # NOTE: Consecutive subscription payments are added to the DB under _roughly_ the same
         # transaction ID (this differs between platforms). We only want to consider that latest
@@ -1410,6 +1504,25 @@ def _lookup_user_expiry(tx: db.SQLTransaction, master_pkey: nacl.signing.VerifyK
             result.best_expiry = payment_expires_at
             result.best_grace = grace
             result.best_auto_renewing = bool(auto_renewing)
+
+    # Credits extend whatever the subscriptions above cover, from the later of that coverage and the drain
+    # checkpoint (a credit cannot be paying for a moment a subscription already paid for, nor for one
+    # already charged against it). `best_grace`/`best_auto_renewing` stay attributed to the subscription
+    # that won the max: a subscriber holding a voucher is still auto-renewing, whatever sets their expiry.
+    if credit_total > pendulum.duration():
+        if credits_drained_through is None:
+            # The mint sets the checkpoint, and the drain clears it only once every credit is spent, so a
+            # live credit with no checkpoint is a broken invariant. Anchor on the coverage we do know
+            # about rather than silently answering with 1970, and make the noise visible.
+            log.warning(
+                f'Live credit with no drain checkpoint for {base.maybe_obfuscate_bytes(master_pkey)}: '
+                f'anchoring its remaining length on known coverage instead'
+            )
+        anchor = credits_drained_through if credits_drained_through is not None else base.EPOCH
+        result.best_expiry = max(result.best_expiry, anchor) if result.best_expiry else anchor
+        result.best_expiry += credit_total
+        redeemed = result.expiry_from_redeemed
+        result.expiry_from_redeemed = (max(redeemed, anchor) if redeemed else anchor) + credit_total
     return result
 
 
@@ -1596,7 +1709,11 @@ def add_unredeemed_payment(
     platform_obfuscated_account_id: bytes | str,
     err: base.ErrorSink,
     needs_ack: bool = False,
+    credit_remaining: pendulum.Duration | None = None,
 ):
+    """Record a payment nobody has claimed yet. `credit_remaining` marks the row as a one-shot CREDIT with
+    that much length left to give (see schema/004): a store subscription leaves it None, since its
+    `expires_at` already states an absolute paid-through instant."""
 
     if log.getEffectiveLevel() <= logging.INFO:
         payment_tx_label = payment_provider_tx_log_label_safe(payment_tx)
@@ -1626,6 +1743,7 @@ def add_unredeemed_payment(
                 'platform_refund_expires_at': platform_refund_expires_at,
                 'purchased_at': purchased_at,
                 'auto_renewing': True,  # on by default until Google notifies otherwise
+                'credit_remaining': credit_remaining,
             },
             detail_table='google_play_payment_details',
             detail={
@@ -1654,6 +1772,7 @@ def add_unredeemed_payment(
                 'platform_refund_expires_at': platform_refund_expires_at,
                 'purchased_at': purchased_at,
                 'auto_renewing': True,  # on by default until Apple notifies otherwise
+                'credit_remaining': credit_remaining,
             },
             detail_table='app_store_payment_details',
             detail={
@@ -1676,6 +1795,7 @@ def add_unredeemed_payment(
                 'platform_refund_expires_at': platform_refund_expires_at,
                 'purchased_at': purchased_at,
                 'auto_renewing': False,  # Rangeproof vouchers never auto-renew
+                'credit_remaining': credit_remaining,
             },
             detail_table='rangeproof_payment_details',
             detail={'order_id': payment_tx.rangeproof_order_id},
@@ -1881,6 +2001,26 @@ def _ensure_active_generation(
     # already-revoked). The revoke path depends on exactly this: it sets revoked_at first, then calls here,
     # so it rolls onto a fresh generation. The user row must already exist (redeem creates it via
     # get_or_create_user_and_generation; revoke's user exists).
+    # Start the drain clock for a credit that has just become this user's, BEFORE reading the entitlement
+    # below: the fold anchors a credit's remaining length on this checkpoint, so setting it afterwards would
+    # store an expiry dated from the epoch. Every path that claims a payment comes through here, so this is
+    # the one place it cannot be forgotten — and forgetting it would leave a live credit that never drains,
+    # i.e. a voucher that never expires. Only when currently NULL: resetting an existing checkpoint would
+    # forgive whatever uncovered time has accrued against the account's other credits.
+    db.query(
+        tx.conn,
+        '''
+        UPDATE users
+        SET    credits_drained_through = %(at)s
+        WHERE  master_pkey = %(master_pkey)s AND credits_drained_through IS NULL
+          AND  EXISTS (SELECT 1 FROM payments
+                       WHERE user_id = users.id AND revoked_at IS NULL
+                         AND credit_remaining > '0'::interval)
+    ''',
+        at=issued_at,
+        master_pkey=bytes(master_pkey),
+    )
+
     result = AllocatedGenID()
     lookup: LookupUserExpiry = _lookup_user_expiry(tx, master_pkey)
     result.expires_at = lookup.expiry_from_redeemed
@@ -1917,6 +2057,127 @@ def _ensure_active_generation(
     result.grace_period = lookup.best_grace
 
     return result
+
+
+@db.transactional
+def drain_due_credits(tx: db.SQLTransaction, now: pendulum.DateTime, stale_after: pendulum.Duration) -> int:
+    """Charge elapsed uncovered time against the credits of every account whose drain checkpoint is older
+    than `stale_after`, and return how many accounts were visited.
+
+    A credit is spent only while nothing else covers the account, so the charge is the span since that
+    account's checkpoint — never an assumed interval — which makes a pass that runs late charge exactly
+    what it should and a pass that runs twice charge nothing the second time. Coverage is sampled once,
+    now: a subscription that lapsed part-way through the span is charged for the whole of it, and one that
+    started part-way through is charged for none, each bounded by one interval and only at a genuine
+    coverage transition (a renewal is not one — `expires_at` moves before the old term lapses).
+
+    SKIP LOCKED so a second runner, or an overlapping pass, cannot charge the same account twice."""
+    due = db.query(
+        tx.conn,
+        '''
+        SELECT   id, master_pkey, credits_drained_through
+        FROM     users
+        WHERE    credits_drained_through IS NOT NULL AND credits_drained_through < %(cutoff)s
+        ORDER BY credits_drained_through
+        FOR UPDATE SKIP LOCKED
+    ''',
+        cutoff=now - stale_after,
+    )
+
+    visited = 0
+    for user_id, master_pkey_raw, checkpoint in typing.cast(list[tuple[typing.Any, ...]], due.fetchall()):
+        visited += 1
+        master_pkey = nacl.signing.VerifyKey(bytes(master_pkey_raw))
+
+        # Is a SUBSCRIPTION covering this account right now? Deliberately computed from the subscription
+        # rows and NOT from users.expires_at: that already includes the credits' own remaining length, so a
+        # credit would report the account as covered, protect itself from being charged, and never expire.
+        coverage_rows = db.query(
+            tx.conn,
+            '''
+            SELECT expires_at, grace_period, auto_renewing
+            FROM   payments
+            WHERE  user_id = %(user_id)s AND revoked_at IS NULL AND credit_remaining IS NULL
+        ''',
+            user_id=user_id,
+        )
+        covered_now = any(
+            subscription_coverage_end(expires_at, grace_period, auto_renewing) > now
+            for expires_at, grace_period, auto_renewing in typing.cast(
+                list[tuple[typing.Any, ...]], coverage_rows.fetchall()
+            )
+        )
+
+        # Clamped at zero: a checkpoint ahead of `now` (a clock stepping back, a future-dated pass) must
+        # never hand length BACK to a credit.
+        budget = pendulum.duration() if covered_now else max(now - checkpoint, pendulum.duration())
+
+        live_rows = db.query(
+            tx.conn,
+            '''
+            SELECT   id, credit_remaining
+            FROM     payments
+            WHERE    user_id = %(user_id)s AND revoked_at IS NULL AND credit_remaining > '0'::interval
+            ORDER BY purchased_at, id
+        ''',
+            user_id=user_id,
+        )
+        live = [
+            CreditToDrain(payment_id=row[0], remaining=row[1])
+            for row in typing.cast(list[tuple[typing.Any, ...]], live_rows.fetchall())
+        ]
+        remaining_before = {credit.payment_id: credit.remaining for credit in live}
+        drained = drain_credits(live, budget)
+
+        # Walk the charges in consumption order so an emptied credit can be dated: its length ran out at the
+        # checkpoint plus everything charged up to and including it. `expires_at` is a receipt value for a
+        # credit (unlike a subscription, where the store owns it), and this is the one thing that writes it
+        # after the mint — so that a spent credit states when it really ran out rather than what it was
+        # worth on the day it was granted.
+        spent_so_far = pendulum.duration()
+        for payment_id, new_remaining in drained.updated:
+            spent_so_far += remaining_before[payment_id] - new_remaining
+            emptied_at = checkpoint + spent_so_far if new_remaining == pendulum.duration() else None
+            db.query(
+                tx.conn,
+                '''
+                UPDATE payments
+                SET    credit_remaining = %(remaining)s,
+                       expires_at       = COALESCE(%(emptied_at)s, expires_at)
+                WHERE  id = %(payment_id)s
+            ''',
+                remaining=new_remaining,
+                emptied_at=emptied_at,
+                payment_id=payment_id,
+            )
+
+        # If the credits ran out partway through this span, the checkpoint is the instant they ran out, not
+        # `now`: the account's expiry is derived as checkpoint + what remains, so with nothing remaining and
+        # a checkpoint of `now` it would walk forward by an interval on every pass and hand out free time.
+        checkpoint_next = checkpoint + drained.spent if drained.exhausted else now
+        db.query(
+            tx.conn,
+            'UPDATE users SET credits_drained_through = %(at)s WHERE id = %(user_id)s',
+            at=checkpoint_next,
+            user_id=user_id,
+        )
+        _update_user_expiry_grace_and_renew_flag_from_payment_list(tx, master_pkey)
+
+        # Stop visiting an account with nothing left to charge — but only AFTER the refresh above, which
+        # needs the checkpoint to date the entitlement the credits just finished providing.
+        db.query(
+            tx.conn,
+            '''
+            UPDATE users SET credits_drained_through = NULL
+            WHERE  id = %(user_id)s
+              AND  NOT EXISTS (SELECT 1 FROM payments
+                               WHERE user_id = %(user_id)s AND revoked_at IS NULL
+                                 AND credit_remaining > '0'::interval)
+        ''',
+            user_id=user_id,
+        )
+
+    return visited
 
 
 def make_generate_pro_proof_message(

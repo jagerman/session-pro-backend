@@ -31,6 +31,8 @@ import time
 import traceback
 import typing
 
+import pendulum
+
 import base
 import backend
 import config
@@ -47,6 +49,13 @@ PRUNE_INTERVAL_S = 600  # ~10 min; a no-op prune is a cheap indexed empty scan
 # how soon a notification we failed to accept gets applied. A poll that finds nothing is one empty API
 # call, so the interval is cheap; see catchup_on_missed_notifications for the window it asks for.
 APPLE_CATCHUP_INTERVAL_S = 300  # 5 min
+
+# The credit drain is scheduled twice over. The TASK runs often, so the accounts that come due are spread
+# thinly across the day instead of landing in one spike; each ACCOUNT is visited only once its own
+# checkpoint is a day old. Neither number affects what gets charged — the charge is the span since that
+# account's checkpoint — so this is purely how the write load is shaped.
+CREDIT_DRAIN_INTERVAL_S = 120  # 2 min
+CREDIT_DRAIN_STALE_AFTER: pendulum.Duration = 1 * base.DAY
 
 
 @dataclasses.dataclass
@@ -83,6 +92,14 @@ def _prune() -> None:
                 log.error(f'Prune of {name} failed:\n{traceback.format_exc()}')
                 counts.append(f'{name}=FAILED')
     log.info(f'Pruned expired rows ({", ".join(counts)})')
+
+
+def _drain_credits() -> None:
+    now = base.utc_now()
+    with db.connection() as conn:
+        visited = backend.drain_due_credits(conn, now=now, stale_after=CREDIT_DRAIN_STALE_AFTER)
+    if visited:
+        log.info(f'Drained credits for {visited} account(s)')
 
 
 def loop(tasks: list[Task], stop: threading.Event) -> None:
@@ -127,7 +144,10 @@ def run() -> None:
     base.PROVIDER_TESTING_ENV = parsed.provider_testing_env
     base.PROVIDER_DRY_RUN = parsed.provider_dry_run
 
-    tasks: list[Task] = [Task(name='prune', interval_s=PRUNE_INTERVAL_S, run=_prune)]
+    tasks: list[Task] = [
+        Task(name='prune', interval_s=PRUNE_INTERVAL_S, run=_prune),
+        Task(name='credit-drain', interval_s=CREDIT_DRAIN_INTERVAL_S, run=_drain_credits),
+    ]
 
     if parsed.with_provider_app_store:
         # Import and construct the Apple provider only if enabled — zero footprint when disabled. `core`

@@ -131,7 +131,13 @@ def mint_payment(
         case _:
             raise base.FailError(f'Cannot mint a payment for payment provider: {provider}')
 
-    expires_at: pendulum.DateTime = now + (duration if duration is not None else PLAN_DEFAULT_DURATION[plan])
+    # A minted payment is a CREDIT: it carries a length rather than an absolute paid-through instant, so it
+    # stacks on top of whatever the account is already covered by instead of running in parallel with it and
+    # being absorbed by the max the entitlement fold takes. `expires_at` is the receipt figure — what this
+    # length is worth if nothing else covers the account — while `credit_remaining` is what the fold and the
+    # drain actually work from.
+    length: pendulum.Duration = duration if duration is not None else PLAN_DEFAULT_DURATION[plan]
+    expires_at: pendulum.DateTime = now + length
 
     err = base.ErrorSink()
     backend.add_unredeemed_payment(
@@ -143,6 +149,7 @@ def mint_payment(
         platform_refund_expires_at=base.EPOCH,
         platform_obfuscated_account_id=platform_obfuscated_account_id,
         err=err,
+        credit_remaining=length,
     )
     if err.has():
         raise base.ServerError(f'Failed to mint payment: {err.build()}')

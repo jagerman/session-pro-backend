@@ -45,6 +45,7 @@ import cli
 import config
 import maintenance
 import migrations
+import minting
 import server
 from providers import app_store
 import db
@@ -315,6 +316,86 @@ def test_apple_catchup_isolates_a_bad_notification(monkeypatch, pg_database):
         app_store.catchup_on_missed_notifications(core=core, sql_conn=conn, now=later)
         assert base.datetime_from_unix_ms(requested[1].startDate) == at - app_store.NOTIFICATION_HISTORY_OVERLAP
     pool.close()
+
+
+def test_drain_credits():
+    # The pure half of credit consumption: spend a budget of uncovered time across live credits, oldest
+    # first. No clock, no DB, so every shape can be enumerated cheaply -- including the ones that only
+    # arise after an outage (a budget far larger than the credits) or a clock stepping backwards.
+    def credits(*amounts: pendulum.Duration) -> list[backend.CreditToDrain]:
+        return [backend.CreditToDrain(payment_id=i, remaining=a) for i, a in enumerate(amounts, start=1)]
+
+    D = base.DAY
+    ZERO = pendulum.duration()
+
+    # (name, credits, budget, expected updated rows, expected spent, expected exhausted)
+    cases = [
+        ('nothing to charge', credits(30 * D), ZERO, [], ZERO, False),
+        # The caller clamps, but a checkpoint ahead of `now` (clock step, a future-dated pass) must never
+        # hand length BACK to a credit.
+        ('negative budget is inert', credits(30 * D), -5 * D, [], ZERO, False),
+        ('no credits at all', [], 5 * D, [], ZERO, False),
+        ('partial charge', credits(30 * D), 5 * D, [(1, 25 * D)], 5 * D, False),
+        ('charged exactly empty', credits(30 * D), 30 * D, [(1, ZERO)], 30 * D, False),
+        ('budget outruns the only credit', credits(30 * D), 45 * D, [(1, ZERO)], 30 * D, True),
+        # Oldest-first: the first credit absorbs everything it can before the next is touched at all.
+        (
+            'spills into the second only',
+            credits(10 * D, 30 * D, 30 * D),
+            25 * D,
+            [(1, ZERO), (2, 15 * D)],
+            25 * D,
+            False,
+        ),
+        ('untouched credits are not reported', credits(30 * D, 30 * D, 30 * D), 5 * D, [(1, 25 * D)], 5 * D, False),
+        (
+            'budget outruns all three',
+            credits(10 * D, 10 * D, 10 * D),
+            100 * D,
+            [(1, ZERO), (2, ZERO), (3, ZERO)],
+            30 * D,
+            True,
+        ),
+        # A multi-day catch-up after the drain was down: one pass charges the whole elapsed span.
+        ('five-day catch-up', credits(3 * D, 30 * D), 5 * D, [(1, ZERO), (2, 28 * D)], 5 * D, False),
+        # Sub-day credits (the --dev-duration-ms path) are the same arithmetic.
+        (
+            'seconds, not days',
+            credits(base.duration_from_seconds(5), base.duration_from_seconds(30)),
+            base.duration_from_seconds(20),
+            [(1, ZERO), (2, base.duration_from_seconds(15))],
+            base.duration_from_seconds(20),
+            False,
+        ),
+    ]
+
+    for name, cs, budget, want_updated, want_spent, want_exhausted in cases:
+        before_total = sum((c.remaining for c in cs), ZERO)
+        got = backend.drain_credits(cs, budget)
+        assert got.updated == want_updated, name
+        assert got.spent == want_spent, name
+        assert got.exhausted == want_exhausted, name
+
+        # Invariants that must hold for EVERY shape, not just the ones enumerated above:
+        # spend what was asked for or all there is, whichever is less -- never more, never less.
+        assert got.spent == min(max(budget, ZERO), before_total), name
+        # The credits' total falls by exactly what was spent.
+        new_by_id = dict(got.updated)
+        after_total = sum((new_by_id.get(c.payment_id, c.remaining) for c in cs), ZERO)
+        assert after_total == before_total - got.spent, name
+        # No credit is ever driven negative, and none gains length.
+        for c in cs:
+            assert ZERO <= new_by_id.get(c.payment_id, c.remaining) <= c.remaining, name
+        # `exhausted` means precisely "the budget outran the credits", i.e. nothing is left to charge.
+        assert got.exhausted == (after_total == ZERO and got.spent < max(budget, ZERO) and len(cs) > 0), name
+
+    # Draining is idempotent once everything is spent: a second pass over already-empty credits with more
+    # budget reports no writes (there is nothing to update) and charges nothing.
+    empty = credits(ZERO, ZERO)
+    again = backend.drain_credits(empty, 10 * D)
+    assert again.updated == []
+    assert again.spent == ZERO
+    assert again.exhausted is True
 
 
 def test_maintenance_loop_runs_due_tasks_and_survives_a_raising_one():
@@ -853,6 +934,472 @@ def test_generate_pro_proof_auto_redeems(pg_database):
         proof_hash = backend.build_proof_message(proof.revocation_tag, proof.rotating_pkey, proof.expires_at)
         backend_key.verify_key.verify(smessage=proof_hash, signature=proof.sig)
         assert not backend.get_unredeemed_payments_list(conn)
+    pool.close()
+
+
+class _CreditFixture:
+    """Scaffolding for the credit scenarios: mint credits, seed store subscriptions, run the drain at a
+    chosen instant, and read back what the account is entitled to.
+
+    Everything takes an explicit instant. The drain's whole contract is "charge the span since this
+    account's checkpoint", so being able to place mints, lapses, refunds and passes at chosen instants is
+    what makes the scenarios expressible at all -- and it means none of them depend on the wall clock.
+    """
+
+    def __init__(self, conn, now: pendulum.DateTime):
+        self.conn = conn
+        self.master_key = nacl.signing.SigningKey.generate()
+        self.pkey = self.master_key.verify_key
+        self.now = now
+
+    def mint(self, length: pendulum.Duration, at: pendulum.DateTime | None = None) -> int:
+        """Grant a credit of `length`, claimed immediately (the CLI voucher path). Returns its payment id."""
+        with db.transaction(self.conn) as tx:
+            minted = minting.mint_payment(
+                tx,
+                master_pkey=self.pkey,
+                provider=base.PaymentProvider.Rangeproof,
+                plan=base.ProPlan.OneMonth,
+                now=at if at is not None else self.now,
+                duration=length,
+            )
+        assert minted.redeemed
+        return self.payment_id_of(minted.payment_tx.rangeproof_order_id)
+
+    def payment_id_of(self, rangeproof_order_id: str) -> int:
+        return db.query_scalar(
+            self.conn, 'SELECT payment_id FROM rangeproof_payment_details WHERE order_id = %s', rangeproof_order_id
+        )
+
+    def subscribe(
+        self,
+        expires_at: pendulum.DateTime,
+        purchased_at: pendulum.DateTime | None = None,
+        auto_renewing: bool = True,
+        grace: pendulum.Duration | None = None,
+    ) -> base.PaymentProviderTransaction:
+        """Seed a store subscription (Google) and claim it, as the mule + a client request would."""
+        tx_ids = base.PaymentProviderTransaction()
+        tx_ids.provider = base.PaymentProvider.GooglePlayStore
+        tx_ids.google_payment_token = os.urandom(backend.BLAKE2B_DIGEST_SIZE).hex()
+        tx_ids.google_order_id = 'DEV.' + os.urandom(backend.BLAKE2B_DIGEST_SIZE).hex()
+        err = base.ErrorSink()
+        purchased = purchased_at if purchased_at is not None else self.now
+        backend.add_unredeemed_payment(
+            self.conn,
+            payment_tx=tx_ids,
+            plan=base.ProPlan.OneMonth,
+            purchased_at=purchased,
+            expires_at=expires_at,
+            platform_refund_expires_at=base.EPOCH,
+            platform_obfuscated_account_id=bytes(self.pkey),
+            err=err,
+        )
+        assert not err.msg_list, err.msg_list
+        assert backend.reconcile_pending_payments(self.conn, self.pkey, redeemed_at=purchased) >= 1
+        if not auto_renewing or grace is not None:
+            with db.transaction(self.conn) as tx:
+                backend.update_payment_renewal_info(
+                    tx, payment_tx=tx_ids, grace_period=grace, auto_renewing=None if auto_renewing else False, err=err
+                )
+            assert not err.msg_list, err.msg_list
+        return tx_ids
+
+    def drain(self, at: pendulum.DateTime, stale_after: pendulum.Duration | None = None) -> int:
+        """Run one drain pass as of `at`. `stale_after` defaults to zero so a scenario can place passes
+        wherever it likes rather than having to wait out the production staleness threshold."""
+        return backend.drain_due_credits(
+            self.conn, now=at, stale_after=stale_after if stale_after is not None else pendulum.duration()
+        )
+
+    def expiry(self) -> pendulum.DateTime:
+        return backend.get_user(self.conn, self.pkey).expires_at
+
+    def checkpoint(self) -> pendulum.DateTime | None:
+        return db.query_scalar(
+            self.conn, 'SELECT credits_drained_through FROM users WHERE master_pkey = %s', bytes(self.pkey)
+        )
+
+    def remaining(self, payment_id: int) -> pendulum.Duration:
+        return db.query_scalar(self.conn, 'SELECT credit_remaining FROM payments WHERE id = %s', payment_id)
+
+    def total_remaining(self) -> pendulum.Duration:
+        return db.query_scalar(
+            self.conn,
+            '''SELECT COALESCE(SUM(credit_remaining), '0'::interval) FROM payments p JOIN users u ON u.id = p.user_id
+               WHERE u.master_pkey = %s AND p.revoked_at IS NULL''',
+            bytes(self.pkey),
+        )
+
+
+def test_credit_stacks_on_nothing(pg_database):
+    # A credit granted to an account with no coverage is worth exactly its length, from the grant -- the
+    # behaviour that already existed, and the one case the old `now + duration` insert got right.
+    pool = backend.bootstrap_db(database_url=pg_database())
+    assert pool
+    with db.connection() as conn:
+        T = base.round_datetime_to_next_day(base.utc_now())
+        f = _CreditFixture(conn, T)
+        f.mint(30 * base.DAY)
+        assert f.expiry() == T + 30 * base.DAY
+        assert f.checkpoint() == T
+    pool.close()
+
+
+def test_credit_stacks_on_a_live_subscription(pg_database):
+    # The bug this whole mechanism exists for: a credit granted to a covered account used to lose the max
+    # and be silently absorbed. It must sit on TOP of the subscription's coverage.
+    pool = backend.bootstrap_db(database_url=pg_database())
+    assert pool
+    with db.connection() as conn:
+        T = base.round_datetime_to_next_day(base.utc_now())
+        f = _CreditFixture(conn, T)
+        f.subscribe(expires_at=T + 30 * base.DAY)
+        assert f.expiry() == T + 30 * base.DAY
+        f.mint(365 * base.DAY)
+        assert f.expiry() == T + 30 * base.DAY + 365 * base.DAY
+    pool.close()
+
+
+def test_credit_is_not_drained_or_absorbed_while_a_subscription_covers(pg_database):
+    # A short credit under a renewing subscription is the sharpest version: month after month of coverage
+    # marches past it, and it must still be worth a full month whenever the subscription finally stops.
+    pool = backend.bootstrap_db(database_url=pg_database())
+    assert pool
+    with db.connection() as conn:
+        T = base.round_datetime_to_next_day(base.utc_now())
+        f = _CreditFixture(conn, T)
+        f.subscribe(expires_at=T + 30 * base.DAY)
+        credit = f.mint(30 * base.DAY)
+
+        # Renewal cycles, each drained through while covered: nothing is charged, but the checkpoint keeps
+        # advancing (otherwise the covered span would be charged later, once coverage ends).
+        f.subscribe(expires_at=T + 60 * base.DAY, purchased_at=T + 30 * base.DAY)
+        assert f.drain(at=T + 31 * base.DAY) == 1
+        assert f.remaining(credit) == 30 * base.DAY
+        assert f.checkpoint() == T + 31 * base.DAY
+
+        f.subscribe(expires_at=T + 90 * base.DAY, purchased_at=T + 60 * base.DAY)
+        assert f.drain(at=T + 61 * base.DAY) == 1
+        assert f.remaining(credit) == 30 * base.DAY
+
+        # Still a full month, now stacked on the latest coverage rather than on the term it was granted in.
+        assert f.expiry() == T + 90 * base.DAY + 30 * base.DAY
+    pool.close()
+
+
+def test_three_credits_stack_with_and_without_a_subscription(pg_database):
+    # Several live credits sum rather than run concurrently -- the case a plain max over expiries collapses
+    # to one credit's worth.
+    pool = backend.bootstrap_db(database_url=pg_database())
+    assert pool
+    with db.connection() as conn:
+        T = base.round_datetime_to_next_day(base.utc_now())
+        f = _CreditFixture(conn, T)
+        f.subscribe(expires_at=T + 30 * base.DAY)
+        for _ in range(3):
+            f.mint(30 * base.DAY)
+        assert f.expiry() == T + 30 * base.DAY + 90 * base.DAY
+
+        # And with no subscription at all, three credits are still worth their sum, consumed one at a time.
+        g = _CreditFixture(conn, T)
+        ids = [g.mint(30 * base.DAY) for _ in range(3)]
+        assert g.expiry() == T + 90 * base.DAY
+        # 45 days of uncovered time empties the first and takes half the second; the third is untouched.
+        # Two accounts exist in this database and both are due, so a single pass visits both -- the drain is
+        # not per-account-per-pass.
+        assert g.drain(at=T + 45 * base.DAY) == 2
+        assert g.remaining(ids[0]) == pendulum.duration()
+        assert g.remaining(ids[1]) == 15 * base.DAY
+        assert g.remaining(ids[2]) == 30 * base.DAY
+        # The account's expiry has not moved: the credits were consumed by exactly the time that elapsed.
+        assert g.expiry() == T + 90 * base.DAY
+    pool.close()
+
+
+def test_credit_only_account_actually_drains(pg_database):
+    # The trap: computing "is this account covered?" from users.expires_at would see the credit's own
+    # remaining length, report the account as covered, and protect the credit from ever being charged.
+    pool = backend.bootstrap_db(database_url=pg_database())
+    assert pool
+    with db.connection() as conn:
+        T = base.round_datetime_to_next_day(base.utc_now())
+        f = _CreditFixture(conn, T)
+        credit = f.mint(30 * base.DAY)
+        assert f.expiry() == T + 30 * base.DAY  # so users.expires_at IS in the future
+
+        assert f.drain(at=T + 10 * base.DAY) == 1
+        assert f.remaining(credit) == 20 * base.DAY
+        assert f.expiry() == T + 30 * base.DAY  # unmoved: 10 days elapsed, 10 days charged
+    pool.close()
+
+
+def test_credit_exhaustion_does_not_slide(pg_database):
+    # Once the length is gone the account's expiry is the instant it ran out -- not `now`, which would walk
+    # forward on every pass and hand out free entitlement forever.
+    pool = backend.bootstrap_db(database_url=pg_database())
+    assert pool
+    with db.connection() as conn:
+        T = base.round_datetime_to_next_day(base.utc_now())
+        f = _CreditFixture(conn, T)
+        credit = f.mint(30 * base.DAY)
+
+        # A pass long after the credit ran out charges only what was there.
+        assert f.drain(at=T + 100 * base.DAY) == 1
+        assert f.remaining(credit) == pendulum.duration()
+        assert f.expiry() == T + 30 * base.DAY
+        # Nothing left to visit, so the account leaves the drain's due-set.
+        assert f.checkpoint() is None
+
+        # Further passes cannot move it, however late they run.
+        assert f.drain(at=T + 400 * base.DAY) == 0
+        assert f.expiry() == T + 30 * base.DAY
+    pool.close()
+
+
+def test_credit_multi_day_catchup_and_clock_skew(pg_database):
+    # A pass that runs late charges the whole elapsed span in one go (the charge is the span since the
+    # checkpoint, never an assumed interval), and one that runs with a checkpoint ahead of it charges
+    # nothing rather than handing length back.
+    pool = backend.bootstrap_db(database_url=pg_database())
+    assert pool
+    with db.connection() as conn:
+        T = base.round_datetime_to_next_day(base.utc_now())
+        f = _CreditFixture(conn, T)
+        a = f.mint(3 * base.DAY)
+        b = f.mint(30 * base.DAY)
+
+        # Down for five days: one pass charges five days, spilling from the first credit into the second.
+        assert f.drain(at=T + 5 * base.DAY) == 1
+        assert f.remaining(a) == pendulum.duration()
+        assert f.remaining(b) == 28 * base.DAY
+        assert f.total_remaining() == 28 * base.DAY
+
+        # A pass dated BEFORE the checkpoint (clock stepped back) is inert.
+        before = f.total_remaining()
+        assert f.drain(at=T + 2 * base.DAY) == 0  # not even due: checkpoint is ahead of `now`
+        assert f.total_remaining() == before
+    pool.close()
+
+
+def test_credit_stale_after_gates_which_accounts_are_visited(pg_database):
+    # The per-account threshold only decides WHEN an account is visited, never what it is charged.
+    pool = backend.bootstrap_db(database_url=pg_database())
+    assert pool
+    with db.connection() as conn:
+        T = base.round_datetime_to_next_day(base.utc_now())
+        f = _CreditFixture(conn, T)
+        credit = f.mint(30 * base.DAY)
+
+        # Half a day in, with a one-day threshold: not yet due, nothing charged.
+        assert f.drain(at=T + 12 * base.HOUR, stale_after=base.DAY) == 0
+        assert f.remaining(credit) == 30 * base.DAY
+
+        # Two days in: due, and charged for the full two days -- not for one.
+        assert f.drain(at=T + 2 * base.DAY, stale_after=base.DAY) == 1
+        assert f.remaining(credit) == 28 * base.DAY
+    pool.close()
+
+
+def test_credit_granted_while_covered_drains_only_after_the_lapse(pg_database):
+    # The transition: a credit protected by a subscription starts being consumed when that coverage ends,
+    # so its length is delivered rather than partly overlapping the term it was granted in.
+    pool = backend.bootstrap_db(database_url=pg_database())
+    assert pool
+    with db.connection() as conn:
+        T = base.round_datetime_to_next_day(base.utc_now())
+        f = _CreditFixture(conn, T)
+        f.subscribe(expires_at=T + 30 * base.DAY, auto_renewing=False)  # cancelled: covers to term end
+        credit = f.mint(10 * base.DAY)
+        assert f.expiry() == T + 40 * base.DAY
+
+        # Passes at the production cadence, straddling the lapse at T+30d.
+        for day in range(1, 36):
+            assert f.drain(at=T + day * base.DAY) == 1
+
+        # 5 days of genuinely uncovered time elapsed (T+30d..T+35d), and 6 were charged. The extra day is
+        # the sampled-coverage slop: the pass dated exactly T+30d finds the term already over and charges
+        # the whole day it covers, including the covered part. Bounded by one interval, and only ever at a
+        # real coverage transition -- a renewal is not one, since expiry moves before the old term lapses.
+        assert f.remaining(credit) == 4 * base.DAY
+        assert f.expiry() == T + 39 * base.DAY
+    pool.close()
+
+
+def test_credit_sampled_coverage_charges_a_whole_late_span(pg_database):
+    # The other half of that trade, pinned deliberately: coverage is sampled once per pass, so if the drain
+    # has not run for a while and the subscription lapsed somewhere inside that span, the WHOLE span is
+    # charged. The error is bounded by however late the pass is, and it is against the account -- if this
+    # ever needs to be exact, the fix is to clip the span at the coverage end, and this test should fail.
+    pool = backend.bootstrap_db(database_url=pg_database())
+    assert pool
+    with db.connection() as conn:
+        T = base.round_datetime_to_next_day(base.utc_now())
+        f = _CreditFixture(conn, T)
+        f.subscribe(expires_at=T + 30 * base.DAY, auto_renewing=False)
+        credit = f.mint(30 * base.DAY)
+
+        # One pass inside the term, then nothing for fifteen days -- the lapse falls in the middle of it.
+        assert f.drain(at=T + 20 * base.DAY) == 1
+        assert f.remaining(credit) == 30 * base.DAY
+        assert f.drain(at=T + 35 * base.DAY) == 1
+        # Only 5 of those 15 days were uncovered, but all 15 are charged.
+        assert f.remaining(credit) == 15 * base.DAY
+    pool.close()
+
+
+def test_credit_dark_gap_charges_nobody_and_a_regrant_restarts_the_clock(pg_database):
+    # Time during which the account had nothing at all is charged to nobody: there is no credit to charge,
+    # and the elapsed span must not be banked against a credit granted later.
+    pool = backend.bootstrap_db(database_url=pg_database())
+    assert pool
+    with db.connection() as conn:
+        T = base.round_datetime_to_next_day(base.utc_now())
+        f = _CreditFixture(conn, T)
+        first = f.mint(10 * base.DAY)
+
+        # Spend it, then go dark for 90 days.
+        assert f.drain(at=T + 10 * base.DAY) == 1
+        assert f.remaining(first) == pendulum.duration()
+        assert f.checkpoint() is None
+        assert f.drain(at=T + 100 * base.DAY) == 0  # nothing to visit while dark
+
+        # A second credit granted after the dark stretch is worth its full length from the grant: the 90
+        # unentitled days are not charged to it, and the checkpoint restarts rather than resuming.
+        second = f.mint(30 * base.DAY, at=T + 100 * base.DAY)
+        assert f.checkpoint() == T + 100 * base.DAY
+        assert f.expiry() == T + 130 * base.DAY
+        assert f.drain(at=T + 105 * base.DAY) == 1
+        assert f.remaining(second) == 25 * base.DAY
+        assert f.expiry() == T + 130 * base.DAY
+
+        # And a subscription bought later simply takes over as the better coverage.
+        f.subscribe(expires_at=T + 200 * base.DAY, purchased_at=T + 105 * base.DAY)
+        assert f.expiry() == T + 200 * base.DAY + 25 * base.DAY
+    pool.close()
+
+
+def test_credit_expiry_is_unmoved_by_unrelated_recomputes(pg_database):
+    # Why the credit total is anchored on the drain checkpoint rather than on `now`: the account's expiry has
+    # to be a fixed instant. Anything that refreshes the user row between passes -- a payment registered, a
+    # redeem, a revocation elsewhere -- must land on the same answer, not walk it forward by however much of
+    # the interval has elapsed.
+    pool = backend.bootstrap_db(database_url=pg_database())
+    assert pool
+    with db.connection() as conn:
+        T = base.round_datetime_to_next_day(base.utc_now())
+        f = _CreditFixture(conn, T)
+        f.mint(30 * base.DAY)
+        before = f.expiry()
+        assert before == T + 30 * base.DAY
+
+        # Refresh the user row repeatedly at later and later instants, with no drain pass in between.
+        for day in (1, 5, 12):
+            with db.transaction(conn) as tx:
+                backend._update_user_expiry_grace_and_renew_flag_from_payment_list(tx, f.pkey)
+            assert f.expiry() == before, f'expiry moved on a refresh {day} days in'
+            with db.transaction(conn) as tx:
+                backend._ensure_active_generation(tx, f.pkey, issued_at=T + day * base.DAY)
+            assert f.expiry() == before, f'expiry moved on a generation refresh {day} days in'
+    pool.close()
+
+
+def test_credit_survives_a_refund_and_grant_order_is_irrelevant(pg_database):
+    # Refund-then-grant and grant-then-refund must land in the same place: a credit is not charged for the
+    # period a subscription covered, and a refund does not retroactively charge it either (no clawback --
+    # a refunded subscriber has already had that Pro, and that is accepted).
+    pool = backend.bootstrap_db(database_url=pg_database())
+    assert pool
+    with db.connection() as conn:
+        T = base.round_datetime_to_next_day(base.utc_now())
+        REFUND_AT = T + 60 * base.DAY
+        err = base.ErrorSink()
+
+        # Order A: refund lands, THEN the credit is granted.
+        a = _CreditFixture(conn, T)
+        sub_a = a.subscribe(expires_at=T + 365 * base.DAY)
+        with db.transaction(conn) as tx:
+            assert backend.add_google_revocation(
+                tx, google_payment_token=sub_a.google_payment_token, revoke_at=REFUND_AT, err=err
+            )
+        a.mint(365 * base.DAY, at=REFUND_AT)
+
+        # Order B: the credit is granted first, THEN the refund lands.
+        b = _CreditFixture(conn, T)
+        sub_b = b.subscribe(expires_at=T + 365 * base.DAY)
+        b.mint(365 * base.DAY, at=REFUND_AT)
+        with db.transaction(conn) as tx:
+            assert backend.add_google_revocation(
+                tx, google_payment_token=sub_b.google_payment_token, revoke_at=REFUND_AT, err=err
+            )
+        assert not err.msg_list, err.msg_list
+
+        assert a.expiry() == b.expiry()
+        # And that shared answer is the credit's full year from the refund: the two months already consumed
+        # under the refunded subscription are not charged back to it.
+        assert a.expiry() == REFUND_AT + 365 * base.DAY
+    pool.close()
+
+
+def test_revoking_a_credit_drops_exactly_its_remaining(pg_database):
+    # Clawing a credit back removes its remaining length and nothing else -- the rest of the account's
+    # entitlement is untouched.
+    pool = backend.bootstrap_db(database_url=pg_database())
+    assert pool
+    with db.connection() as conn:
+        T = base.round_datetime_to_next_day(base.utc_now())
+        f = _CreditFixture(conn, T)
+        f.subscribe(expires_at=T + 30 * base.DAY)
+        keep = f.mint(10 * base.DAY)
+        claw = f.mint(90 * base.DAY)
+        assert f.expiry() == T + 130 * base.DAY
+
+        with db.transaction(conn) as tx:
+            db.query(tx.conn, 'UPDATE payments SET revoked_at = %s, auto_renewing = FALSE WHERE id = %s', T, claw)
+            backend._update_user_expiry_grace_and_renew_flag_from_payment_list(tx, f.pkey)
+
+        assert f.expiry() == T + 40 * base.DAY
+        assert f.remaining(keep) == 10 * base.DAY
+        # A revoked credit is not charged either: the drain skips it entirely.
+        assert f.drain(at=T + 5 * base.DAY) == 1
+        assert f.remaining(claw) == 90 * base.DAY
+    pool.close()
+
+
+def test_credit_does_not_make_a_subscriber_look_non_renewing(pg_database):
+    # A credit sets the account's expiry but says nothing about renewal: auto_renewing and the grace period
+    # must still describe the live subscription, or a subscriber holding a voucher reads as cancelled.
+    pool = backend.bootstrap_db(database_url=pg_database())
+    assert pool
+    with db.connection() as conn:
+        T = base.round_datetime_to_next_day(base.utc_now())
+        f = _CreditFixture(conn, T)
+        f.subscribe(expires_at=T + 30 * base.DAY, grace=2 * base.DAY)
+        f.mint(365 * base.DAY)
+
+        user = backend.get_user(conn, f.pkey)
+        assert user.auto_renewing is True
+        assert user.grace_period == 2 * base.DAY
+        # Coverage runs to the paid term plus grace, and only then does the credit's year begin.
+        assert user.expires_at == T + 32 * base.DAY + 365 * base.DAY
+    pool.close()
+
+
+def test_credit_sub_day_length(pg_database):
+    # The --dev-duration-ms path: a credit shorter than the drain interval is the same arithmetic.
+    pool = backend.bootstrap_db(database_url=pg_database())
+    assert pool
+    with db.connection() as conn:
+        T = base.round_datetime_to_next_day(base.utc_now())
+        f = _CreditFixture(conn, T)
+        credit = f.mint(base.duration_from_seconds(30))
+        assert f.expiry() == T + base.duration_from_seconds(30)
+
+        assert f.drain(at=T + base.duration_from_seconds(10)) == 1
+        assert f.remaining(credit) == base.duration_from_seconds(20)
+        assert f.drain(at=T + base.duration_from_seconds(45)) == 1
+        assert f.remaining(credit) == pendulum.duration()
+        assert f.expiry() == T + base.duration_from_seconds(30)
     pool.close()
 
 
