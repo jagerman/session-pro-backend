@@ -190,6 +190,7 @@ def test_apple_grace_period_stores_duration_not_absolute_date(pg_database):
             assert len(payment_list) == 1
             assert payment_list[0].grace_period == base.duration_from_ms(grace_len_ms)
             # and `expiry + grace` resolves to exactly gracePeriodExpiresDate (the absolute instant).
+            assert payment_list[0].expiry_at is not None
             assert payment_list[0].expiry_at + payment_list[0].grace_period == base.datetime_from_unix_ms(
                 renewal_info.gracePeriodExpiresDate
             )

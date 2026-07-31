@@ -716,7 +716,8 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
     # NOTE: Grab the latest expiring payment so that we have access to the payment details
     last_payment = backend.PaymentRow()
     for payment_it in backend.get_payments_list(db_conn):
-        if payment_it.expiry_at > last_payment.expiry_at:
+        assert payment_it.expiry_at is not None  # store payments only in this flow
+        if last_payment.expiry_at is None or payment_it.expiry_at > last_payment.expiry_at:
             last_payment = payment_it
 
     # NOTE: Add a grace period

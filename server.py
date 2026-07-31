@@ -260,7 +260,7 @@ def _payment_item_wire(
         'payment_provider': payment.payment_provider.value,
         'auto_renewing': payment.auto_renewing,
         'purchased_ts': base.unix_seconds_float_from_datetime(payment.purchased_at),
-        'expiry_ts': base.unix_seconds_from_datetime(payment.expiry_at),
+        'expiry_ts': base.unix_seconds_from_datetime(payment.expiry_at) if payment.expiry_at else 0,
         'grace_period_duration': (
             base.seconds_from_duration(payment.grace_period) if payment.grace_period is not None else 0
         ),

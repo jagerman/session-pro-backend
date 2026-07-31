@@ -31,7 +31,9 @@ class MintedPayment:
     # holder's next authenticated request.
     payment_id: str = ''
     plan: base.ProPlan = base.ProPlan.Nil
-    expiry_at: pendulum.DateTime = base.EPOCH
+    # The account's entitlement end after this grant, which is what an operator wants to see. None when
+    # the payment was left unclaimed, since an unclaimed payment entitles nobody yet.
+    account_expiry_at: pendulum.DateTime | None = None
     redeemed: bool = False
 
 
@@ -133,18 +135,16 @@ def mint_payment(
 
     # A minted payment is a CREDIT: it carries a length rather than an absolute paid-through instant, so it
     # stacks on top of whatever the account is already covered by instead of running in parallel with it and
-    # being absorbed by the max the entitlement fold takes. `expiry_at` is the receipt figure — what this
-    # length is worth if nothing else covers the account — while `credit_remaining` is what the fold and the
-    # drain actually work from.
+    # being absorbed by the max the entitlement fold takes. It gets no `expiry_at` at all until the drain
+    # latches one: where its coverage ends depends on what else covers the account between now and then.
     length: pendulum.Duration = duration if duration is not None else PLAN_DEFAULT_DURATION[plan]
-    expiry_at: pendulum.DateTime = now + length
 
     err = base.ErrorSink()
     backend.add_unredeemed_payment(
         tx,
         payment_tx=payment_tx,
         plan=plan,
-        expiry_at=expiry_at,
+        expiry_at=None,
         purchased_at=now,
         platform_refund_expiry_at=base.EPOCH,
         platform_obfuscated_account_id=platform_obfuscated_account_id,
@@ -167,7 +167,6 @@ def mint_payment(
             stf_order_id=payment_tx.stf_order_id,
         ),
         plan=plan,
-        expiry_at=expiry_at,
     )
 
     if redeem:
@@ -178,5 +177,8 @@ def mint_payment(
         # purchase-acknowledgement to the mule, so redeeming here never reaches a store.
         backend.redeem_minted_payment(tx, master_pkey, payment_tx, backend.to_redeemed_at(now))
         result.redeemed = True
+        # Read the account's entitlement end back rather than predicting it: a credit stacks on whatever
+        # coverage is already there, so the answer depends on the account, not on the length granted.
+        result.account_expiry_at = backend.get_user(tx.conn, master_pkey).expiry_at
 
     return result

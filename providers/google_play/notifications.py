@@ -835,6 +835,9 @@ def handle_subscription_notification(
 
                 if not err.has():
                     assert payment is not None
+                    # A store subscription always states its expiry; only a live credit leaves it open, and
+                    # Google never issues one.
+                    assert payment.expiry_at is not None
                     rounded_expiry_at = backend.round_datetime_to_next_day_with_provider_testing_support(
                         payment_provider=tx_payment.provider, at=payment.expiry_at
                     )

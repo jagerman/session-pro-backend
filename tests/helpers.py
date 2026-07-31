@@ -135,18 +135,29 @@ def _redeem_and_prove(conn, backend_key, master_key, rotating_key, request_at):
     )
 
 
+def _grant_voucher(conn, master_key, at, duration, plan=None):
+    """Mint an out-of-band credit for `master_key`, claimed on the spot -- the CLI voucher path. The only
+    way to create a payment no store witnessed, so a test cannot accidentally exercise a shape production
+    can no longer produce."""
+    with db.transaction(conn) as tx:
+        minting.mint_payment(
+            tx,
+            master_pkey=master_key.verify_key,
+            provider=base.PaymentProvider.SessionFoundation,
+            plan=plan if plan is not None else base.ProPlan.OneMonth,
+            now=at,
+            duration=duration,
+        )
+
+
 def _grant_and_get_offset(conn, backend_key, master_key, rotating_key, granted_at, expiry_at, plan=None):
-    """Grant a voucher entitlement ending at `expiry_at` and return the account's proof-expiry offset."""
-    backend.grant_voucher(
-        conn,
-        master_pkey=master_key.verify_key,
-        rotating_pkey=rotating_key.verify_key,
-        signing_key=backend_key,
-        request_at=granted_at,
-        redeemed_at=granted_at,
-        plan=plan if plan is not None else base.ProPlan.OneMonth,
-        expiry_at=expiry_at,
-    )
+    """Grant a voucher long enough to run to `expiry_at` and return the account's proof-expiry offset.
+
+    `granted_at` must be a UTC day boundary for the entitlement to end exactly at `expiry_at`: a credit is
+    anchored at its day-rounded redemption instant, so granting at any other time of day runs the
+    entitlement to the following midnight plus the length. Callers that assert on the resulting expiry need
+    `base.round_datetime_to_next_day` first; callers that only read the offset back do not care."""
+    _grant_voucher(conn, master_key, at=granted_at, duration=expiry_at - granted_at, plan=plan)
     return backend.get_user(conn, master_key.verify_key).proof_expiry_offset
 
 

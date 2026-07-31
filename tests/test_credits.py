@@ -7,12 +7,14 @@ import nacl.signing
 import nacl.bindings
 import nacl.public
 import pendulum
+import psycopg
+import pytest
 import backend
 import base
 import minting
 import db
 
-from tests.helpers import _redeem_and_prove, _CreditFixture
+from tests.helpers import _grant_voucher, _redeem_and_prove, _CreditFixture
 
 
 def test_credit_stacks_on_nothing(pg_database):
@@ -26,6 +28,59 @@ def test_credit_stacks_on_nothing(pg_database):
         f.mint(30 * base.DAY)
         assert f.expiry() == T + 30 * base.DAY
         assert f.checkpoint() == T
+    pool.close()
+
+
+def test_live_credit_has_no_expiry_until_it_runs_out(pg_database):
+    # A credit's coverage end is not knowable while it still has length: it depends on what else covers the
+    # account between now and then. So the column says NULL rather than a projection, and the drain latches
+    # the real instant when the length is spent.
+    pool = backend.bootstrap_db(database_url=pg_database())
+    assert pool
+    with db.connection() as conn:
+        T = base.round_datetime_to_next_day(base.utc_now())
+        f = _CreditFixture(conn, T)
+        credit = f.mint(30 * base.DAY)
+
+        def stored_expiry(payment_id: int) -> pendulum.DateTime | None:
+            return db.query_scalar(conn, 'SELECT expiry_at FROM payments WHERE id = %s', payment_id)
+
+        assert stored_expiry(credit) is None
+
+        # Spend it with nothing else covering the account: the latched instant is exactly where the length
+        # ran out, and it is what the account's expiry then rests on.
+        assert f.drain(at=T + 40 * base.DAY) == 1
+        assert f.remaining(credit) == pendulum.duration()
+        assert stored_expiry(credit) == T + 30 * base.DAY
+        assert f.expiry() == T + 30 * base.DAY
+
+        # A credit held under a subscription stays open however many passes go by: nothing has determined
+        # where its coverage ends.
+        g = _CreditFixture(conn, T)
+        g.subscribe(expiry_at=T + 365 * base.DAY)
+        protected = g.mint(30 * base.DAY)
+        for day in (1, 30, 200):
+            assert g.drain(at=T + day * base.DAY) >= 1
+        assert stored_expiry(protected) is None
+        assert g.remaining(protected) == 30 * base.DAY
+    pool.close()
+
+
+def test_every_payment_states_an_end(pg_database):
+    # The constraint behind the nullable expiry: a payment says where its coverage ends either as a fixed
+    # instant or as a remaining length. Neither is a row nothing can reason about.
+    pool = backend.bootstrap_db(database_url=pg_database())
+    assert pool
+    with db.connection() as conn:
+        with pytest.raises(psycopg.errors.CheckViolation):
+            with db.transaction(conn) as tx:
+                db.query(
+                    tx.conn,
+                    '''INSERT INTO payments (plan, payment_provider, purchased_at, platform_refund_expiry_at)
+                       VALUES ('1m', 'stf', %s, %s)''',
+                    base.utc_now(),
+                    base.EPOCH,
+                )
     pool.close()
 
 
@@ -321,10 +376,12 @@ def test_credit_expiry_obfuscation_is_not_perturbed_by_draining(pg_database):
         later = _redeem_and_prove(conn, backend_key, f.master_key, rotating_key, T + 3 * base.DAY)
         assert later.expiry_at == first.expiry_at
 
-        # The published expiry is the grid point at or after the true one, never the true instant itself
-        # unless the account's grid happens to land there.
+        # The published expiry is a grid point at or after the account's, never its exact instant unless the
+        # grid happens to land there. It can sit up to the renewal lead plus one whole grid period past it:
+        # that is the over-provision, not slack in this assertion.
+        shape = base.proof_expiry_shape()
         assert first.expiry_at >= expiry_before
-        assert first.expiry_at - expiry_before < base.DAY
+        assert first.expiry_at - expiry_before <= shape.renewal_lead + shape.grid
     pool.close()
 
 
@@ -482,16 +539,8 @@ def test_grant_voucher(pg_database):
 
     with db.connection() as conn:
         assert not backend.get_user(conn, master_key.verify_key).found
-        proof = backend.grant_voucher(
-            conn,
-            master_pkey=master_key.verify_key,
-            rotating_pkey=rotating_key.verify_key,
-            signing_key=backend_key,
-            request_at=now,
-            redeemed_at=now,
-            plan=base.ProPlan.OneMonth,
-            expiry_at=now + 30 * base.DAY,
-        )
+        _grant_voucher(conn, master_key, at=now, duration=30 * base.DAY)
+        proof = _redeem_and_prove(conn, backend_key, master_key, rotating_key, now)
         # The proof verifies against the backend key, and the key is now an entitled user.
         proof_hash = backend.build_proof_message(proof.revocation_tag, proof.rotating_pkey, proof.expiry_at)
         backend_key.verify_key.verify(smessage=proof_hash, signature=proof.sig)

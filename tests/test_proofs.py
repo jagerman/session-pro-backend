@@ -16,7 +16,7 @@ import backend
 import base
 import db
 
-from tests.helpers import TestingContext, _grant_and_get_offset, _prove_at
+from tests.helpers import _grant_voucher, _redeem_and_prove, TestingContext, _grant_and_get_offset, _prove_at
 
 
 def test_proof_reports_account_expiry(pg_database):
@@ -32,16 +32,8 @@ def test_proof_reports_account_expiry(pg_database):
     account_expiry = now + 365 * base.DAY
 
     with db.connection() as conn:
-        proof = backend.grant_voucher(
-            conn,
-            master_pkey=master_key.verify_key,
-            rotating_pkey=rotating_key.verify_key,
-            signing_key=backend_key,
-            request_at=now,
-            redeemed_at=now,
-            plan=base.ProPlan.TwelveMonth,
-            expiry_at=account_expiry,
-        )
+        _grant_voucher(conn, master_key, at=now, duration=account_expiry - now, plan=base.ProPlan.TwelveMonth)
+        proof = _redeem_and_prove(conn, backend_key, master_key, rotating_key, now)
         # Proof validity rides the rolling clamp (~30 days); the account entitlement runs the full year, so
         # account_expiry_ts is the TRUE expiry exactly -- max() only ever reads back the proof's own expiry
         # in the closing window where the over-provision overtakes the true end, which is nowhere near here.
@@ -77,16 +69,7 @@ def test_expired_proof_fail_carries_account_expiry(pg_database):
 
     with db.connection() as conn:
         # Grant a short entitlement (valid at grant time).
-        backend.grant_voucher(
-            conn,
-            master_pkey=master_key.verify_key,
-            rotating_pkey=rotating_key.verify_key,
-            signing_key=backend_key,
-            request_at=granted_at,
-            redeemed_at=granted_at,
-            plan=base.ProPlan.OneMonth,
-            expiry_at=account_expiry,
-        )
+        _grant_voucher(conn, master_key, at=granted_at, duration=account_expiry - granted_at)
         # Ask for a proof from after the entitlement AND its proof over-provision are spent (the offset
         # buys up to a day past the true expiry, so an hour later is not yet lapsed as far as proofs go --
         # see test_lapsed_account_keeps_proofs_through_the_over_provision) -> subscription_expired, with the
@@ -223,16 +206,7 @@ def test_proof_expiry_offset_redraws_only_when_true_expiry_moves(monkeypatch, pg
         assert backend.get_user(conn, master_key.verify_key).proof_expiry_offset == offset
 
         # A new payment that extends the entitlement moves the true expiry -> new cycle, new offset.
-        backend.grant_voucher(
-            conn,
-            master_pkey=master_key.verify_key,
-            rotating_pkey=rotating_key.verify_key,
-            signing_key=backend_key,
-            request_at=now,
-            redeemed_at=now,
-            plan=base.ProPlan.OneMonth,
-            expiry_at=now + 60 * base.DAY,
-        )
+        _grant_voucher(conn, master_key, at=now, duration=60 * base.DAY)
         assert backend.get_user(conn, master_key.verify_key).proof_expiry_offset != offset
     pool.close()
 
@@ -246,7 +220,11 @@ def test_proof_expiry_lands_on_the_account_grid(pg_database):
     assert pool
     backend_key = nacl.signing.SigningKey.generate()
     rotating_key = nacl.signing.SigningKey.generate()
-    now = base.utc_now()
+    # A day boundary, so that `true_expiry` below is exactly what the pinned arm gets: a credit's clock
+    # starts at its day-rounded redemption instant, so granting at any other time of day would run the
+    # entitlement to the following midnight plus the length, and the assertion would then hold or fail
+    # depending on where the account's random offset fell relative to the time of day.
+    now = base.round_datetime_to_next_day(base.utc_now())
     shape = base.proof_expiry_shape()
 
     with db.connection() as conn:
@@ -297,7 +275,10 @@ def test_lapsed_account_keeps_proofs_through_the_over_provision(pg_database):
     backend_key = nacl.signing.SigningKey.generate()
     master_key = nacl.signing.SigningKey.generate()
     rotating_key = nacl.signing.SigningKey.generate()
-    now = base.utc_now()
+    # A day boundary, because a credit's clock starts at its day-rounded redemption instant (see
+    # to_redeemed_at): granting at an arbitrary time of day would put the account's expiry at the following
+    # midnight plus the length, and this test is about the over-provision, not about that anchoring.
+    now = base.round_datetime_to_next_day(base.utc_now())
     true_expiry = now + pendulum.duration(hours=1)
     shape = base.proof_expiry_shape()
 

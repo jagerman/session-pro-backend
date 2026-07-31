@@ -593,7 +593,7 @@ def cmd_revoke_list(args: argparse.Namespace) -> int:
                         case base.PaymentProvider.SessionFoundation:
                             payment_id = f'{payment.stf_order_id}'
 
-                    if now >= payment.expiry_at:
+                    if payment.expiry_at is not None and now >= payment.expiry_at:
                         continue
 
                     status_label = backend.derive_payment_status(payment, now).name
@@ -602,7 +602,7 @@ def cmd_revoke_list(args: argparse.Namespace) -> int:
                         f'Status={status_label}; '
                         f'Plan={plan_label}; '
                         f'Unredeemed={base.readable(payment.purchased_at)}; '
-                        f'Expiry={base.readable(payment.expiry_at)};'
+                        f'Expiry={base.readable(payment.expiry_at) if payment.expiry_at else "pending"};'
                     )
                     eligible_count += 1
 

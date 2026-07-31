@@ -11,7 +11,6 @@ import logging
 import enum
 import csv
 import io
-import uuid
 
 import base
 import db
@@ -256,7 +255,9 @@ class PaymentRow:
     auto_renewing: bool = False
     purchased_at: pendulum.DateTime = base.EPOCH
     redeemed_at: pendulum.DateTime | None = None
-    expiry_at: pendulum.DateTime = base.EPOCH
+    # None while a live credit's length has not run out: nothing has determined where its coverage ends yet.
+    # Set for every store subscription, and latched by the drain when a credit is spent.
+    expiry_at: pendulum.DateTime | None = None
     grace_period: pendulum.Duration | None = None
     platform_refund_expiry_at: pendulum.DateTime = base.EPOCH
     revoked_at: pendulum.DateTime | None = None
@@ -504,7 +505,7 @@ def derive_payment_status(payment: PaymentRow, now: pendulum.DateTime) -> base.P
     if payment.revoked_at is not None:
         return base.PaymentStatus.Revoked
     assert payment.redeemed_at is not None, 'an unclaimed payment has no status; test redeemed_at IS NULL'
-    if now >= payment.expiry_at:
+    if payment.expiry_at is not None and now >= payment.expiry_at:
         return base.PaymentStatus.Expired
     return base.PaymentStatus.Redeemed
 
@@ -834,7 +835,8 @@ def verify_db(conn: psycopg.Connection, err: base.ErrorSink) -> bool:
 
         if it.revoked_at is None and it.redeemed_at is not None:
             # Redeemed (and not revoked): a redeemed payment must not have expired before it was redeemed.
-            if it.expiry_at < it.redeemed_at:
+            # A live credit has no expiry yet, so there is nothing to compare.
+            if it.expiry_at is not None and it.expiry_at < it.redeemed_at:
                 redeemed_date = it.redeemed_at.strftime('%Y-%m-%d')
                 expiry_date = it.expiry_at.strftime('%Y-%m-%d')
                 err.msg_list.append(
@@ -989,7 +991,7 @@ def revoke_payments_by_id_internal(tx: db.SQLTransaction, rows: typing.Any, revo
         # For different platforms in their testing environments, they have different timespans
         # for a day, for example in Google 1 day is 10s. We handle that explicitly here.
         expiry_at = master_pkey_dict[it]
-        if expiry_at <= revoke_at_next_day:
+        if expiry_at is not None and expiry_at <= revoke_at_next_day:
             continue
 
         # Even when the revoked payment's own proof would outlive the day boundary, a broadcast revocation
@@ -1479,6 +1481,7 @@ def _lookup_user_expiry(tx: db.SQLTransaction, master_pkey: nacl.signing.VerifyK
         # revoked_at set), never a flattened status. Whether a payment has *expired* is a separate,
         # now-relative concern handled downstream (get_pro_status / proof-expiry clamping) — it must
         # not gate what expiry the user is *entitled* to, so no wall-clock enters here.
+        assert expiry_at is not None, 'a row reaching the max has an expiry: live credits are summed above'
         if revoked_at is not None:
             assert not auto_renewing
             payment_expiry_at = revoked_at
@@ -1697,7 +1700,7 @@ def add_unredeemed_payment(
     tx: db.SQLTransaction,
     payment_tx: base.PaymentProviderTransaction,
     plan: base.ProPlan,
-    expiry_at: pendulum.DateTime,
+    expiry_at: pendulum.DateTime | None,
     purchased_at: pendulum.DateTime,
     platform_refund_expiry_at: pendulum.DateTime,
     platform_obfuscated_account_id: bytes | str,
@@ -1721,7 +1724,8 @@ def add_unredeemed_payment(
         payment_tx_label = payment_provider_tx_log_label_safe(payment_tx)
         log.info(
             f'Unredeemed payment (payment={payment_tx_label}, plan={plan.name}, '
-            f'expiry={base.readable(expiry_at)}, unredeemed={base.readable(purchased_at)}, '
+            f'expiry={base.readable(expiry_at) if expiry_at else "on exhaustion"}, '
+            f'unredeemed={base.readable(purchased_at)}, '
             f'refund={base.readable(platform_refund_expiry_at)})'
         )
 
@@ -2378,7 +2382,7 @@ def build_current_entitlement_proof(
     signing_key: nacl.signing.SigningKey,
 ) -> ProSubscriptionProof:
     '''Sign a proof for the user's CURRENT entitlement using their existing generation token (NO roll).
-    Shared by generate_pro_proof and grant_voucher. Raises a FailError with the matching slug when
+    Called by generate_pro_proof. Raises a FailError with the matching slug when
     there is nothing to sign: `not_subscribed` (no user row), `revoked` (current generation revoked),
     `expired` (entitlement lapsed past the clamped proof window).'''
     get_user = get_user_and_payments(tx, master_pkey)
@@ -2468,62 +2472,6 @@ def generate_pro_proof(
         # the client treats as "not yet — retry").
         reconcile_pending_payments(tx, master_pkey, redeemed_at=to_redeemed_at(request_at))
         return build_current_entitlement_proof(tx, master_pkey, rotating_pkey, request_at, signing_key)
-
-
-@db.transactional
-def grant_voucher(
-    tx: db.SQLTransaction,
-    master_pkey: nacl.signing.VerifyKey,
-    rotating_pkey: nacl.signing.VerifyKey,
-    signing_key: nacl.signing.SigningKey,
-    request_at: pendulum.DateTime,
-    redeemed_at: pendulum.DateTime,
-    plan: base.ProPlan,
-    expiry_at: pendulum.DateTime,
-) -> ProSubscriptionProof:
-    """Directly grant a voucher — a Pro payment no store witnessed — to `master_pkey` and return the proof.
-    Admin/CLI only: there is no client-facing voucher flow — a real one-time-use voucher, with a client
-    claim path, is future work. `stf_payment_details.order_id` here is an internal unique row id,
-    not a voucher; we create the payment already redeemed and linked to the key, then build the proof."""
-    order_id = str(uuid.uuid4())
-    err = base.ErrorSink()
-    payment_tx = base.PaymentProviderTransaction()
-    payment_tx.provider = base.PaymentProvider.SessionFoundation
-    payment_tx.stf_order_id = order_id
-    add_unredeemed_payment(
-        tx,
-        payment_tx=payment_tx,
-        plan=plan,
-        expiry_at=expiry_at,
-        purchased_at=redeemed_at,
-        platform_refund_expiry_at=base.EPOCH,
-        platform_obfuscated_account_id=b'',
-        err=err,
-    )
-    if err.has():
-        raise base.ServerError(f'Failed to create stf payment: {err.build()}')
-
-    row_result = db.query(
-        tx.conn,
-        '''
-        UPDATE payments
-        SET    redeemed_at = %(redeemed_at)s
-        WHERE  id IN (SELECT payment_id FROM stf_payment_details WHERE order_id = %(order_id)s)
-          AND  redeemed_at IS NULL AND revoked_at IS NULL
-        RETURNING id
-        ''',
-        redeemed_at=redeemed_at,
-        order_id=order_id,
-    )
-    redeemed_ids = [row[0] for row in row_result.fetchall()]
-    assert len(redeemed_ids) == 1, 'the stf payment we just created must redeem exactly once'
-
-    user_id = get_or_create_user_and_generation(tx, master_pkey, issued_at=redeemed_at)[0]
-    db.query(
-        tx.conn, 'UPDATE payments SET user_id = %(user_id)s WHERE id = ANY(%(ids)s)', user_id=user_id, ids=redeemed_ids
-    )
-    _ensure_active_generation(tx, master_pkey, issued_at=redeemed_at)
-    return build_current_entitlement_proof(tx, master_pkey, rotating_pkey, request_at, signing_key)
 
 
 # Housekeeping deletes, one table each. All are pure storage reclamation: nothing here affects a live
