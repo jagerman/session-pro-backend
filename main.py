@@ -11,19 +11,6 @@ import nacl.signing
 import logging
 import sys
 
-try:
-    from uwsgidecorators import timer
-except ModuleNotFoundError:
-    # uwsgidecorators does `import uwsgi`, which only exists inside a uWSGI runtime. Outside it
-    # (`flask --app main run`, tests, tooling, a bare `import main`) fall back to a no-op decorator:
-    # the periodic prune is a uWSGI worker-1 concern and simply doesn't run in those contexts.
-    def timer(*_args, **_kwargs):  # type: ignore[no-redef]
-        def _decorator(fn):
-            return fn
-
-        return _decorator
-
-
 import base
 import backend
 import config
@@ -32,37 +19,6 @@ import server
 
 log = logging.Logger('PRO')
 webhook_loggers: list[base.AsyncSessionWebhookLogHandler] = []
-
-PRUNE_INTERVAL_S = 600  # ~10 min; a no-op prune is a cheap indexed empty scan
-# Apple's own webhook retries are hours apart (1, 12, 24, 48, 72), so polling this often is what decides
-# how soon a notification we failed to accept gets applied. A poll that finds nothing is one empty API
-# call, so the interval is cheap; see catchup_on_missed_notifications for the window it asks for.
-APPLE_CATCHUP_INTERVAL_S = 300  # 5 min
-
-
-@timer(PRUNE_INTERVAL_S, target='worker1')
-def _periodic_cleanup(signum: int) -> None:
-    # Periodic DB prune (expired revocations / orphaned users / expired notification history). uWSGI
-    # targets this signal at worker 1 ONLY, so exactly one process prunes — no N-worker race, and no
-    # dedicated mule (a mule can't register uWSGI signals). A busy worker just defers the tick; the
-    # prune is idempotent, non-urgent housekeeping, so a delay is harmless.
-    now = base.utc_now()
-    try:
-        with db.connection() as conn:
-            result = backend.expire_payments_revocations_and_users(conn=conn, now=now)
-        if result.success:
-            log.info(
-                'Pruned expired rows (revocations/users/apple/google={}/{}/{}/{})'.format(
-                    result.revocations,
-                    result.users,
-                    result.apple_notification_uuid_history,
-                    result.google_notification_history,
-                )
-            )
-        else:
-            log.error('DB prune failed')
-    except Exception as e:
-        log.error(f'DB prune raised: {e}')
 
 
 def entry_point() -> flask.Flask:
@@ -212,24 +168,11 @@ def entry_point() -> flask.Flask:
             )
             app_store.equip_flask_routes(core, result)
 
-            # NOTE: Recover notifications Apple failed to deliver, on a worker-1 timer. Registered here
-            # rather than as a module-level @timer because it closes over `core`, which exists only when
-            # Apple is enabled. This must NOT run during app load: it makes paginated 30s-timeout calls to
-            # Apple, so on a backlog it would hold up the master's fork — and therefore the whole service
-            # — for as long as it took to drain. As a timer, a slow Apple delays a background tick instead.
-            @timer(APPLE_CATCHUP_INTERVAL_S, target='worker1')
-            def _apple_catchup(signum: int) -> None:
-                try:
-                    with db.connection() as catchup_conn:
-                        app_store.catchup_on_missed_notifications(core=core, sql_conn=catchup_conn)
-                except Exception as e:
-                    log.error(f'Apple notification catch-up raised: {e}', exc_info=True)
-
-        # NOTE: The Google Pub/Sub subscriber is singleton background work — it runs once in the
-        # maintenance mule (providers/google_play/mule.py), not per-worker here. (The periodic DB prune and
-        # the Apple catch-up are also singleton but run on worker 1 via an @timer, since a mule can't
-        # register uWSGI signals.) The Apple notification route is registered above because it's an HTTP
-        # endpoint the workers serve.
+        # NOTE: Singleton background work does NOT run here. The Google Pub/Sub subscriber runs in its own
+        # mule (providers/google_play/mule.py), and the periodic prune plus the Apple notification catch-up
+        # run in the maintenance mule (maintenance.py) — a plain loop, so neither needs a uWSGI signal and
+        # neither competes with request handling. Only the Apple notification ROUTE is registered above,
+        # because that is an HTTP endpoint the workers serve.
     return result
 
 
