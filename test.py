@@ -1304,6 +1304,47 @@ def test_credit_expiry_is_unmoved_by_unrelated_recomputes(pg_database):
     pool.close()
 
 
+def test_credit_expiry_obfuscation_is_not_perturbed_by_draining(pg_database):
+    # A one-shot payment's true expiry is `grant + length`, so publishing it exactly would hand a DM
+    # recipient the purchase instant. The proof carries an expiry rounded onto the account's random 24h
+    # grid instead, which bounds an observer to ~a day -- but ONLY while the offset holds still. If the
+    # grid were re-drawn as the credit drained, proofs collected over several days would average the
+    # randomness out and recover the true instant far more precisely than the grid promises.
+    pool = backend.bootstrap_db(database_url=pg_database())
+    assert pool
+    backend_key = nacl.signing.SigningKey.generate()
+    rotating_key = nacl.signing.SigningKey.generate()
+    with db.connection() as conn:
+        T = base.round_datetime_to_next_day(base.utc_now())
+        f = _CreditFixture(conn, T)
+        # Short enough that the proof pins to the account's expiry rather than the ~30d sliding cap.
+        f.mint(20 * base.DAY)
+
+        def offset() -> int:
+            return db.query_scalar(conn, 'SELECT proof_expiry_offset FROM users WHERE master_pkey = %s', bytes(f.pkey))
+
+        expiry_before, offset_before = f.expiry(), offset()
+        first = _redeem_and_prove(conn, backend_key, f.master_key, rotating_key, T + base.DAY)
+
+        # Drain repeatedly, including past exhaustion, with proofs taken along the way.
+        for day in (2, 5, 10, 19, 25):
+            assert f.drain(at=T + day * base.DAY) in (0, 1)
+            # The account's own expiry never moves, so the grid offset is never re-drawn...
+            assert f.expiry() == expiry_before, f'account expiry moved at day {day}'
+            assert offset() == offset_before, f'grid offset re-drawn at day {day}'
+
+        # ...and therefore a proof taken later carries the SAME published expiry: repeated sampling tells
+        # an observer nothing beyond the first sample.
+        later = _redeem_and_prove(conn, backend_key, f.master_key, rotating_key, T + 3 * base.DAY)
+        assert later.expires_at == first.expires_at
+
+        # The published expiry is the grid point at or after the true one, never the true instant itself
+        # unless the account's grid happens to land there.
+        assert first.expires_at >= expiry_before
+        assert first.expires_at - expiry_before < base.DAY
+    pool.close()
+
+
 def test_credit_survives_a_refund_and_grant_order_is_irrelevant(pg_database):
     # Refund-then-grant and grant-then-refund must land in the same place: a credit is not charged for the
     # period a subscription covered, and a refund does not retroactively charge it either (no clawback --
