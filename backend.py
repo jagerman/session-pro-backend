@@ -11,6 +11,7 @@ import logging
 import enum
 import csv
 import io
+import uuid
 
 import base
 import db
@@ -23,24 +24,14 @@ BLAKE2B_DIGEST_SIZE = 32
 log = logging.Logger("BACKEND")
 # 16-byte domain-separation prefix on the signed MESSAGE (signatures are Ed25519 over the message
 # directly — no BLAKE2b, so this is a domain prefix, not a hash personalisation; see signed_message).
-# Kept at 16 bytes with the same values so the proof's version-selecting domain prefix (Q12) is unchanged.
 DOMAIN_SIZE = 16
 GENERATE_PROOF_DOMAIN = b'ProGenerateProof'
-BUILD_PROOF_DOMAIN = b'ProProof_v0_____'  # version lives IN the domain prefix (Q12), not a byte/field
-ADD_PRO_PAYMENT_DOMAIN = b'ProAddPayment___'
-SET_PAYMENT_REFUND_REQUESTED_DOMAIN = b'ProSetRefundReq_'
+BUILD_PROOF_DOMAIN = b'ProProof_v0_____'  # the proof version lives IN the prefix, not in a signed field
 GET_PAYMENT_DETAILS_DOMAIN = b'ProGetPayDetails'
 GET_PRO_STATUS_DOMAIN = b'ProGetProStatus_'
 assert all(
     len(p) == DOMAIN_SIZE
-    for p in (
-        GENERATE_PROOF_DOMAIN,
-        BUILD_PROOF_DOMAIN,
-        ADD_PRO_PAYMENT_DOMAIN,
-        SET_PAYMENT_REFUND_REQUESTED_DOMAIN,
-        GET_PAYMENT_DETAILS_DOMAIN,
-        GET_PRO_STATUS_DOMAIN,
-    )
+    for p in (GENERATE_PROOF_DOMAIN, BUILD_PROOF_DOMAIN, GET_PAYMENT_DETAILS_DOMAIN, GET_PRO_STATUS_DOMAIN)
 )
 
 # Explicit column list for payments table queries. Rows are read with `db.dict_row` and unpacked by
@@ -70,7 +61,6 @@ PAYMENTS_COLUMNS = ", ".join(
         "gd.payment_token AS google_payment_token",
         "gd.order_id AS google_order_id",
         "rd.order_id AS rangeproof_order_id",
-        "p.refund_requested_at",
         "gd.obfuscated_account_id AS google_obfuscated_account_id",
         "ad.app_account_token AS apple_app_account_token",
     )
@@ -98,7 +88,7 @@ USERS_COLUMNS = ", ".join(
         "u.expires_at",
         "u.grace_period",
         "u.auto_renewing",
-        "u.refund_requested_at",
+        "u.proof_expiry_offset",
     )
 )
 USERS_FROM = "users u JOIN generations g ON g.id = u.current_generation_id"
@@ -132,7 +122,6 @@ class ReportRow:
     plan_1m: int
     plan_3m: int
     plan_12m: int
-    refunds_initiated: int
     revoked: int
     cancelled: int
 
@@ -160,8 +149,20 @@ class ProSubscriptionProof:
     expires_at: datetime.datetime = base.EPOCH
     sig: bytes = b''
 
+    # --- Advisory account-entitlement value: NOT signed and NOT part of the proof message (the signed
+    # message is revocation_tag ‖ rotating_pkey ‖ expires_at). Populated by
+    # build_current_entitlement_proof from the SAME DB snapshot that produced the proof, so a proof
+    # fetch also hands the client its current subscription horizon in one response. This is the TRUE
+    # entitlement end (grace-inclusive, matching what get_pro_status reports), except in the closing
+    # window where the proof's over-provision runs past it and it reads back the proof's own expiry so
+    # that `expires_at <= account_expires_at` always holds. Deliberately distinct from `expires_at`
+    # above, which is the rolling, clamped (~30 d) proof validity — never conflate the two.
+    # Display state only; the signed proof + revocation list remain authoritative.
+    # Left at the default on any proof built without a user context (none today). ---
+    account_expires_at: datetime.datetime = base.EPOCH
+
     def to_dict(self) -> dict[str, str | int]:
-        # `version` is a PLAINTEXT field, deliberately NOT bound into the signature (Q12). It is the
+        # `version` is a PLAINTEXT field, deliberately NOT bound into the signature. It is the
         # external indicator a verifier reads to pick the domain prefix + layout it must use to
         # reconstruct and check the signed message; v0's domain prefix is BUILD_PROOF_DOMAIN
         # (`ProProof_v0_____`). The version→domain-prefix map is per-version and arbitrary — a future
@@ -173,9 +174,13 @@ class ProSubscriptionProof:
             "version": self.version,
             "revocation_tag": self.revocation_tag.hex(),
             "rotating_pkey": bytes(self.rotating_pkey).hex(),
-            # Proof expiry is day-aligned, so integer seconds is exact (wire spec §2).
+            # Whole seconds by construction — a store expiry (µs-capable) only reaches here through
+            # _build_proof_clamped_expiry_time, and the signed message needs an exact integer (wire §2).
             "expiry_ts": base.unix_seconds_from_datetime(self.expires_at),
             "sig": self.sig.hex(),
+            # Advisory, UNSIGNED (see field comment): the account's true entitlement end, distinct from
+            # the clamped proof `expiry_ts` above. Lets a proof fetch refresh the client's cached expiry.
+            "account_expiry_ts": base.unix_seconds_from_datetime(self.account_expires_at),
         }
         return result
 
@@ -185,28 +190,11 @@ class LookupUserExpiry:
     # `None` expiry = "no such payment found yet". Durations default to zero.
     expiry_from_redeemed: datetime.datetime | None = None
     grace_from_redeemed: datetime.timedelta = datetime.timedelta(0)
-    refund_requested_from_redeemed: datetime.datetime | None = None
     auto_renewing_from_redeemed: bool = False
 
     best_expiry: datetime.datetime | None = None
     best_grace: datetime.timedelta = datetime.timedelta(0)
-    best_refund_requested: datetime.datetime | None = None
     best_auto_renewing: bool = False
-
-
-class RedeemPaymentStatus(enum.Enum):
-    # redeem_payment now returns Success or raises (FailError(unknown_payment)/revoked/expired), so the
-    # old AlreadyRedeemed/UnknownPayment result codes are gone — a re-redeem is idempotent success and a
-    # missing payment is a raised fail. (Error remains only as the pre-success init sentinel.)
-    Nil = 0
-    Error = 1
-    Success = 2
-
-
-@dataclasses.dataclass
-class RedeemPayment:
-    proof: ProSubscriptionProof = dataclasses.field(default_factory=ProSubscriptionProof)
-    status: RedeemPaymentStatus = RedeemPaymentStatus.Nil
 
 
 AddRevocationIterator: typing.TypeAlias = tuple[
@@ -232,11 +220,6 @@ class UserPaymentTransaction:
     rangeproof_order_id: str = ''
     google_payment_token: str = ''
     google_order_id: str = ''
-    # The opaque wire `payment_id` (§3.5), hashed verbatim. On ingress it is the exact bytes the client
-    # sent (then split into the typed fields above for DB lookup); when the backend builds a request it
-    # is derived from the typed fields. Kept as its own field so the signed hash is byte-identical to
-    # what the client signed, never a lossy re-join of the split fields.
-    payment_id: str = ''
 
 
 # Google folds its two identifiers into one opaque `payment_id` as `token | order_id`, split once on the
@@ -252,8 +235,8 @@ def encode_payment_id(
     apple_tx_id: str = '',
     rangeproof_order_id: str = '',
 ) -> str:
-    # Encode a payment's provider-specific identifier(s) into the single opaque wire `payment_id`
-    # (§3.5). The backend owns this encoding; the client treats the result as opaque bytes.
+    # Fold a payment's provider-specific identifier(s) into the single opaque `payment_id` returned on
+    # get_payment_details items (§5.2). The backend owns this encoding; clients treat it as opaque.
     match provider:
         case base.PaymentProvider.GooglePlayStore:
             return f'{google_payment_token}{GOOGLE_PAYMENT_ID_DELIMITER}{google_order_id}'
@@ -263,30 +246,6 @@ def encode_payment_id(
             return rangeproof_order_id
         case _:
             return ''
-
-
-def payment_id_from_user_tx(tx: UserPaymentTransaction) -> str:
-    return encode_payment_id(
-        tx.provider,
-        google_payment_token=tx.google_payment_token,
-        google_order_id=tx.google_order_id,
-        apple_tx_id=tx.apple_tx_id,
-        rangeproof_order_id=tx.rangeproof_order_id,
-    )
-
-
-def apply_payment_id_to_tx(tx: UserPaymentTransaction) -> None:
-    # Split the opaque wire `payment_id` back into the backend's typed fields for DB lookup (§3.5).
-    # A new provider only needs a new case here; the wire/hash never learn a payment has sub-fields.
-    match tx.provider:
-        case base.PaymentProvider.GooglePlayStore:
-            tx.google_payment_token, _, tx.google_order_id = tx.payment_id.partition(GOOGLE_PAYMENT_ID_DELIMITER)
-        case base.PaymentProvider.iOSAppStore:
-            tx.apple_tx_id = tx.payment_id
-        case base.PaymentProvider.Rangeproof:
-            tx.rangeproof_order_id = tx.payment_id
-        case _:
-            pass
 
 
 @dataclasses.dataclass
@@ -313,14 +272,13 @@ class PaymentRow:
     apple: AppleTransaction = dataclasses.field(default_factory=AppleTransaction)
     google_payment_token: str = ''
     google_order_id: str = ''
-    refund_requested_at: datetime.datetime | None = None
     rangeproof_order_id: str = ''
     google_obfuscated_account_id: bytes | None = None
     apple_app_account_token: str | None = None
 
 
 def payment_id_from_payment_row(row: PaymentRow) -> str:
-    # Egress: fold a stored payment's typed columns back into the opaque wire `payment_id` (§3.5).
+    # Egress: fold a stored payment's typed columns back into the opaque `payment_id` (§5.2).
     return encode_payment_id(
         row.payment_provider,
         google_payment_token=row.google_payment_token,
@@ -340,7 +298,9 @@ class UserRow:
     expires_at: datetime.datetime = base.EPOCH
     grace_period: datetime.timedelta = datetime.timedelta(0)
     auto_renewing: bool = False
-    refund_requested_at: datetime.datetime | None = None
+    # This account's private proof-expiry grid: expiries land on `UTC midnight + this + k * one day`.
+    # Re-drawn whenever `expires_at` moves. See new_proof_expiry_offset / _build_proof_clamped_expiry_time.
+    proof_expiry_offset: int = 0
 
 
 @dataclasses.dataclass
@@ -412,20 +372,6 @@ def payment_provider_tx_log_label_safe(tx: base.PaymentProviderTransaction) -> s
     return f'{tx.provider.name}, {ids}'
 
 
-def _add_pro_payment_user_tx_log_label_safe(tx: UserPaymentTransaction) -> str:
-    # Only the active provider's ids are populated; show just those (obfuscated).
-    match tx.provider:
-        case base.PaymentProvider.iOSAppStore:
-            ids = f'apple={base.maybe_obfuscate(tx.apple_tx_id)}'
-        case base.PaymentProvider.GooglePlayStore:
-            ids = f'google=({base.maybe_obfuscate(tx.google_payment_token)}/{base.maybe_obfuscate(tx.google_order_id)})'
-        case base.PaymentProvider.Rangeproof:
-            ids = f'rangeproof={base.maybe_obfuscate(tx.rangeproof_order_id)}'
-        case _:
-            ids = '(no provider ids)'
-    return f'{tx.provider.name}, {ids}'
-
-
 def user_payment_tx_to_safe_string(tx: UserPaymentTransaction) -> str:
     # Only the active provider's ids are populated; show just those (obfuscated).
     match tx.provider:
@@ -477,30 +423,6 @@ def signed_message(domain: bytes, *fields: nacl.signing.VerifyKey | bytes | date
     return bytes(out)
 
 
-def make_add_pro_payment_message(
-    master_pkey: nacl.signing.VerifyKey, rotating_pkey: nacl.signing.VerifyKey, payment_tx: UserPaymentTransaction
-) -> bytes:
-    return signed_message(
-        ADD_PRO_PAYMENT_DOMAIN, master_pkey, rotating_pkey, payment_tx.provider.value, payment_tx.payment_id
-    )
-
-
-def make_set_payment_refund_requested_message(
-    master_pkey: nacl.signing.VerifyKey,
-    request_at: datetime.datetime,
-    refund_requested_at: datetime.datetime,
-    payment_tx: UserPaymentTransaction,
-) -> bytes:
-    return signed_message(
-        SET_PAYMENT_REFUND_REQUESTED_DOMAIN,
-        master_pkey,
-        request_at,
-        refund_requested_at,
-        payment_tx.provider.value,
-        payment_tx.payment_id,
-    )
-
-
 def make_get_pro_status_message(master_pkey: nacl.signing.VerifyKey, request_at: datetime.datetime) -> bytes:
     return signed_message(GET_PRO_STATUS_DOMAIN, master_pkey, request_at)
 
@@ -514,7 +436,7 @@ def make_get_payment_details_message(
 # --- get-payment-details keyset pagination cursor ------------------------------------------------
 # Seek pagination keys on the payment's surrogate id, but that id is a global identity sequence, so
 # handing the raw value to the client would leak system-wide payment volume/ordering (the same reason
-# `payment_id` is opaque, §3.5). So we hand back the boundary id sealed in an XChaCha20-Poly1305 token
+# `payment_id` is opaque, §5.2). So we hand back the boundary id sealed in an XChaCha20-Poly1305 token
 # the client echoes verbatim. The key is derived from the backend signing key via a domain-separated
 # BLAKE2b — no separate secret to provision; rotating the signing key just invalidates outstanding
 # cursors (harmless — the client re-fetches from the newest page). The master_pkey is the AEAD
@@ -574,7 +496,6 @@ def payment_row_from_dict(row: dict[str, typing.Any]) -> PaymentRow:
     result.google_payment_token = str(row['google_payment_token']) if row['google_payment_token'] else ''
     result.google_order_id = str(row['google_order_id']) if row['google_order_id'] else ''
     result.rangeproof_order_id = str(row['rangeproof_order_id']) if row['rangeproof_order_id'] else ''
-    result.refund_requested_at = row['refund_requested_at']  # NULL = none requested
     result.google_obfuscated_account_id = (
         bytes(row['google_obfuscated_account_id']) if row['google_obfuscated_account_id'] is not None else None
     )
@@ -685,7 +606,7 @@ def user_row_from_dict(row: dict[str, typing.Any]) -> UserRow:
         expires_at=row['expires_at'],
         grace_period=row['grace_period'],
         auto_renewing=bool(row['auto_renewing']),
-        refund_requested_at=row['refund_requested_at'],
+        proof_expiry_offset=row['proof_expiry_offset'],
     )
 
 
@@ -899,6 +820,34 @@ def verify_db(conn: psycopg.Connection, err: base.ErrorSink) -> bool:
     return result
 
 
+def new_proof_expiry_offset() -> int:
+    '''Draw a fresh per-account proof-expiry offset: uniform seconds spanning exactly one expiry grid
+    period (a day, in production).
+
+    Two properties are load-bearing, both for the same reason — an observer reads the offset off any proof
+    and is trying to work backwards from it (see `_build_proof_clamped_expiry_time` for what the offset
+    buys, and `schema/003_proof_expiry_offset.sql` for why it is stored and re-drawn per cycle):
+    UNPREDICTABLE, so it must come from the CSPRNG and never from the clock or the account key; and
+    UNIFORM over the full period, since a skew re-clusters the expiry times the offset exists to scatter.
+    '''
+    # Reducing a 64-bit draw modulo the period leaves a bias of ~1 part in 10^15 — far below any skew that
+    # could cluster anything, so it is accepted rather than rejection-sampled away.
+    return int.from_bytes(nacl.utils.random(8), 'big') % base.proof_expiry_shape().offset_range
+
+
+# Re-draw `users.proof_expiry_offset` exactly when the account's true expiry MOVES. Both users of this
+# clause set expires_at from the payment list, so "moved" is the honest trigger for a new subscription
+# cycle: it covers a redeem, a renewal, a stacked purchase and a revocation, and skips a no-op refresh (a
+# flag-only touch, a re-reconcile that claims nothing). That precision matters in both directions — never
+# re-drawing against a fixed anniversary instant would leave a stable per-account fingerprint, while
+# re-drawing on every touch would hand an observer repeated samples of the same true expiry, whose minimum
+# converges straight back onto it.
+_REDRAW_OFFSET_IF_EXPIRY_MOVED = (
+    "proof_expiry_offset = CASE WHEN expires_at IS DISTINCT FROM %(expiry)s"
+    " THEN %(proof_random_offset)s ELSE proof_expiry_offset END"
+)
+
+
 @db.transactional
 def _update_user_expiry_grace_and_renew_flag_from_payment_list(
     tx: db.SQLTransaction, master_pkey: nacl.signing.VerifyKey
@@ -910,16 +859,17 @@ def _update_user_expiry_grace_and_renew_flag_from_payment_list(
     # NOTE: We have the latest expiry value, now update the user
     db.query(
         tx.conn,
-        '''
+        f'''
         UPDATE users
         SET    expires_at = %(expiry)s, grace_period = %(grace)s,
-               auto_renewing = %(renewing)s, refund_requested_at = %(refund)s
+               auto_renewing = %(renewing)s,
+               {_REDRAW_OFFSET_IF_EXPIRY_MOVED}
         WHERE  master_pkey = %(pkey)s
     ''',
         expiry=lookup.best_expiry,
         grace=lookup.best_grace,
         renewing=lookup.best_auto_renewing,
-        refund=lookup.best_refund_requested,
+        proof_random_offset=new_proof_expiry_offset(),
         pkey=master_pkey_bytes,
     )
 
@@ -954,12 +904,14 @@ def revoke_payments_by_id_internal(tx: db.SQLTransaction, rows: typing.Any, revo
 
     revoke_at_next_day = round_datetime_to_next_day_with_provider_testing_support(base.PaymentProvider.Nil, revoke_at)
 
-    # The furthest into the future any outstanding proof can certify: a proof clamps its expiry to
-    # round_up_day(request_at + 30d) (_build_proof_clamped_expiry_time) and request_at is only accepted
-    # within DEFAULT_TIMESTAMP_TOLERANCE of the server clock, so no live proof reaches beyond this
-    # relative to the revoke instant.
-    max_outstanding_proof_expiry = base.round_datetime_to_next_day(
-        revoke_at + base.DEFAULT_TIMESTAMP_TOLERANCE + datetime.timedelta(days=30)
+    # The furthest into the future any outstanding proof can certify: a proof reaches at most
+    # `max_proof_lifetime` past its request instant (_build_proof_clamped_expiry_time) and a request_at is
+    # only accepted within DEFAULT_TIMESTAMP_TOLERANCE of the server clock, so no proof issued up to the
+    # revoke instant reaches beyond this. Anchoring to `revoke_at` assumes we process the refund promptly: a
+    # notification that reaches us late — a backlog drained after an outage — leaves any proof issued in the
+    # interim outside this bound.
+    max_outstanding_proof_expiry = (
+        revoke_at + base.DEFAULT_TIMESTAMP_TOLERANCE + base.proof_expiry_shape().max_proof_lifetime
     )
 
     for it in master_pkey_dict:
@@ -970,9 +922,12 @@ def revoke_payments_by_id_internal(tx: db.SQLTransaction, rows: typing.Any, revo
         master_pkey = nacl.signing.VerifyKey(it)
         _update_user_expiry_grace_and_renew_flag_from_payment_list(tx, master_pkey)
 
-        # NOTE: expires_at in the db is not rounded, but the proof's themselves have an
-        # expiry timestamp rounded to the end of the UTC day. So we only actually want to revoke
-        # proofs that aren't going to self-expire by the end of the day.
+        # NOTE: A payment at or past the end of the current day is on its way out anyway, so revoking it is
+        # not worth an entry in the (network-costly, every-client-fetches-it) revocation list. A proof built
+        # against such a payment can reach the renewal lead plus a whole grid period (≤ ~25 h) past that
+        # boundary, so an outstanding proof for a nearly-expired, then-refunded payment can outlive this
+        # early-out by that much. Accepted: it takes a refund of the account's *longest* payment inside that
+        # payment's final day, and the outcome is bounded extra Pro on an entitlement that was ending anyway.
         #
         # For different platforms in their testing environments, they have different timespans
         # for a day, for example in Google 1 day is 10s. We handle that explicitly here.
@@ -980,12 +935,12 @@ def revoke_payments_by_id_internal(tx: db.SQLTransaction, rows: typing.Any, revo
         if expires_at <= revoke_at_next_day:
             continue
 
-        # Item 4: even when the revoked payment's own proof would outlive the day boundary, a broadcast
-        # revocation + generation roll is only needed if the refund drops the user's *remaining*
-        # entitlement below something an outstanding proof already certifies. If enough paid time
-        # survives the refund (aggregate expiry at or beyond the furthest a live proof can reach) every
-        # outstanding proof stays honest, so we skip the revocation entirely. The revocation list is
-        # fetched by every client, so keeping it minimal is the point.
+        # Even when the revoked payment's own proof would outlive the day boundary, a broadcast revocation
+        # + generation roll is only needed if the refund drops the user's *remaining* entitlement below
+        # something an outstanding proof already certifies. If enough paid time survives the refund
+        # (aggregate expiry at or beyond the furthest a live proof can reach) every outstanding proof stays
+        # honest, so we skip the revocation entirely. The revocation list is fetched by every client, so
+        # keeping it minimal is the point.
         post_refund_expiry = _lookup_user_expiry(tx, master_pkey).best_expiry
         if post_refund_expiry is not None and post_refund_expiry >= max_outstanding_proof_expiry:
             continue
@@ -1164,229 +1119,146 @@ def add_google_revocation(
 
 
 @db.transactional
-def redeem_payment(
+def reconcile_pending_payments(
+    tx: db.SQLTransaction, master_pkey: nacl.signing.VerifyKey, redeemed_at: datetime.datetime
+) -> int:
+    """Redeem every unredeemed, unrevoked Google/Apple payment bound to `master_pkey`, link the claimed
+    payments to the user, refresh entitlement, and return how many were newly claimed.
+
+    The stores attest the account identifier AS a function of the master key — Google's
+    obfuscatedAccountId is the pubkey verbatim, Apple's appAccountToken is uuid_from_master_pk(pubkey) —
+    so holding the key IS the claim; there's no separate client-supplied token to match. This is the
+    reconcile step every master-key-authenticated endpoint runs up front, so a payment the mule has
+    already registered gets bound to its owner on the owner's next request, whichever endpoint that is.
+
+    Claim-all: a key legitimately accumulates several unredeemed payments (e.g. a device offline across a
+    couple of renewals). A no-match is not an error and touches nothing — in particular NO user row is
+    created for a key with no payments, so a signed-but-payment-less status probe can't spawn users."""
+    from providers import app_store
+
+    def claim(detail_table: str, account_column: str, account_value: bytes | str) -> list[int]:
+        # detail_table/account_column are module-internal literals (never request data), so interpolating
+        # them is safe; the account value is always a bound parameter.
+        rows = db.query(
+            tx.conn,
+            f'''
+            UPDATE payments
+            SET    redeemed_at = %(redeemed_at)s
+            WHERE  id IN (SELECT payment_id FROM {detail_table} WHERE {account_column} = %(account)s)
+              AND  redeemed_at IS NULL AND revoked_at IS NULL
+            RETURNING id
+            ''',
+            redeemed_at=redeemed_at,
+            account=account_value,
+        )
+        return [row[0] for row in rows.fetchall()]
+
+    claimed = claim('google_play_payment_details', 'obfuscated_account_id', bytes(master_pkey))
+    claimed += claim(
+        'app_store_payment_details', 'app_account_token', app_store.uuid_from_master_pk(bytes(master_pkey))
+    )
+    if not claimed:
+        return 0
+
+    # master_pkey lives only in `users`: ensure the identity row (+ its generation) exists, link the
+    # just-claimed payments to it, then refresh entitlement (reuses the current generation — a redeem
+    # never rolls it, so the client's revocation_tag is untouched).
+    user_id = get_or_create_user_and_generation(tx, master_pkey, issued_at=redeemed_at)[0]
+    db.query(tx.conn, 'UPDATE payments SET user_id = %(user_id)s WHERE id = ANY(%(ids)s)', user_id=user_id, ids=claimed)
+    _ensure_active_generation(tx, master_pkey, issued_at=redeemed_at)
+    return len(claimed)
+
+
+def _redeem_payment_for_user(
     tx: db.SQLTransaction,
     master_pkey: nacl.signing.VerifyKey,
-    rotating_pkey: nacl.signing.VerifyKey | None,
-    signing_key: nacl.signing.SigningKey | None,
-    request_at: datetime.datetime,
+    payment_tx: base.PaymentProviderTransaction,
     redeemed_at: datetime.datetime,
-    payment_tx: UserPaymentTransaction,
-) -> RedeemPayment:
-    """
-    request_at: The timestamp typically accurate to the current time, used as a frame-of-reference
-    to clamp the duration of the proof returned to the user to at most 1 month, also used to mask
-    metadata about the type of subscription a user is currently using.
+) -> None:
+    """Redeem ONE specific payment and link it to master_pkey's (already-existing) user, matched by the
+    payment's OWN store identifier — Google (payment_token, order_id) / Apple tx_id — NOT by the
+    master-key-derived account-id.
 
-    redeemed_at: Timestamp to mark as the time in point in which the payment was redeemed.
-    This timestamp is typically rounded up by using 'to_redeemed_at' to
-    #mask metadata about the time the user redeemed the payment.
-    """
-
-    result = RedeemPayment(status=RedeemPaymentStatus.Error)
-    master_pkey_bytes: bytes = bytes(master_pkey)
-    # A redeem marks the matched unredeemed payment(s) Redeemed; user_id is linked separately once the
-    # users row is ensured (master_pkey lives only in users now). The UPDATEs RETURN their ids so we
-    # can link exactly those rows without re-matching the per-provider WHERE.
-
-    payment_tx_label = _add_pro_payment_user_tx_log_label_safe(payment_tx)
-    rotating_pkey_label = base.maybe_obfuscate_bytes(bytes(rotating_pkey)) if rotating_pkey else '(none)'
-    log.info(
-        f'Redeeming payment (master={base.maybe_obfuscate_bytes(master_pkey)}, rotating={rotating_pkey_label}, '
-        f'redeemed={base.readable(redeemed_at)}, payment={payment_tx_label})'
-    )
-
-    # NOTE: We technically always allow a redeem of an unredeemed payment as long as the user
-    # knows the transaction ID (payment token/tx ID). If for example the user sits on the
-    # payment and doesn't redeem it and it expires but the expiry task hasn't been run yet, the
-    # user can still redeem the payment, they won't be allowed to use the proof because it has
-    # expired, but, they can register their public key for the payment and associate it with
-    # their account.
-    #
-    # The payment will now show up in their cross-platform payment history and visible across
-    # all the Session devices they have.
-    #
-    # TODO: What if the payment was expired and it has no master public key? Following the same
-    # train of thought it would be nice to let the user claim that payment so that they have
-    # the ability to maintain proper-book-keeping, but it's not clear to me if its even possible
-    # for that to happen. Maybe more realistically a payment could get revoked before it was
-    # redeemed and it'd be nice to allow the user to claim it and get it attributed to their
-    # account.
-
+    Used by the renewal auto-redeem, where the owner was resolved from the store's subscription-continuity
+    linkage (payment_token / original_tx_id → a prior, securely-bound payment). That linkage is the
+    authority, so we deliberately never touch the appAccountToken UUID: the mule stays out of UUID matching
+    entirely, so a (vanishingly unlikely) 122-bit appAccountToken collision can never make a renewal bind a
+    stranger's payment. The account-id match stays confined to the client path, where the caller is the
+    owner and "the new payer is the next to claim their own UUID" holds."""
     if payment_tx.provider == base.PaymentProvider.GooglePlayStore:
-        row_result = db.query(
-            tx.conn,
-            '''
-            UPDATE payments
-            SET    redeemed_at = %(redeemed_at)s
-            WHERE  id IN (SELECT payment_id FROM google_play_payment_details
-                          WHERE payment_token = %(token)s AND order_id = %(order_id)s
-                                AND obfuscated_account_id = %(account_id)s)
-              AND  redeemed_at IS NULL AND revoked_at IS NULL
-            RETURNING id
-        ''',  # SET values
-            redeemed_at=redeemed_at,
-            # WHERE values
-            token=payment_tx.google_payment_token,
-            order_id=payment_tx.google_order_id,
-            # The account tag Google attests IS the master pubkey (the client sets obfuscatedAccountId
-            # to it verbatim), so binding is a direct byte-equality against the request-signed key.
-            account_id=bytes(master_pkey),
-        )
+        detail_where = 'google_play_payment_details WHERE payment_token = %(token)s AND order_id = %(order_id)s'
+        params: dict[str, typing.Any] = {
+            'token': payment_tx.google_payment_token,
+            'order_id': payment_tx.google_order_id,
+        }
     elif payment_tx.provider == base.PaymentProvider.iOSAppStore:
-        # Import the Apple provider lazily, only on the Apple redeem path: a bare `import backend`
-        # (main/mule/cli) must not pull the Apple SDK in. Zero footprint when disabled; mirrors the
-        # Google lazy-import discipline. DO NOT hoist.
-        from providers import app_store
-
-        row_result = db.query(
-            tx.conn,
-            '''
-            UPDATE payments
-            SET    redeemed_at = %(redeemed_at)s
-            WHERE  id IN (SELECT payment_id FROM app_store_payment_details
-                          WHERE tx_id = %(tx_id)s AND app_account_token = %(account_token)s)
-              AND  redeemed_at IS NULL AND revoked_at IS NULL
-            RETURNING id
-        ''',  # SET fields
-            redeemed_at=redeemed_at,
-            # WHERE fields
-            tx_id=payment_tx.apple_tx_id,
-            # Apple attests appAccountToken = UUID(first 16 bytes of the master pubkey); binding is
-            # equality against the same UUID recomputed from the request-signed key.
-            account_token=app_store.uuid_from_master_pk(bytes(master_pkey)),
-        )
-    elif payment_tx.provider == base.PaymentProvider.Rangeproof:
-        row_result = db.query(
-            tx.conn,
-            '''
-            UPDATE payments
-            SET    redeemed_at = %(redeemed_at)s
-            WHERE  id IN (SELECT payment_id FROM rangeproof_payment_details WHERE order_id = %(rangeproof_order_id)s)
-              AND  redeemed_at IS NULL AND revoked_at IS NULL
-            RETURNING id
-        ''',  # SET fields
-            redeemed_at=redeemed_at,
-            # WHERE fields
-            rangeproof_order_id=payment_tx.rangeproof_order_id,
-        )
+        detail_where = 'app_store_payment_details WHERE tx_id = %(tx_id)s'
+        params = {'tx_id': payment_tx.apple_tx_id}
     else:
-        raise base.FailError('Payment to register specifies an unknown payment provider')
+        return
 
-    redeemed_ids = [row[0] for row in row_result.fetchall()]
-    if redeemed_ids:
-        assert len(redeemed_ids) == 1
-
-        # master_pkey lives only in `users`: ensure the identity row (+ its first generation) exists,
-        # then link the just-redeemed payment(s) to it.
-        user_id = get_or_create_user_and_generation(tx, master_pkey, issued_at=redeemed_at)[0]
-        db.query(
-            tx.conn,
-            '''
-            UPDATE payments
-            SET    user_id = %(user_id)s
-            WHERE  id = ANY(%(ids)s)
+    row_result = db.query(
+        tx.conn,
+        f'''
+        UPDATE payments
+        SET    redeemed_at = %(redeemed_at)s,
+               user_id     = (SELECT id FROM users WHERE master_pkey = %(master_pkey)s)
+        WHERE  id IN (SELECT payment_id FROM {detail_where})
+          AND  redeemed_at IS NULL AND revoked_at IS NULL
+        RETURNING id
         ''',
-            user_id=user_id,
-            ids=redeemed_ids,
-        )
+        redeemed_at=redeemed_at,
+        master_pkey=bytes(master_pkey),
+        **params,
+    )
+    if row_result.fetchall():
+        # Only refresh entitlement if we actually redeemed something (it may already be redeemed).
+        _ensure_active_generation(tx, master_pkey, issued_at=redeemed_at)
 
-        # Refresh the user's entitlement to reflect the now-linked payments. A generation is an epoch
-        # (item 3): this REUSES the user's current generation (brand-new user → its initial one; existing
-        # user → the same one they already had), so a redeem never rolls the generation or the client's
-        # revocation_tag. (_allocate mints a fresh generation only if the current one is revoked.)
-        allocated = _ensure_active_generation(tx, master_pkey, issued_at=redeemed_at)
-        # found ⟺ expires_at is not None (the allocator sets found only after the expiry-None early-return);
-        # assert the expiry directly so it's the non-None datetime the proof build needs.
-        assert (
-            allocated.expires_at is not None
-        ), "We just added the user's payment we expect to find the latest expiry date for the pkey"
 
-        # NOTE: Only generate the proof if a rotating public key was given — a payment can be redeemed
-        # without automatically creating the corresponding proof.
-        if rotating_pkey:
-            assert (
-                signing_key
-            ), "Rotating public key and signing key have to be given in tandem, either both set or both set to nil"
-            proposed_proof_expires_at: datetime.datetime = base.round_datetime_to_next_day(allocated.expires_at)
-            result.proof = build_proof(
-                revocation_tag=allocated.token,
-                rotating_pkey=rotating_pkey,
-                expires_at=_build_proof_clamped_expiry_time(
-                    request_at=request_at, proposed_expires_at=proposed_proof_expires_at
-                ),
-                signing_key=signing_key,
-            )
-            assert result.proof.expires_at == base.round_datetime_to_start_of_day(
-                result.proof.expires_at
-            ), f"Proof expiry must land on a UTC day boundary, was {base.readable(result.proof.expires_at)}"
-
+def redeem_minted_payment(
+    tx: db.SQLTransaction,
+    master_pkey: nacl.signing.VerifyKey,
+    payment_tx: base.PaymentProviderTransaction,
+    redeemed_at: datetime.datetime,
+) -> None:
+    """Redeem ONE just-minted payment and bind it to master_pkey's user (creating the user + generation
+    if needed), matched by the payment's OWN store identifier. This is the shared redeem for the minting
+    path — the CLI `voucher` command and the `/dev/add_payment` route (see minting.py). Distinct from the
+    two client-facing redeems: unlike reconcile_pending_payments it claims exactly the one minted payment
+    rather than everything sharing the account-id, and unlike _redeem_payment_for_user it creates the user
+    and also handles Rangeproof, which has no store account-id to reconcile against."""
+    if payment_tx.provider == base.PaymentProvider.GooglePlayStore:
+        detail_where = 'google_play_payment_details WHERE payment_token = %(token)s AND order_id = %(order_id)s'
+        params: dict[str, typing.Any] = {
+            'token': payment_tx.google_payment_token,
+            'order_id': payment_tx.google_order_id,
+        }
+    elif payment_tx.provider == base.PaymentProvider.iOSAppStore:
+        detail_where = 'app_store_payment_details WHERE tx_id = %(tx_id)s'
+        params = {'tx_id': payment_tx.apple_tx_id}
+    elif payment_tx.provider == base.PaymentProvider.Rangeproof:
+        detail_where = 'rangeproof_payment_details WHERE order_id = %(order_id)s'
+        params = {'order_id': payment_tx.rangeproof_order_id}
     else:
-        # Nothing claimable matched. Distinguish "this user already redeemed this exact payment"
-        # (replay/double-submit → idempotent success) from "no such payment for this user" (a genuine
-        # dead-end → unknown_payment). The COUNT below only reads data the user themselves sent.
-        redeemed_count = 0
-        if payment_tx.provider == base.PaymentProvider.GooglePlayStore:
-            redeemed_count = db.query_scalar(
-                tx.conn,
-                '''
-                SELECT COUNT(*)
-                FROM   payments p JOIN google_play_payment_details gd ON gd.payment_id = p.id
-                WHERE  gd.payment_token = %(token)s
-                  AND  gd.order_id      = %(order_id)s
-                  AND  p.redeemed_at IS NOT NULL
-                  AND  p.user_id        = (SELECT id FROM users WHERE master_pkey = %(master_pkey)s)
-            ''',
-                token=payment_tx.google_payment_token,
-                order_id=payment_tx.google_order_id,
-                master_pkey=master_pkey_bytes,
-            )
-        elif payment_tx.provider == base.PaymentProvider.iOSAppStore:
-            redeemed_count = db.query_scalar(
-                tx.conn,
-                '''
-                SELECT COUNT(*)
-                FROM   payments p JOIN app_store_payment_details ad ON ad.payment_id = p.id
-                WHERE  ad.tx_id = %(tx_id)s
-                  AND  p.redeemed_at IS NOT NULL
-                  AND  p.user_id  = (SELECT id FROM users WHERE master_pkey = %(master_pkey)s)
-            ''',
-                tx_id=payment_tx.apple_tx_id,
-                master_pkey=master_pkey_bytes,
-            )
-        elif payment_tx.provider == base.PaymentProvider.Rangeproof:
-            redeemed_count = db.query_scalar(
-                tx.conn,
-                '''
-                SELECT COUNT(*)
-                FROM   payments p JOIN rangeproof_payment_details rd ON rd.payment_id = p.id
-                WHERE  rd.order_id = %(order_id)s
-                  AND  p.redeemed_at IS NOT NULL
-                  AND  p.user_id     = (SELECT id FROM users WHERE master_pkey = %(master_pkey)s)
-            ''',
-                order_id=payment_tx.rangeproof_order_id,
-                master_pkey=master_pkey_bytes,
-            )
+        raise base.ServerError(f'Cannot redeem a minted payment for provider: {payment_tx.provider}')
 
-        if redeemed_count > 0:
-            # Already redeemed by this user → idempotent: hand back a proof for their CURRENT entitlement
-            # via the existing generation (no roll), identical to generate_pro_proof. If that entitlement
-            # is since revoked/expired the helper raises the truthful slug.
-            log.info(
-                f'Payment already redeemed for this user (idempotent): {user_payment_tx_to_safe_string(payment_tx)}'
-            )
-            if rotating_pkey:
-                assert signing_key, "Rotating public key and signing key have to be given in tandem"
-                result.proof = build_current_entitlement_proof(tx, master_pkey, rotating_pkey, request_at, signing_key)
-        else:
-            raise base.FailError(
-                f'Payment was not redeemed, no payments were found matching the request tx: '
-                f'{user_payment_tx_to_safe_string(payment_tx)}',
-                code=base.ErrorCode.unknown_payment,
-            )
-
-    result.status = RedeemPaymentStatus.Success
-    return result
+    user_id = get_or_create_user_and_generation(tx, master_pkey, issued_at=redeemed_at)[0]
+    row_result = db.query(
+        tx.conn,
+        f'''
+        UPDATE payments
+        SET    redeemed_at = %(redeemed_at)s, user_id = %(user_id)s
+        WHERE  id IN (SELECT payment_id FROM {detail_where})
+          AND  redeemed_at IS NULL AND revoked_at IS NULL
+        RETURNING id
+        ''',
+        redeemed_at=redeemed_at,
+        user_id=user_id,
+        **params,
+    )
+    assert len(row_result.fetchall()) == 1, 'a freshly-minted payment must redeem exactly once'
+    _ensure_active_generation(tx, master_pkey, issued_at=redeemed_at)
 
 
 def verify_payment_provider_tx(payment_tx: base.PaymentProviderTransaction, err: base.ErrorSink):
@@ -1423,7 +1295,7 @@ def _lookup_user_expiry(tx: db.SQLTransaction, master_pkey: nacl.signing.VerifyK
     result_set = db.query(
         tx.conn,
         '''
-        SELECT    p.expires_at, p.grace_period, p.auto_renewing, p.redeemed_at, p.refund_requested_at,
+        SELECT    p.expires_at, p.grace_period, p.auto_renewing, p.redeemed_at,
                   p.payment_provider, ad.original_tx_id, gd.order_id, rd.order_id, p.revoked_at
         FROM      payments p
                   LEFT JOIN app_store_payment_details ad      ON ad.payment_id = p.id
@@ -1450,7 +1322,6 @@ def _lookup_user_expiry(tx: db.SQLTransaction, master_pkey: nacl.signing.VerifyK
             grace_period,
             auto_renewing,
             redeemed_at,
-            refund_requested_at,
             payment_provider,
             apple_original_tx_id,
             google_order_id,
@@ -1538,13 +1409,11 @@ def _lookup_user_expiry(tx: db.SQLTransaction, master_pkey: nacl.signing.VerifyK
         if is_redeemed and (best_wo_grace_from_redeemed is None or expires_at > best_wo_grace_from_redeemed):
             result.expiry_from_redeemed = payment_expires_at
             result.grace_from_redeemed = grace
-            result.refund_requested_from_redeemed = refund_requested_at
             result.auto_renewing_from_redeemed = bool(auto_renewing)
 
         if best_wo_grace is None or expires_at > best_wo_grace:
             result.best_expiry = payment_expires_at
             result.best_grace = grace
-            result.best_refund_requested = refund_requested_at
             result.best_auto_renewing = bool(auto_renewing)
     return result
 
@@ -1731,6 +1600,7 @@ def add_unredeemed_payment(
     platform_refund_expires_at: datetime.datetime,
     platform_obfuscated_account_id: bytes | str,
     err: base.ErrorSink,
+    needs_ack: bool = False,
 ):
 
     if log.getEffectiveLevel() <= logging.INFO:
@@ -1761,13 +1631,15 @@ def add_unredeemed_payment(
                 'platform_refund_expires_at': platform_refund_expires_at,
                 'purchased_at': purchased_at,
                 'auto_renewing': True,  # on by default until Google notifies otherwise
-                'refund_requested_at': None,
             },
             detail_table='google_play_payment_details',
             detail={
                 'payment_token': payment_tx.google_payment_token,
                 'order_id': payment_tx.google_order_id,
                 'obfuscated_account_id': platform_obfuscated_account_id,
+                # Outstanding Google purchase-ack obligation. The mule's sweep acks and clears it; a
+                # fresh, not-yet-acknowledged purchase sets it TRUE (renewals arrive acknowledged).
+                'needs_ack': needs_ack,
             },
             dedup_keys=['payment_token', 'order_id'],
         )
@@ -1787,7 +1659,6 @@ def add_unredeemed_payment(
                 'platform_refund_expires_at': platform_refund_expires_at,
                 'purchased_at': purchased_at,
                 'auto_renewing': True,  # on by default until Apple notifies otherwise
-                'refund_requested_at': None,
             },
             detail_table='app_store_payment_details',
             detail={
@@ -1810,7 +1681,6 @@ def add_unredeemed_payment(
                 'platform_refund_expires_at': platform_refund_expires_at,
                 'purchased_at': purchased_at,
                 'auto_renewing': False,  # Rangeproof vouchers never auto-renew
-                'refund_requested_at': None,
             },
             detail_table='rangeproof_payment_details',
             detail={'order_id': payment_tx.rangeproof_order_id},
@@ -1902,26 +1772,20 @@ def add_unredeemed_payment(
                 # before the deadline we are eligible to auto-redeem this payment and assign it to the
                 # previous known master public key.
                 if purchased_at <= auto_redeem_deadline_at:
-                    add_pro_payment_user_tx = UserPaymentTransaction()
-                    add_pro_payment_user_tx.provider = payment_tx.provider
-                    add_pro_payment_user_tx.apple_tx_id = payment_tx.apple_tx_id
-                    add_pro_payment_user_tx.google_payment_token = payment_tx.google_payment_token
-                    add_pro_payment_user_tx.google_order_id = payment_tx.google_order_id
-
-                    # A failed auto-redeem is swallowed: the user can still claim the payment manually
-                    # later, and propagating the failure to the platform layers (google/apple) would stall
-                    # them unnecessarily. The savepoint keeps a failed redeem from poisoning the outer
+                    # Bind THIS renewal to the owner we just resolved from the store's subscription
+                    # continuity, matched by the renewal's own identifier — NOT the master-key-derived
+                    # account-id. We already hold the full master key, so there's no need to route through
+                    # the appAccountToken UUID, and deliberately not doing so keeps a mule-side renewal from
+                    # ever claiming a stranger's payment on a (vanishingly unlikely) 122-bit UUID collision.
+                    #
+                    # A failed auto-redeem is swallowed: the user can still claim the payment later, and
+                    # propagating the failure to the platform layers (google/apple) would stall them
+                    # unnecessarily. The savepoint keeps a failed redeem from poisoning the outer
                     # transaction; we log it for internal visibility.
                     try:
                         with tx.conn.transaction():
-                            redeem_payment(
-                                tx,
-                                master_pkey=master_pkey,
-                                rotating_pkey=None,
-                                signing_key=None,
-                                request_at=purchased_at,
-                                redeemed_at=to_redeemed_at(purchased_at),
-                                payment_tx=add_pro_payment_user_tx,
+                            _redeem_payment_for_user(
+                                tx, master_pkey, payment_tx, redeemed_at=to_redeemed_at(purchased_at)
                             )
                     except base.ApiError as e:
                         log.error(
@@ -1980,14 +1844,17 @@ def get_or_create_user_and_generation(
     won = db.query_one(
         tx.conn,
         '''
-        INSERT INTO users (id, master_pkey, current_generation_id, expires_at)
-        VALUES            (%(id)s, %(master_pkey)s, %(gen_id)s, to_timestamp(0))
+        INSERT INTO users (id, master_pkey, current_generation_id, expires_at, proof_expiry_offset)
+        VALUES            (%(id)s, %(master_pkey)s, %(gen_id)s, to_timestamp(0), %(proof_expiry_offset)s)
         ON CONFLICT (master_pkey) DO NOTHING
         RETURNING id
     ''',
         id=user_id,
         master_pkey=master_pkey_bytes,
         gen_id=gen_id,
+        # A seed value only: the placeholder expiry above is immediately overwritten by
+        # _ensure_active_generation, and that write re-draws the offset along with it.
+        proof_expiry_offset=new_proof_expiry_offset(),
     )
     if won is None:
         # Lost a concurrent create — re-read the winner (our pre-allocated ids simply go unused).
@@ -2008,7 +1875,7 @@ def _ensure_active_generation(
     tx: db.SQLTransaction, master_pkey: nacl.signing.VerifyKey, issued_at: datetime.datetime
 ) -> AllocatedGenID:
     # Refresh the user's top-level entitlement fields from their current best payment, and settle which
-    # generation they're on. A generation is an EPOCH, not a per-payment value (item 3): REUSE the user's
+    # generation they're on. A generation is an EPOCH, not a per-payment value: REUSE the user's
     # current generation across payments — stacking, renewals, auto-redeem, natural-lapse reactivation — so
     # the revocation_tag stays stable (no per-payment revocation-list churn, no subscription-cadence leak).
     # Mint a FRESH generation only when the current one is REVOKED (reusing it would mint proofs born
@@ -2032,13 +1899,13 @@ def _ensure_active_generation(
 
     db.query(
         tx.conn,
-        '''
+        f'''
         UPDATE users
         SET    current_generation_id        = %(gen_id)s,
                expires_at                   = %(expiry)s,
                grace_period                 = %(grace)s,
                auto_renewing                = %(auto_renewing)s,
-               refund_requested_at          = %(refund_ts)s
+               {_REDRAW_OFFSET_IF_EXPIRY_MOVED}
         WHERE  id = %(user_id)s
     ''',
         gen_id=result.generation_id,
@@ -2046,7 +1913,7 @@ def _ensure_active_generation(
         expiry=lookup.best_expiry,
         grace=lookup.best_grace,
         auto_renewing=lookup.best_auto_renewing,
-        refund_ts=lookup.best_refund_requested,
+        proof_random_offset=new_proof_expiry_offset(),
     )
     result.grace_period = lookup.best_grace
 
@@ -2069,14 +1936,54 @@ def build_proof_message(
 
 
 def _build_proof_clamped_expiry_time(
-    request_at: datetime.datetime, proposed_expires_at: datetime.datetime
+    request_at: datetime.datetime, proposed_expires_at: datetime.datetime, proof_expiry_offset: int
 ) -> datetime.datetime:
-    # NOTE: Clamp the expiry time of the proof to 1 month and also make it land on the day boundary
-    # to reduce metadata leakage. If it's less than 1 month then just take the value verbatim as
-    # their subscription is coming to a close.
-    clamped_expires_at = base.round_datetime_to_next_day(request_at + datetime.timedelta(days=30))
-    result = min(clamped_expires_at, proposed_expires_at)
-    return result
+    '''How far ahead a proof issued at `request_at` certifies, given the account's true (grace-inclusive)
+    entitlement end and its stored per-account offset:
+
+        round_up_onto_grid( min(request_at + clamp, true) + renewal_lead )
+
+    where the grid is this account's own, `{ UTC midnight + proof_expiry_offset + k * one day }`.
+
+    Clamp, pad, then round up. Two arms come out of the `min`: while the subscription still has more than
+    the clamp left the expiry SLIDES with the request (a rolling ~30 d proof lifetime, so a lost or leaked
+    proof self-expires); as the subscription end comes into range the expiry PINS near it.
+
+    The round-up onto the grid is what makes both arms safe to publish. Landing on a grid point means the
+    expiry is constant for a whole period and then steps by exactly one: two of a user's devices asking at
+    different moments in the same period get identical proofs, and the value carries only which period the
+    request fell in, never the instant.
+
+    * The offset (uniform over one period, re-drawn each cycle) is what stops the pinned expiry from BEING
+      the account's exact true expiry, which would otherwise publish the precise purchase/renewal instant
+      as a stable time-of-day fingerprint and, via midnight-vs-not, the plan cadence — all readable by any
+      conversation partner. It equally stops clients herding into one minute at renewal time, which is what
+      any deterministic expiry (a plain day boundary, or the plan anniversary) does. An observer can read
+      the offset straight off the wire (`expiry_ts` modulo the period) but gains nothing by it: `true` is
+      still only pinned to within one period, and the offset is a random per-cycle value, less identifying
+      than the `revocation_tag` already in the proof. Note the rounding only ever goes UP — pulling an
+      expiry DOWN onto a boundary would advertise an end up to a period BEFORE the entitlement really
+      ends, and the renewal payment may well not have arrived by then.
+    * `renewal_lead` (1 h 1 min) keeps a renewing client's attempt on the correct side of `true`. A client
+      starts renewing one hour before its proof expires, so the attempt lands no earlier than
+      `min(...) + 60 s` — at least a minute past `true` in the pinned arm, since rounding up only pushes it
+      later — and `true` is grace-inclusive, i.e. the last instant an upstream store might still notify us
+      of the renewal. The 60 s absorbs a client clock running up to a minute fast so it still cannot fire
+      early. This is a LOCKED PAIR with the client's one-hour lead: a client that renews earlier needs a
+      matching change here, or its attempts start landing before the renewal can have resolved.
+
+    The cost is over-provisioning: an account is honoured for up to one period past `true + renewal_lead`.
+    That is deliberate (it also buffers a late store notification), and the per-cycle re-draw keeps the luck
+    from settling on the same accounts. `shape.max_proof_lifetime` bounds the resulting proof lifetime.
+    '''
+    shape = base.proof_expiry_shape()
+    # The stored column's own range (a day — the schema CHECK), NOT the current shape's: a database written
+    # before the shape changed still holds day-wide offsets, which the grid helper reduces modulo the period.
+    assert 0 <= proof_expiry_offset < base.PROOF_EXPIRY_SHAPE.offset_range
+    clamped_expires_at = min(request_at + shape.clamp, proposed_expires_at)
+    return base.round_datetime_up_onto_offset_grid(
+        clamped_expires_at + shape.renewal_lead, period=shape.grid, offset_seconds=proof_expiry_offset
+    )
 
 
 def build_proof(
@@ -2151,134 +2058,34 @@ def internal_verify_add_payment_and_get_proof_common_arguments(
 
 
 @db.transactional
-def add_pro_payment(
-    tx: db.SQLTransaction,
-    signing_key: nacl.signing.SigningKey,
-    request_at: datetime.datetime,
-    redeemed_at: datetime.datetime,
-    master_pkey: nacl.signing.VerifyKey,
-    rotating_pkey: nacl.signing.VerifyKey,
-    payment_tx: UserPaymentTransaction,
-) -> RedeemPayment:
-
-    # Note being able to pass in the creation unix timestamp is mainly for
-    # testing purposes to allow time-travel. User space should never be
-    # specifying this argument, so clients should not be specifying this time,
-    # ever, it should be generated and rounded up by the server hence the
-    # assert.
-    assert redeemed_at == base.round_datetime_to_start_of_day(
-        redeemed_at
-    ), "The passed in creation (and or activated) timestamp must lie on a day boundary: {}".format(
-        base.readable(redeemed_at)
-    )
-
-    # Redeem the payment (raises FailError(unknown_payment)/revoked/expired on failure).
-    result = redeem_payment(
-        tx,
-        master_pkey=master_pkey,
-        rotating_pkey=rotating_pkey,
-        signing_key=signing_key,
-        request_at=request_at,
-        redeemed_at=redeemed_at,
-        payment_tx=payment_tx,
-    )
-
-    # For Google we acknowledge the payment against Google's servers in the SAME transaction as the
-    # redeem: an ack can't be undone, so we redeem first and ack last, and if Google can't be reached we
-    # raise — the exception rolls the transaction back (undoing the redeem) and the client re-attempts.
-    # Acknowledging on claim binds the client's knowledge of its own payment to the backend ack in one
-    # step, avoiding a client-acks-but-server-hasn't poll race. (Under provider_dry_run these Google calls
-    # are stubbed in google_play.api — a synthetic already-acknowledged fetch + no-op acknowledge.)
-    if payment_tx.provider == base.PaymentProvider.GooglePlayStore:
-        # Import the Google provider lazily, only on the Google redeem path: a bare `import backend`
-        # (main/mule/cli all do it) must never pull google_play in. A disabled provider then has zero
-        # footprint, and it keeps grpcio out of the uWSGI master/mule fork path. DO NOT hoist.
-        from providers import google_play
-
-        # google_play.api is still ErrorSink-based (the deferred sweep); bridge with a local sink and
-        # translate its failure into a raise.
-        google_err = base.ErrorSink()
-        sub_data: google_play.types.SubscriptionV2Data | None = google_play.api.fetch_subscription_v2_details(
-            package_name=google_play.api.package_name, purchase_token=payment_tx.google_payment_token, err=google_err
-        )
-        if sub_data is None or google_err.has():
-            raise base.ServerError(f'Google subscription lookup failed during redeem: {google_err.build()}')
-
-        payment_tx_label = _add_pro_payment_user_tx_log_label_safe(payment_tx)
-        log.info(
-            f'Google ack. payment check (master={base.maybe_obfuscate_bytes(master_pkey)}, payment={payment_tx_label}, '
-            f'acked={sub_data.acknowledgement_state})'
-        )
-
-        if sub_data.acknowledgement_state != google_play.types.SubscriptionsV2AcknowledgementState.ACKNOWLEDGED:
-            google_play.api.subscription_v1_acknowledge(purchase_token=payment_tx.google_payment_token, err=google_err)
-            if google_err.has():
-                raise base.ServerError(
-                    f'Google subscription acknowledgement failed during redeem: {google_err.build()}'
-                )
-    return result
-
-
-def verify_and_add_pro_payment(
-    conn: psycopg.Connection,
-    signing_key: nacl.signing.SigningKey,
-    request_at: datetime.datetime,
-    redeemed_at: datetime.datetime,
-    master_pkey: nacl.signing.VerifyKey,
-    rotating_pkey: nacl.signing.VerifyKey,
-    payment_tx: UserPaymentTransaction,
-    master_sig: bytes,
-    rotating_sig: bytes,
-) -> RedeemPayment:
-    """
-    request_at: The timestamp typically accurate to the current time, used as a frame-of-reference
-    to clamp the duration of the proof returned to the user to at most 1 month, also used to mask
-    metadata about the type of subscription a user is currently using.
-
-    redeemed_at: Timestamp to mark as the time in point in which the payment was redeemed.
-    This timestamp is typically rounded up by using 'to_redeemed_at' to
-    #mask metadata about the time the user redeemed the payment.
-    """
-
-    payment_tx_label = _add_pro_payment_user_tx_log_label_safe(payment_tx)
-    log.info(
-        f'Add payment (redeemed={base.readable(redeemed_at)}, master={base.maybe_obfuscate_bytes(master_pkey)}, '
-        f'payment={payment_tx_label})'
-    )
-
-    # Authenticate the request (raises FailError(bad_signature) / invalid_request on failure).
-    message: bytes = make_add_pro_payment_message(
-        master_pkey=master_pkey, rotating_pkey=rotating_pkey, payment_tx=payment_tx
-    )
-    internal_verify_add_payment_and_get_proof_common_arguments(
-        signing_key=signing_key,
-        master_pkey=master_pkey,
-        rotating_pkey=rotating_pkey,
-        message=message,
-        master_sig=master_sig,
-        rotating_sig=rotating_sig,
-    )
-
-    return add_pro_payment(conn, signing_key, request_at, redeemed_at, master_pkey, rotating_pkey, payment_tx)
-
-
-@db.transactional
 def revoke_master_pkey_proofs_and_allocate_new_gen_id(
     tx: db.SQLTransaction, master_pkey: nacl.signing.VerifyKey, created_at: datetime.datetime
 ) -> AllocatedGenID:
     # Revoke the user's current generation (terminal): sets revoked_at, which blocks every proof issued
     # under that generation and (via the trigger) bumps the revocation ticket. The `revoked_at IS NULL`
     # guard makes a double-revoke a no-op rather than tripping the terminal-immutability trigger.
+    #
+    # `revoked_at` is stamped with OUR clock, read here, and is deliberately NOT `created_at` and NOT a
+    # parameter. The served list turns this stamp into `effective_ts = revoked_at +
+    # REVOCATION_EFFECTIVE_DELAY`, so it must mean "when we recorded the revocation", never "when the store
+    # says the refund happened": a notification we process late (a backlog drained after an outage carries
+    # refunds dated hours or days back) would otherwise be broadcast already-effective, and peers would
+    # start rejecting the sender's proof before the sender could possibly have polled and learnt of it —
+    # precisely the compose-then-truncate gap the delay exists to close. Reading the clock at the single
+    # write site, rather than taking it from the caller, is what makes that unrepresentable: every caller
+    # here holds a provider timestamp, and one passed in by mistake looks exactly like a correct argument.
+    # `created_at` is the entitlement-side revoke instant (and the new generation's issued_at below);
+    # `payments.revoked_at` likewise keeps the store's own date — the user really was entitled until then.
     db.query(
         tx.conn,
         '''
         UPDATE generations
-        SET    revoked_at = %(created_at)s
+        SET    revoked_at = %(recorded_at)s
         WHERE  id = (SELECT current_generation_id FROM users WHERE master_pkey = %(master_pkey)s)
           AND  revoked_at IS NULL
     ''',
         master_pkey=bytes(master_pkey),
-        created_at=created_at,
+        recorded_at=base.utc_now(),
     )
 
     # If the user still has usable payments, roll them onto a fresh generation for subsequent proofs.
@@ -2309,9 +2116,9 @@ def build_current_entitlement_proof(
     signing_key: nacl.signing.SigningKey,
 ) -> ProSubscriptionProof:
     '''Sign a proof for the user's CURRENT entitlement using their existing generation token (NO roll).
-    Shared by generate_pro_proof and the idempotent add_pro_payment replay path. Raises a FailError with
-    the matching slug when there is nothing to sign: `not_subscribed` (no user row), `revoked` (current
-    generation revoked), `expired` (entitlement lapsed past the clamped proof window).'''
+    Shared by generate_pro_proof and grant_rangeproof. Raises a FailError with the matching slug when
+    there is nothing to sign: `not_subscribed` (no user row), `revoked` (current generation revoked),
+    `expired` (entitlement lapsed past the clamped proof window).'''
     get_user = get_user_and_payments(tx, master_pkey)
     if get_user.user.master_pkey != bytes(master_pkey):
         raise base.FailError(
@@ -2323,8 +2130,15 @@ def build_current_entitlement_proof(
         raise base.FailError(f'User {bytes(master_pkey).hex()} payment has been revoked', code=base.ErrorCode.revoked)
 
     proof_expires_at = _build_proof_clamped_expiry_time(
-        request_at=request_at, proposed_expires_at=get_user.user.expires_at
+        request_at=request_at,
+        proposed_expires_at=get_user.user.expires_at,
+        proof_expiry_offset=get_user.user.proof_expiry_offset,
     )
+    # The expiry we are willing to certify is the honest cut-off, so a lapsed account keeps getting proofs
+    # (all with this same, stable expiry — the offset only moves when the true expiry does) until the
+    # over-provision above genuinely runs out, up to ~25 h past its true expiry. That is the same
+    # over-provision every live account gets, granted no further, and it keeps us consistent with the
+    # `account_expiry_ts` we already handed the client.
     if request_at > proof_expires_at:
         payment_expires_at = (
             get_user.user.expires_at - get_user.user.grace_period
@@ -2335,14 +2149,29 @@ def build_current_entitlement_proof(
             f'User {bytes(master_pkey).hex()} entitlement expired at {base.readable(get_user.user.expires_at)} '
             f'({base.readable(payment_expires_at)} + {get_user.user.grace_period})',
             code=base.ErrorCode.subscription_expired,
+            # Advisory, same as the success path: carry the (now-past) account entitlement end so the
+            # client can refresh its cached horizon without a separate get_pro_status. Only on this slug —
+            # not_subscribed has no expiry, and revoked is a distinct state (its expiry may be future).
+            data={'account_expiry_ts': base.unix_seconds_from_datetime(get_user.user.expires_at)},
         )
 
-    return build_proof(
+    proof = build_proof(
         revocation_tag=get_user.user.token,
         rotating_pkey=rotating_pkey,
         expires_at=proof_expires_at,
         signing_key=signing_key,
     )
+    # Advisory (unsigned) account entitlement end, from this same snapshot — the client's true
+    # subscription horizon, distinct from the clamped proof expiry above.
+    #
+    # `max` so `expiry_ts <= account_expiry_ts` holds by construction rather than by luck. Everywhere the
+    # proof is still clamped (all of a long plan's life) this is exactly the true expiry, which is what the
+    # owner should see. It only reads back the proof's own expiry in the closing window where the
+    # over-provision pushes the proof past the true end — and there the two agree, to within the ≤25 h we
+    # are honouring anyway, so the client is never told its subscription ended before a proof we signed
+    # stops verifying.
+    proof.account_expires_at = max(get_user.user.expires_at, proof.expires_at)
+    return proof
 
 
 def generate_pro_proof(
@@ -2370,7 +2199,69 @@ def generate_pro_proof(
     )
 
     with db.transaction(conn) as tx:
+        # Reconcile first: claim any payment the mule has already registered for this key but that hasn't
+        # been redeemed yet, so a client's post-purchase proof request binds it right here — no separate
+        # redeem call. A no-op when there's nothing new. Then build the proof from the current entitlement
+        # (build_current_entitlement_proof raises the truthful "no Pro" slug if there's still nothing, which
+        # the client treats as "not yet — retry").
+        reconcile_pending_payments(tx, master_pkey, redeemed_at=to_redeemed_at(request_at))
         return build_current_entitlement_proof(tx, master_pkey, rotating_pkey, request_at, signing_key)
+
+
+@db.transactional
+def grant_rangeproof(
+    tx: db.SQLTransaction,
+    master_pkey: nacl.signing.VerifyKey,
+    rotating_pkey: nacl.signing.VerifyKey,
+    signing_key: nacl.signing.SigningKey,
+    request_at: datetime.datetime,
+    redeemed_at: datetime.datetime,
+    plan: base.ProPlan,
+    expires_at: datetime.datetime,
+) -> ProSubscriptionProof:
+    """Directly grant a Rangeproof (dev-house) Pro payment to `master_pkey` and return the proof.
+    Admin/CLI only: there is no client-facing voucher flow — a real one-time-use voucher, with a client
+    claim path, is future work. `rangeproof_payment_details.order_id` here is an internal unique row id,
+    not a voucher; we create the payment already redeemed and linked to the key, then build the proof."""
+    order_id = str(uuid.uuid4())
+    err = base.ErrorSink()
+    payment_tx = base.PaymentProviderTransaction()
+    payment_tx.provider = base.PaymentProvider.Rangeproof
+    payment_tx.rangeproof_order_id = order_id
+    add_unredeemed_payment(
+        tx,
+        payment_tx=payment_tx,
+        plan=plan,
+        expires_at=expires_at,
+        purchased_at=redeemed_at,
+        platform_refund_expires_at=base.EPOCH,
+        platform_obfuscated_account_id=b'',
+        err=err,
+    )
+    if err.has():
+        raise base.ServerError(f'Failed to create rangeproof payment: {err.build()}')
+
+    row_result = db.query(
+        tx.conn,
+        '''
+        UPDATE payments
+        SET    redeemed_at = %(redeemed_at)s
+        WHERE  id IN (SELECT payment_id FROM rangeproof_payment_details WHERE order_id = %(order_id)s)
+          AND  redeemed_at IS NULL AND revoked_at IS NULL
+        RETURNING id
+        ''',
+        redeemed_at=redeemed_at,
+        order_id=order_id,
+    )
+    redeemed_ids = [row[0] for row in row_result.fetchall()]
+    assert len(redeemed_ids) == 1, 'the rangeproof payment we just created must redeem exactly once'
+
+    user_id = get_or_create_user_and_generation(tx, master_pkey, issued_at=redeemed_at)[0]
+    db.query(
+        tx.conn, 'UPDATE payments SET user_id = %(user_id)s WHERE id = ANY(%(ids)s)', user_id=user_id, ids=redeemed_ids
+    )
+    _ensure_active_generation(tx, master_pkey, issued_at=redeemed_at)
+    return build_current_entitlement_proof(tx, master_pkey, rotating_pkey, request_at, signing_key)
 
 
 def expire_payments_revocations_and_users(conn: psycopg.Connection, now: datetime.datetime) -> ExpireResult:
@@ -2460,7 +2351,7 @@ SELECT EXISTS (
 
 def has_user_error(conn: psycopg.Connection, payment_provider: base.PaymentProvider, payment_id: str) -> bool:
     # Single SELECT on the given connection (mid-tx callers pass tx.conn). payment_provider is a string
-    # code (item 9) — compared directly, NOT int()-cast (that was a latent crash on the CLI path).
+    # code (the lookup tables key on the code itself) — compared directly, never int()-cast.
     row = db.query_one(
         conn,
         'SELECT 1 FROM user_errors WHERE payment_id = %s AND payment_provider = %s',
@@ -2538,81 +2429,6 @@ def get_payment(
             result = payment_row_from_dict(record)
 
     return result
-
-
-@db.transactional
-def set_refund_requested(
-    tx: db.SQLTransaction, payment_tx: UserPaymentTransaction, refund_requested_at: datetime.datetime | None
-) -> bool:
-    rows: db.Result | None = None
-    if payment_tx.provider == base.PaymentProvider.Rangeproof or payment_tx.provider == base.PaymentProvider.Nil:
-        return False
-
-    if payment_tx.provider == base.PaymentProvider.GooglePlayStore:
-        rows = db.query(
-            tx.conn,
-            '''
-            UPDATE payments
-            SET    refund_requested_at = %(ts)s
-            WHERE  id IN (SELECT payment_id FROM google_play_payment_details
-                            WHERE payment_token = %(token)s AND order_id = %(order_id)s)
-        ''',
-            ts=refund_requested_at,
-            token=payment_tx.google_payment_token,
-            order_id=payment_tx.google_order_id,
-        )
-    elif payment_tx.provider == base.PaymentProvider.iOSAppStore:
-        rows = db.query(
-            tx.conn,
-            '''
-            UPDATE payments
-            SET    refund_requested_at = %(ts)s
-            WHERE  id IN (SELECT payment_id FROM app_store_payment_details WHERE tx_id = %(tx_id)s)
-        ''',
-            ts=refund_requested_at,
-            tx_id=payment_tx.apple_tx_id,
-        )
-
-    assert rows and (rows.rowcount == 0 or rows.rowcount == 1)
-    success = rows.rowcount > 0
-
-    # If the refund timestamp has been set, immediately refresh the user's row.
-    #
-    # When a client hits /get_payment_details, that endpoint uses the user's row which caches the
-    # "best" payment that should be used to entitle a user to pro. Hence if their refund
-    # timestamp changes for that best payment, that metadata that is cached in the user details
-    # must be updated.
-    if success:
-        row = None
-        if payment_tx.provider == base.PaymentProvider.GooglePlayStore:
-            row = db.query_one(
-                tx.conn,
-                '''
-                SELECT u.master_pkey
-                FROM   payments p JOIN users u ON u.id = p.user_id
-                       JOIN google_play_payment_details gd ON gd.payment_id = p.id
-                WHERE  gd.payment_token = %(token)s AND gd.order_id = %(order_id)s
-            ''',
-                token=payment_tx.google_payment_token,
-                order_id=payment_tx.google_order_id,
-            )
-        elif payment_tx.provider == base.PaymentProvider.iOSAppStore:
-            row = db.query_one(
-                tx.conn,
-                '''
-                SELECT u.master_pkey
-                FROM   payments p JOIN users u ON u.id = p.user_id
-                       JOIN app_store_payment_details ad ON ad.payment_id = p.id
-                WHERE  ad.tx_id = %s
-            ''',
-                payment_tx.apple_tx_id,
-            )
-
-        if row:
-            master_pkey = nacl.signing.VerifyKey(bytes(row[0]))
-            _update_user_expiry_grace_and_renew_flag_from_payment_list(tx, master_pkey)
-
-    return success
 
 
 @db.transactional
@@ -2701,6 +2517,22 @@ def google_notification_message_id_is_in_db(tx: db.SQLTransaction, message_id: s
         result.present = True
         result.handled = row[0] > 0  # NOTE: Should always be 0 or 1 but we'll be extra careful
     return result
+
+
+def google_payment_tokens_needing_ack(conn: psycopg.Connection) -> list[str]:
+    """Distinct Google purchase-tokens with an outstanding acknowledgement (needs_ack). The mule's
+    sweep acks each against Google and clears the flag via google_clear_needs_ack."""
+    rows = db.query(conn, '''SELECT DISTINCT payment_token FROM google_play_payment_details WHERE needs_ack''')
+    return [row[0] for row in rows]
+
+
+@db.transactional
+def google_clear_needs_ack(tx: db.SQLTransaction, payment_token: str) -> None:
+    """Clear the acknowledgement obligation for every row of `payment_token` (a token is acknowledged as
+    a whole, so all its billing-cycle rows clear together)."""
+    db.query(
+        tx.conn, '''UPDATE google_play_payment_details SET needs_ack = FALSE WHERE payment_token = %s''', payment_token
+    )
 
 
 def _get_date_group_expr_sql(column: str, period: ReportPeriod) -> str:
@@ -2850,13 +2682,6 @@ def generate_report_rows(conn: psycopg.Connection, period: ReportPeriod, limit: 
             tx_conn=tx.conn, period=period, date_column="purchased_at", where_clause="purchased_at IS NOT NULL"
         )
 
-        refunds_initiated: dict[str, int] = fetch_counts(
-            tx_conn=tx.conn,
-            period=period,
-            date_column="refund_requested_at",
-            where_clause="refund_requested_at IS NOT NULL",
-        )
-
         revocations: dict[str, int] = fetch_counts(
             tx_conn=tx.conn, period=period, date_column="revoked_at", where_clause="revoked_at IS NOT NULL"
         )
@@ -2871,13 +2696,7 @@ def generate_report_rows(conn: psycopg.Connection, period: ReportPeriod, limit: 
         active_users: dict[str, int] = fetch_active_users(tx.conn, period)
 
         all_periods: set[str] = set()
-        for key_list in [
-            new_subs.keys(),
-            refunds_initiated.keys(),
-            revocations.keys(),
-            cancelled.keys(),
-            active_users.keys(),
-        ]:
+        for key_list in [new_subs.keys(), revocations.keys(), cancelled.keys(), active_users.keys()]:
             for it in key_list:
                 all_periods.add(it)
 
@@ -2895,7 +2714,6 @@ def generate_report_rows(conn: psycopg.Connection, period: ReportPeriod, limit: 
                     plan_1m=plan_1m.get(it, 0),
                     plan_3m=plan_3m.get(it, 0),
                     plan_12m=plan_12m.get(it, 0),
-                    refunds_initiated=refunds_initiated.get(it, 0),
                     revoked=revocations.get(it, 0),
                     cancelled=cancelled.get(it, 0),
                 )
@@ -2922,7 +2740,6 @@ def generate_report_str(period: ReportPeriod, data: list[ReportRow], type: Repor
         Section("Plan 1m", 10),
         Section("Plan 3m", 10),
         Section("Plan 12m", 10),
-        Section("Refunds Initiated", 20),
         Section("Revoked", 10),
         Section("Cancelling", 12),
     ]
@@ -3001,11 +2818,6 @@ def generate_report_str(period: ReportPeriod, data: list[ReportRow], type: Repor
                 part_section = sections[len(human_parts)]
                 padding = part_section.width
                 align = '<' if part_section.align_left else '>'
-                human_parts.append(f"{row.refunds_initiated:20}")
-
-                part_section = sections[len(human_parts)]
-                padding = part_section.width
-                align = '<' if part_section.align_left else '>'
                 human_parts.append(f"{row.revoked:{align}{padding}}")
 
                 part_section = sections[len(human_parts)]
@@ -3032,7 +2844,6 @@ def generate_report_str(period: ReportPeriod, data: list[ReportRow], type: Repor
                     row.plan_1m,
                     row.plan_3m,
                     row.plan_12m,
-                    row.refunds_initiated,
                     row.revoked,
                     row.cancelled,
                 ]

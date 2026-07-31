@@ -1,7 +1,8 @@
 '''
 Startup configuration for the Session Pro Backend: the `.INI` + environment parsing that produces a
 `ParsedArgs`. Kept separate from `main.py` so it can be imported without side effects by both the Flask
-entry point (`main.py`) and the maintenance mule (`mule.py`) — importing `main` would build the Flask app.
+entry point (`main.py`) and the maintenance mule (`providers/google_play/mule.py`) — importing `main`
+would build the Flask app.
 '''
 
 import configparser

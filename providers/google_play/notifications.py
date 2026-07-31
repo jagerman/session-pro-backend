@@ -19,6 +19,8 @@ import collections.abc
 from google.oauth2 import service_account
 
 import googleapiclient.discovery
+import google_auth_httplib2
+import httplib2
 
 import backend
 import base
@@ -112,7 +114,12 @@ def init(
         api.credentials = service_account.Credentials.from_service_account_file(
             app_credentials_path, scopes=['https://www.googleapis.com/auth/androidpublisher']
         )
-        api.publisher_service = googleapiclient.discovery.build('androidpublisher', 'v3', credentials=api.credentials)
+        # Bound every Play API call with a socket timeout. googleapiclient's default httplib2 transport
+        # has NO timeout, so a hung Google request would block the mule's single-threaded pull loop
+        # indefinitely (there's no harakiri leash on the mule like there is on the request workers). 15s
+        # is plenty; a timeout just fails the call, and the mule retries — nothing it does is time-critical.
+        authed_http = google_auth_httplib2.AuthorizedHttp(api.credentials, http=httplib2.Http(timeout=15))
+        api.publisher_service = googleapiclient.discovery.build('androidpublisher', 'v3', http=authed_http)
 
     api.package_name = package_name
     api.subscription_product_id = subscription_product_id
@@ -266,6 +273,51 @@ def _process_notification_message(
     return handled
 
 
+def _sweep_pending_acks() -> None:
+    """Acknowledge to Google every Google purchase still flagged needs_ack, then clear the flag. This is
+    the SOLE acker: notification handling only records needs_ack, and the pull loop calls this once per
+    iteration (right before blocking on the next pull), so a fresh purchase is acked the next cycle and a
+    crash between committing a payment and acking it is picked up by the next sweep — startup included, no
+    special case. Google 400s an already-acknowledged purchase with no cleanly-identifiable error, so on
+    ANY ack failure we consult the authoritative acknowledgement_state and clear the flag iff Google
+    already considers it acked (the "acked, then crashed before clearing" case); otherwise leave it set to
+    retry. Best-effort — never raises, so it can't break the pull loop."""
+    try:
+        with db.open_database(base.DB_URL) as engine:
+            with db.connection(engine) as conn:
+                tokens = backend.google_payment_tokens_needing_ack(conn)
+    except Exception:
+        log.error(f'needs_ack sweep: failed to load pending acks. Error was {traceback.format_exc()}')
+        return
+
+    for token in tokens:
+        ack_err = base.ErrorSink()
+        api.subscription_v1_acknowledge(purchase_token=token, err=ack_err)
+        acked = not ack_err.has()
+        if not acked:
+            # Ack failed: either a transient error, or we already acked and crashed before clearing the
+            # flag. Read the authoritative state rather than trying to parse Google's ambiguous 400.
+            fetch_err = base.ErrorSink()
+            details = api.fetch_subscription_v2_details(api.package_name, token, fetch_err)
+            acked = (
+                not fetch_err.has()
+                and details is not None
+                and details.acknowledgement_state == SubscriptionsV2AcknowledgementState.ACKNOWLEDGED
+            )
+        if acked:
+            try:
+                with db.open_database(base.DB_URL) as engine:
+                    with db.connection(engine) as conn:
+                        backend.google_clear_needs_ack(conn, payment_token=token)
+            except Exception:
+                log.error(
+                    f'needs_ack sweep: acked but failed to clear flag for {base.maybe_obfuscate(token)}. '
+                    f'Error was {traceback.format_exc()}'
+                )
+        else:
+            log.warning(f'needs_ack sweep: ack still failing for {base.maybe_obfuscate(token)}; will retry next sweep')
+
+
 def thread_entry_point(
     context: ThreadContext, app_credentials_path: str, cloud_project_id: str, cloud_subscription_name: str
 ):
@@ -368,9 +420,7 @@ def thread_entry_point(
                         message_data = json.loads(it.message.data)
                         published = base.readable(base.datetime_from_unix_ms(it.message.publish_time.ToMilliseconds()))
                         parse = parse_notification(message_data, err)
-                        message_id = (
-                            it.message.message_id
-                        )  # Pub/Sub ids are opaque strings — never int()-cast (item 11)
+                        message_id = it.message.message_id  # Pub/Sub ids are opaque strings — never int()-cast
                         if err.has():
                             log.warning(
                                 f'Discarding message #{index}: could not parse it '
@@ -501,6 +551,12 @@ def thread_entry_point(
                 except Exception:
                     log.error(f'Google notification handling failed. Error was {traceback.format_exc()}')
 
+                # Acknowledge any purchases still owing a Google ack, right before blocking on the next
+                # pull. Decoupled from handling (which only records the obligation): this is the sole
+                # acker, and running it every iteration covers fresh purchases, failed-ack retries, and
+                # startup/crash leftovers uniformly — no special startup path.
+                _sweep_pending_acks()
+
 
 def _update_payment_renewal_info(
     tx_payment: base.PaymentProviderTransaction,
@@ -605,60 +661,62 @@ def handle_subscription_notification(
                setObfuscatedProfileId.
             """
             if tx_event.subscription_state == SubscriptionsV2State.ACTIVE:
-                if tx_event.purchase_acknowledged == SubscriptionsV2AcknowledgementState.ACKNOWLEDGED:
-                    err.msg_list.append('Latest subscription state is already acknowledged')
-                else:
-                    assert (
-                        tx_event.pro_plan != ProPlan.Nil
-                    ), "Plan was parsed into a valid enum when extracting notification data, but is now Nil"
-                    assert len(tx_payment.google_order_id) > 0 and len(tx_payment.google_payment_token) > 0
+                assert (
+                    tx_event.pro_plan != ProPlan.Nil
+                ), "Plan was parsed into a valid enum when extracting notification data, but is now Nil"
+                assert len(tx_payment.google_order_id) > 0 and len(tx_payment.google_payment_token) > 0
 
-                    obfuscated_external_account_id: bytes = require_obfuscated_external_account_id(tx_event, err)
-                    if not err.has():
-                        # NOTE: Acknowledge the payment
-                        expiry: str = base.readable(base.datetime_from_unix_ms(tx_event.expiry_time.unix_milliseconds))
-                        unredeemed: str = base.readable(base.datetime_from_unix_ms(tx_event.event_ts_ms))
-                        payment_label: str = backend.payment_provider_tx_log_label_safe(tx_payment)
-                        log.info(
-                            f'{tx_event.notification.name}+{tx_event.subscription_state.name}; '
-                            f'(linked_token={base.maybe_obfuscate(tx_event.linked_purchase_token)}, '
-                            f'plan={tx_event.pro_plan.name}, payment={payment_label}, '
-                            f'unredeemed={unredeemed}, expiry={expiry})'
-                        )
+                obfuscated_external_account_id: bytes = require_obfuscated_external_account_id(tx_event, err)
+                if not err.has():
+                    expiry: str = base.readable(base.datetime_from_unix_ms(tx_event.expiry_time.unix_milliseconds))
+                    unredeemed: str = base.readable(base.datetime_from_unix_ms(tx_event.event_ts_ms))
+                    payment_label: str = backend.payment_provider_tx_log_label_safe(tx_payment)
+                    log.info(
+                        f'{tx_event.notification.name}+{tx_event.subscription_state.name}; '
+                        f'(linked_token={base.maybe_obfuscate(tx_event.linked_purchase_token)}, '
+                        f'plan={tx_event.pro_plan.name}, payment={payment_label}, '
+                        f'unredeemed={unredeemed}, expiry={expiry}, acked={tx_event.purchase_acknowledged.name})'
+                    )
 
-                        # NOTE: If a linked token is in the payload, it means that the old token
-                        # needs to be voided first before continuing as the link token is the new
-                        # token allocated to the user.
+                    # NOTE: If a linked token is in the payload, it means that the old token
+                    # needs to be voided first before continuing as the link token is the new
+                    # token allocated to the user.
 
-                        # NOTE: Revoke the old token
-                        if tx_event.linked_purchase_token is not None:
-                            # NOTE: For google, the only information we have about the previous order
-                            # is the purchase token. So we have to go and find the latest payment
-                            # valid for a purchase token and void that.
-                            backend.add_google_revocation(
-                                tx,
-                                google_payment_token=tx_event.linked_purchase_token,
-                                revoke_at=base.datetime_from_unix_ms(tx_event.event_ts_ms),
-                                err=err,
-                            )
-                        # NOTE: Register the payment
-                        backend.add_unredeemed_payment(
+                    # NOTE: Revoke the old token
+                    if tx_event.linked_purchase_token is not None:
+                        # NOTE: For google, the only information we have about the previous order
+                        # is the purchase token. So we have to go and find the latest payment
+                        # valid for a purchase token and void that.
+                        backend.add_google_revocation(
                             tx,
-                            payment_tx=tx_payment,
-                            plan=tx_event.pro_plan,
-                            expires_at=base.datetime_from_unix_ms(tx_event.expiry_time.unix_milliseconds),
-                            purchased_at=base.datetime_from_unix_ms(tx_event.event_ts_ms),
-                            platform_refund_expires_at=base.datetime_from_unix_ms(
-                                tx_event.event_ts_ms + api.refund_deadline_duration_ms
-                            ),
-                            platform_obfuscated_account_id=obfuscated_external_account_id,
+                            google_payment_token=tx_event.linked_purchase_token,
+                            revoke_at=base.datetime_from_unix_ms(tx_event.event_ts_ms),
                             err=err,
                         )
+                    # NOTE: Register the payment. Idempotent on (token, order_id), so a Pub/Sub
+                    # redelivery of an already-handled purchase re-registers harmlessly instead of
+                    # erroring. needs_ack flags a fresh, not-yet-acknowledged purchase for the mule's
+                    # separate ack sweep (the "confirm within 3 days or it's auto-refunded" step) — kept
+                    # off this transaction so we never tell Google a payment is provisioned before our DB
+                    # durably records it.
+                    backend.add_unredeemed_payment(
+                        tx,
+                        payment_tx=tx_payment,
+                        plan=tx_event.pro_plan,
+                        expires_at=base.datetime_from_unix_ms(tx_event.expiry_time.unix_milliseconds),
+                        purchased_at=base.datetime_from_unix_ms(tx_event.event_ts_ms),
+                        platform_refund_expires_at=base.datetime_from_unix_ms(
+                            tx_event.event_ts_ms + api.refund_deadline_duration_ms
+                        ),
+                        platform_obfuscated_account_id=obfuscated_external_account_id,
+                        err=err,
+                        needs_ack=tx_event.purchase_acknowledged != SubscriptionsV2AcknowledgementState.ACKNOWLEDGED,
+                    )
 
-                        if not err.has():
-                            set_purchase_grace_period_duration(
-                                tx_payment=tx_payment, tx=tx, grace_period=base.DEFAULT_GOOGLE_GRACE_PERIOD, err=err
-                            )
+                    if not err.has():
+                        set_purchase_grace_period_duration(
+                            tx_payment=tx_payment, tx=tx, grace_period=base.DEFAULT_GOOGLE_GRACE_PERIOD, err=err
+                        )
 
         case SubscriptionNotificationType.IN_GRACE_PERIOD:
             if tx_event.subscription_state == SubscriptionsV2State.IN_GRACE_PERIOD:
@@ -709,6 +767,9 @@ def handle_subscription_notification(
                         ),
                         platform_obfuscated_account_id=obfuscated_external_account_id,
                         err=err,
+                        # Renewals normally arrive already acknowledged; flag for the sweep on the off
+                        # chance Google reports one that isn't.
+                        needs_ack=tx_event.purchase_acknowledged != SubscriptionsV2AcknowledgementState.ACKNOWLEDGED,
                     )
 
                     if not err.has():
@@ -798,9 +859,10 @@ def handle_subscription_notification(
                         payment_provider=tx_payment.provider, at=base.datetime_from_unix_ms(tx_event.event_ts_ms)
                     )
 
-                    # NOTE: expires_at in the db is not rounded, but the proof's themselves have an
-                    # expiry timestamp rounded to the end of the UTC day. So we only actually want to revoke
-                    # proofs that aren't going to self-expire by the end of the day.
+                    # NOTE: A payment at or past the end of the current day is expiring anyway, so it isn't
+                    # worth an entry in the revocation list every client fetches. Mirrors the day-boundary
+                    # early-out in backend.revoke_payments_by_id_internal — see the note there for the
+                    # bounded window an outstanding proof can outlive it by.
                     if rounded_expiry_at > rounded_event_at:
                         backend.add_google_revocation(
                             tx,

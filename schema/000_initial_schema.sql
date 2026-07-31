@@ -15,9 +15,7 @@ CREATE TABLE IF NOT EXISTS users (
     current_generation_id        BIGINT      NOT NULL,
     expires_at                   TIMESTAMPTZ NOT NULL,
     grace_period                 INTERVAL    NOT NULL DEFAULT '0'::interval,
-    auto_renewing                BOOLEAN     NOT NULL DEFAULT FALSE,
-    -- NULL = no refund requested.
-    refund_requested_at          TIMESTAMPTZ
+    auto_renewing                BOOLEAN     NOT NULL DEFAULT FALSE
     -- (No account-id columns here: the provider account ids are pure functions of master_pkey — see
     -- {google,apple}_obfuscated_account_id_from_master_pkey — and are stored on `payments` only, where
     -- they serve as the auto-redeem lookup key. Persisting them on the user row was redundant.)
@@ -58,10 +56,7 @@ CREATE TABLE IF NOT EXISTS payments (
     expires_at                        TIMESTAMPTZ NOT     NULL,
     grace_period                      INTERVAL    NOT NULL DEFAULT '0'::interval,
     platform_refund_expires_at        TIMESTAMPTZ NOT     NULL,
-    revoked_at                        TIMESTAMPTZ,                    -- NOT NULL once revoked
-
-    -- NULL = no refund requested.
-    refund_requested_at               TIMESTAMPTZ
+    revoked_at                        TIMESTAMPTZ                     -- NOT NULL once revoked
 
     -- Provider-specific identifiers do NOT live here — they're in the per-provider *_payment_details
     -- tables below (one row, keyed by payment_id, in exactly the table matching payment_provider). That
@@ -72,7 +67,7 @@ CREATE TABLE IF NOT EXISTS payments (
 CREATE INDEX IF NOT EXISTS payments_user_id_idx    ON payments (user_id) WHERE user_id IS NOT NULL;  -- owner lookups + PAYMENTS_FROM join
 CREATE INDEX IF NOT EXISTS payments_expires_at_idx ON payments (expires_at);                         -- daily expiry sweep
 
--- Per-provider payment identifiers (item 15 follow-up). Exactly one of these has a row for a given
+-- Per-provider payment identifiers. Exactly one of these has a row for a given
 -- payment, in the table matching payments.payment_provider; payment_id is the PK *and* FK, so the 1:1 is
 -- structural and the detail row is pruned with its payment (ON DELETE CASCADE). Typed columns with real
 -- NOT NULLs replace the old sparse provider columns on `payments`.
@@ -158,13 +153,13 @@ CREATE TABLE IF NOT EXISTS apple_notification_uuid_history (
 );
 
 CREATE TABLE IF NOT EXISTS google_notification_history (
-    message_id        TEXT PRIMARY KEY,   -- Pub/Sub message id: opaque STRING, never a number (item 11)
+    message_id        TEXT PRIMARY KEY,   -- Pub/Sub message id: opaque STRING, never a number
     handled           BOOLEAN NOT NULL DEFAULT FALSE,
     payload           TEXT,
     expires_at        TIMESTAMPTZ NOT NULL
 );
 -- The startup drain reads `WHERE NOT handled`; a partial index keeps that off a full seq-scan as the
--- buffer grows (item 10).
+-- buffer grows.
 CREATE INDEX IF NOT EXISTS google_notification_history_unhandled ON google_notification_history (message_id) WHERE NOT handled;
 
 -- `payment_id` here is the provider's tx-id STRING (Apple original_tx_id / Google payment_token), NOT

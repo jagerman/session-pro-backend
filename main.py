@@ -214,9 +214,10 @@ def entry_point() -> flask.Flask:
             end_unix_ts_ms = int((time.time() - 10) * 1000)
             app_store.catchup_on_missed_notifications(core=core, sql_conn=conn, end_unix_ts_ms=end_unix_ts_ms)
 
-        # NOTE: The Google Pub/Sub subscriber and the periodic DB prune are singleton background work —
-        # they run once in the maintenance mule (mule.py, `mule = mule:run`), not per-worker here. The
-        # Apple notification route is registered above because it's an HTTP endpoint the workers serve;
+        # NOTE: The Google Pub/Sub subscriber is singleton background work — it runs once in the
+        # maintenance mule (providers/google_play/mule.py), not per-worker here. (The periodic DB prune is
+        # also singleton but runs on worker 1 via an @timer, since a mule can't register uWSGI signals.)
+        # The Apple notification route is registered above because it's an HTTP endpoint the workers serve;
         # only Apple's startup catch-up remains per-worker for now (a one-shot — a follow-up could move
         # it to the mule too).
     return result

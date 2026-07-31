@@ -14,6 +14,7 @@ endpoint.
 import argparse
 import collections.abc
 import contextlib
+import itertools
 import pprint
 import flask
 import json
@@ -479,6 +480,674 @@ def test_google_process_notification_message(monkeypatch, pg_database):
             assert backend.has_user_error(conn, base.PaymentProvider.GooglePlayStore, 'tok-e') is True
 
 
+def test_google_ack_sweep(monkeypatch, pg_database):
+    # The mule's needs_ack sweep is the SOLE Google purchase-acker (notification handling only records the
+    # obligation). Cover its three outcomes: a clean ack clears the flag; an ack that FAILS but that Google
+    # already considers acknowledged (we acked then crashed before clearing) clears via the authoritative
+    # acknowledgement_state; a genuinely failing ack leaves the flag set to retry next sweep.
+    dsn = pg_database()
+    monkeypatch.setattr(base, 'DB_URL', dsn)  # the sweep opens its own connection via base.DB_URL
+    pool = backend.bootstrap_db(database_url=dsn)
+    assert pool
+
+    class _AckedDetails:
+        acknowledgement_state = google_play.types.SubscriptionsV2AcknowledgementState.ACKNOWLEDGED
+
+    def seed(conn, token, needs_ack):
+        tx = base.PaymentProviderTransaction()
+        tx.provider = base.PaymentProvider.GooglePlayStore
+        tx.google_payment_token = token
+        tx.google_order_id = os.urandom(backend.BLAKE2B_DIGEST_SIZE).hex()
+        err = base.ErrorSink()
+        backend.add_unredeemed_payment(
+            conn,
+            payment_tx=tx,
+            plan=base.ProPlan.OneMonth,
+            purchased_at=base.EPOCH,
+            expires_at=base.EPOCH,
+            platform_refund_expires_at=base.EPOCH,
+            platform_obfuscated_account_id=os.urandom(32),
+            err=err,
+            needs_ack=needs_ack,
+        )
+        assert not err.msg_list, err.msg_list
+
+    def flag(conn, token):
+        return db.query_scalar(
+            conn, 'SELECT needs_ack FROM google_play_payment_details WHERE payment_token = %s', token
+        )
+
+    tok_ok = os.urandom(32).hex()
+    tok_crashed = os.urandom(32).hex()
+    tok_fail = os.urandom(32).hex()
+    tok_already = os.urandom(32).hex()
+
+    with db.connection(pool) as conn:
+        # Each case seeds its token TRUE just before running the sweep, so the sweep (which processes all
+        # currently-TRUE tokens) only sees this case's token — no cross-case interference, no re-seeding.
+
+        # (1) Ack succeeds -> flag cleared. A FALSE row (already acknowledged at registration) is never
+        #     even selected by the sweep.
+        seed(conn, tok_already, needs_ack=False)
+        seed(conn, tok_ok, needs_ack=True)
+        monkeypatch.setattr('providers.google_play.api.subscription_v1_acknowledge', lambda purchase_token, err: None)
+        google_play.notifications._sweep_pending_acks()
+        assert flag(conn, tok_ok) is False
+        assert flag(conn, tok_already) is False
+
+        # (2) Ack FAILS but Google reports it already ACKNOWLEDGED (acked-then-crashed) -> cleared via the
+        #     authoritative acknowledgement_state fetch.
+        seed(conn, tok_crashed, needs_ack=True)
+        monkeypatch.setattr(
+            'providers.google_play.api.subscription_v1_acknowledge',
+            lambda purchase_token, err: err.msg_list.append('ack boom'),
+        )
+        monkeypatch.setattr(
+            'providers.google_play.api.fetch_subscription_v2_details', lambda pkg, token, err: _AckedDetails()
+        )
+        google_play.notifications._sweep_pending_acks()
+        assert flag(conn, tok_crashed) is False
+
+        # (3) Ack FAILS and Google does NOT confirm acknowledged (fetch returns nothing) -> flag stays set
+        #     for the next sweep. (ack stub from case 2 still in effect.)
+        seed(conn, tok_fail, needs_ack=True)
+        monkeypatch.setattr('providers.google_play.api.fetch_subscription_v2_details', lambda pkg, token, err: None)
+        google_play.notifications._sweep_pending_acks()
+        assert flag(conn, tok_fail) is True
+    pool.close()
+
+
+def test_reconcile_pending_payments(pg_database):
+    # reconcile_pending_payments claims ALL unredeemed Google/Apple payments bound to a master key (the
+    # store-attested account id IS a function of the key), links them, and refreshes entitlement -- and
+    # touches nothing, in particular creates NO user row, for a key with no payments.
+    pool = backend.bootstrap_db(database_url=pg_database())
+    assert pool
+
+    master = nacl.signing.SigningKey.generate()
+    other = nacl.signing.SigningKey.generate()
+    now = base.round_datetime_to_next_day(datetime.datetime.now(datetime.timezone.utc))
+
+    def seed_google(conn, master_vk):
+        tx = base.PaymentProviderTransaction()
+        tx.provider = base.PaymentProvider.GooglePlayStore
+        tx.google_payment_token = os.urandom(backend.BLAKE2B_DIGEST_SIZE).hex()
+        tx.google_order_id = os.urandom(backend.BLAKE2B_DIGEST_SIZE).hex()
+        err = base.ErrorSink()
+        backend.add_unredeemed_payment(
+            conn,
+            payment_tx=tx,
+            plan=base.ProPlan.OneMonth,
+            purchased_at=now,
+            expires_at=now + datetime.timedelta(days=30),
+            platform_refund_expires_at=base.EPOCH,
+            platform_obfuscated_account_id=bytes(master_vk),
+            err=err,
+        )
+        assert not err.msg_list, err.msg_list
+
+    with db.connection(pool) as conn:
+        # Two unredeemed Google payments for the same key (e.g. a device offline across a renewal).
+        seed_google(conn, master.verify_key)
+        seed_google(conn, master.verify_key)
+
+        assert backend.reconcile_pending_payments(conn, master.verify_key, redeemed_at=now) == 2  # claim-ALL
+        assert backend.get_user(conn, master.verify_key).found  # user created + entitled
+        # Idempotent: nothing left unredeemed.
+        assert backend.reconcile_pending_payments(conn, master.verify_key, redeemed_at=now) == 0
+
+        # A key with no payments claims nothing AND must not spawn a user row.
+        assert backend.reconcile_pending_payments(conn, other.verify_key, redeemed_at=now) == 0
+        assert not backend.get_user(conn, other.verify_key).found
+    pool.close()
+
+
+def test_generate_pro_proof_auto_redeems(pg_database):
+    # The reflow core: a proof request reconciles first, so a payment the mule registered (unredeemed) is
+    # bound AND proven on the client's proof call -- no separate /add_pro_payment redeem step.
+    pool = backend.bootstrap_db(database_url=pg_database())
+    assert pool
+    backend_key = nacl.signing.SigningKey.generate()
+    master_key = nacl.signing.SigningKey.generate()
+    rotating_key = nacl.signing.SigningKey.generate()
+    now = base.round_datetime_to_next_day(datetime.datetime.now(datetime.timezone.utc))
+
+    with db.connection(pool) as conn:
+        # A mule-registered, unredeemed Google payment bound to the master key.
+        seed_tx = base.PaymentProviderTransaction()
+        seed_tx.provider = base.PaymentProvider.GooglePlayStore
+        seed_tx.google_payment_token = os.urandom(backend.BLAKE2B_DIGEST_SIZE).hex()
+        seed_tx.google_order_id = os.urandom(backend.BLAKE2B_DIGEST_SIZE).hex()
+        err = base.ErrorSink()
+        backend.add_unredeemed_payment(
+            conn,
+            payment_tx=seed_tx,
+            plan=base.ProPlan.OneMonth,
+            purchased_at=now,
+            expires_at=now + datetime.timedelta(days=30),
+            platform_refund_expires_at=base.EPOCH,
+            platform_obfuscated_account_id=bytes(master_key.verify_key),
+            err=err,
+        )
+        assert not err.msg_list, err.msg_list
+        assert len(backend.get_unredeemed_payments_list(conn)) == 1
+
+        # Proof request with NO explicit redeem -> auto-redeems + returns a valid proof.
+        hash_to_sign = backend.make_generate_pro_proof_message(
+            master_pkey=master_key.verify_key, rotating_pkey=rotating_key.verify_key, request_at=now
+        )
+        proof = backend.generate_pro_proof(
+            conn=conn,
+            signing_key=backend_key,
+            master_pkey=master_key.verify_key,
+            rotating_pkey=rotating_key.verify_key,
+            request_at=now,
+            master_sig=bytes(master_key.sign(hash_to_sign).signature),
+            rotating_sig=bytes(rotating_key.sign(hash_to_sign).signature),
+        )
+        # The proof verifies against the backend key, and the payment is now redeemed.
+        proof_hash = backend.build_proof_message(proof.revocation_tag, proof.rotating_pkey, proof.expires_at)
+        backend_key.verify_key.verify(smessage=proof_hash, signature=proof.sig)
+        assert not backend.get_unredeemed_payments_list(conn)
+    pool.close()
+
+
+def test_grant_rangeproof(pg_database):
+    # Admin/CLI Rangeproof grant: create an already-redeemed payment linked to a master key and return a
+    # proof -- no voucher, no client claim step.
+    pool = backend.bootstrap_db(database_url=pg_database())
+    assert pool
+    backend_key = nacl.signing.SigningKey.generate()
+    master_key = nacl.signing.SigningKey.generate()
+    rotating_key = nacl.signing.SigningKey.generate()
+    now = base.round_datetime_to_next_day(datetime.datetime.now(datetime.timezone.utc))
+
+    with db.connection(pool) as conn:
+        assert not backend.get_user(conn, master_key.verify_key).found
+        proof = backend.grant_rangeproof(
+            conn,
+            master_pkey=master_key.verify_key,
+            rotating_pkey=rotating_key.verify_key,
+            signing_key=backend_key,
+            request_at=now,
+            redeemed_at=now,
+            plan=base.ProPlan.OneMonth,
+            expires_at=now + datetime.timedelta(days=30),
+        )
+        # The proof verifies against the backend key, and the key is now an entitled user.
+        proof_hash = backend.build_proof_message(proof.revocation_tag, proof.rotating_pkey, proof.expires_at)
+        backend_key.verify_key.verify(smessage=proof_hash, signature=proof.sig)
+        assert backend.get_user(conn, master_key.verify_key).found
+    pool.close()
+
+
+def test_proof_reports_account_expiry(pg_database):
+    # A proof response carries account_expiry_ts -- the account's TRUE entitlement end -- distinct from
+    # the proof's clamped (~30d) validity window. Grant a 12-month entitlement: the proof caps at ~30d
+    # while account_expires_at reports the full year, and account_expiry_ts is NOT in the signed message.
+    pool = backend.bootstrap_db(database_url=pg_database())
+    assert pool
+    backend_key = nacl.signing.SigningKey.generate()
+    master_key = nacl.signing.SigningKey.generate()
+    rotating_key = nacl.signing.SigningKey.generate()
+    now = base.round_datetime_to_next_day(datetime.datetime.now(datetime.timezone.utc))
+    account_expiry = now + datetime.timedelta(days=365)
+
+    with db.connection(pool) as conn:
+        proof = backend.grant_rangeproof(
+            conn,
+            master_pkey=master_key.verify_key,
+            rotating_pkey=rotating_key.verify_key,
+            signing_key=backend_key,
+            request_at=now,
+            redeemed_at=now,
+            plan=base.ProPlan.TwelveMonth,
+            expires_at=account_expiry,
+        )
+        # Proof validity rides the rolling clamp (~30 days); the account entitlement runs the full year, so
+        # account_expiry_ts is the TRUE expiry exactly -- max() only ever reads back the proof's own expiry
+        # in the closing window where the over-provision overtakes the true end, which is nowhere near here.
+        shape = base.proof_expiry_shape()
+        offset = backend.get_user(conn, master_key.verify_key).proof_expiry_offset
+        assert proof.expires_at == base.round_datetime_up_onto_offset_grid(
+            now + shape.clamp + shape.renewal_lead, period=shape.grid, offset_seconds=offset
+        )
+        assert proof.account_expires_at == account_expiry
+        assert proof.expires_at < proof.account_expires_at
+
+        wire = proof.to_dict()
+        assert wire['account_expiry_ts'] == base.unix_seconds_from_datetime(account_expiry)
+        assert wire['expiry_ts'] != wire['account_expiry_ts']
+
+        # account_expiry_ts is advisory: it is NOT part of the signed message the verifier reconstructs.
+        proof_hash = backend.build_proof_message(proof.revocation_tag, proof.rotating_pkey, proof.expires_at)
+        backend_key.verify_key.verify(smessage=proof_hash, signature=proof.sig)
+    pool.close()
+
+
+def test_expired_proof_fail_carries_account_expiry(pg_database):
+    # A proof request against a lapsed entitlement fails with subscription_expired AND carries the
+    # account's (now-past) expiry as account_expiry_ts on the error, so the client can refresh its cached
+    # horizon without a separate get_pro_status.
+    pool = backend.bootstrap_db(database_url=pg_database())
+    assert pool
+    backend_key = nacl.signing.SigningKey.generate()
+    master_key = nacl.signing.SigningKey.generate()
+    rotating_key = nacl.signing.SigningKey.generate()
+    granted_at = base.round_datetime_to_next_day(datetime.datetime.now(datetime.timezone.utc))
+    account_expiry = granted_at + datetime.timedelta(hours=1)
+
+    with db.connection(pool) as conn:
+        # Grant a short entitlement (valid at grant time).
+        backend.grant_rangeproof(
+            conn,
+            master_pkey=master_key.verify_key,
+            rotating_pkey=rotating_key.verify_key,
+            signing_key=backend_key,
+            request_at=granted_at,
+            redeemed_at=granted_at,
+            plan=base.ProPlan.OneMonth,
+            expires_at=account_expiry,
+        )
+        # Ask for a proof from after the entitlement AND its proof over-provision are spent (the offset
+        # buys up to a day past the true expiry, so an hour later is not yet lapsed as far as proofs go --
+        # see test_lapsed_account_keeps_proofs_through_the_over_provision) -> subscription_expired, with the
+        # past TRUE expiry attached (never the over-provisioned one).
+        request_at = account_expiry + base.proof_expiry_shape().max_proof_lifetime
+        with db.transaction(conn) as tx:
+            with pytest.raises(base.FailError) as excinfo:
+                backend.build_current_entitlement_proof(
+                    tx, master_key.verify_key, rotating_key.verify_key, request_at, backend_key
+                )
+        assert excinfo.value.code == base.ErrorCode.subscription_expired
+        assert excinfo.value.data == {'account_expiry_ts': base.unix_seconds_from_datetime(account_expiry)}
+    pool.close()
+
+
+def _grant_and_get_offset(conn, backend_key, master_key, rotating_key, granted_at, expires_at, plan=None):
+    """Grant a Rangeproof entitlement ending at `expires_at` and return the account's proof-expiry offset."""
+    backend.grant_rangeproof(
+        conn,
+        master_pkey=master_key.verify_key,
+        rotating_pkey=rotating_key.verify_key,
+        signing_key=backend_key,
+        request_at=granted_at,
+        redeemed_at=granted_at,
+        plan=plan if plan is not None else base.ProPlan.OneMonth,
+        expires_at=expires_at,
+    )
+    return backend.get_user(conn, master_key.verify_key).proof_expiry_offset
+
+
+def _prove_at(conn, backend_key, master_key, rotating_key, request_at):
+    with db.transaction(conn) as tx:
+        return backend.build_current_entitlement_proof(
+            tx, master_key.verify_key, rotating_key.verify_key, request_at, backend_key
+        )
+
+
+def test_proof_expiry_offset_is_random_per_account_and_per_cycle(pg_database):
+    # The offset must be random along BOTH axes, and this exercises the real RNG on both (unlike the re-draw
+    # test below, which pins the trigger with a stubbed draw). Across accounts: a shared or key-derived value
+    # would herd every client's renewal onto one instant and be a stable cross-generation fingerprint.
+    # Across cycles of ONE account: a value fixed for the account's lifetime would leave its expiry pinned to
+    # one time-of-day forever (the fingerprint again), and would permanently hand the same accounts the ~25 h
+    # of over-provisioned Pro the offset carries.
+    #
+    # Both assertions are near-distinctness rather than full distinctness: independent draws over 86400
+    # values collide with probability ~0.3% at 24 samples, so demanding all-distinct would be flaky, while
+    # near-distinctness still fails loudly for a constant, a derived, or a coarsely-quantised offset.
+    pool = backend.bootstrap_db(database_url=pg_database())
+    assert pool
+    backend_key = nacl.signing.SigningKey.generate()
+    rotating_key = nacl.signing.SigningKey.generate()
+    now = datetime.datetime.now(datetime.timezone.utc)
+    shape = base.proof_expiry_shape()
+
+    with db.connection(pool) as conn:
+        across_accounts = [
+            _grant_and_get_offset(
+                conn,
+                backend_key,
+                nacl.signing.SigningKey.generate(),
+                rotating_key,
+                now,
+                now + datetime.timedelta(days=30),
+            )
+            for _ in range(24)
+        ]
+        assert all(0 <= offset < shape.offset_range for offset in across_accounts)
+        assert len(set(across_accounts)) >= 20
+
+        # One account, 24 successive cycles: each grant extends the entitlement, which moves the true expiry
+        # and so re-draws the offset.
+        master_key = nacl.signing.SigningKey.generate()
+        across_cycles = [
+            _grant_and_get_offset(
+                conn, backend_key, master_key, rotating_key, now, now + datetime.timedelta(days=30 + cycle)
+            )
+            for cycle in range(24)
+        ]
+        assert all(0 <= offset < shape.offset_range for offset in across_cycles)
+        assert len(set(across_cycles)) >= 20
+    pool.close()
+
+
+def test_proof_is_identical_for_requests_in_the_same_grid_period(pg_database):
+    # Multi-device convergence, which is the reason the expiry is rounded onto a grid rather than shifted by
+    # the offset. A user's devices share the derived rotating key, so two of them asking a few SECONDS apart
+    # -- different seconds, same grid period -- must receive byte-identical proofs, not one proof per request
+    # instant. Crossing a grid point is the only thing that changes the answer, and it changes it by exactly
+    # one period.
+    pool = backend.bootstrap_db(database_url=pg_database())
+    assert pool
+    backend_key = nacl.signing.SigningKey.generate()
+    master_key = nacl.signing.SigningKey.generate()
+    rotating_key = nacl.signing.SigningKey.generate()
+    now = datetime.datetime.now(datetime.timezone.utc)
+    shape = base.proof_expiry_shape()
+
+    with db.connection(pool) as conn:
+        # A year-long plan, so every request below sits in the sliding arm where the expiry would otherwise
+        # track the request instant -- the arm the grid has to collapse.
+        offset = _grant_and_get_offset(
+            conn,
+            backend_key,
+            master_key,
+            rotating_key,
+            now,
+            now + datetime.timedelta(days=365),
+            plan=base.ProPlan.TwelveMonth,
+        )
+        # Aim at the grid point one period past the nearest one, so `first_at` is safely after the grant
+        # whatever the drawn offset, and 5 minutes below the boundary so none of the requests straddle it.
+        target = (
+            base.round_datetime_up_onto_offset_grid(
+                now + shape.clamp + shape.renewal_lead, period=shape.grid, offset_seconds=offset
+            )
+            + shape.grid
+        )
+        first_at = target - shape.clamp - shape.renewal_lead - datetime.timedelta(minutes=5)
+        assert first_at > now
+
+        proofs = [
+            _prove_at(conn, backend_key, master_key, rotating_key, first_at + datetime.timedelta(seconds=delay))
+            for delay in (0, 1, 7, 59, 299)
+        ]
+        assert proofs[0].expires_at == target
+        # Byte-identical on the wire: same expiry AND the same signature over it, so two devices cannot be
+        # told apart by their proofs and neither has to prefer one over the other.
+        assert all(proof.to_dict() == proofs[0].to_dict() for proof in proofs)
+
+        # The last instant that still maps here agrees too; one second later steps by exactly one period.
+        latest = target - shape.clamp - shape.renewal_lead
+        assert _prove_at(conn, backend_key, master_key, rotating_key, latest).to_dict() == proofs[0].to_dict()
+        stepped = _prove_at(conn, backend_key, master_key, rotating_key, latest + datetime.timedelta(seconds=1))
+        assert stepped.expires_at == target + shape.grid
+
+        # The grid belongs to the ACCOUNT, not to a key: a different rotating key gets the same expiry, just
+        # a different signature over it.
+        other_rotating_key = nacl.signing.SigningKey.generate()
+        other = _prove_at(conn, backend_key, master_key, other_rotating_key, first_at)
+        assert other.expires_at == proofs[0].expires_at
+        assert other.sig != proofs[0].sig
+    pool.close()
+
+
+def test_proof_expiry_offset_redraws_only_when_true_expiry_moves(monkeypatch, pg_database):
+    # The offset tracks the subscription CYCLE, not every touch of the user row. Both directions matter:
+    # re-drawing on a refresh that changes nothing would hand an observer repeated samples against one true
+    # expiry, and the minimum of those samples converges straight back onto it; never re-drawing would leave
+    # a fixed expiry time-of-day (a stable fingerprint) and let the same accounts perpetually collect the
+    # offset's bonus Pro. So: re-draw exactly when `users.expires_at` moves.
+    draws = itertools.count(1)
+    monkeypatch.setattr(backend, 'new_proof_expiry_offset', lambda: next(draws))
+
+    pool = backend.bootstrap_db(database_url=pg_database())
+    assert pool
+    backend_key = nacl.signing.SigningKey.generate()
+    master_key = nacl.signing.SigningKey.generate()
+    rotating_key = nacl.signing.SigningKey.generate()
+    now = datetime.datetime.now(datetime.timezone.utc)
+
+    with db.connection(pool) as conn:
+        offset = _grant_and_get_offset(
+            conn, backend_key, master_key, rotating_key, now, now + datetime.timedelta(days=30)
+        )
+
+        # A refresh from the same payment list recomputes the same expiry -> the offset must NOT move. Called
+        # directly because it IS the clause under test: both writers of users.expires_at share it, and going
+        # through a caller would only prove whichever path that caller happens to take.
+        backend._update_user_expiry_grace_and_renew_flag_from_payment_list(conn, master_key.verify_key)
+        assert backend.get_user(conn, master_key.verify_key).proof_expiry_offset == offset
+
+        # A new payment that extends the entitlement moves the true expiry -> new cycle, new offset.
+        backend.grant_rangeproof(
+            conn,
+            master_pkey=master_key.verify_key,
+            rotating_pkey=rotating_key.verify_key,
+            signing_key=backend_key,
+            request_at=now,
+            redeemed_at=now,
+            plan=base.ProPlan.OneMonth,
+            expires_at=now + datetime.timedelta(days=60),
+        )
+        assert backend.get_user(conn, master_key.verify_key).proof_expiry_offset != offset
+    pool.close()
+
+
+def test_proof_expiry_lands_on_the_account_grid(pg_database):
+    # The expiry is min(request + clamp, true) + renewal lead, rounded UP onto the account's own grid
+    # (UTC midnight + its offset). Two properties pinned here: the sliding arm is STEPPED, so every device
+    # asking within the same period gets an identical expiry and the value never tracks the request instant;
+    # and it steps by exactly one period, never drifting.
+    pool = backend.bootstrap_db(database_url=pg_database())
+    assert pool
+    backend_key = nacl.signing.SigningKey.generate()
+    rotating_key = nacl.signing.SigningKey.generate()
+    now = datetime.datetime.now(datetime.timezone.utc)
+    shape = base.proof_expiry_shape()
+
+    with db.connection(pool) as conn:
+        # Sliding arm: a year-long plan, so the `min` always takes the clamp.
+        sliding_key = nacl.signing.SigningKey.generate()
+        offset = _grant_and_get_offset(
+            conn,
+            backend_key,
+            sliding_key,
+            rotating_key,
+            now,
+            now + datetime.timedelta(days=365),
+            plan=base.ProPlan.TwelveMonth,
+        )
+        expiry = base.round_datetime_up_onto_offset_grid(
+            now + shape.clamp + shape.renewal_lead, period=shape.grid, offset_seconds=offset
+        )
+        assert _prove_at(conn, backend_key, sliding_key, rotating_key, now).expires_at == expiry
+        # On the grid, hence an exact whole second (nothing sub-second reaches the signed message).
+        assert (expiry - base.EPOCH) % shape.grid == datetime.timedelta(seconds=offset)
+
+        # Every request up to the last instant that still maps here agrees; one second later steps by
+        # exactly one period.
+        latest = expiry - shape.clamp - shape.renewal_lead
+        assert latest >= now
+        assert _prove_at(conn, backend_key, sliding_key, rotating_key, latest).expires_at == expiry
+        stepped = _prove_at(conn, backend_key, sliding_key, rotating_key, latest + datetime.timedelta(seconds=1))
+        assert stepped.expires_at == expiry + shape.grid
+
+        # Pinned arm: an entitlement inside the clamp, so the `min` takes the true expiry and the expiry
+        # stops moving with the request entirely -- the same value however long the client waits.
+        pinned_key = nacl.signing.SigningKey.generate()
+        true_expiry = now + datetime.timedelta(days=5)
+        pinned_offset = _grant_and_get_offset(conn, backend_key, pinned_key, rotating_key, now, true_expiry)
+        pinned = base.round_datetime_up_onto_offset_grid(
+            true_expiry + shape.renewal_lead, period=shape.grid, offset_seconds=pinned_offset
+        )
+        assert _prove_at(conn, backend_key, pinned_key, rotating_key, now).expires_at == pinned
+        later = _prove_at(conn, backend_key, pinned_key, rotating_key, now + datetime.timedelta(hours=13))
+        assert later.expires_at == pinned
+        # The over-provision is bounded by the lead plus one period, and never rounds an expiry DOWN (which
+        # would advertise an end before the entitlement's, with the renewal payment possibly not yet in).
+        assert true_expiry + shape.renewal_lead <= pinned < true_expiry + shape.renewal_lead + shape.grid
+    pool.close()
+
+
+def test_lapsed_account_keeps_proofs_through_the_over_provision(pg_database):
+    # A proof we already signed runs to the over-provisioned expiry, so a lapsed account keeps being issued
+    # proofs -- all with that SAME expiry, never a fresh extension -- until it is spent. That keeps us
+    # consistent with the account_expiry_ts we handed the client, which is where max() reads back the
+    # proof's own expiry: past the true end the two must agree rather than contradict each other.
+    pool = backend.bootstrap_db(database_url=pg_database())
+    assert pool
+    backend_key = nacl.signing.SigningKey.generate()
+    master_key = nacl.signing.SigningKey.generate()
+    rotating_key = nacl.signing.SigningKey.generate()
+    now = datetime.datetime.now(datetime.timezone.utc)
+    true_expiry = now + datetime.timedelta(hours=1)
+    shape = base.proof_expiry_shape()
+
+    with db.connection(pool) as conn:
+        offset = _grant_and_get_offset(conn, backend_key, master_key, rotating_key, now, true_expiry)
+        expiry = base.round_datetime_up_onto_offset_grid(
+            true_expiry + shape.renewal_lead, period=shape.grid, offset_seconds=offset
+        )
+        assert expiry > true_expiry
+
+        # Past the true expiry but inside the over-provision: still served, and the expiry has not budged.
+        lapsed = _prove_at(conn, backend_key, master_key, rotating_key, true_expiry + datetime.timedelta(minutes=30))
+        assert lapsed.expires_at == expiry
+        # account_expiry_ts reads back the proof's expiry here (it is the later of the two), so the client is
+        # never told its subscription ended while a proof we signed still verifies.
+        assert lapsed.account_expires_at == expiry
+        assert lapsed.expires_at <= lapsed.account_expires_at
+
+        # Spent: now it lapses, reporting the TRUE expiry and never the over-provisioned one.
+        with pytest.raises(base.FailError) as excinfo:
+            _prove_at(conn, backend_key, master_key, rotating_key, expiry + datetime.timedelta(seconds=1))
+        assert excinfo.value.code == base.ErrorCode.subscription_expired
+        assert excinfo.value.data == {'account_expiry_ts': base.unix_seconds_from_datetime(true_expiry)}
+    pool.close()
+
+
+def test_revocation_effective_ts_is_anchored_to_processing_time(monkeypatch, pg_database):
+    # generations.revoked_at is OUR record stamp, and the served list turns it into
+    # effective_ts = revoked_at + REVOCATION_EFFECTIVE_DELAY. Anchoring it to the store's refund date
+    # instead is a real break: a notification we handle late (a backlog drained after an outage carries
+    # refunds dated well back) would broadcast already-effective, so peers would reject the sender's proof
+    # before it could possibly have polled and learnt of its own tag. payments.revoked_at keeps the store's
+    # date regardless -- the user really was entitled until the store refunded.
+    pool = backend.bootstrap_db(database_url=pg_database())
+    assert pool
+    err = base.ErrorSink()
+    master_key = nacl.signing.SigningKey.generate()
+    recorded_at = datetime.datetime.now(datetime.timezone.utc)
+    monkeypatch.setattr(base, 'utc_now', lambda: recorded_at)
+    stale_revoke_at = recorded_at - datetime.timedelta(days=5)  # as if we had been down for five days
+
+    def seed_google(conn, expires_at):
+        tx = base.PaymentProviderTransaction()
+        tx.provider = base.PaymentProvider.GooglePlayStore
+        tx.google_payment_token = os.urandom(backend.BLAKE2B_DIGEST_SIZE).hex()
+        tx.google_order_id = os.urandom(backend.BLAKE2B_DIGEST_SIZE).hex()
+        backend.add_unredeemed_payment(
+            conn,
+            payment_tx=tx,
+            plan=base.ProPlan.OneMonth,
+            purchased_at=recorded_at,
+            expires_at=expires_at,
+            platform_refund_expires_at=base.EPOCH,
+            platform_obfuscated_account_id=bytes(master_key.verify_key),
+            err=err,
+        )
+        assert not err.msg_list, err.msg_list
+        return tx
+
+    with db.connection(pool) as conn:
+        # Two payments so a surviving one keeps the account entitled: the refunded (longer) one is what a
+        # live proof would have been clamped to, so revoking it really does need broadcasting.
+        seed_google(conn, recorded_at + datetime.timedelta(days=3))
+        refunded = seed_google(conn, recorded_at + datetime.timedelta(days=40))
+        assert backend.reconcile_pending_payments(conn, master_key.verify_key, redeemed_at=recorded_at) == 2
+
+        with db.transaction(conn) as tx:
+            assert backend.add_google_revocation(
+                tx, google_payment_token=refunded.google_payment_token, revoke_at=stale_revoke_at, err=err
+            )
+        assert not err.msg_list, err.msg_list
+
+        revocations = backend.get_revocations_list(conn)
+        assert len(revocations) == 1
+        # Stamped with our clock, so the full delay is still ahead of the client that has to learn of it.
+        # The store's date would have put effective_ts days in the past -- enforced before it could poll.
+        assert revocations[0].revoked_at == recorded_at
+        assert revocations[0].revoked_at + base.REVOCATION_EFFECTIVE_DELAY > recorded_at
+        assert stale_revoke_at + base.REVOCATION_EFFECTIVE_DELAY < recorded_at
+
+        # The entitlement side is unaffected: the payment carries the store's own refund date, and the fresh
+        # generation minted for the surviving payment is issued at the revoke instant, not our stamp.
+        refunded_row = [p for p in backend.get_payments_list(conn) if p.revoked_at is not None]
+        assert len(refunded_row) == 1
+        assert refunded_row[0].revoked_at == stale_revoke_at
+        user = backend.get_user(conn, master_key.verify_key)
+        assert user.current_generation_id != revocations[0].generation_id
+        with db.transaction(conn) as tx:
+            issued_at = db.query_scalar(
+                tx.conn, "SELECT issued_at FROM generations WHERE id = %s", user.current_generation_id
+            )
+        assert issued_at == stale_revoke_at
+    pool.close()
+
+
+def test_renewal_binds_by_identifier_not_account_id(pg_database):
+    # The renewal auto-redeem binds a payment to its owner by the payment's OWN store identifier (via the
+    # subscription-continuity linkage), NOT the master-key-derived account-id -- so the mule never matches
+    # on the appAccountToken UUID. Prove it: bind a payment whose stored account-id belongs to a DIFFERENT
+    # key. reconcile (account-id) can't claim it; the direct bind does.
+    pool = backend.bootstrap_db(database_url=pg_database())
+    assert pool
+    owner = nacl.signing.SigningKey.generate()  # the payment's stored account-id
+    binder = nacl.signing.SigningKey.generate()  # who we actually bind it to
+    now = base.round_datetime_to_next_day(datetime.datetime.now(datetime.timezone.utc))
+
+    def seed_google(conn, account_id_key):
+        tx = base.PaymentProviderTransaction()
+        tx.provider = base.PaymentProvider.GooglePlayStore
+        tx.google_payment_token = os.urandom(backend.BLAKE2B_DIGEST_SIZE).hex()
+        tx.google_order_id = os.urandom(backend.BLAKE2B_DIGEST_SIZE).hex()
+        err = base.ErrorSink()
+        backend.add_unredeemed_payment(
+            conn,
+            payment_tx=tx,
+            plan=base.ProPlan.OneMonth,
+            purchased_at=now,
+            expires_at=now + datetime.timedelta(days=30),
+            platform_refund_expires_at=base.EPOCH,
+            platform_obfuscated_account_id=bytes(account_id_key.verify_key),
+            err=err,
+        )
+        assert not err.msg_list, err.msg_list
+        return tx
+
+    with db.connection(pool) as conn:
+        # binder gets a user + entitlement the normal way.
+        seed_google(conn, binder)
+        assert backend.reconcile_pending_payments(conn, binder.verify_key, redeemed_at=now) == 1
+        assert backend.get_user(conn, binder.verify_key).found
+
+        # A payment whose stored account-id is `owner`'s key, not binder's.
+        foreign = seed_google(conn, owner)
+        # reconcile(binder) can't claim it — the account-id doesn't match binder's key.
+        assert backend.reconcile_pending_payments(conn, binder.verify_key, redeemed_at=now) == 0
+        # The direct bind binds it to binder by its own token, ignoring the account-id.
+        with db.transaction(conn) as tx:
+            backend._redeem_payment_for_user(tx, binder.verify_key, foreign, redeemed_at=now)
+
+        # Everything is redeemed, and it went to binder (owner never became a user).
+        assert not backend.get_unredeemed_payments_list(conn)
+        assert not backend.get_user(conn, owner.verify_key).found
+    pool.close()
+
+
 def test_migrations_bootstrap_and_idempotency(pg_database):
     # bootstrap_db runs the schema/ migrations; every migration file should be recorded, the globals
     # rows seeded exactly once, and a second pass must be a clean no-op (nothing re-run or duplicated).
@@ -522,7 +1191,7 @@ def test_status_endpoint(pg_database):
             assert isinstance(result['timestamp'], int), result
 
         # (a) Direct GET
-        response = ctx.flask_client.get(server.FLASK_ROUTE_STATUS)
+        response = ctx.flask_client.get('/status')
         assert response.status_code == 200
         body = response.get_json()
         assert body['status'] == 'ok', body
@@ -535,10 +1204,7 @@ def test_status_endpoint(pg_database):
             our_x25519_skey=our_x25519_skey, server_x25519_pkey=server_x25519_skey.public_key
         )
         onion_request = onion_req.make_request_v4(
-            our_x25519_pkey=our_x25519_skey.public_key,
-            shared_key=shared_key,
-            endpoint=server.FLASK_ROUTE_STATUS,
-            request_body={},
+            our_x25519_pkey=our_x25519_skey.public_key, shared_key=shared_key, endpoint='/status', request_body={}
         )
         response = ctx.flask_client.post(onion_req.ROUTE_OXEN_V4_LSRPC, data=onion_request)
         onion_response = onion_req.make_response_v4(shared_key=shared_key, encrypted_response=response.data)
@@ -557,7 +1223,7 @@ def test_stale_revocation_is_not_served(pg_database):
     pool = backend.bootstrap_db(database_url=pg_database())
     assert pool
 
-    RETAIN_FOR = base.SECONDS_IN_MONTH
+    RETAIN_FOR = base.seconds_from_timedelta(base.REVOCATION_RETAIN_FOR)
     now = base.datetime_from_unix_seconds(1_700_000_000)
     master_pkey = nacl.signing.SigningKey.generate().verify_key
     with db.connection(pool) as conn:
@@ -602,6 +1268,24 @@ def test_stale_revocation_is_not_served(pg_database):
     pool.close()
 
 
+def _redeem_and_prove(conn, backend_key, master_key, rotating_key, request_at):
+    """The reflow's client flow: generate_pro_proof reconciles any pending payments for the key (redeeming
+    whatever the mule registered, bound by the master-key-derived account-id) and returns the proof.
+    Replaces the retired verify_and_add_pro_payment in tests that seed a payment then 'redeem' it."""
+    msg = backend.make_generate_pro_proof_message(
+        master_pkey=master_key.verify_key, rotating_pkey=rotating_key.verify_key, request_at=request_at
+    )
+    return backend.generate_pro_proof(
+        conn=conn,
+        signing_key=backend_key,
+        master_pkey=master_key.verify_key,
+        rotating_pkey=rotating_key.verify_key,
+        request_at=request_at,
+        master_sig=bytes(master_key.sign(msg).signature),
+        rotating_sig=bytes(rotating_key.sign(msg).signature),
+    )
+
+
 def test_provider_dry_run_redeems_google_without_egress(monkeypatch, pg_database):
     # With provider_dry_run on, a Google payment redeems to a signed proof with NO call to Google: the
     # in-function stubs (synthetic already-acknowledged fetch + no-op acknowledge) stand in for the
@@ -638,28 +1322,10 @@ def test_provider_dry_run_redeems_google_without_egress(monkeypatch, pg_database
         )
         assert not err.msg_list, f'{err.msg_list}'
 
-        # Client redeems it with a real add_pro_payment (no dev_* fields, no DEV. id, no monkeypatch).
-        user_tx = backend.UserPaymentTransaction()
-        user_tx.provider = base.PaymentProvider.GooglePlayStore
-        user_tx.google_payment_token = seed_tx.google_payment_token
-        user_tx.google_order_id = seed_tx.google_order_id
-        add_payment_hash = backend.make_add_pro_payment_message(
-            master_pkey=master_key.verify_key, rotating_pkey=rotating_key.verify_key, payment_tx=user_tx
-        )
-        redeemed = backend.verify_and_add_pro_payment(
-            conn=db_conn,
-            signing_key=backend_key,
-            request_at=now,
-            redeemed_at=redeemed_at,
-            master_pkey=master_key.verify_key,
-            rotating_pkey=rotating_key.verify_key,
-            payment_tx=user_tx,
-            master_sig=master_key.sign(add_payment_hash).signature,
-            rotating_sig=rotating_key.sign(add_payment_hash).signature,
-        )
-
-        assert redeemed.status == backend.RedeemPaymentStatus.Success
-        assert redeemed.proof is not None
+        # Client redeems it simply by requesting a proof: generate_pro_proof reconciles the pending
+        # payment (bound by the master-key account-id) and returns the proof -- no explicit redeem call.
+        proof = _redeem_and_prove(db_conn, backend_key, master_key, rotating_key, now)
+        assert proof is not None
         assert not backend.get_unredeemed_payments_list(db_conn)
     finally:
         db_engine.putconn(db_conn)
@@ -752,52 +1418,19 @@ def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_d
         assert unredeemed_payment_list[0].google_order_id == it.google_order_id
         assert unredeemed_payment_list[0].plan == it.plan
 
-        # Register the payment
-        add_pro_payment_tx = backend.UserPaymentTransaction()
-        add_pro_payment_tx.provider = payment_tx.provider
-        add_pro_payment_tx.google_payment_token = payment_tx.google_payment_token
-        add_pro_payment_tx.google_order_id = payment_tx.google_order_id
-
-        add_payment_hash = backend.make_add_pro_payment_message(
-            master_pkey=master_key.verify_key, rotating_pkey=rotating_key.verify_key, payment_tx=add_pro_payment_tx
-        )
-
-        redeemed_payment = backend.verify_and_add_pro_payment(
-            conn=db_conn,
-            signing_key=backend_key,
-            request_at=now,
-            redeemed_at=redeemed_at,
-            master_pkey=master_key.verify_key,
-            rotating_pkey=rotating_key.verify_key,
-            payment_tx=add_pro_payment_tx,
-            master_sig=master_key.sign(add_payment_hash).signature,
-            rotating_sig=rotating_key.sign(add_payment_hash).signature,
-        )
-        it.proof = redeemed_payment.proof
+        # Client redeems by requesting a proof (reconciles the pending payment).
+        proof = _redeem_and_prove(db_conn, backend_key, master_key, rotating_key, now)
+        it.proof = proof
 
         # Verify payment was redeemed
-        unredeemed_payment_list = backend.get_unredeemed_payments_list(db_conn)
-        assert not unredeemed_payment_list
-        assert redeemed_payment.status == backend.RedeemPaymentStatus.Success
+        assert not backend.get_unredeemed_payments_list(db_conn)
 
-        # Claiming it again is idempotent: it returns ok + a freshly-signed proof for the user's current
-        # entitlement (identical to the first claim), rather than an AlreadyRedeemed error.
-        redeemed_payment_2nd = backend.verify_and_add_pro_payment(
-            conn=db_conn,
-            signing_key=backend_key,
-            request_at=now,
-            redeemed_at=redeemed_at,
-            master_pkey=master_key.verify_key,
-            rotating_pkey=rotating_key.verify_key,
-            payment_tx=add_pro_payment_tx,
-            master_sig=master_key.sign(add_payment_hash).signature,
-            rotating_sig=rotating_key.sign(add_payment_hash).signature,
-        )
+        # Requesting a proof again is idempotent: a freshly-signed proof for the user's current entitlement
+        # (identical to the first claim), and reconcile finds nothing new to redeem.
+        proof_2nd = _redeem_and_prove(db_conn, backend_key, master_key, rotating_key, now)
+        assert len(proof_2nd.revocation_tag) == backend.BLAKE2B_DIGEST_SIZE
 
-        assert redeemed_payment_2nd.status == backend.RedeemPaymentStatus.Success
-        assert len(redeemed_payment_2nd.proof.revocation_tag) == backend.BLAKE2B_DIGEST_SIZE
-
-    # Two payments stacked for one user → ONE generation, REUSED (item 3: a generation is an epoch, not a
+    # Two payments stacked for one user → ONE generation, REUSED (a generation is an epoch, not a
     # per-payment value — a redeem reuses the current generation rather than rolling, since neither payment
     # was revoked). So the revocation_tag is stable across the stack.
     gen_ids: list[int] = [
@@ -810,7 +1443,7 @@ def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_d
     ]
     assert len(gen_ids) == 1
 
-    # Item 5 (privacy — subscription-cadence leak): the revocation_tag a group member observes on the
+    # Privacy (subscription-cadence leak): the revocation_tag a group member observes on the
     # user's proofs is STABLE across the stack. Both redeems produced proofs carrying the SAME tag (the
     # reused generation's token), so bump frequency can't leak the renewal cadence — the tag changes only
     # on a binding revocation (test_revocation_cutting_refund_rolls_generation).
@@ -979,30 +1612,10 @@ def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_d
             unredeemed_payment_list = backend.get_unredeemed_payments_list(db_conn)
             assert len(unredeemed_payment_list) == 1
 
-            # Register the payment
-            add_pro_payment_tx = backend.UserPaymentTransaction()
-            add_pro_payment_tx.provider = payment_tx.provider
-            add_pro_payment_tx.google_payment_token = payment_tx.google_payment_token
-            add_pro_payment_tx.google_order_id = payment_tx.google_order_id
-            add_payment_hash = backend.make_add_pro_payment_message(
-                master_pkey=auto_redeem_user_master_key.verify_key,
-                rotating_pkey=auto_redeem_user_rotating_key.verify_key,
-                payment_tx=add_pro_payment_tx,
+            # Client redeems the payment by requesting a proof (reconciles the pending payment).
+            proof = _redeem_and_prove(
+                db_conn, backend_key, auto_redeem_user_master_key, auto_redeem_user_rotating_key, now
             )
-
-            redeemed_payment = backend.verify_and_add_pro_payment(
-                conn=db_conn,
-                signing_key=backend_key,
-                request_at=now,
-                redeemed_at=redeemed_at,
-                master_pkey=auto_redeem_user_master_key.verify_key,
-                rotating_pkey=auto_redeem_user_rotating_key.verify_key,
-                payment_tx=add_pro_payment_tx,
-                master_sig=auto_redeem_user_master_key.sign(add_payment_hash).signature,
-                rotating_sig=auto_redeem_user_rotating_key.sign(add_payment_hash).signature,
-            )
-
-            assert redeemed_payment.status == backend.RedeemPaymentStatus.Success, redeemed_payment
 
             # Verify payment was redeemed
             unredeemed_payment_list = backend.get_unredeemed_payments_list(db_conn)
@@ -1011,13 +1624,13 @@ def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_d
             payment_list = backend.get_payments_list(db_conn)
             assert len(payment_list) == 3
 
-            # Item 5 (privacy): capture the tag the manual redeem established. The proof carries it, and
+            # Privacy: capture the tag the manual redeem established. The proof carries it, and
             # the server-side auto-redeem below must leave it unchanged.
             with db.transaction(db_conn) as tx:
                 auto_redeem_tag_after_manual = backend.get_user_and_payments(
                     tx, auto_redeem_user_master_key.verify_key
                 ).user.token
-            assert redeemed_payment.proof.revocation_tag == auto_redeem_tag_after_manual
+            assert proof.revocation_tag == auto_redeem_tag_after_manual
 
         # NOTE: This is the payment that was not claimed via add_pro_payment. If we check the
         # payments table there should be 4 payments (2 from the first test, 2 from this test). The 2
@@ -1044,7 +1657,7 @@ def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_d
             assert payments_list[3].auto_renewing
             assert payments_list[3].grace_period == auto_redeem_scenarios[1].grace_period
 
-            # Item 5 (privacy — cadence leak): the SERVER-SIDE auto-redeem (the exact renewal path that
+            # Privacy (cadence leak): the SERVER-SIDE auto-redeem (the exact renewal path that
             # used to roll the generation on every cycle) must NOT change the observable revocation_tag.
             with db.transaction(db_conn) as tx:
                 auto_redeem_tag_after_auto = backend.get_user_and_payments(
@@ -1054,7 +1667,7 @@ def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_d
 
 
 def test_revocation_cutting_refund_rolls_generation(monkeypatch, pg_database):
-    """Item 4 case 2: a refund that drops the user's remaining entitlement BELOW what an outstanding
+    """The CUTTING refund: one that drops the user's remaining entitlement BELOW what an outstanding
     proof can still certify (a proof's reach is clamped to ~30 days) must revoke the current generation
     and roll the user onto a fresh one for the reduced-but-still-standing entitlement. This is the middle
     case between the two already covered in test_server_add_payment_flow: a non-cutting refund that leaves
@@ -1093,29 +1706,11 @@ def test_revocation_cutting_refund_rolls_generation(monkeypatch, pg_database):
             platform_obfuscated_account_id=bytes(master_key.verify_key),
             err=err,
         )
-        user_tx = backend.UserPaymentTransaction()
-        user_tx.provider = base.PaymentProvider.GooglePlayStore
-        user_tx.google_payment_token = seed_tx.google_payment_token
-        user_tx.google_order_id = seed_tx.google_order_id
-        msg = backend.make_add_pro_payment_message(
-            master_pkey=master_key.verify_key, rotating_pkey=rotating_key.verify_key, payment_tx=user_tx
-        )
-        redeemed = backend.verify_and_add_pro_payment(
-            conn=db_conn,
-            signing_key=backend_key,
-            request_at=now,
-            redeemed_at=redeemed_at,
-            master_pkey=master_key.verify_key,
-            rotating_pkey=rotating_key.verify_key,
-            payment_tx=user_tx,
-            master_sig=master_key.sign(msg).signature,
-            rotating_sig=rotating_key.sign(msg).signature,
-        )
-        assert redeemed.status == backend.RedeemPaymentStatus.Success, f'{err.msg_list}'
+        _redeem_and_prove(db_conn, backend_key, master_key, rotating_key, now)
         return seed_tx.google_payment_token
 
     try:
-        # Two stacked payments on one (shared, item-3) generation: a long one we will refund and a short
+        # Two stacked payments on one shared generation: a long one we will refund and a short
         # survivor that leaves only ~5 days of entitlement — less than the ~30-day reach of a live proof.
         long_token = seed_and_redeem(redeemed_at + datetime.timedelta(days=90))
         seed_and_redeem(redeemed_at + datetime.timedelta(days=5))
@@ -1182,24 +1777,7 @@ def test_apple_refund_reversal_reinstates_and_rolls_generation(pg_database):
         )
         assert not err.has(), err.msg_list
 
-        user_tx = backend.UserPaymentTransaction()
-        user_tx.provider = base.PaymentProvider.iOSAppStore
-        user_tx.apple_tx_id = tx_id
-        msg = backend.make_add_pro_payment_message(
-            master_pkey=master_key.verify_key, rotating_pkey=rotating_key.verify_key, payment_tx=user_tx
-        )
-        redeemed = backend.verify_and_add_pro_payment(
-            conn=db_conn,
-            signing_key=backend_key,
-            request_at=now,
-            redeemed_at=redeemed_at,
-            master_pkey=master_key.verify_key,
-            rotating_pkey=rotating_key.verify_key,
-            payment_tx=user_tx,
-            master_sig=master_key.sign(msg).signature,
-            rotating_sig=rotating_key.sign(msg).signature,
-        )
-        assert redeemed.status == backend.RedeemPaymentStatus.Success, f'{err.msg_list}'
+        _redeem_and_prove(db_conn, backend_key, master_key, rotating_key, now)
 
         with db.transaction(db_conn) as tx:
             user_before = backend.get_user_and_payments(tx, master_key.verify_key).user
@@ -1248,48 +1826,23 @@ def test_apple_refund_reversal_reinstates_and_rolls_generation(pg_database):
         db_engine.close()
 
 
-def test_payment_binding_rejects_mismatched_master_key(monkeypatch, pg_database):
-    '''The store-attested account tag binds a redeem to exactly one master key: a purchase tagged for
-    key A cannot be claimed by a different key B, even though B's own request signature is valid.
-    Covers both providers -- Google's raw-pubkey tag and Apple's derived-UUID tag -- i.e. the property
-    that closes the Apple tx_id authorization hole (the old `''` stub let any key claim any tx_id).'''
-    # Google's redeem path fetches+acks against Google; stub both so the owner-success path stays local.
-    monkeypatch.setattr("providers.google_play.api.subscription_v1_acknowledge", lambda *a, **k: None)
-    monkeypatch.setattr(
-        "providers.google_play.api.fetch_subscription_v2_details",
-        lambda *a, **k: google_play.types.SubscriptionV2Data(),
-    )
-
+def test_payment_binding_rejects_mismatched_master_key(pg_database):
+    '''The store-attested account tag binds a payment to exactly one master key: a purchase tagged for
+    key A cannot be claimed by a different key B. reconcile matches on the master-key-derived account-id,
+    so B's reconcile claims nothing while A's claims the payment. Covers both providers -- Google's
+    raw-pubkey tag and Apple's derived-UUID tag -- i.e. the property that closes the Apple tx_id
+    authorization hole (the old `''` stub let any key claim any tx_id).'''
     db_engine = backend.bootstrap_db(database_url=pg_database())
     assert db_engine
-    backend_key = nacl.signing.SigningKey.generate()
     owner = nacl.signing.SigningKey.generate()
-    owner_rot = nacl.signing.SigningKey.generate()
     attacker = nacl.signing.SigningKey.generate()
-    attacker_rot = nacl.signing.SigningKey.generate()
     now = datetime.datetime.now(datetime.timezone.utc)
     redeemed_at = base.round_datetime_to_next_day(now)
 
     db_conn = db_engine.getconn()
     try:
 
-        def redeem(redeem_tx, signer, rot):
-            msg = backend.make_add_pro_payment_message(
-                master_pkey=signer.verify_key, rotating_pkey=rot.verify_key, payment_tx=redeem_tx
-            )
-            return backend.verify_and_add_pro_payment(
-                conn=db_conn,
-                signing_key=backend_key,
-                request_at=now,
-                redeemed_at=redeemed_at,
-                master_pkey=signer.verify_key,
-                rotating_pkey=rot.verify_key,
-                payment_tx=redeem_tx,
-                master_sig=signer.sign(msg).signature,
-                rotating_sig=rot.sign(msg).signature,
-            )
-
-        def check_binding(seed_tx, redeem_tx, owner_tag):
+        def check_binding(seed_tx, owner_tag):
             err = base.ErrorSink()
             backend.add_unredeemed_payment(
                 db_conn,
@@ -1303,25 +1856,17 @@ def test_payment_binding_rejects_mismatched_master_key(monkeypatch, pg_database)
             )
             assert not err.has(), err.msg_list
 
-            # A different key -- validly signed -- must be rejected: its derived tag != the stored tag.
-            with pytest.raises(base.FailError) as exc:
-                redeem(redeem_tx, attacker, attacker_rot)
-            assert exc.value.code == base.ErrorCode.unknown_payment
-            db_conn.rollback()
-
+            # A different key claims nothing -- its derived account-id != the stored tag.
+            assert backend.reconcile_pending_payments(db_conn, attacker.verify_key, redeemed_at=redeemed_at) == 0
             # The tagged owner can claim the very same payment.
-            assert redeem(redeem_tx, owner, owner_rot).status == backend.RedeemPaymentStatus.Success
+            assert backend.reconcile_pending_payments(db_conn, owner.verify_key, redeemed_at=redeemed_at) == 1
 
         # Google: the tag is the raw 32-byte master pubkey.
         g_seed = base.PaymentProviderTransaction()
         g_seed.provider = base.PaymentProvider.GooglePlayStore
         g_seed.google_payment_token = os.urandom(8).hex()
         g_seed.google_order_id = os.urandom(8).hex()
-        g_redeem = backend.UserPaymentTransaction()
-        g_redeem.provider = base.PaymentProvider.GooglePlayStore
-        g_redeem.google_payment_token = g_seed.google_payment_token
-        g_redeem.google_order_id = g_seed.google_order_id
-        check_binding(g_seed, g_redeem, bytes(owner.verify_key))
+        check_binding(g_seed, bytes(owner.verify_key))
 
         # Apple: the tag is the derived v4 UUID of the pubkey.
         a_seed = base.PaymentProviderTransaction()
@@ -1329,17 +1874,14 @@ def test_payment_binding_rejects_mismatched_master_key(monkeypatch, pg_database)
         a_seed.apple_original_tx_id = os.urandom(8).hex()
         a_seed.apple_tx_id = os.urandom(8).hex()
         a_seed.apple_web_line_order_tx_id = os.urandom(8).hex()
-        a_redeem = backend.UserPaymentTransaction()
-        a_redeem.provider = base.PaymentProvider.iOSAppStore
-        a_redeem.apple_tx_id = a_seed.apple_tx_id
-        check_binding(a_seed, a_redeem, app_store.uuid_from_master_pk(bytes(owner.verify_key)))
+        check_binding(a_seed, app_store.uuid_from_master_pk(bytes(owner.verify_key)))
     finally:
         db_engine.putconn(db_conn)
         db_engine.close()
 
 
 def test_bump_revocation_ticket(pg_database):
-    """Item 7: the manual DR bump (backing the `revoke bump-ticket` CLI command) advances the monotonic
+    """The manual DR bump (backing the `revoke bump-ticket` CLI command) advances the monotonic
     revocation ticket by the given amount and returns the new value. Used to recover after a DB restore
     from an older backup rolls the counter backward (see docs/deploy.md)."""
     db_engine: psycopg_pool.ConnectionPool | None = backend.bootstrap_db(database_url=pg_database())
@@ -1419,7 +1961,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
     onion_request = onion_req.make_request_v4(
         our_x25519_pkey=our_x25519_skey.public_key,
         shared_key=shared_key,
-        endpoint=server.FLASK_ROUTE_GET_PRO_STATUS,
+        endpoint='/get_pro_status',
         request_body=request_body,
     )
 
@@ -1439,34 +1981,32 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
     assert 'result' in response_json, f'Response was: {json.dumps(response_json, indent=2)}'
     result_json = response_json['result']
 
-    # Extract the fields — the cheap status endpoint carries the latest payment, none yet.
+    # Under the reflow, this first status touch RECONCILED the seeded (mule-registered) payment, so the
+    # user is already Active and the latest payment is present -- no separate /add_pro_payment redeem.
     result_latest = result_json.get('latest_payment')
     result_status = base.json_dict_require_str(d=result_json, key='user_status', err=err)
     assert not err.msg_list, '{err.msg_list}'
-    assert result_status == server.UserProStatus.Never.value, f'Response was: {json.dumps(response_json, indent=2)}'
-    assert result_latest is None, f'Response was: {json.dumps(response_json, indent=2)}'
+    assert result_status == server.UserProStatus.Active.value, f'Response was: {json.dumps(response_json, indent=2)}'
+    assert result_latest is not None, f'Response was: {json.dumps(response_json, indent=2)}'
 
-    # Simulate client request to register a payment
-    add_pro_payment_tx = backend.UserPaymentTransaction()
-    add_pro_payment_tx.provider = payment_tx.provider
-    add_pro_payment_tx.google_payment_token = payment_tx.google_payment_token
-    add_pro_payment_tx.google_order_id = payment_tx.google_order_id
-    add_pro_payment_tx.payment_id = backend.payment_id_from_user_tx(add_pro_payment_tx)
-
-    payment_hash_to_sign = backend.make_add_pro_payment_message(
-        master_pkey=master_key.verify_key, rotating_pkey=rotating_key.verify_key, payment_tx=add_pro_payment_tx
+    # Client requests a proof: generate_pro_proof reconciles (a no-op now) and returns a live proof.
+    unix_ts_ms = int(time.time() * 1000)
+    payment_hash_to_sign = backend.make_generate_pro_proof_message(
+        master_pkey=master_key.verify_key,
+        rotating_pkey=rotating_key.verify_key,
+        request_at=base.datetime_from_unix_seconds(unix_ts_ms // 1000),
     )
 
     onion_request = onion_req.make_request_v4(
         our_x25519_pkey=our_x25519_skey.public_key,
         shared_key=shared_key,
-        endpoint=server.FLASK_ROUTE_ADD_PRO_PAYMENT,
+        endpoint='/generate_pro_proof',
         request_body={
             'master_pkey': bytes(master_key.verify_key).hex(),
             'rotating_pkey': bytes(rotating_key.verify_key).hex(),
+            'ts': unix_ts_ms // 1000,
             'master_sig': bytes(master_key.sign(payment_hash_to_sign).signature).hex(),
             'rotating_sig': bytes(rotating_key.sign(payment_hash_to_sign).signature).hex(),
-            'payment_tx': {'provider': add_pro_payment_tx.provider.value, 'payment_id': add_pro_payment_tx.payment_id},
         },
     )
 
@@ -1545,7 +2085,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
     onion_request = onion_req.make_request_v4(
         our_x25519_pkey=our_x25519_skey.public_key,
         shared_key=shared_key,
-        endpoint=server.FLASK_ROUTE_GENERATE_PRO_PROOF,
+        endpoint='/generate_pro_proof',
         request_body=request_body,
     )
 
@@ -1599,16 +2139,20 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
     )
     backend_key.verify_key.verify(smessage=proof_hash, signature=result_sig)
 
-    # Check that the expiry time does not exceed 31 days (we clamped to 30 days and if there's
-    # overrun of 30 days we round up to 31 days)
-    assert result_expiry_ts % base.SECONDS_IN_DAY == 0
+    # The payment runs 90 days, so the proof sits on the rolling clamp: request_at + the clamp + the renewal
+    # lead, rounded up onto this account's own expiry grid. On a grid point, so NOT midnight-aligned.
+    shape = base.proof_expiry_shape()
+    with db.transaction(db_conn) as tx:
+        proof_expiry_offset = backend.get_user_and_payments(tx, master_key.verify_key).user.proof_expiry_offset
+    assert 0 <= proof_expiry_offset < shape.offset_range
     assert result_expiry_ts == base.unix_seconds_from_datetime(
-        base.round_datetime_to_start_of_day(request_at + datetime.timedelta(days=31))
-    ) or result_expiry_ts == base.unix_seconds_from_datetime(
-        base.round_datetime_to_start_of_day(request_at + datetime.timedelta(days=30))
+        base.round_datetime_up_onto_offset_grid(
+            base.datetime_from_unix_seconds(unix_ts_ms // 1000) + shape.clamp + shape.renewal_lead,
+            period=shape.grid,
+            offset_seconds=proof_expiry_offset,
+        )
     )
 
-    new_add_pro_payment_tx = backend.UserPaymentTransaction()
     # Register another payment on the same user, backend will choose the latest expiring payment
     new_payment_tx = base.PaymentProviderTransaction()
     new_payment_tx.provider = base.PaymentProvider.GooglePlayStore
@@ -1625,30 +2169,26 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
         err=err,
     )
 
-    new_add_pro_payment_tx.provider = new_payment_tx.provider
-    new_add_pro_payment_tx.google_payment_token = new_payment_tx.google_payment_token
-    new_add_pro_payment_tx.google_order_id = new_payment_tx.google_order_id
-    new_add_pro_payment_tx.payment_id = backend.payment_id_from_user_tx(new_add_pro_payment_tx)
-    payment_hash_to_sign = backend.make_add_pro_payment_message(
-        master_pkey=master_key.verify_key, rotating_pkey=rotating_key.verify_key, payment_tx=new_add_pro_payment_tx
+    # Client requests a proof again: generate_pro_proof reconciles the newly-seeded payment and returns
+    # the proof for the now-extended entitlement.
+    unix_ts_ms = int(time.time() * 1000)
+    payment_hash_to_sign = backend.make_generate_pro_proof_message(
+        master_pkey=master_key.verify_key,
+        rotating_pkey=rotating_key.verify_key,
+        request_at=base.datetime_from_unix_seconds(unix_ts_ms // 1000),
     )
-
-    request_body = {
-        'master_pkey': bytes(master_key.verify_key).hex(),
-        'rotating_pkey': bytes(rotating_key.verify_key).hex(),
-        'master_sig': bytes(master_key.sign(payment_hash_to_sign).signature).hex(),
-        'rotating_sig': bytes(rotating_key.sign(payment_hash_to_sign).signature).hex(),
-        'payment_tx': {
-            'provider': new_add_pro_payment_tx.provider.value,
-            'payment_id': new_add_pro_payment_tx.payment_id,
-        },
-    }
 
     onion_request = onion_req.make_request_v4(
         our_x25519_pkey=our_x25519_skey.public_key,
         shared_key=shared_key,
-        endpoint=server.FLASK_ROUTE_ADD_PRO_PAYMENT,
-        request_body=request_body,
+        endpoint='/generate_pro_proof',
+        request_body={
+            'master_pkey': bytes(master_key.verify_key).hex(),
+            'rotating_pkey': bytes(rotating_key.verify_key).hex(),
+            'ts': unix_ts_ms // 1000,
+            'master_sig': bytes(master_key.sign(payment_hash_to_sign).signature).hex(),
+            'rotating_sig': bytes(rotating_key.sign(payment_hash_to_sign).signature).hex(),
+        },
     )
 
     # POST and get response
@@ -1708,7 +2248,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
     onion_request = onion_req.make_request_v4(
         our_x25519_pkey=our_x25519_skey.public_key,
         shared_key=shared_key,
-        endpoint=server.FLASK_ROUTE_GET_PRO_REVOCATIONS,
+        endpoint='/get_pro_revocations',
         request_body=request_body,
     )
 
@@ -1747,7 +2287,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
     db_conn = db_engine.getconn()
 
     # Capture the user's current generation. The manual revoke below targets only the shorter
-    # (30-day) payment while the original (~90-day) payment survives, so item 4 must SKIP the
+    # (30-day) payment while the original (~90-day) payment survives, so the revocation-skip must OMIT the
     # revocation entirely: the surviving entitlement still covers everything any outstanding proof
     # can certify (≤ 30 days of reach), so the generation must NOT roll and nothing must land on
     # the (network-costly) revocation list.
@@ -1761,7 +2301,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
     with db.transaction(db_conn) as tx:
         revoked = backend.add_google_revocation(
             tx,
-            google_payment_token=new_add_pro_payment_tx.google_payment_token,
+            google_payment_token=new_payment_tx.google_payment_token,
             revoke_at=base.datetime_from_unix_ms(unix_ts_ms),
             err=err,
         )
@@ -1773,7 +2313,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
     onion_request = onion_req.make_request_v4(
         our_x25519_pkey=our_x25519_skey.public_key,
         shared_key=shared_key,
-        endpoint=server.FLASK_ROUTE_GET_PRO_REVOCATIONS,
+        endpoint='/get_pro_revocations',
         request_body=request_body,
     )
 
@@ -1800,10 +2340,10 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
     result_retry_in = base.json_dict_require_int(d=result_json, key='retry_in', err=err)
     result_retain_for = base.json_dict_require_int(d=result_json, key='retain_for', err=err)
     assert not err.msg_list, '{err.msg_list}'
-    # Item 4: the non-cutting refund produced NO revocation entry, so the ticket is unchanged.
+    # The non-cutting refund produced NO revocation entry, so the ticket is unchanged.
     assert result_ticket == 0
     assert result_retry_in == base.SECONDS_IN_DAY
-    assert result_retain_for == base.SECONDS_IN_MONTH
+    assert result_retain_for == base.seconds_from_timedelta(base.REVOCATION_RETAIN_FOR)
     curr_revocation_ticket = result_ticket
     assert not result_items
 
@@ -1823,7 +2363,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
     onion_request = onion_req.make_request_v4(
         our_x25519_pkey=our_x25519_skey.public_key,
         shared_key=shared_key,
-        endpoint=server.FLASK_ROUTE_GET_PRO_REVOCATIONS,
+        endpoint='/get_pro_revocations',
         request_body={'ticket': curr_revocation_ticket},
     )
 
@@ -1850,10 +2390,10 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
     result_retry_in = base.json_dict_require_int(d=result_json, key='retry_in', err=err)
     result_retain_for = base.json_dict_require_int(d=result_json, key='retain_for', err=err)
     assert not err.msg_list, '{err.msg_list}'
-    # Item 4: the non-cutting refund above created no revocation entry, so the ticket is still 0.
+    # The non-cutting refund above created no revocation entry, so the ticket is still 0.
     assert result_ticket == 0, f'Response was: {json.dumps(response_json, indent=2)}'
     assert result_retry_in == base.SECONDS_IN_DAY
-    assert result_retain_for == base.SECONDS_IN_MONTH
+    assert result_retain_for == base.seconds_from_timedelta(base.REVOCATION_RETAIN_FOR)
 
     # List should be empty because we passed in the newest revocation
     # ticket. There are no changes to the revocation list so the backend
@@ -1875,7 +2415,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
     onion_request = onion_req.make_request_v4(
         our_x25519_pkey=our_x25519_skey.public_key,
         shared_key=shared_key,
-        endpoint=server.FLASK_ROUTE_GET_PRO_STATUS,
+        endpoint='/get_pro_status',
         request_body=request_body,
     )
 
@@ -1911,7 +2451,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
     onion_request = onion_req.make_request_v4(
         our_x25519_pkey=our_x25519_skey.public_key,
         shared_key=shared_key,
-        endpoint=server.FLASK_ROUTE_GET_PRO_STATUS,
+        endpoint='/get_pro_status',
         request_body={
             'master_pkey': bytes(master_key.verify_key).hex(),
             'master_sig': bytes(master_key.sign(hash_to_sign).signature).hex(),
@@ -1941,7 +2481,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
     onion_request = onion_req.make_request_v4(
         our_x25519_pkey=our_x25519_skey.public_key,
         shared_key=shared_key,
-        endpoint=server.FLASK_ROUTE_GET_PRO_STATUS,
+        endpoint='/get_pro_status',
         request_body={
             'master_pkey': bytes(master_key.verify_key).hex(),
             'master_sig': bytes(master_key.sign(hash_to_sign).signature).hex(),
@@ -1977,7 +2517,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
         onion_request = onion_req.make_request_v4(
             our_x25519_pkey=our_x25519_skey.public_key,
             shared_key=shared_key,
-            endpoint=server.FLASK_ROUTE_GET_PAYMENT_DETAILS,
+            endpoint='/get_payment_details',
             request_body={
                 'master_pkey': bytes(master_key.verify_key).hex(),
                 'master_sig': bytes(master_key.sign(hash_to_sign).signature).hex(),
@@ -2027,7 +2567,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
     bad_onion = onion_req.make_request_v4(
         our_x25519_pkey=our_x25519_skey.public_key,
         shared_key=shared_key,
-        endpoint=server.FLASK_ROUTE_GET_PAYMENT_DETAILS,
+        endpoint='/get_payment_details',
         request_body={
             'master_pkey': bytes(master_key.verify_key).hex(),
             'master_sig': bytes(master_key.sign(bad_hash).signature).hex(),
@@ -2097,8 +2637,10 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
     proof_hash = backend.build_proof_message(proof.revocation_tag, proof.rotating_pkey, proof.expires_at)
     backend_key.verify_key.verify(smessage=proof_hash, signature=proof.sig)
 
-    # NOTE: Generating a proof after the deadline must now fail — entitlement expired → FailError.
-    unix_ts_ms = pro_proof_deadline_unix_ts_ms + 1
+    # NOTE: Generating a proof once the deadline AND the proof over-provision are both spent must fail —
+    # entitlement expired → FailError. The over-provision (renewal lead + the account's offset, ≤ ~25 h) is
+    # what a proof issued at the deadline already certifies, so we honour re-fetches until it runs out.
+    unix_ts_ms = pro_proof_deadline_unix_ts_ms + base.ms_from_timedelta(base.proof_expiry_shape().max_proof_lifetime)
     hash_to_sign = backend.make_generate_pro_proof_message(
         master_pkey=master_key.verify_key,
         rotating_pkey=rotating_key.verify_key,
@@ -2157,7 +2699,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
     onion_request = onion_req.make_request_v4(
         our_x25519_pkey=our_x25519_skey.public_key,
         shared_key=shared_key,
-        endpoint=server.FLASK_ROUTE_GENERATE_PRO_PROOF,
+        endpoint='/generate_pro_proof',
         request_body=request_body,
     )
 
@@ -2172,132 +2714,6 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
 
     # Parse status from the pro proof response
     assert response_json['status'] == 'fail', f'Response was: {json.dumps(response_json, indent=2)}'
-    assert 'error' in response_json, f'Response was: {json.dumps(response_json, indent=2)}'
-
-    # Initiate a "refund" request on the payment
-
-    throwaway_id = os.urandom(16).hex()
-
-    # Create Apple payment, only apple payments can set refund requested
-    apple_payment_tx = base.PaymentProviderTransaction()
-    apple_payment_tx.provider = base.PaymentProvider.iOSAppStore
-    apple_payment_tx.apple_original_tx_id = throwaway_id
-    apple_payment_tx.apple_tx_id = throwaway_id
-    apple_payment_tx.apple_web_line_order_tx_id = throwaway_id
-
-    apple_tx = backend.UserPaymentTransaction()
-    apple_tx.provider = base.PaymentProvider.iOSAppStore
-    apple_tx.apple_tx_id = throwaway_id
-    apple_tx.payment_id = backend.payment_id_from_user_tx(apple_tx)
-    backend.add_unredeemed_payment(
-        db_conn,
-        payment_tx=apple_payment_tx,
-        plan=base.ProPlan.OneMonth,
-        purchased_at=base.datetime_from_unix_ms(unix_ts_ms),
-        expires_at=base.datetime_from_unix_ms(unix_ts_ms) + datetime.timedelta(days=30),
-        platform_refund_expires_at=base.EPOCH,
-        platform_obfuscated_account_id='',
-        err=err,
-    )
-
-    # Register the payment
-    payment_hash_to_sign = backend.make_add_pro_payment_message(
-        master_pkey=master_key.verify_key, rotating_pkey=rotating_key.verify_key, payment_tx=apple_tx
-    )
-
-    onion_request = onion_req.make_request_v4(
-        our_x25519_pkey=our_x25519_skey.public_key,
-        shared_key=shared_key,
-        endpoint=server.FLASK_ROUTE_ADD_PRO_PAYMENT,
-        request_body={
-            'master_pkey': bytes(master_key.verify_key).hex(),
-            'rotating_pkey': bytes(rotating_key.verify_key).hex(),
-            'master_sig': bytes(master_key.sign(payment_hash_to_sign).signature).hex(),
-            'rotating_sig': bytes(rotating_key.sign(payment_hash_to_sign).signature).hex(),
-            'payment_tx': {'provider': base.PaymentProvider.iOSAppStore.value, 'payment_id': apple_tx.payment_id},
-        },
-    )
-    response = flask_client.post(onion_req.ROUTE_OXEN_V4_LSRPC, data=onion_request)
-
-    # Set refunded
-    hash_to_sign = backend.make_set_payment_refund_requested_message(
-        master_pkey=master_key.verify_key,
-        request_at=base.datetime_from_unix_seconds(start_unix_ts_ms // 1000),
-        refund_requested_at=base.datetime_from_unix_seconds(start_unix_ts_ms // 1000),
-        payment_tx=apple_tx,
-    )
-
-    request_body = {
-        'master_pkey': bytes(master_key.verify_key).hex(),
-        'master_sig': bytes(master_key.sign(hash_to_sign).signature).hex(),
-        'ts': start_unix_ts_ms // 1000,
-        'refund_requested_ts': start_unix_ts_ms // 1000,
-        'payment_tx': {'provider': base.PaymentProvider.iOSAppStore.value, 'payment_id': apple_tx.payment_id},
-    }
-
-    onion_request = onion_req.make_request_v4(
-        our_x25519_pkey=our_x25519_skey.public_key,
-        shared_key=shared_key,
-        endpoint=server.FLASK_ROUTE_SET_PAYMENT_REFUND_REQUESTED,
-        request_body=request_body,
-    )
-
-    # POST and get response for refund request
-    response = flask_client.post(onion_req.ROUTE_OXEN_V4_LSRPC, data=onion_request)
-    onion_response = onion_req.make_response_v4(shared_key=shared_key, encrypted_response=response.data)
-    assert onion_response.success
-
-    # Parse the JSON refund request
-    response_json = json.loads(onion_response.body)
-    assert isinstance(response_json, dict), f'Response {onion_response.body!r}'
-
-    # Parse fields in the JSON
-    assert (
-        'error' not in response_json
-    ), f'Request was: {json.dumps(request_body, indent=2)}\nResponse was: {json.dumps(response_json, indent=2)}'
-    assert response_json['status'] == 'ok', f'Response was: {json.dumps(response_json, indent=2)}'
-    assert response_json['result']['updated'], f'Response was: {json.dumps(response_json, indent=2)}'
-
-    # Initiate a "refund" on a non-existing payment
-
-    fake_payment = backend.UserPaymentTransaction()
-    fake_payment.provider = base.PaymentProvider.GooglePlayStore
-    fake_payment.google_payment_token = 'non-existent-payment-token-to-trigger-fail-response'
-    fake_payment.google_order_id = 'non-existent-order-id-to-trigger-fail-response'
-    fake_payment.payment_id = backend.payment_id_from_user_tx(fake_payment)
-
-    hash_to_sign = backend.make_set_payment_refund_requested_message(
-        master_pkey=master_key.verify_key,
-        request_at=base.datetime_from_unix_seconds(start_unix_ts_ms // 1000),
-        refund_requested_at=base.datetime_from_unix_seconds(start_unix_ts_ms // 1000),
-        payment_tx=fake_payment,
-    )
-
-    request_body = {
-        'master_pkey': bytes(master_key.verify_key).hex(),
-        'master_sig': bytes(master_key.sign(hash_to_sign).signature).hex(),
-        'payment_tx': {'provider': fake_payment.provider.value, 'payment_id': fake_payment.payment_id},
-        'ts': start_unix_ts_ms // 1000,
-        'refund_requested_ts': start_unix_ts_ms // 1000,
-    }
-
-    onion_request = onion_req.make_request_v4(
-        our_x25519_pkey=our_x25519_skey.public_key,
-        shared_key=shared_key,
-        endpoint=server.FLASK_ROUTE_SET_PAYMENT_REFUND_REQUESTED,
-        request_body=request_body,
-    )
-
-    # POST and get response for refund request
-    response = flask_client.post(onion_req.ROUTE_OXEN_V4_LSRPC, data=onion_request)
-    onion_response = onion_req.make_response_v4(shared_key=shared_key, encrypted_response=response.data)
-    assert onion_response.success
-
-    # Parse the JSON refund request
-    response_json = json.loads(onion_response.body)
-    assert isinstance(response_json, dict), f'Response {onion_response.body!r}'
-
-    # Parse fields in the JSON, we expect it to fail
     assert 'error' in response_json, f'Response was: {json.dumps(response_json, indent=2)}'
 
 
@@ -2484,7 +2900,6 @@ def test_platform_apple(pg_database):
     # UUID as each purchase's appAccountToken, so the notifications carry it and the redeem (and the
     # later auto-redeems) bind against it.
     master_key = nacl.signing.SigningKey.generate()
-    rotating_key = nacl.signing.SigningKey.generate()
     apple_token = app_store.uuid_from_master_pk(bytes(master_key.verify_key))
 
     # NOTE: These tests were using the old debug product id, "com.getsession.org.pro_sub" which was
@@ -2607,75 +3022,15 @@ def test_platform_apple(pg_database):
             assert unredeemed_list[0].apple.tx_id == tx_info.transactionId
             assert unredeemed_list[0].apple.web_line_order_tx_id == tx_info.webOrderLineItemId
 
-        # NOTE: Then claim the payment (master_key/rotating_key generated at the top of the test)
-        add_pro_payment_tx = backend.UserPaymentTransaction()
-        add_pro_payment_tx.provider = base.PaymentProvider.iOSAppStore
-        add_pro_payment_tx.apple_tx_id = unredeemed_list[0].apple.tx_id
-        add_pro_payment_tx.payment_id = backend.payment_id_from_user_tx(add_pro_payment_tx)
-        payment_hash_to_sign = backend.make_add_pro_payment_message(
-            master_pkey=master_key.verify_key, rotating_pkey=rotating_key.verify_key, payment_tx=add_pro_payment_tx
-        )
-
-        # NOTE: POST and get response
-        response = test.flask_client.post(
-            server.FLASK_ROUTE_ADD_PRO_PAYMENT,
-            json={
-                'master_pkey': bytes(master_key.verify_key).hex(),
-                'rotating_pkey': bytes(rotating_key.verify_key).hex(),
-                'master_sig': bytes(master_key.sign(payment_hash_to_sign).signature).hex(),
-                'rotating_sig': bytes(rotating_key.sign(payment_hash_to_sign).signature).hex(),
-                'payment_tx': {
-                    'provider': add_pro_payment_tx.provider.value,
-                    'payment_id': add_pro_payment_tx.payment_id,
-                },
-            },
-        )
-
-        # NOTE: Parse the JSON from the response
-        response_json = json.loads(response.data)
-        assert isinstance(response_json, dict), f'Response {response_json}'
-
-        # NOTE: Parse status from response
-        assert response_json['status'] == 'ok', f'Response was: {json.dumps(response_json, indent=2)}'
-        assert 'error' not in response_json, f'Response was: {json.dumps(response_json, indent=2)}'
-
-        # NOTE: Parse result object is at root
-        assert 'result' in response_json, f'Response was: {json.dumps(response_json, indent=2)}'
-        result_json = response_json['result']
-
-        # NOTE: Extract the fields
-        assert isinstance(result_json, dict)
-        result_revocation_tag_hex = base.json_dict_require_str(d=result_json, key='revocation_tag', err=err)
-        result_rotating_pkey_hex = base.json_dict_require_str(d=result_json, key='rotating_pkey', err=err)
-        result_expiry_ts = base.json_dict_require_int(d=result_json, key='expiry_ts', err=err)
-        result_sig_hex = base.json_dict_require_str(d=result_json, key='sig', err=err)
-        assert not err.msg_list, '{err.msg_list}'
-
-        # NOTE: Parse hex fields to bytes
-        result_rotating_pkey = nacl.signing.VerifyKey(
-            base.hex_to_bytes(
-                hex=result_rotating_pkey_hex,
-                label='Rotating public key',
-                hex_len=nacl.bindings.crypto_sign_PUBLICKEYBYTES * 2,
-                err=err,
-            )
-        )
-        result_sig = base.hex_to_bytes(
-            hex=result_sig_hex, label='Signature', hex_len=nacl.bindings.crypto_sign_BYTES * 2, err=err
-        )
-        result_revocation_tag = base.hex_to_bytes(
-            hex=result_revocation_tag_hex, label='Revocation tag', hex_len=backend.BLAKE2B_DIGEST_SIZE * 2, err=err
-        )
-        assert not err.msg_list, '{err.msg_list}'
-
-        # NOTE: Check the rotating key returned matches what we asked the server to sign
-        assert result_rotating_pkey == rotating_key.verify_key
-
-        # NOTE: Check that the server signed our proof w/ their public key
-        proof_hash = backend.build_proof_message(
-            result_revocation_tag, result_rotating_pkey, base.datetime_from_unix_seconds(result_expiry_ts)
-        )
-        test.backend_key.verify_key.verify(smessage=proof_hash, signature=result_sig)
+        # NOTE: Claim the payment. Redemption now happens via reconcile, which binds the mule-registered
+        # payment by the master-key-derived account-id -- the reflow replaces the old /add_pro_payment
+        # call. This renewal is dated in the past, so we assert the binding (proof issuance is covered by
+        # the generate_pro_proof tests).
+        with test.connection() as conn:
+            redeemed_at = base.round_datetime_to_next_day(base.datetime_from_unix_ms(tx_info.signedDate))
+            assert backend.reconcile_pending_payments(conn, master_key.verify_key, redeemed_at=redeemed_at) == 1
+            assert not backend.get_unredeemed_payments_list(conn)
+            assert backend.get_user(conn, master_key.verify_key).found
 
     # The following is a sequence of notifications/events that transpired for the same account under
     # the same billing cycle (e.g. a subscribe, cancelling of subscription, then expiring). Since
@@ -3840,29 +4195,12 @@ def test_platform_apple(pg_database):
         assert unredeemed_payment_list[0].apple.tx_id == e00_sub_to_3_months_tx_info.transactionId
         assert unredeemed_payment_list[0].apple.web_line_order_tx_id == e00_sub_to_3_months_tx_info.webOrderLineItemId
 
-        # NOTE: Then redeem the payment
-        add_pro_payment_tx = backend.UserPaymentTransaction()
-        add_pro_payment_tx.provider = base.PaymentProvider.iOSAppStore
-        add_pro_payment_tx.apple_tx_id = unredeemed_payment_list[0].apple.tx_id
-        add_pro_payment_tx.payment_id = backend.payment_id_from_user_tx(add_pro_payment_tx)
-        payment_hash_to_sign = backend.make_add_pro_payment_message(
-            master_pkey=master_key.verify_key, rotating_pkey=rotating_key.verify_key, payment_tx=add_pro_payment_tx
-        )
-
-        # NOTE: POST and get response
-        response = test.flask_client.post(
-            server.FLASK_ROUTE_ADD_PRO_PAYMENT,
-            json={
-                'master_pkey': bytes(master_key.verify_key).hex(),
-                'rotating_pkey': bytes(rotating_key.verify_key).hex(),
-                'master_sig': bytes(master_key.sign(payment_hash_to_sign).signature).hex(),
-                'rotating_sig': bytes(rotating_key.sign(payment_hash_to_sign).signature).hex(),
-                'payment_tx': {
-                    'provider': add_pro_payment_tx.provider.value,
-                    'payment_id': add_pro_payment_tx.payment_id,
-                },
-            },
-        )
+        # NOTE: Then redeem the payment (reconcile binds it by the master-key-derived account-id).
+        with test.connection() as conn:
+            redeemed_at = base.round_datetime_to_next_day(
+                base.datetime_from_unix_ms(e00_sub_to_3_months_tx_info.purchaseDate)
+            )
+            assert backend.reconcile_pending_payments(conn, master_key.verify_key, redeemed_at=redeemed_at) == 1
 
         # NOTE: Check payment got redeemed to the DB
         with test.connection() as conn:
@@ -3924,9 +4262,9 @@ def test_platform_apple(pg_database):
             assert payment_list[0].apple.web_line_order_tx_id == e00_sub_to_3_months_tx_info.webOrderLineItemId
             assert payment_list[0].revoked_at == base.datetime_from_unix_ms(e01_upgrade_to_1wk_tx_info.purchaseDate)
 
-            # NOTE: The previous payment was revoked, but it won't be in the revocation list because
-            # a revocation's start time is rounded to the end of the day. So they won't show up if
-            # the proof will expire before the revocation activates.
+            # NOTE: The previous payment was revoked, but it won't be in the revocation list: it was already
+            # expiring within the day, and revoke_payments_by_id_internal's day-boundary early-out skips
+            # broadcasting a payment that is on its way out regardless.
             #
             # In this example in particular, because we are using the apple sandbox testing
             # environment their timespans for subscriptions are greatly reduced to within the minute
@@ -4566,7 +4904,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
     """
 
     def get_pro_status(user_ctx: TestUserCtx, ctx: TestingContext, unix_ts_ms: int) -> base.JSONObject:
-        ts = unix_ts_ms // 1000  # wire nonce is integer seconds (wire spec §3.4)
+        ts = unix_ts_ms // 1000  # wire nonce is integer seconds (wire spec §1.1)
         hash_to_sign = backend.make_get_pro_status_message(
             master_pkey=user_ctx.master_key.verify_key, request_at=base.datetime_from_unix_seconds(ts)
         )
@@ -4576,7 +4914,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             'ts': ts,
         }
         server.time_now = lambda: unix_ts_ms / 1000.0
-        response = ctx.flask_client.post(server.FLASK_ROUTE_GET_PRO_STATUS, json=request_body)
+        response = ctx.flask_client.post('/get_pro_status', json=request_body)
         server.time_now = lambda: time.time()
         response_json = response.json
         assert response_json is not None
@@ -4585,7 +4923,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
     def get_payment_details(
         user_ctx: TestUserCtx, ctx: TestingContext, unix_ts_ms: int, limit: int, before: str = ''
     ) -> base.JSONObject:
-        ts = unix_ts_ms // 1000  # wire nonce is integer seconds (wire spec §3.4)
+        ts = unix_ts_ms // 1000  # wire nonce is integer seconds (wire spec §1.1)
         hash_to_sign = backend.make_get_payment_details_message(
             master_pkey=user_ctx.master_key.verify_key,
             request_at=base.datetime_from_unix_seconds(ts),
@@ -4600,35 +4938,21 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             'before': before,
         }
         server.time_now = lambda: unix_ts_ms / 1000.0
-        response = ctx.flask_client.post(server.FLASK_ROUTE_GET_PAYMENT_DETAILS, json=request_body)
+        response = ctx.flask_client.post('/get_payment_details', json=request_body)
         server.time_now = lambda: time.time()
         response_json = response.json
         assert response_json is not None
         return response_json
 
     def add_payment(tx: TestTx, user_ctx: TestUserCtx, ctx: TestingContext) -> int:
-        add_pro_payment_tx = backend.UserPaymentTransaction()
-        add_pro_payment_tx.provider = base.PaymentProvider.GooglePlayStore
-        add_pro_payment_tx.google_payment_token = tx.purchase_token
-        add_pro_payment_tx.google_order_id = tx.order_id
-        add_pro_payment_tx.payment_id = backend.payment_id_from_user_tx(add_pro_payment_tx)
-        payment_hash_to_sign = backend.make_add_pro_payment_message(
-            master_pkey=user_ctx.master_key.verify_key,
-            rotating_pkey=user_ctx.rotating_key.verify_key,
-            payment_tx=add_pro_payment_tx,
-        )
-        request_body = {
-            'master_pkey': bytes(user_ctx.master_key.verify_key).hex(),
-            'rotating_pkey': bytes(user_ctx.rotating_key.verify_key).hex(),
-            'master_sig': bytes(user_ctx.master_key.sign(payment_hash_to_sign).signature).hex(),
-            'rotating_sig': bytes(user_ctx.rotating_key.sign(payment_hash_to_sign).signature).hex(),
-            'payment_tx': {'provider': add_pro_payment_tx.provider.value, 'payment_id': add_pro_payment_tx.payment_id},
-        }
-
-        server.time_now = lambda: tx.event_ms / 1000.0
-        ctx.flask_client.post(server.FLASK_ROUTE_ADD_PRO_PAYMENT, json=request_body)
-        server.time_now = lambda: time.time()
-
+        # Redeem the mule-registered payment for this user: reconcile binds it by the master-key
+        # account-id (the reflow replaces the old /add_pro_payment round-trip).
+        with ctx.connection() as conn:
+            backend.reconcile_pending_payments(
+                conn,
+                user_ctx.master_key.verify_key,
+                redeemed_at=backend.to_redeemed_at(base.datetime_from_unix_ms(tx.event_ms)),
+            )
         return base.unix_ms_from_datetime(base.round_datetime_to_next_day(base.datetime_from_unix_ms(tx.event_ms)))
 
     def backend_expire_payments_at_end_of_day(event_ms: int, assert_success: bool = False):
@@ -4715,7 +5039,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             assert isinstance(user, backend.UserRow)
             assert user.master_pkey == bytes(user_ctx.master_key.verify_key)
             # The user points at a live current generation with a populated 32-byte token. We do NOT
-            # assert a generation count here: a generation is an epoch (item 3), reused across payments and
+            # assert a generation count here: a generation is an epoch, reused across payments and
             # rolled only on revocation, so the count is scenario-dependent, not one-per-payment. The
             # current generation must be one of the user's, and (for these non-revoked scenarios) live.
             user_gen_ids = {row[0] for row in db.query(conn, "SELECT id FROM generations WHERE user_id = %s", user.id)}
@@ -4779,7 +5103,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
         item_status = base.json_dict_require_str_coerce_to_enum(item, "status", base.PaymentStatus, err)
         assert not err.has()
         assert item_expiry_ts == to_s(tx.expires_at), res_latest
-        # Google `payment_id` is the opaque `token|order_id` composite (§3.5).
+        # Google `payment_id` is the opaque `token|order_id` composite (backend-owned; §5.2).
         assert item_payment_id == f'{tx.purchase_token}|{tx.order_id}'
         assert item_grace_duration == base.seconds_from_timedelta(grace_duration)
         assert item_payment_provider == base.PaymentProvider.GooglePlayStore

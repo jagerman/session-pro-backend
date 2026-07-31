@@ -966,32 +966,6 @@ def handle_notification_tx(
                         f'Received TX: {print_obj(tx)}, with unrecognised subtype for a DID_FAIL_TO_RENEW notification'
                     )
 
-    elif decoded_notification.body.notificationType == AppleNotificationV2.REFUND_DECLINED:
-        # A notification type that indicates the App Store declined a refund request.
-        #
-        # NOTE: No-op, the user is still entitled to Session Pro, we either get a REFUND or
-        # REFUND_DECLINED, they are mutually exclusive. In the REFUND case we will end their
-        # entitlement.
-        #
-        # TODO: Needs some more testing
-        tx = decoded_notification.tx_info
-        if not tx:
-            err.msg_list.append(f'{notif_type} is missing TX info {print_obj(tx)}')
-
-        if not err.has():
-            assert tx
-            payment_tx = payment_tx_from_apple_jws_transaction(tx, err)
-            if not err.has():
-                user_payment_tx = backend.UserPaymentTransaction(
-                    provider=payment_tx.provider, apple_tx_id=payment_tx.apple_tx_id
-                )
-                log.debug(
-                    f'{notif_type} for {payment_tx_id_label(payment_tx)}: '
-                    f'clearing refund request (refund_requested_at = NULL)'
-                )
-                if not backend.set_refund_requested(sql_tx, payment_tx=user_payment_tx, refund_requested_at=None):
-                    log.warning(f"{notif_type} for {payment_tx_id_label(payment_tx)} failed to remove refund timestamp")
-
     elif decoded_notification.body.notificationType == AppleNotificationV2.TEST:
         # NOTE: Test notification that we can invoke for testing. No-op
         pass

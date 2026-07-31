@@ -13,9 +13,8 @@ Overview
   The authoritative wire/proof format — endpoints, signed-message layouts, response shapes, and the
   revocation list — is documented in docs/pro-wire-protocol.md.
 
-  Endpoints served here: add_pro_payment, generate_pro_proof, get_pro_revocations, get_pro_status,
-  get_payment_details, set_payment_refund_requested, status, apple_notifications_v2 (Apple webhook),
-  oxen/v4/lsrpc (onion transport).
+  Endpoints served here: generate_pro_proof, get_pro_revocations, get_pro_status, get_payment_details,
+  status, apple_notifications_v2 (Apple webhook), oxen/v4/lsrpc (onion transport).
 '''
 
 import collections.abc
@@ -55,15 +54,6 @@ FLASK_CONFIG_DB_URL_KEY = 'session_pro_backend_db_url'
 # the flask config rather than the DB so it never touches the database (or its backups).
 FLASK_CONFIG_BACKEND_SKEY_KEY = 'session_pro_backend_signing_key'
 
-# Name of the endpoints exposed on the server
-FLASK_ROUTE_ADD_PRO_PAYMENT = '/add_pro_payment'
-FLASK_ROUTE_GENERATE_PRO_PROOF = '/generate_pro_proof'
-FLASK_ROUTE_GET_PRO_REVOCATIONS = '/get_pro_revocations'
-FLASK_ROUTE_GET_PRO_STATUS = '/get_pro_status'
-FLASK_ROUTE_GET_PAYMENT_DETAILS = '/get_payment_details'
-FLASK_ROUTE_SET_PAYMENT_REFUND_REQUESTED = '/set_payment_refund_requested'
-FLASK_ROUTE_STATUS = '/status'
-
 # The object containing routes that you register onto a Flask app to turn it
 # into an app that accepts Session Pro Backend client requests.
 flask_blueprint = flask.Blueprint('session-pro-backend-blueprint', __name__)
@@ -91,7 +81,10 @@ def handle_api_error(e: base.ApiError) -> flask.Response:
     # the response envelope (wire spec §5). It fires inside Flask's dispatch — including the onion
     # subrequest's full_dispatch_request — so the envelope is produced in-band and onion-wrapped normally.
     # HTTP stays 200 (the envelope `status` is authoritative; make_subrequest warns on any non-200).
-    return flask.jsonify({'status': e.wire_status, 'error_code': e.code.value, 'error': str(e)})
+    envelope: dict[str, typing.Any] = {'status': e.wire_status, 'error_code': e.code.value, 'error': str(e)}
+    # Optional extra fields carried on the error (e.g. account_expiry_ts on a subscription_expired fail).
+    envelope.update(e.data)
+    return flask.jsonify(envelope)
 
 
 def get_json_from_flask_request(request: flask.Request) -> dict[str, typing.Any]:
@@ -135,7 +128,7 @@ def init(
     return result
 
 
-@flask_blueprint.route(FLASK_ROUTE_STATUS, methods=['GET', 'POST'])
+@flask_blueprint.route('/status', methods=['GET', 'POST'])
 def status():
     # Health/readiness probe. Unauthenticated, no DB access, no request body — reachable both directly
     # (a plain GET, for monitors) and over the v4 onion transport (GET or POST). Returns the backend
@@ -151,60 +144,7 @@ def status():
     )
 
 
-@flask_blueprint.route(FLASK_ROUTE_ADD_PRO_PAYMENT, methods=['POST'])
-def add_pro_payment():
-    # Extract + validate request fields (each raises FailError(invalid_request) on the first bad field).
-    get_json = get_json_from_flask_request(flask.request)
-    master_pkey = base.json_dict_require_str(get_json, 'master_pkey')
-    rotating_pkey = base.json_dict_require_str(get_json, 'rotating_pkey')
-    master_sig = base.json_dict_require_str(get_json, 'master_sig')
-    rotating_sig = base.json_dict_require_str(get_json, 'rotating_sig')
-    payment_tx = base.json_dict_require_obj(get_json, 'payment_tx')
-    payment_provider = base.json_dict_require_str(payment_tx, 'provider')
-    base.verify_payment_provider(payment_provider=payment_provider)
-
-    user_payment = backend.UserPaymentTransaction()
-    user_payment.provider = base.PaymentProvider(payment_provider)
-    # One opaque `payment_id` (§3.5): hashed verbatim, then split into the backend's typed fields for DB
-    # lookup. The wire/hash never sees the provider-specific sub-fields.
-    user_payment.payment_id = base.json_dict_require_str(payment_tx, 'payment_id')
-    if user_payment.provider == base.PaymentProvider.Rangeproof:
-        # Rangeproof grants are written directly to the DB; a client can't claim one via this route.
-        raise base.FailError('Bad payment provider given')
-    backend.apply_payment_id_to_tx(user_payment)
-
-    master_pkey_bytes = base.hex_to_bytes(
-        hex=master_pkey, label='Master public key', hex_len=nacl.bindings.crypto_sign_PUBLICKEYBYTES * 2
-    )
-    rotating_pkey_bytes = base.hex_to_bytes(
-        hex=rotating_pkey, label='Rotating public key', hex_len=nacl.bindings.crypto_sign_PUBLICKEYBYTES * 2
-    )
-    master_sig_bytes = base.hex_to_bytes(
-        hex=master_sig, label='Master key signature', hex_len=nacl.bindings.crypto_sign_BYTES * 2
-    )
-    rotating_sig_bytes = base.hex_to_bytes(
-        hex=rotating_sig, label='Rotating key signature', hex_len=nacl.bindings.crypto_sign_BYTES * 2
-    )
-
-    # Submit the payment to the DB (raises FailError(bad_signature/unknown_payment/…) or ServerError).
-    with get_db(flask.current_app) as engine:
-        with db.connection(engine) as conn:
-            request_at = base.datetime_from_unix_ms(int(time_now() * 1000))
-            redeemed_payment = backend.verify_and_add_pro_payment(
-                conn=conn,
-                signing_key=flask.current_app.config[FLASK_CONFIG_BACKEND_SKEY_KEY],
-                request_at=request_at,
-                redeemed_at=backend.to_redeemed_at(request_at),
-                master_pkey=nacl.signing.VerifyKey(master_pkey_bytes),
-                rotating_pkey=nacl.signing.VerifyKey(rotating_pkey_bytes),
-                payment_tx=user_payment,
-                master_sig=master_sig_bytes,
-                rotating_sig=rotating_sig_bytes,
-            )
-            return make_success_response(dict_result=redeemed_payment.proof.to_dict())
-
-
-@flask_blueprint.route(FLASK_ROUTE_GENERATE_PRO_PROOF, methods=['POST'])
+@flask_blueprint.route('/generate_pro_proof', methods=['POST'])
 def generate_pro_proof() -> flask.Response:
     # Extract + validate request fields (each raises FailError(invalid_request) on the first bad field).
     get_json = get_json_from_flask_request(flask.request)
@@ -252,16 +192,16 @@ def generate_pro_proof() -> flask.Response:
             return make_success_response(dict_result=proof.to_dict())
 
 
-@flask_blueprint.route(FLASK_ROUTE_GET_PRO_REVOCATIONS, methods=['POST'])
+@flask_blueprint.route('/get_pro_revocations', methods=['POST'])
 def get_pro_revocations():
     get_json = get_json_from_flask_request(flask.request)
     ticket: int = base.json_dict_require_int(get_json, 'ticket')
 
     RETRY_IN = base.SECONDS_IN_DAY
-    # List-level window (~proof validity, ~30d) after which a client drops a seen entry from its
-    # in-memory revocation list (wire spec §4 / Delta #6). Memory-only aging: a dropped entry can't
-    # reactivate anything, so this has no correctness dependence.
-    RETAIN_FOR = base.SECONDS_IN_MONTH
+    # List-level window (≥ the max proof validity) after which a client drops a seen entry from its
+    # in-memory revocation list (wire spec §4). Memory-only aging: a dropped entry can't reactivate
+    # anything, so this has no correctness dependence.
+    RETAIN_FOR = base.seconds_from_timedelta(base.REVOCATION_RETAIN_FOR)
     now = base.datetime_from_unix_ms(int(time_now() * 1000))
     revocation_items: list[dict[str, str | int]] = []
     revocation_ticket: int = 0
@@ -280,8 +220,13 @@ def get_pro_revocations():
                         retain_cutoff,
                     ):
                         token, revoked_at = row
-                        effective_at = revoked_at + datetime.timedelta(seconds=RETRY_IN)
-                        # Per-entry wire shape (spec §4 / Delta #6): revocation_tag + effective_ts only.
+                        # `revoked_at` is when the BACKEND recorded the revocation (not the store's own
+                        # refund date — see revoke_master_pkey_proofs_and_allocate_new_gen_id), so this
+                        # delay is always fully ahead of the client that has to learn of it. Its own
+                        # constant, not `retry_in`: that one is a poll-cadence hint, this one is the
+                        # guarantee that a revoked sender sees its tag before peers start rejecting it.
+                        effective_at = revoked_at + base.REVOCATION_EFFECTIVE_DELAY
+                        # Per-entry wire shape (spec §4): revocation_tag + effective_ts only.
                         # Clients age entries out via the list-level retain_for below, not a per-entry expiry.
                         revocation_items.append(
                             {
@@ -328,7 +273,7 @@ def _payment_item_wire(
 ) -> dict[str, str | int | float | bool]:
     # Wire seconds (wire spec §1/§5): integer everywhere the backend computes/rounds the value; the two
     # upstream provider event instants — `purchased_ts` and `revoked_ts` — are floats carrying the
-    # provider's sub-second precision. `payment_id` is the single opaque value (§3.5, Q10).
+    # provider's sub-second precision. `payment_id` is the single opaque value (§5.2).
     return {
         'status': backend.derive_payment_status(payment, request_at).value,
         'plan': payment.plan.value,
@@ -342,14 +287,11 @@ def _payment_item_wire(
         ),
         'platform_refund_expiry_ts': base.unix_seconds_from_datetime(payment.platform_refund_expires_at),
         'revoked_ts': base.unix_seconds_float_from_datetime(payment.revoked_at) if payment.revoked_at else 0.0,
-        'refund_requested_ts': (
-            base.unix_seconds_from_datetime(payment.refund_requested_at) if payment.refund_requested_at else 0
-        ),
         'payment_id': backend.payment_id_from_payment_row(payment),
     }
 
 
-@flask_blueprint.route(FLASK_ROUTE_GET_PRO_STATUS, methods=['POST'])
+@flask_blueprint.route('/get_pro_status', methods=['POST'])
 def get_pro_status():
     # Cheap, hot-path entitlement check: the account's Pro status + the single latest payment item. No
     # history, no pagination — this is what clients hit to render "am I Pro?" / the Pro-settings screen.
@@ -378,23 +320,24 @@ def get_pro_status():
     auto_renewing = False
     expiry_ts = 0
     grace_period_duration = 0
-    refund_requested_ts = 0
     error_report = 0
     latest_payment: dict[str, str | int | float | bool] | None = None
 
     with get_db(flask.current_app) as engine:
         with db.connection(engine) as conn:
             with db.transaction(conn) as tx:
+                # Bind any payment the mule has registered for this key but that isn't yet redeemed, so a
+                # status check right after purchase reflects it. No-op when there's nothing new.
+                backend.reconcile_pending_payments(tx, master_pkey_nacl, redeemed_at=backend.to_redeemed_at(request_at))
                 error_report = int(backend.has_user_error_from_master_pkey(tx, master_pkey_nacl))
                 user = backend.get_user(tx.conn, master_pkey_nacl)
                 if user.found:
                     auto_renewing = user.auto_renewing
-                    # Egress: user datetimes/timedelta → integer-seconds wire values (day-aligned, exact).
+                    # Egress: user datetimes/timedelta → integer-seconds wire values. This is the account's
+                    # TRUE expiry, straight from the store, so any sub-second part is floored (wire spec §1)
+                    # — unlike the proof's expiry, which lands on a whole second by construction (§2.3).
                     expiry_ts = base.unix_seconds_from_datetime(user.expires_at)
                     grace_period_duration = base.seconds_from_timedelta(user.grace_period)
-                    refund_requested_ts = (
-                        base.unix_seconds_from_datetime(user.refund_requested_at) if user.refund_requested_at else 0
-                    )
 
                     # Status decided against the *request* clock (signed, anti-replay-bounded to ≈now) —
                     # the same clock the latest item's derived status uses, never a second time.time().
@@ -411,7 +354,6 @@ def get_pro_status():
             'user_status': user_pro_status.value,
             'auto_renewing': auto_renewing,
             'expiry_ts': expiry_ts,
-            'refund_requested_ts': refund_requested_ts,
             'grace_period_duration': grace_period_duration if auto_renewing else 0,
             'error_report': error_report,
             'latest_payment': latest_payment,
@@ -419,7 +361,7 @@ def get_pro_status():
     )
 
 
-@flask_blueprint.route(FLASK_ROUTE_GET_PAYMENT_DETAILS, methods=['POST'])
+@flask_blueprint.route('/get_payment_details', methods=['POST'])
 def get_payment_details():
     # Extract + validate request fields (each raises FailError(invalid_request) on the first bad field).
     get_json = get_json_from_flask_request(flask.request)
@@ -467,6 +409,9 @@ def get_payment_details():
     with get_db(flask.current_app) as engine:
         with db.connection(engine) as conn:
             with db.transaction(conn) as tx:
+                # Bind any mule-registered-but-unredeemed payment for this key first, so a details check
+                # right after purchase includes it (only redeemed payments are user-scoped/visible below).
+                backend.reconcile_pending_payments(tx, master_pkey_nacl, redeemed_at=backend.to_redeemed_at(request_at))
                 # One keyset page, newest-first. Each item's status is derived against the *request*
                 # clock `ts` (signed, anti-replay-bounded to ≈now), never a second time.time() read.
                 # The query is user-scoped and only redeemed payments carry a user_id, so unredeemed
@@ -482,68 +427,3 @@ def get_payment_details():
         next_cursor = backend.encrypt_payment_cursor(cursor_key, master_pkey_nacl, page[-1].id)
 
     return make_success_response({'payments_total': payments_total, 'items': items, 'next_cursor': next_cursor})
-
-
-@flask_blueprint.route(FLASK_ROUTE_SET_PAYMENT_REFUND_REQUESTED, methods=['POST'])
-def set_payment_refund_requested():
-    # Extract + validate request fields (each raises FailError(invalid_request) on the first bad field).
-    get_json = get_json_from_flask_request(flask.request)
-    master_pkey = base.json_dict_require_str(get_json, 'master_pkey')
-    master_sig = base.json_dict_require_str(get_json, 'master_sig')
-    payment_tx = base.json_dict_require_obj(get_json, 'payment_tx')
-    ts = base.json_dict_require_int(get_json, 'ts')
-    refund_requested_ts = base.json_dict_require_int(get_json, 'refund_requested_ts')
-    payment_provider = base.json_dict_require_str(payment_tx, 'provider')
-
-    master_pkey_bytes = base.hex_to_bytes(
-        hex=master_pkey, label='Master public key', hex_len=nacl.bindings.crypto_sign_PUBLICKEYBYTES * 2
-    )
-    master_sig_bytes = base.hex_to_bytes(
-        hex=master_sig, label='Master key signature', hex_len=nacl.bindings.crypto_sign_BYTES * 2
-    )
-
-    user_payment = backend.UserPaymentTransaction()
-    user_payment.provider = base.PaymentProvider(payment_provider)
-    # One opaque `payment_id` (§3.5), hashed verbatim then split into the typed fields for DB lookup.
-    user_payment.payment_id = base.json_dict_require_str(payment_tx, 'payment_id')
-    if user_payment.provider == base.PaymentProvider.iOSAppStore:
-        backend.apply_payment_id_to_tx(user_payment)
-    else:
-        # Google refunds are executed out-of-band (their web portal) with no in-app notification, so
-        # unlike Apple we can't tell the request is legitimate — this route is disabled for non-Apple.
-        raise base.FailError('Bad payment provider given')
-
-    # Timestamp anti-replay window (wire nonce is integer seconds, §3.3). Out of window → stale_request.
-    request_at = base.datetime_from_unix_seconds(ts)
-    refund_requested_at = base.datetime_from_unix_seconds(refund_requested_ts)
-    now = base.datetime_from_unix_ms(int(time_now() * 1000))
-    if abs(now - request_at) >= base.DEFAULT_TIMESTAMP_TOLERANCE:
-        raise base.FailError(
-            f'Timestamp is outside the tolerance window, delta was {abs(now - request_at)}',
-            code=base.ErrorCode.stale_request,
-        )
-
-    # Validate the signature.
-    master_pkey_nacl = nacl.signing.VerifyKey(master_pkey_bytes)
-    hash_to_verify: bytes = backend.make_set_payment_refund_requested_message(
-        master_pkey=master_pkey_nacl,
-        request_at=request_at,
-        refund_requested_at=refund_requested_at,
-        payment_tx=user_payment,
-    )
-    try:
-        master_pkey_nacl.verify(smessage=hash_to_verify, signature=master_sig_bytes)
-    except Exception:
-        raise base.FailError('Signature failed to be verified', code=base.ErrorCode.bad_signature)
-
-    updated: bool = False
-    with get_db(flask.current_app) as engine:
-        with db.connection(engine) as conn:
-            # Wire `0` means "clear the refund request" → NULL internally (the hash above still used the
-            # literal wire value the client signed).
-            updated = backend.set_refund_requested(
-                conn, payment_tx=user_payment, refund_requested_at=refund_requested_at if refund_requested_ts else None
-            )
-
-            result = make_success_response(dict_result={'updated': updated})
-            return result

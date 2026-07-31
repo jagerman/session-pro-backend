@@ -710,8 +710,9 @@ def cmd_voucher(args: argparse.Namespace) -> int:
     """Handle voucher command - mints a payment for the chosen provider and auto-redeems it."""
     config = require_config(args)
 
-    # A google_play voucher's redeem consults Google (see backend.add_pro_payment); with dry-run on
-    # that is stubbed. The CLI has to propagate the flag itself — nothing else sets it in this process.
+    # Synthetic non-Rangeproof payments are only permitted on a throwaway (provider_dry_run) instance —
+    # enforced below. Propagate the flag into this CLI process (nothing else sets it here) so any
+    # dry-run-gated provider egress stays stubbed.
     base.PROVIDER_DRY_RUN = config.provider_dry_run
 
     # Parse master public key
@@ -726,11 +727,12 @@ def cmd_voucher(args: argparse.Namespace) -> int:
 
     provider = base.PaymentProvider(args.provider)
     if provider != base.PaymentProvider.Rangeproof and not config.provider_dry_run:
-        # A minted google_play/app_store payment is fiction as far as the provider is concerned, so its
-        # redeem must never be allowed to talk to one. Rangeproof has no provider to talk to.
+        # A minted google_play/app_store payment is fiction as far as the store is concerned, so it must
+        # only ever be created on a throwaway instance. Rangeproof is a genuine out-of-band dev-house
+        # grant with no store behind it, so it needs no such guard.
         print(
             f"ERROR: --provider {provider.value} requires provider_dry_run to be enabled "
-            f"(the payment is synthetic and its redeem must not reach the provider)",
+            f"(the payment is synthetic and must not be minted on a live instance)",
             file=sys.stderr,
         )
         return 1
@@ -762,14 +764,25 @@ def cmd_voucher(args: argparse.Namespace) -> int:
         print(f"ERROR: {e}", file=sys.stderr)
         return 1
 
+    # Load the backend signing key from disk (not stored in the DB) before opening the transaction.
+    if not config.backend_key_path:
+        print("ERROR: No backend signing key configured ([base] backend_key_path)", file=sys.stderr)
+        return 1
+    try:
+        backend_key = backend.load_backend_signing_key(config.backend_key_path)
+    except Exception as e:
+        print(f"ERROR: Failed to load backend signing key: {e}", file=sys.stderr)
+        return 1
+
     try:
         with db.open_database(config.db_url) as engine:
             with db.connection(engine) as conn:
                 with db.transaction(conn) as tx:
                     request_at = base.datetime_from_unix_ms(int(time.time() * 1000))
 
-                    # Step 1: mint the payment, unredeemed (shared with the /dev/add_payment route).
-                    print(f'\nStep 1: Creating unredeemed {provider.value} payment...')
+                    # Step 1: mint the payment and redeem it (shared with the /dev/add_payment route).
+                    # Redemption registers the entitlement (user row + generation) without minting a proof.
+                    print(f'\nStep 1: Minting and redeeming {provider.value} payment...')
                     minted = minting.mint_payment(
                         tx,
                         master_pkey=master_pkey,
@@ -777,44 +790,20 @@ def cmd_voucher(args: argparse.Namespace) -> int:
                         plan=plan,
                         now=request_at,
                         duration=duration,
-                        redeem=False,
+                        redeem=True,
                     )
-                    print(f"Success: Unredeemed payment created (payment_id: {minted.payment_id})")
+                    print(f"Success: payment redeemed (payment_id: {minted.payment_id})")
 
-                    # Load the backend signing key from disk. It is not stored in the DB.
-                    if not config.backend_key_path:
-                        print("ERROR: No backend signing key configured ([base] backend_key_path)", file=sys.stderr)
-                        return 1
-                    else:
-                        try:
-                            backend_key = backend.load_backend_signing_key(config.backend_key_path)
-                        except Exception as e:
-                            print(f"ERROR: Failed to load backend signing key: {e}", file=sys.stderr)
-                            return 1
-
-                    # Step 2: Redeem the payment via add_pro_payment (raises on failure → caught below).
-                    print('\nStep 2: Redeeming payment and generating pro proof...')
-                    redeem_result = backend.add_pro_payment(
-                        tx,
-                        signing_key=backend_key,
-                        request_at=request_at,
-                        redeemed_at=backend.to_redeemed_at(request_at),
-                        master_pkey=master_pkey,
-                        rotating_pkey=rotating_pkey,
-                        payment_tx=backend.UserPaymentTransaction(
-                            provider=provider,
-                            apple_tx_id=minted.payment_tx.apple_tx_id,
-                            rangeproof_order_id=minted.payment_tx.rangeproof_order_id,
-                            google_payment_token=minted.payment_tx.google_payment_token,
-                            google_order_id=minted.payment_tx.google_order_id,
-                            payment_id=minted.payment_id,
-                        ),
+                    # Step 2: build the proof over the now-active entitlement.
+                    print('\nStep 2: Generating pro proof...')
+                    proof = backend.build_current_entitlement_proof(
+                        tx, master_pkey, rotating_pkey, request_at, backend_key
                     )
 
-                    print("Success: Payment redeemed and pro proof generated")
+                    print(f"Success: {provider.value} payment granted and pro proof generated")
                     print('\nProof Details:')
-                    print(f'  Expiry: {base.readable(redeem_result.proof.expires_at)}')
-                    print(f'  Revocation Tag: {redeem_result.proof.revocation_tag.hex()}')
+                    print(f'  Expiry: {base.readable(proof.expires_at)}')
+                    print(f'  Revocation Tag: {proof.revocation_tag.hex()}')
 
                     return 0
 

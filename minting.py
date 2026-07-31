@@ -25,8 +25,10 @@ import db
 @dataclasses.dataclass
 class MintedPayment:
     payment_tx: base.PaymentProviderTransaction = dataclasses.field(default_factory=base.PaymentProviderTransaction)
-    # The opaque wire `payment_id` (§3.5) for the minted transaction, so a caller can hand it to a client
-    # that then claims the payment through the real add_pro_payment route.
+    # The opaque wire `payment_id` (§5.2) for the minted transaction: what a caller reports back so the
+    # payment can be identified afterwards (e.g. looked up through get_payment_details). Nothing claims a
+    # payment BY this id — redemption is implicit, so an unredeemed minted payment is bound by the account
+    # holder's next authenticated request.
     payment_id: str = ''
     plan: base.ProPlan = base.ProPlan.Nil
     expires_at: datetime.datetime = base.EPOCH
@@ -88,12 +90,14 @@ def mint_payment(
     default) redeem it on the spot.
 
     The synthetic identifiers minted below are arbitrary, but the *account binding* is not: it has to
-    equal what `backend.redeem_payment` recomputes from the master pubkey, or the redeem matches no
-    row. Google binds on the raw 32-byte pubkey; Apple on `uuid_from_master_pk` of it.
+    equal what a redeem recomputes from the master pubkey, or a later client reconcile matches no row.
+    Google binds on the raw 32-byte pubkey; Apple on `uuid_from_master_pk` of it.
 
-    `redeem=False` stops after the unredeemed payment and hands back its `payment_id`, so a client can
-    claim it through the real `add_pro_payment` route — the closest thing to a genuine store purchase
-    that can be staged locally.
+    `redeem=False` stops after the unredeemed payment and hands back its `payment_id`. For Google/Apple
+    the payment carries the master-derived account-id, so the account holder's next authenticated request
+    (generate_pro_proof / get_pro_status) reconciles it automatically — the closest thing to a genuine
+    store purchase that can be staged locally. Rangeproof has no account-id, so an unredeemed Rangeproof
+    payment is never auto-claimed; pass redeem=True for it.
     '''
     if plan == base.ProPlan.Nil:
         raise base.FailError('Cannot mint a payment for the nil plan')
@@ -157,27 +161,12 @@ def mint_payment(
     )
 
     if redeem:
-        # rotating_pkey/signing_key are deliberately None: this registers the entitlement (user row +
-        # generation) WITHOUT minting a proof, leaving the client to request one through
-        # generate_pro_proof with its own rotating key. Calls redeem_payment rather than
-        # add_pro_payment on purpose — the latter's Google branch is an acknowledgement against
-        # Google's servers, which has no meaning for a payment Google never saw.
-        backend.redeem_payment(
-            tx,
-            master_pkey=master_pkey,
-            rotating_pkey=None,
-            signing_key=None,
-            request_at=now,
-            redeemed_at=backend.to_redeemed_at(now),
-            payment_tx=backend.UserPaymentTransaction(
-                provider=provider,
-                apple_tx_id=payment_tx.apple_tx_id,
-                rangeproof_order_id=payment_tx.rangeproof_order_id,
-                google_payment_token=payment_tx.google_payment_token,
-                google_order_id=payment_tx.google_order_id,
-                payment_id=result.payment_id,
-            ),
-        )
+        # Register the entitlement (user row + generation) for the payment we just minted, WITHOUT
+        # building a proof — the client requests one through generate_pro_proof with its own rotating
+        # key. Binds the exact minted payment by its own identifier, so Rangeproof (which has no store
+        # account-id to reconcile against) is claimed too. No provider egress: the reflow moved Google's
+        # purchase-acknowledgement to the mule, so redeeming here never reaches a store.
+        backend.redeem_minted_payment(tx, master_pkey, payment_tx, backend.to_redeemed_at(now))
         result.redeemed = True
 
     return result
