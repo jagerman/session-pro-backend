@@ -814,12 +814,6 @@ def verify_db(conn: psycopg.Connection, err: base.ErrorSink) -> bool:
     payments: list[PaymentRow] = get_payments_list(conn)
     for index, it in enumerate(payments):
         # NOTE: Check mandatory fields
-        if it.plan == base.ProPlan.Nil:
-            err.msg_list.append(
-                f'Payment #{index} plan is invalid. '
-                f'It should have been derived from the platform payment provider '
-                f'(e.g. by converting the unredeemedd plan ID to a plan)'
-            )
         if it.payment_provider == base.PaymentProvider.Nil:
             err.msg_list.append(
                 f'Payment #{index} payment provider is set to {it.payment_provider.name} '

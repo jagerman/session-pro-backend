@@ -17,10 +17,9 @@ correctness/entitlement hole — an over-entitled user (kept Pro after a refund)
 Apple eventually stops retrying).
 
 This file is the single, human-visible list of those constraints. It is the **proactive** half of the
-safeguard; the **reactive** half is a planned loud-guard (Phase 4 — see `docs/refactor-plan.md`): a shared
-`unsupported_feature(name, …)` helper that logs CRITICAL (→ ops alert) and safely skips (never raises /
-wedges) when one of these branches is hit. Neither substitutes for actually implementing the handler
-before the feature is enabled.
+safeguard; the **reactive** half is a planned loud-guard: a shared `unsupported_feature(name, …)` helper
+that logs CRITICAL (→ ops alert) and safely skips (never raises / wedges) when one of these branches is
+hit. Neither substitutes for actually implementing the handler before the feature is enabled.
 
 Keep this in sync with the code — it describes real branches, not intentions.
 
@@ -157,3 +156,62 @@ subscription lifetime, and that is covered by a test. **Binding-revocation obser
 changes on a revocation) is likewise intrinsic and accepted.
 
 *(Ref: wire spec §2.3.)*
+
+### Google RTDN ordering (accepted; the safety property is load-bearing)
+
+Google does not set Pub/Sub ordering keys on RTDNs, so notifications for one purchase token arrive out of
+order, both within a single pull and on a replay. The subscriber sorts a batch by `eventTimeMillis`, which
+orders only *within* that batch; across batches, ordering is handled by the handler failing and the message
+being retried with a back-off until whatever it depended on has landed. There is no reorder buffer.
+
+**What makes that safe is an invariant, not the sort:** every mutating branch in
+`handle_subscription_notification` gates on the `subscription_state` from a *freshly fetched* subscription
+resource, so a notification whose type no longer matches the store's current state does nothing rather than
+applying a stale change. The notification is a hint; the resource is the truth (as `google.md` says).
+
+**Wiring any dormant branch above without that guard breaks it.** A handler that acts on the notification
+type alone will apply stale changes out of order. The same applies to a handler that needs a payment row to
+already exist: it will fail and retry until the row appears, which is correct but costs a `user_error` and
+error-level logs in the meantime.
+
+### Credits are not clawed back on refund (accepted)
+
+A one-shot payment (a voucher; anything minted) is consumed only while nothing else covers the account. When
+a subscription is refunded, the time the account already spent under it is **not** charged back to a credit
+it holds. So a year-long voucher held through two months of a subscription that is then refunded still owes
+a full year, and those two months were free.
+
+Accepted deliberately: a refund is the store deciding to return money for service already delivered, and
+charging the voucher for it would manufacture entitlement out of a refund. It also makes the outcome
+independent of whether the voucher was granted just before or just after the refund landed, which a clawback
+could not be. Both facts are asserted by tests, so a later decision to claw back will show up as failures
+rather than as a silent change.
+
+The exposure scales with how long the refunded subscription was consumed, and the half we control is
+developer-initiated refunds: issuing those routinely on voucher-holding accounts is what would make this
+matter.
+
+### `revoked_at` means "entitlement stopped here" (invariant, not a limitation)
+
+`payments.revoked_at` carries the *store's* refund instant, and the entitlement it granted up to that
+instant stands — the user really was subscribed until then. It must never be repurposed to mean "this
+payment never existed": the credit accounting above depends on it, and back-dating it to a purchase instant
+would retroactively turn a consumed term into uncovered time, silently charging any credit that was alive
+during it. Whether the same voucher was worth two months or eleven would then depend on when in the term it
+was granted.
+
+(`generations.revoked_at` is a different thing: our own clock, stamped at the write site, because the served
+list turns it into `effective_ts`.)
+
+### Credit drain: coverage is sampled, not reconstructed (accepted)
+
+A drain pass asks only whether a subscription covers the account *right now*, then charges the whole span
+since that account's checkpoint. The charge is exact however late the pass runs, but at a genuine coverage
+transition it is off by up to the gap between passes: a lapse is charged for the whole span it falls in, a
+start for none of it. Renewals are not transitions (expiry moves before the old term lapses), so in practice
+this is a couple of events per subscription lifetime. Both directions are pinned by tests.
+
+After an outage the error is bounded by the outage rather than by the interval, and in the "lapse" direction
+it is against the user: a backlog drained after days of downtime can charge a voucher for days it was in
+fact covered. There is no code fix planned — after any incident that drains a large notification backlog,
+re-grant the affected voucher days by hand.

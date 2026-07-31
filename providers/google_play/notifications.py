@@ -322,7 +322,7 @@ def thread_entry_point(
     # grpcio (via google-cloud-pubsub) is imported HERE, not at module scope, deliberately: this is the
     # subscriber thread body and runs only post-fork, inside the mule. A module-level import pulls
     # grpcio's background C threads into the uWSGI master, and the forked mule then segfaults on the
-    # dead inherited threads. DO NOT HOIST these to the top of the file (see docs/refactor-plan.md).
+    # dead inherited threads. DO NOT HOIST these to the top of the file.
     from google.cloud import pubsub_v1  # type: ignore[attr-defined]
     import google.pubsub_v1.types
     import google.api_core.exceptions
@@ -588,16 +588,6 @@ def set_purchase_grace_period_duration(
             f'Failed to update grace period duration for '
             f'purchase_token: {base.maybe_obfuscate(tx_payment.google_payment_token)} '
             f'and order_id: {base.maybe_obfuscate(tx_payment.google_order_id)}'
-        )
-
-
-def validate_no_existing_purchase_token_error(purchase_token: str, conn: psycopg.Connection, err: base.ErrorSink):
-    result = backend.has_user_error(
-        conn=conn, payment_provider=base.PaymentProvider.GooglePlayStore, payment_id=purchase_token
-    )
-    if result:
-        err.msg_list.append(
-            f"Received RTDN notification for already errored purchase token: {base.maybe_obfuscate(purchase_token)}"
         )
 
 
