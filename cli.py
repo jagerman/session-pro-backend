@@ -7,7 +7,6 @@ flushing historical notifications received, generating reports e.t.c
 import argparse
 import configparser
 import dataclasses
-import datetime
 import os
 import pathlib
 import sys
@@ -574,7 +573,7 @@ def cmd_revoke_list(args: argparse.Namespace) -> int:
 
                     eligible_count = 0
                     list_label = ''
-                    now = datetime.datetime.now(datetime.timezone.utc)
+                    now = base.utc_now()
 
                     for row in user_and_payments.payments_it:
                         payment: backend.PaymentRow = backend.payment_row_from_dict(row)
@@ -633,9 +632,7 @@ def cmd_revoke(args: argparse.Namespace, dry_run: bool) -> int:
     # Revocation is terminal, so there is no un-revoke; the manual revoke uses the one real revoke path
     # (revoke the user's current generation + roll them onto a fresh one if they still have valid payments).
     revoke_at = (
-        base.datetime_from_unix_ms(args.creation_unix_ts_s * 1000)
-        if args.creation_unix_ts_s
-        else datetime.datetime.now(datetime.timezone.utc)
+        base.datetime_from_unix_ms(args.creation_unix_ts_s * 1000) if args.creation_unix_ts_s else base.utc_now()
     )
 
     if dry_run:

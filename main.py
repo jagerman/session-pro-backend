@@ -8,7 +8,6 @@ For database operations (user errors, revocations, reports, etc.), use the cli.p
 import flask
 import flask.logging
 import time
-import datetime
 import nacl.signing
 import logging
 import sys
@@ -44,7 +43,7 @@ def _periodic_cleanup(signum: int) -> None:
     # targets this signal at worker 1 ONLY, so exactly one process prunes — no N-worker race, and no
     # dedicated mule (a mule can't register uWSGI signals). A busy worker just defers the tick; the
     # prune is idempotent, non-urgent housekeeping, so a delay is harmless.
-    now = datetime.datetime.now(datetime.timezone.utc)
+    now = base.utc_now()
     try:
         with db.connection(db.get_pool(base.DB_URL)) as conn:
             result = backend.expire_payments_revocations_and_users(conn=conn, now=now)

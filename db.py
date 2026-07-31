@@ -24,15 +24,62 @@ import atexit
 import collections.abc
 import contextlib
 import dataclasses
+import datetime
 import functools
 import logging
+import pendulum
 import threading
 import traceback
 import typing
 
 import psycopg
+import psycopg.abc
 import psycopg_pool
+import typing_extensions
 from psycopg.rows import dict_row as dict_row  # noqa: F401  (re-exported: query(..., row_factory=db.dict_row))
+from psycopg.types.datetime import IntervalBinaryLoader, IntervalLoader, TimestamptzBinaryLoader, TimestamptzLoader
+
+# Postgres instants and intervals arrive as pendulum's DateTime/Duration, not the stdlib's, so that adding
+# a duration to a loaded instant moves an exact span (see base.py's module docstring for why the stdlib
+# cannot express that). psycopg has no pendulum support of its own, so the four loaders below wrap its
+# stdlib results; they are registered on the global adapter registry, which every connection inherits —
+# the pool and `connect_one` alike.
+
+
+def _duration_from_timedelta(value: datetime.timedelta) -> pendulum.Duration:
+    # Fold the day count into seconds so the result is denominated in seconds and therefore an exact span;
+    # passing `days=` through would make it a calendar step.
+    return pendulum.duration(seconds=value.days * 86400 + value.seconds, microseconds=value.microseconds)
+
+
+class _PendulumTimestamptzLoader(TimestamptzLoader):
+    @typing_extensions.override
+    def load(self, data: psycopg.abc.Buffer) -> pendulum.DateTime:
+        return pendulum.instance(super().load(data))
+
+
+class _PendulumTimestamptzBinaryLoader(TimestamptzBinaryLoader):
+    @typing_extensions.override
+    def load(self, data: psycopg.abc.Buffer) -> pendulum.DateTime:
+        return pendulum.instance(super().load(data))
+
+
+class _PendulumIntervalLoader(IntervalLoader):
+    @typing_extensions.override
+    def load(self, data: psycopg.abc.Buffer) -> pendulum.Duration:
+        return _duration_from_timedelta(super().load(data))
+
+
+class _PendulumIntervalBinaryLoader(IntervalBinaryLoader):
+    @typing_extensions.override
+    def load(self, data: psycopg.abc.Buffer) -> pendulum.Duration:
+        return _duration_from_timedelta(super().load(data))
+
+
+psycopg.adapters.register_loader("timestamptz", _PendulumTimestamptzLoader)
+psycopg.adapters.register_loader("timestamptz", _PendulumTimestamptzBinaryLoader)
+psycopg.adapters.register_loader("interval", _PendulumIntervalLoader)
+psycopg.adapters.register_loader("interval", _PendulumIntervalBinaryLoader)
 
 # Pools are cached by DSN: production drives a single DSN (so a single pool), while the
 # test suite spins up many throwaway databases (a pool each). The lock guards the cache;

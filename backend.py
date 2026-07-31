@@ -1,11 +1,11 @@
 import nacl.signing
+import pendulum
 import nacl.utils
 import nacl.bindings
 import functools
 import hashlib
 import typing
 import collections.abc
-import datetime
 import dataclasses
 import logging
 import enum
@@ -146,7 +146,7 @@ class ProSubscriptionProof:
     version: int = 0
     revocation_tag: bytes = b''  # the generation's stored random 32-byte token
     rotating_pkey: nacl.signing.VerifyKey = nacl.signing.VerifyKey(ZERO_BYTES32)
-    expires_at: datetime.datetime = base.EPOCH
+    expires_at: pendulum.DateTime = base.EPOCH
     sig: bytes = b''
 
     # --- Advisory account-entitlement value: NOT signed and NOT part of the proof message (the signed
@@ -159,7 +159,7 @@ class ProSubscriptionProof:
     # above, which is the rolling, clamped (~30 d) proof validity — never conflate the two.
     # Display state only; the signed proof + revocation list remain authoritative.
     # Left at the default on any proof built without a user context (none today). ---
-    account_expires_at: datetime.datetime = base.EPOCH
+    account_expires_at: pendulum.DateTime = base.EPOCH
 
     def to_dict(self) -> dict[str, str | int]:
         # `version` is a PLAINTEXT field, deliberately NOT bound into the signature. It is the
@@ -188,21 +188,21 @@ class ProSubscriptionProof:
 @dataclasses.dataclass
 class LookupUserExpiry:
     # `None` expiry = "no such payment found yet". Durations default to zero.
-    expiry_from_redeemed: datetime.datetime | None = None
-    grace_from_redeemed: datetime.timedelta = datetime.timedelta(0)
+    expiry_from_redeemed: pendulum.DateTime | None = None
+    grace_from_redeemed: pendulum.Duration = pendulum.duration()
     auto_renewing_from_redeemed: bool = False
 
-    best_expiry: datetime.datetime | None = None
-    best_grace: datetime.timedelta = datetime.timedelta(0)
+    best_expiry: pendulum.DateTime | None = None
+    best_grace: pendulum.Duration = pendulum.duration()
     best_auto_renewing: bool = False
 
 
 AddRevocationIterator: typing.TypeAlias = tuple[
-    int, bytes | None, datetime.datetime  # (row) id  # master_pkey
+    int, bytes | None, pendulum.DateTime  # (row) id  # master_pkey
 ]  # expires_at
 
 GoogleUnhandledNotificationIterator: typing.TypeAlias = tuple[
-    str, str | None, datetime.datetime  # message_id (opaque string)  # payload
+    str, str | None, pendulum.DateTime  # message_id (opaque string)  # payload
 ]  # expires_at
 
 
@@ -263,12 +263,12 @@ class PaymentRow:
     plan: base.ProPlan = base.ProPlan.Nil
     payment_provider: base.PaymentProvider = base.PaymentProvider.Nil
     auto_renewing: bool = False
-    purchased_at: datetime.datetime = base.EPOCH
-    redeemed_at: datetime.datetime | None = None
-    expires_at: datetime.datetime = base.EPOCH
-    grace_period: datetime.timedelta | None = None
-    platform_refund_expires_at: datetime.datetime = base.EPOCH
-    revoked_at: datetime.datetime | None = None
+    purchased_at: pendulum.DateTime = base.EPOCH
+    redeemed_at: pendulum.DateTime | None = None
+    expires_at: pendulum.DateTime = base.EPOCH
+    grace_period: pendulum.Duration | None = None
+    platform_refund_expires_at: pendulum.DateTime = base.EPOCH
+    revoked_at: pendulum.DateTime | None = None
     apple: AppleTransaction = dataclasses.field(default_factory=AppleTransaction)
     google_payment_token: str = ''
     google_order_id: str = ''
@@ -295,8 +295,8 @@ class UserRow:
     master_pkey: bytes | None = None
     current_generation_id: int = 0
     token: bytes = b''  # current generation's token (proof revocation_tag)
-    expires_at: datetime.datetime = base.EPOCH
-    grace_period: datetime.timedelta = datetime.timedelta(0)
+    expires_at: pendulum.DateTime = base.EPOCH
+    grace_period: pendulum.Duration = pendulum.duration()
     auto_renewing: bool = False
     # This account's private proof-expiry grid: expiries land on `UTC midnight + this + k * one day`.
     # Re-drawn whenever `expires_at` moves. See new_proof_expiry_offset / _build_proof_clamped_expiry_time.
@@ -316,14 +316,14 @@ class RevocationRow:
 
     generation_id: int = 0
     token: bytes = b''
-    revoked_at: datetime.datetime = base.EPOCH
+    revoked_at: pendulum.DateTime = base.EPOCH
 
 
 @dataclasses.dataclass
 class AllocatedGenID:
     found: bool = False
-    expires_at: datetime.datetime | None = None
-    grace_period: datetime.timedelta = datetime.timedelta(0)
+    expires_at: pendulum.DateTime | None = None
+    grace_period: pendulum.Duration = pendulum.duration()
     generation_id: int = 0
     token: bytes = b''
 
@@ -386,7 +386,7 @@ def user_payment_tx_to_safe_string(tx: UserPaymentTransaction) -> str:
     return f'{tx.provider.name}, {ids}'
 
 
-def to_redeemed_at(at: datetime.datetime) -> datetime.datetime:
+def to_redeemed_at(at: pendulum.DateTime) -> pendulum.DateTime:
     # Round up to the next UTC-day boundary (masks the exact instant the payment was redeemed).
     return base.round_datetime_to_next_day(at)
 
@@ -398,14 +398,14 @@ def to_redeemed_at(at: datetime.datetime) -> datetime.datetime:
 # negatives, so count=-1 and unbounded values Just Work); str as UTF-8. A `\0` separates two ADJACENT
 # variable-length (datetime/int/str) fields; fixed-width fields need no separator. Only payment_id can
 # contain a `\0` and it is always the final field, so the framing is unambiguous.
-def signed_message(domain: bytes, *fields: nacl.signing.VerifyKey | bytes | datetime.datetime | int | str) -> bytes:
+def signed_message(domain: bytes, *fields: nacl.signing.VerifyKey | bytes | pendulum.DateTime | int | str) -> bytes:
     assert len(domain) == DOMAIN_SIZE
     out = bytearray(domain)
     prev_variable = False
     for field in fields:
         if isinstance(field, (nacl.signing.VerifyKey, bytes, bytearray)):
             data, variable = bytes(field), False
-        elif isinstance(field, datetime.datetime):
+        elif isinstance(field, pendulum.DateTime):
             data, variable = str(base.unix_seconds_from_datetime(field)).encode('ascii'), True  # → int seconds
         elif isinstance(field, int):
             data, variable = str(field).encode('ascii'), True  # canonical decimal
@@ -423,12 +423,12 @@ def signed_message(domain: bytes, *fields: nacl.signing.VerifyKey | bytes | date
     return bytes(out)
 
 
-def make_get_pro_status_message(master_pkey: nacl.signing.VerifyKey, request_at: datetime.datetime) -> bytes:
+def make_get_pro_status_message(master_pkey: nacl.signing.VerifyKey, request_at: pendulum.DateTime) -> bytes:
     return signed_message(GET_PRO_STATUS_DOMAIN, master_pkey, request_at)
 
 
 def make_get_payment_details_message(
-    master_pkey: nacl.signing.VerifyKey, request_at: datetime.datetime, limit: int, before: str
+    master_pkey: nacl.signing.VerifyKey, request_at: pendulum.DateTime, limit: int, before: str
 ) -> bytes:
     return signed_message(GET_PAYMENT_DETAILS_DOMAIN, master_pkey, request_at, limit, before)
 
@@ -503,7 +503,7 @@ def payment_row_from_dict(row: dict[str, typing.Any]) -> PaymentRow:
     return result
 
 
-def derive_payment_status(payment: PaymentRow, now: datetime.datetime) -> base.PaymentStatus:
+def derive_payment_status(payment: PaymentRow, now: pendulum.DateTime) -> base.PaymentStatus:
     """Derive the single display status from a payment's timestamps against `now`.
 
     `status` is not stored; it's computed with precedence revoked > expired > redeemed > unredeemed.
@@ -642,7 +642,7 @@ def get_revocations_list(conn: psycopg.Connection) -> list[RevocationRow]:
     return result
 
 
-def is_generation_revoked(conn: psycopg.Connection, generation_id: int, now: datetime.datetime) -> bool:
+def is_generation_revoked(conn: psycopg.Connection, generation_id: int, now: pendulum.DateTime) -> bool:
     # A generation is revoked iff revoked_at is set (revocation is terminal). `now` is accepted for a
     # uniform signature; a set revoked_at is always in effect (there is no per-entry expiry now — the
     # served-list retention window is list-level and memory-only on the client). Single statement, so it
@@ -673,13 +673,13 @@ def get_global_bytes(conn: psycopg.Connection, key: str) -> bytes:
     return bytes(row[0])
 
 
-def get_global_datetime(conn: psycopg.Connection, key: str) -> datetime.datetime:
+def get_global_datetime(conn: psycopg.Connection, key: str) -> pendulum.DateTime:
     row = db.query_one(conn, "SELECT ts_val FROM globals WHERE key = %s", key)
     assert row is not None, f'missing timestamp global "{key}"'
     return row[0]
 
 
-def set_global_datetime(conn: psycopg.Connection, key: str, value: datetime.datetime) -> None:
+def set_global_datetime(conn: psycopg.Connection, key: str, value: pendulum.DateTime) -> None:
     db.query(conn, "UPDATE globals SET ts_val = %s WHERE key = %s", value, key)
 
 
@@ -743,10 +743,10 @@ def verify_db(conn: psycopg.Connection, err: base.ErrorSink) -> bool:
     # possibly be before. We should update this to to the PRO release date. (Was a bare int that,
     # pre-datetime-migration, was seconds compared against millisecond values — so the guard never
     # fired; now a real instant.)
-    PRO_ENABLED_AT: datetime.datetime = datetime.datetime(2025, 8, 27, tzinfo=datetime.timezone.utc)
+    PRO_ENABLED_AT: pendulum.DateTime = pendulum.datetime(2025, 8, 27)
 
     payments: list[PaymentRow] = get_payments_list(conn)
-    now: datetime.datetime = datetime.datetime.now(datetime.timezone.utc)
+    now: pendulum.DateTime = base.utc_now()
     for index, it in enumerate(payments):
         # `status` is derived (not stored) — invariants are really per-fact, but we keep the
         # per-status framing for readable diagnostics.
@@ -875,9 +875,9 @@ def _update_user_expiry_grace_and_renew_flag_from_payment_list(
 
 
 @db.transactional
-def revoke_payments_by_id_internal(tx: db.SQLTransaction, rows: typing.Any, revoke_at: datetime.datetime) -> bool:
+def revoke_payments_by_id_internal(tx: db.SQLTransaction, rows: typing.Any, revoke_at: pendulum.DateTime) -> bool:
     result = False
-    master_pkey_dict: dict[bytes, datetime.datetime] = {}
+    master_pkey_dict: dict[bytes, pendulum.DateTime] = {}
     for row in rows:
         result = True
         id, master_pkey_raw, expires_at = row
@@ -952,7 +952,7 @@ def revoke_payments_by_id_internal(tx: db.SQLTransaction, rows: typing.Any, revo
 
 @db.transactional
 def add_apple_revocation(
-    tx: db.SQLTransaction, apple_original_tx_id: str, revoke_at: datetime.datetime, err: base.ErrorSink
+    tx: db.SQLTransaction, apple_original_tx_id: str, revoke_at: pendulum.DateTime, err: base.ErrorSink
 ) -> bool:
     """Revoke all the payments that aren't revoked that share the same original TX ID. Returns true
     if there were any rows that had the ID"""
@@ -1005,7 +1005,7 @@ def reinstate_apple_payment(
     apple_original_tx_id: str,
     apple_tx_id: str,
     auto_renewing: bool,
-    reinstated_at: datetime.datetime,
+    reinstated_at: pendulum.DateTime,
 ) -> bool:
     """Reverse a prior Apple REFUND for a single transaction (a REFUND_REVERSED notification) — the mirror of
     add_apple_revocation. Un-revoke the payment identified by (original_tx_id, tx_id), restore the affected
@@ -1078,7 +1078,7 @@ def reinstate_apple_payment(
 
 @db.transactional
 def add_google_revocation(
-    tx: db.SQLTransaction, google_payment_token: str, revoke_at: datetime.datetime, err: base.ErrorSink
+    tx: db.SQLTransaction, google_payment_token: str, revoke_at: pendulum.DateTime, err: base.ErrorSink
 ) -> bool:
     """Revoke all the payments that aren't revoked that share the same original TX ID. Returns true
     if there were any rows that had the ID"""
@@ -1120,7 +1120,7 @@ def add_google_revocation(
 
 @db.transactional
 def reconcile_pending_payments(
-    tx: db.SQLTransaction, master_pkey: nacl.signing.VerifyKey, redeemed_at: datetime.datetime
+    tx: db.SQLTransaction, master_pkey: nacl.signing.VerifyKey, redeemed_at: pendulum.DateTime
 ) -> int:
     """Redeem every unredeemed, unrevoked Google/Apple payment bound to `master_pkey`, link the claimed
     payments to the user, refresh entitlement, and return how many were newly claimed.
@@ -1173,7 +1173,7 @@ def _redeem_payment_for_user(
     tx: db.SQLTransaction,
     master_pkey: nacl.signing.VerifyKey,
     payment_tx: base.PaymentProviderTransaction,
-    redeemed_at: datetime.datetime,
+    redeemed_at: pendulum.DateTime,
 ) -> None:
     """Redeem ONE specific payment and link it to master_pkey's (already-existing) user, matched by the
     payment's OWN store identifier — Google (payment_token, order_id) / Apple tx_id — NOT by the
@@ -1220,7 +1220,7 @@ def redeem_minted_payment(
     tx: db.SQLTransaction,
     master_pkey: nacl.signing.VerifyKey,
     payment_tx: base.PaymentProviderTransaction,
-    redeemed_at: datetime.datetime,
+    redeemed_at: pendulum.DateTime,
 ) -> None:
     """Redeem ONE just-minted payment and bind it to master_pkey's user (creating the user + generation
     if needed), matched by the payment's OWN store identifier. This is the shared redeem for the minting
@@ -1329,7 +1329,7 @@ def _lookup_user_expiry(tx: db.SQLTransaction, master_pkey: nacl.signing.VerifyK
             revoked_at,
         ) = row
         # grace_period is nullable; treat "absent" as zero for the entitlement arithmetic below.
-        grace = grace_period if grace_period is not None else datetime.timedelta(0)
+        grace = grace_period if grace_period is not None else pendulum.duration()
 
         # NOTE: Consecutive subscription payments are added to the DB under _roughly_ the same
         # transaction ID (this differs between platforms). We only want to consider that latest
@@ -1422,7 +1422,7 @@ def _lookup_user_expiry(tx: db.SQLTransaction, master_pkey: nacl.signing.VerifyK
 def update_payment_renewal_info(
     tx: db.SQLTransaction,
     payment_tx: base.PaymentProviderTransaction,
-    grace_period: datetime.timedelta | None,
+    grace_period: pendulum.Duration | None,
     auto_renewing: bool | None,
     err: base.ErrorSink,
 ) -> bool:
@@ -1595,9 +1595,9 @@ def add_unredeemed_payment(
     tx: db.SQLTransaction,
     payment_tx: base.PaymentProviderTransaction,
     plan: base.ProPlan,
-    expires_at: datetime.datetime,
-    purchased_at: datetime.datetime,
-    platform_refund_expires_at: datetime.datetime,
+    expires_at: pendulum.DateTime,
+    purchased_at: pendulum.DateTime,
+    platform_refund_expires_at: pendulum.DateTime,
     platform_obfuscated_account_id: bytes | str,
     err: base.ErrorSink,
     needs_ack: bool = False,
@@ -1758,7 +1758,7 @@ def add_unredeemed_payment(
                     # Source: https://support.google.com/googleplay/android-developer/answer/16631229
                     auto_redeem_deadline_at = user.expires_at
                     if user.auto_renewing:
-                        auto_redeem_deadline_at += datetime.timedelta(days=60) - user.grace_period
+                        auto_redeem_deadline_at += 60 * base.DAY - user.grace_period
                 else:
                     assert payment_tx.provider == base.PaymentProvider.iOSAppStore
                     # NOTE: We don't currently configure a grace period/account hold period for Apple
@@ -1794,7 +1794,7 @@ def add_unredeemed_payment(
                         )
 
 
-def mint_generation(tx: db.SQLTransaction, user_id: int, issued_at: datetime.datetime) -> tuple[int, bytes]:
+def mint_generation(tx: db.SQLTransaction, user_id: int, issued_at: pendulum.DateTime) -> tuple[int, bytes]:
     '''Insert a fresh generation (new random 32-byte token) for an existing user; returns
     (generation_id, token). Retries on a token-unique collision — astronomically unlikely for 32 CSPRNG
     bytes, but cheap insurance against a degraded RNG; each attempt is a savepoint so a collision can't
@@ -1818,7 +1818,7 @@ def mint_generation(tx: db.SQLTransaction, user_id: int, issued_at: datetime.dat
 
 
 def get_or_create_user_and_generation(
-    tx: db.SQLTransaction, master_pkey: nacl.signing.VerifyKey, issued_at: datetime.datetime
+    tx: db.SQLTransaction, master_pkey: nacl.signing.VerifyKey, issued_at: pendulum.DateTime
 ) -> tuple[int, int, bytes, bool]:
     '''Ensure a user row AND its first generation exist for master_pkey. Race-free via ON CONFLICT on the
     master_pkey unique index. Returns (user_id, current_generation_id, token, was_created). Must run inside
@@ -1872,7 +1872,7 @@ def get_or_create_user_and_generation(
 
 
 def _ensure_active_generation(
-    tx: db.SQLTransaction, master_pkey: nacl.signing.VerifyKey, issued_at: datetime.datetime
+    tx: db.SQLTransaction, master_pkey: nacl.signing.VerifyKey, issued_at: pendulum.DateTime
 ) -> AllocatedGenID:
     # Refresh the user's top-level entitlement fields from their current best payment, and settle which
     # generation they're on. A generation is an EPOCH, not a per-payment value: REUSE the user's
@@ -1921,7 +1921,7 @@ def _ensure_active_generation(
 
 
 def make_generate_pro_proof_message(
-    master_pkey: nacl.signing.VerifyKey, rotating_pkey: nacl.signing.VerifyKey, request_at: datetime.datetime
+    master_pkey: nacl.signing.VerifyKey, rotating_pkey: nacl.signing.VerifyKey, request_at: pendulum.DateTime
 ) -> bytes:
     '''The message the user signs to authorise a new rotating_pkey for master_pkey's Session Pro
     subscription.'''
@@ -1929,15 +1929,15 @@ def make_generate_pro_proof_message(
 
 
 def build_proof_message(
-    revocation_tag: bytes, rotating_pkey: nacl.signing.VerifyKey, expires_at: datetime.datetime
+    revocation_tag: bytes, rotating_pkey: nacl.signing.VerifyKey, expires_at: pendulum.DateTime
 ) -> bytes:
     '''The message the backend signs to certify a proof.'''
     return signed_message(BUILD_PROOF_DOMAIN, revocation_tag, rotating_pkey, expires_at)
 
 
 def _build_proof_clamped_expiry_time(
-    request_at: datetime.datetime, proposed_expires_at: datetime.datetime, proof_expiry_offset: int
-) -> datetime.datetime:
+    request_at: pendulum.DateTime, proposed_expires_at: pendulum.DateTime, proof_expiry_offset: int
+) -> pendulum.DateTime:
     '''How far ahead a proof issued at `request_at` certifies, given the account's true (grace-inclusive)
     entitlement end and its stored per-account offset:
 
@@ -1989,7 +1989,7 @@ def _build_proof_clamped_expiry_time(
 def build_proof(
     revocation_tag: bytes,
     rotating_pkey: nacl.signing.VerifyKey,
-    expires_at: datetime.datetime,
+    expires_at: pendulum.DateTime,
     signing_key: nacl.signing.SigningKey,
 ) -> ProSubscriptionProof:
     # The revocation_tag is the generation's stored random token, embedded verbatim (no hashing).
@@ -2059,7 +2059,7 @@ def internal_verify_add_payment_and_get_proof_common_arguments(
 
 @db.transactional
 def revoke_master_pkey_proofs_and_allocate_new_gen_id(
-    tx: db.SQLTransaction, master_pkey: nacl.signing.VerifyKey, created_at: datetime.datetime
+    tx: db.SQLTransaction, master_pkey: nacl.signing.VerifyKey, created_at: pendulum.DateTime
 ) -> AllocatedGenID:
     # Revoke the user's current generation (terminal): sets revoked_at, which blocks every proof issued
     # under that generation and (via the trigger) bumps the revocation ticket. The `revoked_at IS NULL`
@@ -2095,14 +2095,14 @@ def revoke_master_pkey_proofs_and_allocate_new_gen_id(
 
 
 def round_datetime_to_next_day_with_provider_testing_support(
-    payment_provider: base.PaymentProvider, at: datetime.datetime
-) -> datetime.datetime:
+    payment_provider: base.PaymentProvider, at: pendulum.DateTime
+) -> pendulum.DateTime:
     """Round `at` up to the next day boundary. In some platforms' testing environments a "day" is
     compressed (Google: 10 seconds); only that case differs from the normal UTC-day rounding."""
     if base.PROVIDER_TESTING_ENV and payment_provider == base.PaymentProvider.GooglePlayStore:
-        google_day = datetime.timedelta(seconds=10)  # in Google's test env, 1 day == 10s
+        google_day = pendulum.duration(seconds=10)  # in Google's test env, 1 day == 10s
         elapsed = at - base.EPOCH
-        units = -((-elapsed) // google_day)  # ceil-divide the timedelta
+        units = -((-elapsed) // google_day)  # ceil-divide the duration
         return base.EPOCH + units * google_day
     return base.round_datetime_to_next_day(at)
 
@@ -2112,7 +2112,7 @@ def build_current_entitlement_proof(
     tx: db.SQLTransaction,
     master_pkey: nacl.signing.VerifyKey,
     rotating_pkey: nacl.signing.VerifyKey,
-    request_at: datetime.datetime,
+    request_at: pendulum.DateTime,
     signing_key: nacl.signing.SigningKey,
 ) -> ProSubscriptionProof:
     '''Sign a proof for the user's CURRENT entitlement using their existing generation token (NO roll).
@@ -2179,7 +2179,7 @@ def generate_pro_proof(
     signing_key: nacl.signing.SigningKey,
     master_pkey: nacl.signing.VerifyKey,
     rotating_pkey: nacl.signing.VerifyKey,
-    request_at: datetime.datetime,
+    request_at: pendulum.DateTime,
     master_sig: bytes,
     rotating_sig: bytes,
 ) -> ProSubscriptionProof:
@@ -2214,10 +2214,10 @@ def grant_rangeproof(
     master_pkey: nacl.signing.VerifyKey,
     rotating_pkey: nacl.signing.VerifyKey,
     signing_key: nacl.signing.SigningKey,
-    request_at: datetime.datetime,
-    redeemed_at: datetime.datetime,
+    request_at: pendulum.DateTime,
+    redeemed_at: pendulum.DateTime,
     plan: base.ProPlan,
-    expires_at: datetime.datetime,
+    expires_at: pendulum.DateTime,
 ) -> ProSubscriptionProof:
     """Directly grant a Rangeproof (dev-house) Pro payment to `master_pkey` and return the proof.
     Admin/CLI only: there is no client-facing voucher flow — a real one-time-use voucher, with a client
@@ -2264,7 +2264,7 @@ def grant_rangeproof(
     return build_current_entitlement_proof(tx, master_pkey, rotating_pkey, request_at, signing_key)
 
 
-def expire_payments_revocations_and_users(conn: psycopg.Connection, now: datetime.datetime) -> ExpireResult:
+def expire_payments_revocations_and_users(conn: psycopg.Connection, now: pendulum.DateTime) -> ExpireResult:
     # Pure idempotent housekeeping: prune rows whose expiry has passed (and orphaned users). Nothing
     # here affects live results — payment expiry is derived on read, and every consuming query
     # self-guards on expiry (e.g. is_generation_revoked) — so this can run on any schedule, any number
@@ -2291,7 +2291,7 @@ def expire_payments_revocations_and_users(conn: psycopg.Connection, now: datetim
 
 
 @db.transactional
-def add_user_error(tx: db.SQLTransaction, error: UserError, at: datetime.datetime):
+def add_user_error(tx: db.SQLTransaction, error: UserError, at: pendulum.DateTime):
     match error.provider:
         case base.PaymentProvider.Rangeproof:
             pass
@@ -2432,7 +2432,7 @@ def get_payment(
 
 
 @db.transactional
-def apple_add_notification_uuid(tx: db.SQLTransaction, uuid: str, expires_at: datetime.datetime):
+def apple_add_notification_uuid(tx: db.SQLTransaction, uuid: str, expires_at: pendulum.DateTime):
     # uuid is the PRIMARY KEY; DO NOTHING keeps this idempotent (and crash-free) if the caller's
     # prior existence check raced with a concurrent insert of the same notification.
     db.query(
@@ -2462,12 +2462,12 @@ def apple_notification_uuid_is_in_db(tx: db.SQLTransaction, uuid: str) -> bool:
     return result
 
 
-def apple_set_notification_checkpoint_at(tx: db.SQLTransaction, checkpoint_at: datetime.datetime):
+def apple_set_notification_checkpoint_at(tx: db.SQLTransaction, checkpoint_at: pendulum.DateTime):
     set_global_datetime(tx.conn, 'apple_notification_checkpoint_at', checkpoint_at)
 
 
 @db.transactional
-def google_add_notification_id(tx: db.SQLTransaction, message_id: str, expires_at: datetime.datetime, payload: str):
+def google_add_notification_id(tx: db.SQLTransaction, message_id: str, expires_at: pendulum.DateTime, payload: str):
     maybe_payload: str | None = None
     if len(payload):
         maybe_payload = payload
@@ -2567,7 +2567,7 @@ def _format_period_label(period_str: str, period: ReportPeriod) -> str:
     """Format period string for display."""
     if period == ReportPeriod.Weekly:
         year, week = period_str.split("-")
-        date = datetime.datetime.fromisocalendar(year=int(year), week=int(week), day=1)
+        date = pendulum.DateTime.fromisocalendar(year=int(year), week=int(week), day=1)
         return date.strftime('%F') + f' (W{week})'
     return period_str
 
