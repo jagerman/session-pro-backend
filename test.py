@@ -1317,19 +1317,15 @@ def test_stale_revocation_is_not_served(pg_database):
         assert backend.is_generation_revoked(conn, gen_recent, now) is True
         assert backend.is_generation_revoked(conn, gen_stale, now) is True
 
-        # The served list applies the retention window: recent is in, stale is filtered out.
+        # The served list applies the retention window: recent is in, stale is filtered out. Read through
+        # the same helper get_pro_revocations serves from, so this exercises that filter rather than a
+        # copy of it.
         retain_cutoff = now - pendulum.duration(seconds=RETAIN_FOR)
-        with db.transaction(conn) as tx:
-            served = {
-                bytes(row[0])
-                for row in db.query(
-                    tx.conn,
-                    "SELECT token FROM generations WHERE revoked_at IS NOT NULL AND revoked_at > %s",
-                    retain_cutoff,
-                )
-            }
+        served = {it.token for it in backend.get_revocations_list(conn, revoked_after=retain_cutoff)}
         assert bytes(token_recent) in served
         assert bytes(token_stale) not in served
+        # Unfiltered, both are present — the filter is the only thing hiding the stale one.
+        assert {it.token for it in backend.get_revocations_list(conn)} >= {bytes(token_recent), bytes(token_stale)}
     pool.close()
 
 

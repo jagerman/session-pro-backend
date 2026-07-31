@@ -633,12 +633,23 @@ def get_user(conn: psycopg.Connection, master_pkey: nacl.signing.VerifyKey) -> U
     return result
 
 
-def get_revocations_list(conn: psycopg.Connection) -> list[RevocationRow]:
+def get_revocations_list(
+    conn: psycopg.Connection, revoked_after: pendulum.DateTime | None = None
+) -> list[RevocationRow]:
+    """Revoked generations. `revoked_after` restricts them to those recorded after that instant, which is
+    how the served list applies its retention window; omitted, this is the whole unfiltered set.
+
+    Single statement, so it runs directly on the given connection: a mid-transaction caller passes
+    `tx.conn` and the read joins that open transaction, a standalone caller autocommits."""
+    sql = "SELECT id, token, revoked_at FROM generations WHERE revoked_at IS NOT NULL"
+    args: tuple[typing.Any, ...] = ()
+    if revoked_after is not None:
+        sql += " AND revoked_at > %s"
+        args = (revoked_after,)
     result: list[RevocationRow] = []
-    with db.transaction(conn) as tx:
-        for row in db.query(tx.conn, "SELECT id, token, revoked_at FROM generations WHERE revoked_at IS NOT NULL"):
-            generation_id, token, revoked_at = row
-            result.append(RevocationRow(generation_id=generation_id, token=bytes(token), revoked_at=revoked_at))
+    for row in db.query(conn, sql, *args):
+        generation_id, token, revoked_at = row
+        result.append(RevocationRow(generation_id=generation_id, token=bytes(token), revoked_at=revoked_at))
     return result
 
 

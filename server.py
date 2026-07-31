@@ -197,23 +197,18 @@ def get_pro_revocations():
                 # now - retain_for`). Filtering by the window (rather than depending on a prune) keeps
                 # the answer independent of whether housekeeping has run; the token IS the wire tag.
                 retain_cutoff = now - pendulum.duration(seconds=RETAIN_FOR)
-                for row in db.query(
-                    tx.conn,
-                    "SELECT token, revoked_at FROM generations WHERE revoked_at IS NOT NULL AND revoked_at > %s",
-                    retain_cutoff,
-                ):
-                    token, revoked_at = row
+                for revocation in backend.get_revocations_list(tx.conn, revoked_after=retain_cutoff):
                     # `revoked_at` is when the BACKEND recorded the revocation (not the store's own
                     # refund date — see revoke_master_pkey_proofs_and_allocate_new_gen_id), so this
                     # delay is always fully ahead of the client that has to learn of it. Derived from
                     # `retry_in` but deliberately larger: that one is a poll-cadence hint, this is the
                     # guarantee that a revoked sender sees its tag before peers start rejecting it.
-                    effective_at = revoked_at + base.REVOCATION_EFFECTIVE_DELAY
+                    effective_at = revocation.revoked_at + base.REVOCATION_EFFECTIVE_DELAY
                     # Per-entry wire shape (spec §4): revocation_tag + effective_ts only.
                     # Clients age entries out via the list-level retain_for below, not a per-entry expiry.
                     revocation_items.append(
                         {
-                            'revocation_tag': bytes(token).hex(),
+                            'revocation_tag': revocation.token.hex(),
                             # Integer seconds: a computed instant (wire spec §1/§4).
                             'effective_ts': base.unix_seconds_from_datetime(effective_at),
                         }
