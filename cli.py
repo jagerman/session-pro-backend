@@ -339,11 +339,12 @@ def require_config(args: argparse.Namespace) -> CLIConfig:
         print("ERROR: No database URL configured in config file", file=sys.stderr)
         sys.exit(1)
 
+    db.set_dsn(result.db_url)
     return result
 
 
 def cmd_user_error_set(args: argparse.Namespace, dry_run: bool) -> int:
-    config = require_config(args)
+    require_config(args)
     try:
         items = parse_set_user_error_arg(args.items)
     except ValueError as e:
@@ -355,48 +356,45 @@ def cmd_user_error_set(args: argparse.Namespace, dry_run: bool) -> int:
         return 0
 
     try:
-        with db.open_database(config.db_url) as engine:
-            with db.connection(engine) as conn:
-                count = 0
-                label = ''
+        with db.connection() as conn:
+            count = 0
+            label = ''
 
-                for index, (payment_provider, payment_id, set_flag) in enumerate(items):
-                    if index:
-                        label += '\n'
-                    label += f'  {index:02d} {payment_provider.value}:{payment_id} = {set_flag}'
+            for index, (payment_provider, payment_id, set_flag) in enumerate(items):
+                if index:
+                    label += '\n'
+                label += f'  {index:02d} {payment_provider.value}:{payment_id} = {set_flag}'
 
-                    if dry_run:
-                        label += ' (dry-run)'
-                        count += 1
-                        continue
+                if dry_run:
+                    label += ' (dry-run)'
+                    count += 1
+                    continue
 
-                    if set_flag:
-                        error = backend.UserError(provider=payment_provider)
-                        if payment_provider == base.PaymentProvider.GooglePlayStore:
-                            error.google_payment_token = payment_id
-                        else:
-                            assert payment_provider == base.PaymentProvider.iOSAppStore
-                            error.apple_original_tx_id = payment_id
-
-                        if backend.has_user_error(conn=conn, payment_provider=payment_provider, payment_id=payment_id):
-                            label += ' (skipped - already exists)'
-                        else:
-                            backend.add_user_error(
-                                conn, error=error, at=base.datetime_from_unix_ms(int(time.time() * 1000))
-                            )
-                            count += 1
-                            label += ' (added)'
+                if set_flag:
+                    error = backend.UserError(provider=payment_provider)
+                    if payment_provider == base.PaymentProvider.GooglePlayStore:
+                        error.google_payment_token = payment_id
                     else:
-                        if backend.delete_user_errors(
-                            conn=conn, payment_provider=payment_provider, payment_id=payment_id
-                        ):
-                            count += 1
-                            label += ' (deleted)'
-                        else:
-                            label += ' (skipped - not found)'
+                        assert payment_provider == base.PaymentProvider.iOSAppStore
+                        error.apple_original_tx_id = payment_id
 
-                print(f"Set {count}/{len(items)} user errors\n{label}")
-                return 0
+                    if backend.has_user_error(conn=conn, payment_provider=payment_provider, payment_id=payment_id):
+                        label += ' (skipped - already exists)'
+                    else:
+                        backend.add_user_error(
+                            conn, error=error, at=base.datetime_from_unix_ms(int(time.time() * 1000))
+                        )
+                        count += 1
+                        label += ' (added)'
+                else:
+                    if backend.delete_user_errors(conn=conn, payment_provider=payment_provider, payment_id=payment_id):
+                        count += 1
+                        label += ' (deleted)'
+                    else:
+                        label += ' (skipped - not found)'
+
+            print(f"Set {count}/{len(items)} user errors\n{label}")
+            return 0
 
     except Exception as e:
         print(f"ERROR: Database error: {e}", file=sys.stderr)
@@ -404,7 +402,7 @@ def cmd_user_error_set(args: argparse.Namespace, dry_run: bool) -> int:
 
 
 def cmd_user_error_delete(args: argparse.Namespace, dry_run: bool) -> int:
-    config = require_config(args)
+    require_config(args)
     try:
         items = parse_payment_id_list(args.items)
     except ValueError as e:
@@ -416,29 +414,28 @@ def cmd_user_error_delete(args: argparse.Namespace, dry_run: bool) -> int:
         return 0
 
     try:
-        with db.open_database(config.db_url) as engine:
-            with db.connection(engine) as conn:
-                count = 0
-                label = ''
+        with db.connection() as conn:
+            count = 0
+            label = ''
 
-                for index, (payment_provider, payment_id) in enumerate(items):
-                    if index:
-                        label += '\n'
-                    label += f'  {index:02d} {payment_provider.value}:{payment_id}'
+            for index, (payment_provider, payment_id) in enumerate(items):
+                if index:
+                    label += '\n'
+                label += f'  {index:02d} {payment_provider.value}:{payment_id}'
 
-                    if dry_run:
-                        label += ' (dry-run)'
-                        count += 1
-                        continue
+                if dry_run:
+                    label += ' (dry-run)'
+                    count += 1
+                    continue
 
-                    if backend.delete_user_errors(conn=conn, payment_provider=payment_provider, payment_id=payment_id):
-                        count += 1
-                        label += ' (deleted)'
-                    else:
-                        label += ' (skipped - not found)'
+                if backend.delete_user_errors(conn=conn, payment_provider=payment_provider, payment_id=payment_id):
+                    count += 1
+                    label += ' (deleted)'
+                else:
+                    label += ' (skipped - not found)'
 
-                print(f"Deleted {count}/{len(items)} user errors\n{label}")
-                return 0
+            print(f"Deleted {count}/{len(items)} user errors\n{label}")
+            return 0
 
     except Exception as e:
         print(f"ERROR: Database error: {e}", file=sys.stderr)
@@ -446,7 +443,7 @@ def cmd_user_error_delete(args: argparse.Namespace, dry_run: bool) -> int:
 
 
 def cmd_google_notification_handle(args: argparse.Namespace, dry_run: bool) -> int:
-    config = require_config(args)
+    require_config(args)
     try:
         message_ids = parse_message_id_list(args.items)
     except ValueError as e:
@@ -458,30 +455,29 @@ def cmd_google_notification_handle(args: argparse.Namespace, dry_run: bool) -> i
         return 0
 
     try:
-        with db.open_database(config.db_url) as engine:
-            with db.connection(engine) as conn:
-                count = 0
-                label = ''
+        with db.connection() as conn:
+            count = 0
+            label = ''
 
-                for index, message_id in enumerate(message_ids):
-                    if index:
-                        label += '\n'
-                    label += f'  {index:02d} {message_id} = Handled'
+            for index, message_id in enumerate(message_ids):
+                if index:
+                    label += '\n'
+                label += f'  {index:02d} {message_id} = Handled'
 
-                    if dry_run:
-                        label += ' (dry-run)'
+                if dry_run:
+                    label += ' (dry-run)'
+                    count += 1
+                    continue
+
+                with db.transaction(conn) as tx:
+                    updated = backend.google_set_notification_handled(tx=tx, message_id=message_id, delete=False)
+                    if updated:
                         count += 1
-                        continue
+                    else:
+                        label += ' (skipped - not found)'
 
-                    with db.transaction(conn) as tx:
-                        updated = backend.google_set_notification_handled(tx=tx, message_id=message_id, delete=False)
-                        if updated:
-                            count += 1
-                        else:
-                            label += ' (skipped - not found)'
-
-                print(f"Marked {count}/{len(message_ids)} google notifications as handled\n{label}")
-                return 0
+            print(f"Marked {count}/{len(message_ids)} google notifications as handled\n{label}")
+            return 0
 
     except Exception as e:
         print(f"ERROR: Database error: {e}", file=sys.stderr)
@@ -489,7 +485,7 @@ def cmd_google_notification_handle(args: argparse.Namespace, dry_run: bool) -> i
 
 
 def cmd_google_notification_delete(args: argparse.Namespace, dry_run: bool) -> int:
-    config = require_config(args)
+    require_config(args)
     try:
         message_ids = parse_message_id_list(args.items)
     except ValueError as e:
@@ -501,30 +497,29 @@ def cmd_google_notification_delete(args: argparse.Namespace, dry_run: bool) -> i
         return 0
 
     try:
-        with db.open_database(config.db_url) as engine:
-            with db.connection(engine) as conn:
-                count = 0
-                label = ''
+        with db.connection() as conn:
+            count = 0
+            label = ''
 
-                for index, message_id in enumerate(message_ids):
-                    if index:
-                        label += '\n'
-                    label += f'  {index:02d} {message_id} = Delete'
+            for index, message_id in enumerate(message_ids):
+                if index:
+                    label += '\n'
+                label += f'  {index:02d} {message_id} = Delete'
 
-                    if dry_run:
-                        label += ' (dry-run)'
+                if dry_run:
+                    label += ' (dry-run)'
+                    count += 1
+                    continue
+
+                with db.transaction(conn) as tx:
+                    updated = backend.google_set_notification_handled(tx=tx, message_id=message_id, delete=True)
+                    if updated:
                         count += 1
-                        continue
+                    else:
+                        label += ' (skipped - not found)'
 
-                    with db.transaction(conn) as tx:
-                        updated = backend.google_set_notification_handled(tx=tx, message_id=message_id, delete=True)
-                        if updated:
-                            count += 1
-                        else:
-                            label += ' (skipped - not found)'
-
-                print(f"Deleted {count}/{len(message_ids)} google notifications\n{label}")
-                return 0
+            print(f"Deleted {count}/{len(message_ids)} google notifications\n{label}")
+            return 0
 
     except Exception as e:
         print(f"ERROR: Database error: {e}", file=sys.stderr)
@@ -532,25 +527,24 @@ def cmd_google_notification_delete(args: argparse.Namespace, dry_run: bool) -> i
 
 
 def cmd_google_notification_list(args: argparse.Namespace) -> int:
-    config = require_config(args)
+    require_config(args)
     try:
-        with db.open_database(config.db_url) as engine:
-            with db.connection(engine) as conn:
-                with db.transaction(conn) as tx:
-                    unhandled_it = backend.google_get_unhandled_notification_iterator(tx)
+        with db.connection() as conn:
+            with db.transaction(conn) as tx:
+                unhandled_it = backend.google_get_unhandled_notification_iterator(tx)
 
-                    items = list(unhandled_it)
-                    if len(items) == 0:
-                        print("No unhandled google notifications")
-                        return 0
-
-                    print(f"Found {len(items)} unhandled google notifications:")
-                    for index, item in enumerate(items):
-                        message_id, payload, expires_at = item
-                        expiry_str = base.readable(expires_at)
-                        print(f"  {index:02d} message_id={message_id}, expiry={expiry_str}")
-
+                items = list(unhandled_it)
+                if len(items) == 0:
+                    print("No unhandled google notifications")
                     return 0
+
+                print(f"Found {len(items)} unhandled google notifications:")
+                for index, item in enumerate(items):
+                    message_id, payload, expires_at = item
+                    expiry_str = base.readable(expires_at)
+                    print(f"  {index:02d} message_id={message_id}, expiry={expiry_str}")
+
+                return 0
 
     except Exception as e:
         print(f"ERROR: Database error: {e}", file=sys.stderr)
@@ -558,7 +552,7 @@ def cmd_google_notification_list(args: argparse.Namespace) -> int:
 
 
 def cmd_revoke_list(args: argparse.Namespace) -> int:
-    config = require_config(args)
+    require_config(args)
     try:
         master_pkey = parse_master_pkey(args.master_pkey)
     except ValueError as e:
@@ -566,55 +560,54 @@ def cmd_revoke_list(args: argparse.Namespace) -> int:
         return 1
 
     try:
-        with db.open_database(config.db_url) as engine:
-            with db.connection(engine) as conn:
-                with db.transaction(conn) as tx:
-                    user_and_payments = backend.get_user_and_payments(tx=tx, master_pkey=master_pkey)
+        with db.connection() as conn:
+            with db.transaction(conn) as tx:
+                user_and_payments = backend.get_user_and_payments(tx=tx, master_pkey=master_pkey)
 
-                    eligible_count = 0
-                    list_label = ''
-                    now = base.utc_now()
+                eligible_count = 0
+                list_label = ''
+                now = base.utc_now()
 
-                    for row in user_and_payments.payments_it:
-                        payment: backend.PaymentRow = backend.payment_row_from_dict(row)
+                for row in user_and_payments.payments_it:
+                    payment: backend.PaymentRow = backend.payment_row_from_dict(row)
 
-                        plan_label = ''
-                        match payment.plan:
-                            case base.ProPlan.Nil:
-                                plan_label = '??'
-                            case base.ProPlan.OneMonth:
-                                plan_label = '1M'
-                            case base.ProPlan.ThreeMonth:
-                                plan_label = '3M'
-                            case base.ProPlan.TwelveMonth:
-                                plan_label = '12M'
+                    plan_label = ''
+                    match payment.plan:
+                        case base.ProPlan.Nil:
+                            plan_label = '??'
+                        case base.ProPlan.OneMonth:
+                            plan_label = '1M'
+                        case base.ProPlan.ThreeMonth:
+                            plan_label = '3M'
+                        case base.ProPlan.TwelveMonth:
+                            plan_label = '12M'
 
-                        payment_id = ''
-                        match payment.payment_provider:
-                            case base.PaymentProvider.Nil:
-                                pass
-                            case base.PaymentProvider.GooglePlayStore:
-                                payment_id = f'{payment.google_payment_token}-{payment.google_order_id}'
-                            case base.PaymentProvider.iOSAppStore:
-                                payment_id = f'{payment.apple.original_tx_id}'
-                            case base.PaymentProvider.Rangeproof:
-                                payment_id = f'{payment.rangeproof_order_id}'
+                    payment_id = ''
+                    match payment.payment_provider:
+                        case base.PaymentProvider.Nil:
+                            pass
+                        case base.PaymentProvider.GooglePlayStore:
+                            payment_id = f'{payment.google_payment_token}-{payment.google_order_id}'
+                        case base.PaymentProvider.iOSAppStore:
+                            payment_id = f'{payment.apple.original_tx_id}'
+                        case base.PaymentProvider.Rangeproof:
+                            payment_id = f'{payment.rangeproof_order_id}'
 
-                        if now >= payment.expires_at:
-                            continue
+                    if now >= payment.expires_at:
+                        continue
 
-                        status_label = backend.derive_payment_status(payment, now).name
-                        list_label += (
-                            f'\n    {eligible_count:02d} RevokeID={payment.payment_provider.name}-{payment_id}; '
-                            f'Status={status_label}; '
-                            f'Plan={plan_label}; '
-                            f'Unredeemed={base.readable(payment.purchased_at)}; '
-                            f'Expiry={base.readable(payment.expires_at)};'
-                        )
-                        eligible_count += 1
+                    status_label = backend.derive_payment_status(payment, now).name
+                    list_label += (
+                        f'\n    {eligible_count:02d} RevokeID={payment.payment_provider.name}-{payment_id}; '
+                        f'Status={status_label}; '
+                        f'Plan={plan_label}; '
+                        f'Unredeemed={base.readable(payment.purchased_at)}; '
+                        f'Expiry={base.readable(payment.expires_at)};'
+                    )
+                    eligible_count += 1
 
-                    print(f"User {args.master_pkey} has {eligible_count} revocable payments{list_label}")
-                    return 0
+                print(f"User {args.master_pkey} has {eligible_count} revocable payments{list_label}")
+                return 0
 
     except Exception as e:
         print(f"ERROR: Database error: {e}", file=sys.stderr)
@@ -622,7 +615,7 @@ def cmd_revoke_list(args: argparse.Namespace) -> int:
 
 
 def cmd_revoke(args: argparse.Namespace, dry_run: bool) -> int:
-    config = require_config(args)
+    require_config(args)
     try:
         master_pkey = parse_master_pkey(args.master_pkey)
     except ValueError as e:
@@ -640,12 +633,11 @@ def cmd_revoke(args: argparse.Namespace, dry_run: bool) -> int:
         return 0
 
     try:
-        with db.open_database(config.db_url) as engine:
-            with db.connection(engine) as conn:
-                with db.transaction(conn) as tx:
-                    backend.revoke_master_pkey_proofs_and_allocate_new_gen_id(tx, master_pkey, created_at=revoke_at)
-                print(f"Revoked current generation for {args.master_pkey} at {base.readable(revoke_at)}")
-                return 0
+        with db.connection() as conn:
+            with db.transaction(conn) as tx:
+                backend.revoke_master_pkey_proofs_and_allocate_new_gen_id(tx, master_pkey, created_at=revoke_at)
+            print(f"Revoked current generation for {args.master_pkey} at {base.readable(revoke_at)}")
+            return 0
 
     except Exception as e:
         print(f"ERROR: Database error: {e}", file=sys.stderr)
@@ -653,7 +645,7 @@ def cmd_revoke(args: argparse.Namespace, dry_run: bool) -> int:
 
 
 def cmd_revoke_bump_ticket(args: argparse.Namespace, dry_run: bool) -> int:
-    config = require_config(args)
+    require_config(args)
 
     # The ticket only ever moves forward (clients treat "my cached ticket < server's" as "list changed").
     if args.amount < 1:
@@ -665,38 +657,36 @@ def cmd_revoke_bump_ticket(args: argparse.Namespace, dry_run: bool) -> int:
         return 0
 
     try:
-        with db.open_database(config.db_url) as engine:
-            with db.connection(engine) as conn:
-                with db.transaction(conn) as tx:
-                    new_ticket = backend.bump_revocation_ticket(tx.conn, args.amount)
-                print(f"Advanced the revocation ticket by {args.amount} to {new_ticket}")
-                return 0
+        with db.connection() as conn:
+            with db.transaction(conn) as tx:
+                new_ticket = backend.bump_revocation_ticket(tx.conn, args.amount)
+            print(f"Advanced the revocation ticket by {args.amount} to {new_ticket}")
+            return 0
     except Exception as e:
         print(f"ERROR: Database error: {e}", file=sys.stderr)
         return 1
 
 
 def cmd_report_generate(args: argparse.Namespace) -> int:
-    config = require_config(args)
+    require_config(args)
     try:
-        with db.open_database(config.db_url) as engine:
-            with db.connection(engine) as conn:
-                report_type = backend.ReportType.Human
-                if args.format.lower() == 'csv':
-                    report_type = backend.ReportType.CSV
+        with db.connection() as conn:
+            report_type = backend.ReportType.Human
+            if args.format.lower() == 'csv':
+                report_type = backend.ReportType.CSV
 
-                report_period = backend.ReportPeriod.Daily
-                if args.period.lower() == 'weekly':
-                    report_period = backend.ReportPeriod.Weekly
-                elif args.period.lower() == 'monthly':
-                    report_period = backend.ReportPeriod.Monthly
+            report_period = backend.ReportPeriod.Daily
+            if args.period.lower() == 'weekly':
+                report_period = backend.ReportPeriod.Weekly
+            elif args.period.lower() == 'monthly':
+                report_period = backend.ReportPeriod.Monthly
 
-                count = args.count
-                report_rows = backend.generate_report_rows(conn, report_period, limit=count)
-                report_str = backend.generate_report_str(report_period, report_rows, report_type)
+            count = args.count
+            report_rows = backend.generate_report_rows(conn, report_period, limit=count)
+            report_str = backend.generate_report_str(report_period, report_rows, report_type)
 
-                print(report_str)
-                return 0
+            print(report_str)
+            return 0
 
     except Exception as e:
         print(f"ERROR: Database error: {e}", file=sys.stderr)
@@ -772,37 +762,34 @@ def cmd_voucher(args: argparse.Namespace) -> int:
         return 1
 
     try:
-        with db.open_database(config.db_url) as engine:
-            with db.connection(engine) as conn:
-                with db.transaction(conn) as tx:
-                    request_at = base.datetime_from_unix_ms(int(time.time() * 1000))
+        with db.connection() as conn:
+            with db.transaction(conn) as tx:
+                request_at = base.datetime_from_unix_ms(int(time.time() * 1000))
 
-                    # Step 1: mint the payment and redeem it (shared with the /dev/add_payment route).
-                    # Redemption registers the entitlement (user row + generation) without minting a proof.
-                    print(f'\nStep 1: Minting and redeeming {provider.value} payment...')
-                    minted = minting.mint_payment(
-                        tx,
-                        master_pkey=master_pkey,
-                        provider=provider,
-                        plan=plan,
-                        now=request_at,
-                        duration=duration,
-                        redeem=True,
-                    )
-                    print(f"Success: payment redeemed (payment_id: {minted.payment_id})")
+                # Step 1: mint the payment and redeem it (shared with the /dev/add_payment route).
+                # Redemption registers the entitlement (user row + generation) without minting a proof.
+                print(f'\nStep 1: Minting and redeeming {provider.value} payment...')
+                minted = minting.mint_payment(
+                    tx,
+                    master_pkey=master_pkey,
+                    provider=provider,
+                    plan=plan,
+                    now=request_at,
+                    duration=duration,
+                    redeem=True,
+                )
+                print(f"Success: payment redeemed (payment_id: {minted.payment_id})")
 
-                    # Step 2: build the proof over the now-active entitlement.
-                    print('\nStep 2: Generating pro proof...')
-                    proof = backend.build_current_entitlement_proof(
-                        tx, master_pkey, rotating_pkey, request_at, backend_key
-                    )
+                # Step 2: build the proof over the now-active entitlement.
+                print('\nStep 2: Generating pro proof...')
+                proof = backend.build_current_entitlement_proof(tx, master_pkey, rotating_pkey, request_at, backend_key)
 
-                    print(f"Success: {provider.value} payment granted and pro proof generated")
-                    print('\nProof Details:')
-                    print(f'  Expiry: {base.readable(proof.expires_at)}')
-                    print(f'  Revocation Tag: {proof.revocation_tag.hex()}')
+                print(f"Success: {provider.value} payment granted and pro proof generated")
+                print('\nProof Details:')
+                print(f'  Expiry: {base.readable(proof.expires_at)}')
+                print(f'  Revocation Tag: {proof.revocation_tag.hex()}')
 
-                    return 0
+                return 0
 
     except Exception as e:
         print(f"ERROR: Database error: {e}", file=sys.stderr)

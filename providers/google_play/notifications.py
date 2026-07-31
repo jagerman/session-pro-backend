@@ -283,9 +283,8 @@ def _sweep_pending_acks() -> None:
     already considers it acked (the "acked, then crashed before clearing" case); otherwise leave it set to
     retry. Best-effort — never raises, so it can't break the pull loop."""
     try:
-        with db.open_database(base.DB_URL) as engine:
-            with db.connection(engine) as conn:
-                tokens = backend.google_payment_tokens_needing_ack(conn)
+        with db.connection() as conn:
+            tokens = backend.google_payment_tokens_needing_ack(conn)
     except Exception:
         log.error(f'needs_ack sweep: failed to load pending acks. Error was {traceback.format_exc()}')
         return
@@ -306,9 +305,8 @@ def _sweep_pending_acks() -> None:
             )
         if acked:
             try:
-                with db.open_database(base.DB_URL) as engine:
-                    with db.connection(engine) as conn:
-                        backend.google_clear_needs_ack(conn, payment_token=token)
+                with db.connection() as conn:
+                    backend.google_clear_needs_ack(conn, payment_token=token)
             except Exception:
                 log.error(
                     f'needs_ack sweep: acked but failed to clear flag for {base.maybe_obfuscate(token)}. '
@@ -332,35 +330,33 @@ def thread_entry_point(
     sorted_msg_list: list[SortedMessage] = []
 
     # NOTE Load unhandled messages from the DB and insert it in to the list of messages to start off
-    with db.open_database(base.DB_URL) as engine:
-        with db.connection(engine) as conn:
-            with db.transaction(conn) as tx:
-                db_it: collections.abc.Iterator[backend.GoogleUnhandledNotificationIterator] = (
-                    backend.google_get_unhandled_notification_iterator(tx)
+    with db.connection() as conn:
+        with db.transaction(conn) as tx:
+            db_it: collections.abc.Iterator[backend.GoogleUnhandledNotificationIterator] = (
+                backend.google_get_unhandled_notification_iterator(tx)
+            )
+            for row in db_it:
+                message_id = row[0]
+                payload: str | None = row[1]
+                if not payload:
+                    continue
+
+                raw_msg = typing.cast(
+                    google.pubsub_v1.types.ReceivedMessage, google.pubsub_v1.types.ReceivedMessage.from_json(payload)
                 )
-                for row in db_it:
-                    message_id = row[0]
-                    payload: str | None = row[1]
-                    if not payload:
-                        continue
+                message_data = json.loads(raw_msg.message.data)
+                tmp_err = base.ErrorSink()
+                parse = parse_notification(message_data, tmp_err)
 
-                    raw_msg = typing.cast(
-                        google.pubsub_v1.types.ReceivedMessage,
-                        google.pubsub_v1.types.ReceivedMessage.from_json(payload),
+                sorted_msg_list.append(
+                    SortedMessage(
+                        event_unix_ts_ms=parse.event_time_ms,
+                        message_id=message_id,
+                        parse=parse,
+                        ack_id=raw_msg.ack_id,
+                        raw=raw_msg,
                     )
-                    message_data = json.loads(raw_msg.message.data)
-                    tmp_err = base.ErrorSink()
-                    parse = parse_notification(message_data, tmp_err)
-
-                    sorted_msg_list.append(
-                        SortedMessage(
-                            event_unix_ts_ms=parse.event_time_ms,
-                            message_id=message_id,
-                            parse=parse,
-                            ack_id=raw_msg.ack_id,
-                            raw=raw_msg,
-                        )
-                    )
+                )
 
     # NOTE: Then connect to Google and start pulling messages
     log.info(f'Loaded {len(sorted_msg_list)} unhandled messages from the DB')
@@ -435,44 +431,42 @@ def thread_entry_point(
                                     is_new_message = False
                                     break
 
-                            # NOTE: Try add it to the DB first, if this fails then we will not add
-                            # it to the sorted message list otherwise our code to check that
-                            # notification is handled or not is going to be bypassed and cause state
-                            # inconsistencies.
+                            # NOTE: Record it in the DB BEFORE queueing it. The dedup lookup in
+                            # _process_notification_message reads an absent row as "handled" (someone
+                            # removed it out-of-band) and acks the message, so a message that reaches
+                            # sorted_msg_list without its row is acked to Google unprocessed — and an
+                            # acked notification is never redelivered. On failure we skip the message
+                            # instead, leaving it unacked so Google delivers it again.
                             def add_notification_id_to_db():
-                                with db.open_database(base.DB_URL) as engine:
-                                    with db.connection(engine) as conn:
-                                        with db.transaction(conn) as tx:
-                                            if not backend.google_notification_message_id_is_in_db(
-                                                tx, message_id
-                                            ).present:
-                                                # NOTE: Our message retention policy for this subscription is 7 days
-                                                # (default). We add a little buffer as we don't know exactly which
-                                                # timestamp Google uses.
-                                                #
-                                                # We always store the messages to mitigate network failures on
-                                                # acknowledgement. We store this in JSON because in the
-                                                # erroneous case there's highly likelihood we need human
-                                                # intervention and having human-readability there will be
-                                                # important.
-                                                backend.google_add_notification_id(
-                                                    tx,
-                                                    message_id=message_id,
-                                                    expires_at=base.datetime_from_unix_ms(
-                                                        parse.event_time_ms + base.MILLISECONDS_IN_DAY * 8
-                                                    ),
-                                                    payload=google.pubsub_v1.types.ReceivedMessage.to_json(it),
-                                                )
+                                with db.connection() as conn:
+                                    with db.transaction(conn) as tx:
+                                        if not backend.google_notification_message_id_is_in_db(tx, message_id).present:
+                                            # NOTE: Our message retention policy for this subscription is 7 days
+                                            # (default). We add a little buffer as we don't know exactly which
+                                            # timestamp Google uses.
+                                            #
+                                            # We always store the messages to mitigate network failures on
+                                            # acknowledgement. We store this in JSON because in the
+                                            # erroneous case there's highly likelihood we need human
+                                            # intervention and having human-readability there will be
+                                            # important.
+                                            backend.google_add_notification_id(
+                                                tx,
+                                                message_id=message_id,
+                                                expires_at=base.datetime_from_unix_ms(
+                                                    parse.event_time_ms + base.MILLISECONDS_IN_DAY * 8
+                                                ),
+                                                payload=google.pubsub_v1.types.ReceivedMessage.to_json(it),
+                                            )
 
-                            db.run_and_log_errors(
-                                add_notification_id_to_db, log, "Add Google notification ID to DB failed"
-                            )
-                            if err.has():
+                            try:
+                                add_notification_id_to_db()
+                            except Exception:
                                 log.warning(
-                                    f'Discarding message #{index}: DB insert repeatedly failed '
-                                    f'(published at {published}).\n'
+                                    f'Discarding message #{index}: could not record it in the DB, leaving '
+                                    f'it unacknowledged for redelivery (published at {published}).\n'
                                     f'Message was:\n{base.maybe_obfuscate(str(it))}\n'
-                                    f'Reason was:\n{err.build()}'
+                                    f'Reason was:\n{traceback.format_exc()}'
                                 )
                                 continue
 
@@ -505,9 +499,8 @@ def thread_entry_point(
                         # file to mark a message as being done or handled so we check before proceeding.
                         if attempt:
                             try:
-                                with db.open_database(base.DB_URL) as engine:
-                                    with db.connection(engine) as conn:
-                                        handled = _process_notification_message(conn, msg, err, now)
+                                with db.connection() as conn:
+                                    handled = _process_notification_message(conn, msg, err, now)
                             except Exception:
                                 # NOTE: On any exception (e.g. the DB was momentarily unavailable) we just
                                 # mark the message not handled; this bumps its retry delay and reattempts.

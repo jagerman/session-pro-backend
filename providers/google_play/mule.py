@@ -18,6 +18,7 @@ import sys
 import threading
 
 import base
+import db
 import backend
 import config
 
@@ -43,7 +44,7 @@ def run() -> None:
         log.error(f'Maintenance mule failed to start, invalid configuration:\n  {e}')
         sys.exit(1)
     base.UNSAFE_LOGGING = parsed.unsafe_logging
-    base.DB_URL = parsed.db_url
+    db.set_dsn(parsed.db_url)
     base.PROVIDER_TESTING_ENV = parsed.provider_testing_env
     base.PROVIDER_DRY_RUN = parsed.provider_dry_run
 

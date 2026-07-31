@@ -170,7 +170,6 @@ DEFAULT_APPLE_GRACE_PERIOD: pendulum.Duration = 1 * HOUR
 DEFAULT_GOOGLE_GRACE_PERIOD: pendulum.Duration = 1 * HOUR
 
 # NOTE: Global variables
-DB_URL = ''
 UNSAFE_LOGGING = False
 PROVIDER_TESTING_ENV = False
 # When set, every payment provider treats all of its OUTBOUND interactions as already-succeeded and
@@ -507,51 +506,6 @@ def hex_to_bytes(hex: str, label: str, hex_len: int, err: ErrorSink | None = Non
 def readable(value: pendulum.DateTime) -> str:
     # Compact UTC timestamp for logs, millisecond precision (no strftime %f-slice hack).
     return value.astimezone(pendulum.UTC).isoformat(sep=' ', timespec='milliseconds')
-
-
-def print_unicode_table(rows: list[list[str]]) -> None:
-    # Calculate maximum width for each column
-    col_widths = [max(len(row[i]) for row in rows) for i in range(len(rows[0]))]
-
-    # Print top border
-    line = '┌'
-    for i, width in enumerate(col_widths):
-        line += '─' * (width + 2)  # +2 for padding spaces
-        if i < len(col_widths) - 1:
-            line += '┬'
-    line += '┐'
-    print(line)
-
-    # Print header (first row)
-    header_row = '│'
-    for i, field in enumerate(rows[0]):
-        header_row += f' {field:<{col_widths[i]}} │'
-    print(header_row)
-
-    # Print separator between header and data
-    separator = '├'
-    for i, width in enumerate(col_widths):
-        separator += '─' * (width + 2)
-        if i < len(col_widths) - 1:
-            separator += '┼'
-    separator += '┤'
-    print(separator)
-
-    # Print data rows
-    for row in rows[1:]:
-        row_str = '│'
-        for i, field in enumerate(row):
-            row_str += f' {field:<{col_widths[i]}} │'
-        print(row_str)
-
-    # Print bottom border
-    bottom = '└'
-    for i, width in enumerate(col_widths):
-        bottom += '─' * (width + 2)
-        if i < len(col_widths) - 1:
-            bottom += '┴'
-    bottom += '┘'
-    print(bottom)
 
 
 def round_datetime_to_start_of_day(value: pendulum.DateTime) -> pendulum.DateTime:
