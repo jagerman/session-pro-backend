@@ -113,7 +113,10 @@ def init(
 
     result = Core(app_store_server_api_client, signed_data_verifier)
     result.sandbox = sandbox_env
-    result.max_history_lookup_in_days = 30 if sandbox_env else 180
+    # How far back a catch-up asks. Comfortably inside what Apple serves (180 days production, 30 sandbox)
+    # — outside that is a hard START_DATE_TOO_FAR_IN_PAST error rather than a clamp — and long enough to
+    # cover any plausible outage without replaying notifications too old to affect a live entitlement.
+    result.max_history_lookup_in_days = 15 if sandbox_env else 30
 
     # NOTE: Apple retries 1, 12, 24 ... hours after the previous attempt
     # NOTE: Then add a 30min buffer just in-case
@@ -121,6 +124,21 @@ def init(
         # Apple retries at 1, 12, 24, 48, 72 hours after the previous attempt; + a 30-min buffer.
         result.notification_retry_duration = pendulum.duration(hours=1 + 12 + 24 + 48 + 72, minutes=30)
     return result
+
+
+# How far back before the checkpoint each catch-up re-reads. The window deliberately OVERLAPS what we
+# already asked for rather than resuming exactly where the last one stopped, because an exact handoff
+# assumes our clock agrees with Apple's, that a failure is recorded at the instant its notification is
+# dated, and that Apple's history view is immediately consistent; any of those being off by a moment drops
+# a notification into the gap between two windows. Re-reading costs nothing, since handle_notification_tx
+# skips anything already in apple_notification_uuid_history.
+#
+# It only has to cover those small boundary uncertainties, which is why it is a few poll intervals rather
+# than hours: the CHECKPOINT is what covers a real gap (down for a week → it stays put and the next run
+# sweeps from there), and anything that still slips is being redelivered to our webhook by Apple for days
+# regardless. Sizing it larger buys margin against an unmeasurable unknown and re-logs an unhandleable
+# notification more often for it.
+NOTIFICATION_HISTORY_OVERLAP: pendulum.Duration = pendulum.duration(minutes=15)
 
 
 def payment_tx_id_label(tx: base.PaymentProviderTransaction) -> str:
@@ -1203,102 +1221,91 @@ def trigger_test_notification(client: AppleAppStoreServerAPIClient, verifier: Ap
         log.error(f'Failed to decode test notification: {e}')
 
 
-def catchup_on_missed_notifications(core: Core, sql_conn: psycopg.Connection, end_unix_ts_ms: int):
+def catchup_on_missed_notifications(core: Core, sql_conn: psycopg.Connection, now: pendulum.DateTime | None = None):
+    """Replay notifications Apple could not deliver to our webhook.
+
+    Apple retries a failed delivery itself for a few days and then gives up permanently; after that this
+    query is the only way to recover one. It is therefore a backstop, not the primary path — which is why
+    it never needs to hold anything up.
+    """
     if base.PROVIDER_DRY_RUN:
         # Dry-run: the catch-up pulls notification history from Apple (outbound gating read) → skip it.
         return
-    # NOTE: Lock the DB and catch on up missed notifications
-    with db.transaction(sql_conn) as tx:
-        # NOTE: Do a catch-up check only if it's been 30mins since the last checkup. UWSGI spawns
-        # multiple processes that call the main entry-point so this naturally dedupes all those
-        # processes racing to try and execute this
-        # The checkpoint is stored as a timestamptz global; Apple's history API speaks ms, so convert at
-        # this boundary (an epoch checkpoint means "never checkpointed").
-        checkpoint_at: pendulum.DateTime = backend.get_global_datetime(tx.conn, 'apple_notification_checkpoint_at')
-        checkpoint_ms: int = base.unix_ms_from_datetime(checkpoint_at)
-        ms_since_last_catchup: int = end_unix_ts_ms - checkpoint_ms
-        ms_between_catchup: int = (60 * 30) * 1000  # 30 minutes
-        do_catchup: bool = ms_since_last_catchup >= ms_between_catchup
 
-        if do_catchup:
-            # NOTE: Setup request
-            min_start_date: int = end_unix_ts_ms - (core.max_history_lookup_in_days * base.MILLISECONDS_IN_DAY)
-            history_req = AppleNotificationHistoryRequest()
-            history_req.onlyFailures = True
-            history_req.startDate = max(min_start_date, checkpoint_ms)
-            history_req.endDate = end_unix_ts_ms
-            log.info(
-                f'Checking for missed notifications from '
-                f'{base.readable(base.datetime_from_unix_ms(history_req.startDate))} => '
-                f'{base.readable(base.datetime_from_unix_ms(history_req.endDate))}'
-            )
+    at = now if now is not None else base.utc_now()
+    # Apple's history API speaks ms, so convert at this boundary (an epoch checkpoint means "never").
+    checkpoint_at: pendulum.DateTime = backend.get_global_datetime(sql_conn, 'apple_notification_checkpoint_at')
+    oldest_available = at - core.max_history_lookup_in_days * base.DAY
+    start_at = max(oldest_available, checkpoint_at - NOTIFICATION_HISTORY_OVERLAP)
 
-            if checkpoint_at != base.EPOCH and checkpoint_ms < min_start_date:
-                log.warning(
-                    f'Apple only allows retrieving 180 days worth of notifications '
-                    f'(i.e. {base.readable(base.datetime_from_unix_ms(min_start_date))}). '
-                    f'Last notification checkpoint was at {base.readable(checkpoint_at)} '
-                    f'which is older than the history that can be recalled'
-                )
+    history_req = AppleNotificationHistoryRequest()
+    history_req.onlyFailures = True
+    history_req.startDate = base.unix_ms_from_datetime(start_at)
+    history_req.endDate = base.unix_ms_from_datetime(at)
+    log.info(f'Checking for missed notifications from {base.readable(start_at)} => {base.readable(at)}')
 
-            # NOTE: Iterate the paginated API
-            failed = False
-            history_page_token = None
-            handled_notifs = 0
-            total_notifs = 0
+    if checkpoint_at != base.EPOCH and checkpoint_at < oldest_available:
+        # Nothing has been handled since before Apple's retention window, so the notifications in between
+        # are unrecoverable: Apple will not serve them and we never processed them. The query below still
+        # runs, over the part that IS available — this is reported because the accounts affected by the lost
+        # notifications now have stale entitlements that only a manual reconcile will correct.
+        log.error(
+            f'Gap in Apple notifications: none handled since {base.readable(checkpoint_at)}, but catch-up '
+            f'only reaches back to {base.readable(oldest_available)}, so '
+            f'{(oldest_available - checkpoint_at).in_words()} is skipped. Continuing from there.'
+        )
+
+    # Each notification gets its OWN transaction, and one that fails is skipped rather than abandoning the
+    # rest: they are unrelated events, and a single unhandleable notification used to roll back everything
+    # handled alongside it AND leave the checkpoint unmoved, which pinned the window behind it forever and
+    # silently disabled recovery from then on. Per-notification transactions also keep any Apple round-trip
+    # out of an open transaction.
+    handled_notifs = 0
+    failed_notifs = 0
+    total_notifs = 0
+    history_page_token = None
+    while True:
+        history_resp: AppleNotificationHistoryResponse = core.app_store_server_api_client.get_notification_history(
+            history_page_token, notification_history_request=history_req
+        )
+        for it in history_resp.notificationHistory or []:
+            total_notifs += 1
             err = base.ErrorSink()
-            while True:
-                history_resp: AppleNotificationHistoryResponse = (
-                    core.app_store_server_api_client.get_notification_history(
-                        history_page_token, notification_history_request=history_req
-                    )
+            handled = False
+            # Decoding and handling both go inside the try: several notification types are known to raise
+            # rather than report through the sink (an unconfigured SKU, an offer with an unexpected
+            # expiresDate — see docs/limitations.md), and one raising must not abandon the notifications
+            # queued behind it.
+            try:
+                assert it.signedPayload
+                resp: AppleResponseBodyV2DecodedPayload = core.signed_data_verifier.verify_and_decode_notification(
+                    it.signedPayload
                 )
-                if history_resp.notificationHistory:
-                    total_notifs += len(history_resp.notificationHistory)
-                    if not failed:
-                        for it in history_resp.notificationHistory:
-                            # NOTE: Decode and handle
-                            assert it.signedPayload
-                            resp: AppleResponseBodyV2DecodedPayload = (
-                                core.signed_data_verifier.verify_and_decode_notification(it.signedPayload)
-                            )
-                            decoded_notification: DecodedNotification = (
-                                decoded_notification_from_apple_response_body_v2(resp, core.signed_data_verifier, err)
-                            )
-                            handled: bool = handle_notification_tx(
-                                decoded_notification, tx, core.notification_retry_duration, err
-                            )
-                            if not handled:
-                                failed = True
-                                assert tx.cancel
-                                err.msg_list.append(f'Failed to handle missed notification {it}')
-                                break
-
-                            handled_notifs += 1
-                if not history_resp.hasMore:
-                    break
-                history_page_token = history_resp.paginationToken
-
-            if err.has():
-                assert tx.cancel
-                log.error(
-                    f'Processed {handled_notifs}/{total_notifs} missed notifications '
-                    f'but encountered errors, rolling back:\n' + '\n  '.join(err.msg_list)
+                decoded_notification: DecodedNotification = decoded_notification_from_apple_response_body_v2(
+                    resp, core.signed_data_verifier, err
                 )
+                if not err.has():
+                    with db.transaction(sql_conn) as tx:
+                        handled = handle_notification_tx(
+                            decoded_notification, tx, core.notification_retry_duration, err
+                        )
+            except Exception as e:
+                err.msg_list.append(f'{e}')
+            if handled:
+                handled_notifs += 1
             else:
-                backend.apple_set_notification_checkpoint_at(tx, base.datetime_from_unix_ms(history_req.endDate))
-                log.info(
-                    f'Processed {handled_notifs}/{total_notifs} missed notifications, checkpointed from '
-                    f'{base.readable(base.datetime_from_unix_ms(history_req.startDate))} => '
-                    f'{base.readable(base.datetime_from_unix_ms(history_req.endDate))}'
-                )
-        else:
-            mins_between_catchup = (ms_between_catchup / 1000) / 60
-            mins_since_last_catchup = (ms_since_last_catchup / 1000) / 60
-            log.debug(
-                f'Skipping catchup of missed notifications last checked {mins_since_last_catchup:.1f} mins ago '
-                f'(catchup occurs every {mins_between_catchup} mins)'
-            )
+                failed_notifs += 1
+                log.error(f'Failed to handle missed notification, skipping it: {it}\nReason was:\n{err.build()}')
+        if not history_resp.hasMore:
+            break
+        history_page_token = history_resp.paginationToken
+
+    # Advance the checkpoint even when some failed. A failure keeps being re-read for as long as the
+    # overlap covers it, then falls out of the window; Apple's own retries remain the durable path.
+    with db.transaction(sql_conn) as tx:
+        backend.apple_set_notification_checkpoint_at(tx, at)
+    if total_notifs or failed_notifs:
+        log.info(f'Processed {handled_notifs}/{total_notifs} missed notifications ({failed_notifs} skipped)')
 
 
 def equip_flask_routes(core: Core, flask: flask.Flask):

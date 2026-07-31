@@ -231,6 +231,90 @@ def test_no_stdlib_datetime_arithmetic_in_source():
     assert not violations, 'stdlib datetime / calendar-duration usage:\n' + '\n'.join(violations)
 
 
+def test_apple_catchup_isolates_a_bad_notification(monkeypatch, pg_database):
+    # A notification Apple could not deliver is recoverable only through the history API, and a single
+    # unhandleable one must not take the others with it. It used to: every notification shared one
+    # transaction, so the first failure rolled back the ones already handled beside it AND left the
+    # checkpoint unmoved, pinning the window behind it so nothing later was ever recovered again.
+    from providers import app_store
+
+    pool = backend.bootstrap_db(database_url=pg_database())
+    assert pool
+    at = pendulum.datetime(2026, 7, 31, 12, 0)
+
+    # Three notifications; the middle one raises, which is how several real branches fail (an
+    # unconfigured SKU, an offer with an unexpected expiresDate) rather than reporting through the sink.
+    payloads = ['good-1', 'boom', 'good-2']
+
+    class StubHistoryItem:
+        def __init__(self, payload: str):
+            self.signedPayload = payload
+            self.sendAttempts: list[typing.Any] = []
+
+    class StubResponse:
+        def __init__(self):
+            self.notificationHistory = [StubHistoryItem(p) for p in payloads]
+            self.hasMore = False
+            self.paginationToken = None
+
+    requested: list[typing.Any] = []
+
+    class StubApiClient:
+        def get_notification_history(self, pagination_token, notification_history_request):
+            requested.append(notification_history_request)
+            return StubResponse()
+
+    class StubVerifier:
+        def verify_and_decode_notification(self, payload: str) -> str:
+            return payload
+
+    def stub_decode(resp, verifier, err):
+        if resp == 'boom':
+            raise AssertionError('Invalid apple plan_id')
+        body = AppleResponseBodyV2DecodedPayload()
+        body.notificationUUID = f'uuid-{resp}'
+        body.signedDate = base.unix_ms_from_datetime(at)
+        return app_store.DecodedNotification(body=body)
+
+    # handle_notification_tx is exercised for real; short-circuit it to "handled" so the test is about the
+    # loop's isolation rather than any one notification type's semantics.
+    def stub_handle(decoded_notification, tx, retry_duration, err):
+        backend.apple_add_notification_uuid(
+            tx, uuid=decoded_notification.body.notificationUUID, expires_at=at + 1 * base.DAY
+        )
+        return True
+
+    monkeypatch.setattr(app_store, 'decoded_notification_from_apple_response_body_v2', stub_decode)
+    monkeypatch.setattr(app_store, 'handle_notification_tx', stub_handle)
+
+    core = app_store.Core(
+        typing.cast(typing.Any, StubApiClient()), typing.cast(typing.Any, StubVerifier()), max_history_lookup_in_days=30
+    )
+
+    with db.connection() as conn:
+        before = backend.get_global_datetime(conn, 'apple_notification_checkpoint_at')
+        assert before == base.EPOCH  # never checkpointed
+        app_store.catchup_on_missed_notifications(core=core, sql_conn=conn, now=at)
+
+        # The good notifications either side of the failure were both recorded, and the bad one was not.
+        with db.transaction(conn) as tx:
+            assert backend.apple_notification_uuid_is_in_db(tx, 'uuid-good-1')
+            assert backend.apple_notification_uuid_is_in_db(tx, 'uuid-good-2')
+            assert not backend.apple_notification_uuid_is_in_db(tx, 'uuid-boom')
+
+        # And the checkpoint advanced despite the failure, so recovery is not pinned behind it.
+        assert backend.get_global_datetime(conn, 'apple_notification_checkpoint_at') == at
+
+        # A first run with no checkpoint asks from the oldest history Apple will serve; the next run
+        # re-reads an overlapping window rather than resuming exactly where this one stopped.
+        assert base.datetime_from_unix_ms(requested[0].startDate) == at - 30 * base.DAY
+        assert base.datetime_from_unix_ms(requested[0].endDate) == at
+        later = at + 5 * base.HOUR
+        app_store.catchup_on_missed_notifications(core=core, sql_conn=conn, now=later)
+        assert base.datetime_from_unix_ms(requested[1].startDate) == at - app_store.NOTIFICATION_HISTORY_OVERLAP
+    pool.close()
+
+
 def test_dry_run_backup_rotation():
     now = pendulum.DateTime(2025, 6, 1, 12, 0, 0)
     files = [

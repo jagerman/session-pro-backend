@@ -7,7 +7,6 @@ For database operations (user errors, revocations, reports, etc.), use the cli.p
 
 import flask
 import flask.logging
-import time
 import nacl.signing
 import logging
 import sys
@@ -35,6 +34,10 @@ log = logging.Logger('PRO')
 webhook_loggers: list[base.AsyncSessionWebhookLogHandler] = []
 
 PRUNE_INTERVAL_S = 600  # ~10 min; a no-op prune is a cheap indexed empty scan
+# Apple's own webhook retries are hours apart (1, 12, 24, 48, 72), so polling this often is what decides
+# how soon a notification we failed to accept gets applied. A poll that finds nothing is one empty API
+# call, so the interval is cheap; see catchup_on_missed_notifications for the window it asks for.
+APPLE_CATCHUP_INTERVAL_S = 300  # 5 min
 
 
 @timer(PRUNE_INTERVAL_S, target='worker1')
@@ -209,16 +212,24 @@ def entry_point() -> flask.Flask:
             )
             app_store.equip_flask_routes(core, result)
 
-            # NOTE: Offset by 10s to account for clock drift between backend and the Apple servers
-            end_unix_ts_ms = int((time.time() - 10) * 1000)
-            app_store.catchup_on_missed_notifications(core=core, sql_conn=conn, end_unix_ts_ms=end_unix_ts_ms)
+            # NOTE: Recover notifications Apple failed to deliver, on a worker-1 timer. Registered here
+            # rather than as a module-level @timer because it closes over `core`, which exists only when
+            # Apple is enabled. This must NOT run during app load: it makes paginated 30s-timeout calls to
+            # Apple, so on a backlog it would hold up the master's fork — and therefore the whole service
+            # — for as long as it took to drain. As a timer, a slow Apple delays a background tick instead.
+            @timer(APPLE_CATCHUP_INTERVAL_S, target='worker1')
+            def _apple_catchup(signum: int) -> None:
+                try:
+                    with db.connection() as catchup_conn:
+                        app_store.catchup_on_missed_notifications(core=core, sql_conn=catchup_conn)
+                except Exception as e:
+                    log.error(f'Apple notification catch-up raised: {e}', exc_info=True)
 
         # NOTE: The Google Pub/Sub subscriber is singleton background work — it runs once in the
-        # maintenance mule (providers/google_play/mule.py), not per-worker here. (The periodic DB prune is
-        # also singleton but runs on worker 1 via an @timer, since a mule can't register uWSGI signals.)
-        # The Apple notification route is registered above because it's an HTTP endpoint the workers serve;
-        # only Apple's startup catch-up remains per-worker for now (a one-shot — a follow-up could move
-        # it to the mule too).
+        # maintenance mule (providers/google_play/mule.py), not per-worker here. (The periodic DB prune and
+        # the Apple catch-up are also singleton but run on worker 1 via an @timer, since a mule can't
+        # register uWSGI signals.) The Apple notification route is registered above because it's an HTTP
+        # endpoint the workers serve.
     return result
 
 

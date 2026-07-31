@@ -14,7 +14,7 @@ type. Each unhandled path is **dormant and safe *only* because the corresponding
 currently turned off**. Flip that switch without first wiring the handler and you get a silent
 correctness/entitlement hole — an over-entitled user (kept Pro after a refund) or a paid-but-no-Pro user
 (payment never registered) — often failing *un-loudly* (an RTDN that retries forever, or an HTTP 500 that
-wedges Apple catch-up).
+Apple eventually stops retrying).
 
 This file is the single, human-visible list of those constraints. It is the **proactive** half of the
 safeguard; the **reactive** half is a planned loud-guard (Phase 4 — see `docs/refactor-plan.md`): a shared
@@ -70,20 +70,27 @@ Keep this in sync with the code — it describes real branches, not intentions.
 | Feature / notification | Enabled in App Store Connect by… | Current behaviour if hit | Consequence | Fails |
 |---|---|---|---|---|
 | **Promotional offers / offer codes / win-back offers** — `OFFER_REDEEMED` | configuring any offer for the subscription group | `assert isinstance(expiresDate, str)` — but `expiresDate` is an int → **AssertionError** | offer redemption crashes the handler → paid-but-no-Pro | crash (500) |
-| **External purchases / alternative marketplaces** — `EXTERNAL_PURCHASE_TOKEN` | enabling the External Purchase entitlement | appends `we do not support 3rd party stores` → 500 + retries + catch-up wedge | 3rd-party-store purchase not handled | loud-ish + wedge |
-| **Renewal-date extensions** — `RENEWAL_EXTENSION` / `RENEWAL_EXTENDED` | requesting a subscription renewal-date extension (e.g. outage compensation) | appends `we don't handle … extension` → 500 + retries + catch-up wedge | extension not applied; catch-up stalls | loud-ish + wedge |
+| **External purchases / alternative marketplaces** — `EXTERNAL_PURCHASE_TOKEN` | enabling the External Purchase entitlement | appends `we do not support 3rd party stores` → 500; Apple retries, then catch-up logs+skips it each pass | 3rd-party-store purchase never handled | loud-ish |
+| **Renewal-date extensions** — `RENEWAL_EXTENSION` / `RENEWAL_EXTENDED` | requesting a subscription renewal-date extension (e.g. outage compensation) | appends `we don't handle … extension` → 500; Apple retries, then catch-up logs+skips it each pass | extension never applied | loud-ish |
 | **New / changed subscription SKU** — `pro_plan_from_product_id` | adding any product id beyond the three known SKUs* | `assert False, 'Invalid apple plan_id'` → crash | any purchase of the new SKU crashes the handler (paid-but-no-Pro) | crash (500) |
 
 \* known SKUs: `com.getsession.org.pro_sub_{1_month,3_months,12_months}`.
+
+None of the rows above stops the *other* Apple notifications being recovered. A notification the handler
+cannot process is logged at ERROR and skipped by `catchup_on_missed_notifications`, which carries on with
+the rest and advances its checkpoint; it is re-read for as long as the history window overlaps it, then
+abandoned. So the cost of each row is confined to the feature it names — but nothing alerts on it, which
+is what the loud-guard is for.
 
 **Handled / intentionally safe (no action needed):**
 - Silent no-ops (entitlement self-expires or nothing to do): `DID_CHANGE_RENEWAL_PREF` (empty subtype),
   `DID_FAIL_TO_RENEW` (grace ended), `REFUND_DECLINED`, `TEST`, `EXPIRED`, `GRACE_PERIOD_EXPIRED`,
   `CONSUMPTION_REQUEST`, `PRICE_INCREASE`. (Caveat: several of these *error* if the notification arrives
-  without `tx_info` — `CONSUMPTION_REQUEST` in particular can — which would 500/wedge; worth folding into
-  the loud-guard.)
-- The final `else` (any unrecognised `notificationType`) errors → 500 + wedge; it catches future Apple
-  notification types, and should route through the loud-guard so a new type doesn't wedge catch-up.
+  without `tx_info` — `CONSUMPTION_REQUEST` in particular can — which would 500; worth folding into the
+  loud-guard.)
+- The final `else` (any unrecognised `notificationType`) errors → 500; it catches future Apple
+  notification types, and should route through the loud-guard so a new type is surfaced rather than
+  merely logged.
 - `REFUND_REVERSED` is now **handled** (was a wedge; see bugs-fixed #13): `reinstate_apple_payment`
   un-revokes the reversed transaction, restores the original expiry (never extends), and mints a fresh
   generation iff the current one was revoked and the window is still live. Idempotent; an unknown tx acks
