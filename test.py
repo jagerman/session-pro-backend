@@ -78,8 +78,8 @@ def pk_hex(pk: bytes | nacl.signing.VerifyKey | None) -> str:
 def derived_status(payment: backend.PaymentRow, at: pendulum.DateTime | None = None) -> base.PaymentStatus:
     """A payment's status is derived from its timestamps, not stored (see backend.derive_payment_status).
 
-    These assertions check the *latched* facts — redeemed / revoked / unredeemed — which do not depend
-    on the observation time (revoked short-circuits; purchase is always before expiry), so by default we
+    These assertions check the *latched* facts — redeemed / revoked — which do not depend on the
+    observation time (revoked short-circuits; purchase is always before expiry), so by default we
     observe at the payment's purchase instant. Pass `at` to probe the one time-relative boundary,
     expiry, explicitly (e.g. `payment.expires_at` to assert Expired)."""
     return backend.derive_payment_status(payment, payment.purchased_at if at is None else at)
@@ -1473,7 +1473,6 @@ def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_d
 
         unredeemed_payment_list = backend.get_unredeemed_payments_list(db_conn)
         assert len(unredeemed_payment_list) == 1
-        assert derived_status(unredeemed_payment_list[0]) == base.PaymentStatus.Unredeemed
         assert unredeemed_payment_list[0].payment_provider == it.payment_provider
         assert unredeemed_payment_list[0].purchased_at == now
         assert unredeemed_payment_list[0].redeemed_at is None
@@ -3081,7 +3080,7 @@ def test_platform_apple(pg_database):
             unredeemed_list: list[backend.PaymentRow] = backend.get_unredeemed_payments_list(conn)
             assert len(unredeemed_list) == 1
             assert unredeemed_list[0].master_pkey is None
-            assert derived_status(unredeemed_list[0]) == base.PaymentStatus.Unredeemed
+            assert unredeemed_list[0].redeemed_at is None
             assert unredeemed_list[0].payment_provider == base.PaymentProvider.iOSAppStore
             assert unredeemed_list[0].apple.original_tx_id == tx_info.originalTransactionId
             assert unredeemed_list[0].apple.tx_id == tx_info.transactionId
@@ -3221,7 +3220,6 @@ def test_platform_apple(pg_database):
             unredeemed_list = backend.get_unredeemed_payments_list(conn)
             assert len(unredeemed_list) == 1
             assert unredeemed_list[0].master_pkey is None
-            assert derived_status(unredeemed_list[0]) == base.PaymentStatus.Unredeemed
             assert unredeemed_list[0].plan == base.ProPlan.OneMonth
             assert unredeemed_list[0].payment_provider == base.PaymentProvider.iOSAppStore
             assert unredeemed_list[0].auto_renewing
@@ -3347,7 +3345,6 @@ def test_platform_apple(pg_database):
             payment_list = backend.get_payments_list(conn)
             assert len(payment_list) == 1
             assert payment_list[0].master_pkey is None
-            assert derived_status(payment_list[0]) == base.PaymentStatus.Unredeemed
             assert payment_list[0].plan == base.ProPlan.OneMonth
             assert payment_list[0].payment_provider == base.PaymentProvider.iOSAppStore
             assert not payment_list[0].auto_renewing
@@ -3476,7 +3473,6 @@ def test_platform_apple(pg_database):
             payment_list = backend.get_payments_list(conn)
             assert len(payment_list) == 1
             assert payment_list[0].master_pkey is None
-            assert derived_status(payment_list[0]) == base.PaymentStatus.Unredeemed
             assert payment_list[0].plan == base.ProPlan.OneMonth
             assert payment_list[0].payment_provider == base.PaymentProvider.iOSAppStore
             assert payment_list[0].purchased_at == base.datetime_from_unix_ms(tx_info.purchaseDate)
@@ -3489,18 +3485,17 @@ def test_platform_apple(pg_database):
             assert payment_list[0].apple.tx_id == tx_info.transactionId
             assert payment_list[0].apple.web_line_order_tx_id == tx_info.webOrderLineItemId
 
-        # NOTE: Now expire the payment
+        # NOTE: Run the housekeeping sweep at an instant past the payment's expiry
         with test.connection() as conn:
             backend.expire_payments_revocations_and_users(
                 conn=conn, now=payment_list[0].expires_at + pendulum.duration(milliseconds=1)
             )
 
-            # NOTE: Now check that the payments were marked expired
+            # NOTE: The sweep leaves the payment untouched — expiry is derived on read, never marked.
             payment_list = backend.get_payments_list(conn)
 
             assert len(payment_list) == 1
             assert payment_list[0].master_pkey is None
-            assert derived_status(payment_list[0], payment_list[0].expires_at) == base.PaymentStatus.Expired
             assert payment_list[0].plan == base.ProPlan.OneMonth
             assert payment_list[0].payment_provider == base.PaymentProvider.iOSAppStore
             assert payment_list[0].purchased_at == base.datetime_from_unix_ms(tx_info.purchaseDate)
@@ -4240,7 +4235,6 @@ def test_platform_apple(pg_database):
 
         assert len(unredeemed_payment_list) == 1
         assert unredeemed_payment_list[0].master_pkey is None
-        assert derived_status(unredeemed_payment_list[0]) == base.PaymentStatus.Unredeemed
         assert unredeemed_payment_list[0].plan == base.ProPlan.ThreeMonth
         assert unredeemed_payment_list[0].payment_provider == base.PaymentProvider.iOSAppStore
         assert unredeemed_payment_list[0].auto_renewing
@@ -5055,7 +5049,6 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
                     found = True
                     assert isinstance(unredeemed_payment, backend.PaymentRow)
                     assert unredeemed_payment.master_pkey is None
-                    assert derived_status(unredeemed_payment) == base.PaymentStatus.Unredeemed
                     assert unredeemed_payment.plan == plan
                     assert unredeemed_payment.payment_provider == base.PaymentProvider.GooglePlayStore
                     assert unredeemed_payment.redeemed_at is None
@@ -5121,7 +5114,6 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
         payment_status: base.PaymentStatus,
         auto_renew: bool,
         grace_duration: pendulum.Duration,
-        redeemed_ts_ms_rounded: int,
         platform_refund_expires_at: int,
         user_ctx: TestUserCtx,
         ctx: TestingContext,
@@ -5163,7 +5155,6 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             item, "payment_provider", base.PaymentProvider, err
         )
         item_platform_refund_expiry_ts = base.json_dict_require_int(item, "platform_refund_expiry_ts", err)
-        item_redeemed_ts = base.json_dict_require_int(item, "redeemed_ts", err)
         item_revoked_ts = base.json_dict_require_float(item, "revoked_ts", err)
         item_status = base.json_dict_require_str_coerce_to_enum(item, "status", base.PaymentStatus, err)
         assert not err.has()
@@ -5173,7 +5164,6 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
         assert item_grace_duration == base.seconds_from_duration(grace_duration)
         assert item_payment_provider == base.PaymentProvider.GooglePlayStore
         assert item_platform_refund_expiry_ts == to_s(platform_refund_expires_at)
-        assert item_redeemed_ts == to_s(redeemed_ts_ms_rounded)
         assert (
             item_revoked_ts == 0.0
             if not revoked
@@ -5221,12 +5211,11 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             payment_status=base.PaymentStatus.Redeemed,
             auto_renew=True,
             grace_duration=base.DEFAULT_GOOGLE_GRACE_PERIOD,
-            redeemed_ts_ms_rounded=redeemed_ts_ms_rounded,
             platform_refund_expires_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
         )
-        return tx, platform_refund_expiry_unix_tx_ms, redeemed_ts_ms_rounded
+        return tx, platform_refund_expiry_unix_tx_ms
 
     with TestingContext(pg_database, provider_testing_env=True) as ctx:
         """
@@ -5387,7 +5376,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
 
         assert_clean_state(ctx)
         """1. User purchases 1-month subscription"""
-        tx_subscribe, platform_refund_expiry_unix_tx_ms, redeemed_ts_ms_rounded = test_make_purchase_and_claim_payment(
+        tx_subscribe, platform_refund_expiry_unix_tx_ms = test_make_purchase_and_claim_payment(
             purchase=purchase, plan=base.ProPlan.OneMonth, user_ctx=user_ctx, ctx=ctx
         )
 
@@ -5399,7 +5388,6 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             payment_status=base.PaymentStatus.Redeemed,
             auto_renew=False,
             grace_duration=base.DEFAULT_GOOGLE_GRACE_PERIOD,
-            redeemed_ts_ms_rounded=redeemed_ts_ms_rounded,
             platform_refund_expires_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
@@ -5413,7 +5401,6 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             payment_status=base.PaymentStatus.Redeemed,
             auto_renew=True,
             grace_duration=base.DEFAULT_GOOGLE_GRACE_PERIOD,
-            redeemed_ts_ms_rounded=redeemed_ts_ms_rounded,
             platform_refund_expires_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
@@ -5427,7 +5414,6 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             payment_status=base.PaymentStatus.Revoked,
             auto_renew=False,
             grace_duration=base.DEFAULT_GOOGLE_GRACE_PERIOD,
-            redeemed_ts_ms_rounded=redeemed_ts_ms_rounded,
             platform_refund_expires_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
@@ -5634,7 +5620,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
 
         assert_clean_state(ctx)
         """1. User purchases 1-month subscription"""
-        tx_subscribe, platform_refund_expiry_unix_tx_ms, redeemed_ts_ms_rounded = test_make_purchase_and_claim_payment(
+        tx_subscribe, platform_refund_expiry_unix_tx_ms = test_make_purchase_and_claim_payment(
             purchase=purchase, plan=base.ProPlan.OneMonth, user_ctx=user_ctx, ctx=ctx
         )
 
@@ -5646,7 +5632,6 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             payment_status=base.PaymentStatus.Redeemed,
             auto_renew=True,
             grace_duration=base.duration_from_ms(test_product_details.grace_period.milliseconds),
-            redeemed_ts_ms_rounded=redeemed_ts_ms_rounded,
             platform_refund_expires_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
@@ -5662,7 +5647,6 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             payment_status=base.PaymentStatus.Expired,
             auto_renew=True,
             grace_duration=base.duration_from_ms(test_product_details.grace_period.milliseconds),
-            redeemed_ts_ms_rounded=redeemed_ts_ms_rounded,
             platform_refund_expires_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
@@ -5686,9 +5670,6 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             payment_status=base.PaymentStatus.Redeemed,
             auto_renew=False,
             grace_duration=base.DEFAULT_GOOGLE_GRACE_PERIOD,
-            redeemed_ts_ms_rounded=base.unix_ms_from_datetime(
-                backend.to_redeemed_at(base.datetime_from_unix_ms(tx_renew.event_ms))
-            ),
             platform_refund_expires_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
@@ -5704,9 +5685,6 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             payment_status=base.PaymentStatus.Redeemed,
             auto_renew=False,
             grace_duration=base.DEFAULT_GOOGLE_GRACE_PERIOD,
-            redeemed_ts_ms_rounded=base.unix_ms_from_datetime(
-                backend.to_redeemed_at(base.datetime_from_unix_ms(tx_renew.event_ms))
-            ),
             platform_refund_expires_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
@@ -5720,9 +5698,6 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             payment_status=base.PaymentStatus.Expired,
             auto_renew=False,
             grace_duration=base.DEFAULT_GOOGLE_GRACE_PERIOD,
-            redeemed_ts_ms_rounded=base.unix_ms_from_datetime(
-                backend.to_redeemed_at(base.datetime_from_unix_ms(tx_renew.event_ms))
-            ),
             platform_refund_expires_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
@@ -6138,9 +6113,6 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             payment_status=base.PaymentStatus.Redeemed,
             auto_renew=False,
             grace_duration=base.DEFAULT_GOOGLE_GRACE_PERIOD,
-            redeemed_ts_ms_rounded=base.unix_ms_from_datetime(
-                backend.to_redeemed_at(base.datetime_from_unix_ms(tx_renew_2.event_ms))
-            ),
             platform_refund_expires_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
@@ -6155,9 +6127,6 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             payment_status=base.PaymentStatus.Redeemed,
             auto_renew=False,
             grace_duration=base.DEFAULT_GOOGLE_GRACE_PERIOD,
-            redeemed_ts_ms_rounded=base.unix_ms_from_datetime(
-                backend.to_redeemed_at(base.datetime_from_unix_ms(tx_renew_2.event_ms))
-            ),
             platform_refund_expires_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
@@ -6172,9 +6141,6 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             payment_status=base.PaymentStatus.Expired,
             auto_renew=False,
             grace_duration=base.DEFAULT_GOOGLE_GRACE_PERIOD,
-            redeemed_ts_ms_rounded=base.unix_ms_from_datetime(
-                backend.to_redeemed_at(base.datetime_from_unix_ms(tx_renew_2.event_ms))
-            ),
             platform_refund_expires_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
@@ -6182,10 +6148,8 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
         )
 
         """6. User purchased (SUBSCRIPTION_PURCHASED)"""
-        tx_resubscribe, platform_refund_expiry_unix_tx_ms, redeemed_ts_ms_rounded = (
-            test_make_purchase_and_claim_payment(
-                purchase=resubscribe, plan=base.ProPlan.OneMonth, user_ctx=user_ctx, ctx=ctx
-            )
+        tx_resubscribe, platform_refund_expiry_unix_tx_ms = test_make_purchase_and_claim_payment(
+            purchase=resubscribe, plan=base.ProPlan.OneMonth, user_ctx=user_ctx, ctx=ctx
         )
 
         """7. User fails to renew (enter grace period)"""
@@ -6196,7 +6160,6 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             payment_status=base.PaymentStatus.Redeemed,
             auto_renew=True,
             grace_duration=base.duration_from_ms(test_product_details.grace_period.milliseconds),
-            redeemed_ts_ms_rounded=redeemed_ts_ms_rounded,  # TODO: This is not a good design, should not use real-time timestamps
             platform_refund_expires_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
@@ -6210,7 +6173,6 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             payment_status=base.PaymentStatus.Expired,
             auto_renew=True,
             grace_duration=base.duration_from_ms(test_product_details.grace_period.milliseconds),
-            redeemed_ts_ms_rounded=redeemed_ts_ms_rounded,
             platform_refund_expires_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
@@ -6225,7 +6187,6 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             payment_status=base.PaymentStatus.Expired,
             auto_renew=True,
             grace_duration=base.duration_from_ms(test_product_details.grace_period.milliseconds),
-            redeemed_ts_ms_rounded=redeemed_ts_ms_rounded,
             platform_refund_expires_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
@@ -6241,7 +6202,6 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             payment_status=base.PaymentStatus.Expired,
             auto_renew=False,
             grace_duration=base.duration_from_ms(test_product_details.grace_period.milliseconds),
-            redeemed_ts_ms_rounded=redeemed_ts_ms_rounded,
             platform_refund_expires_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
@@ -6406,7 +6366,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
 
         assert_clean_state(ctx)
         """1. User purchases 1-month subscription"""
-        tx_subscribe, platform_refund_expiry_unix_tx_ms, redeemed_ts_ms_rounded = test_make_purchase_and_claim_payment(
+        tx_subscribe, platform_refund_expiry_unix_tx_ms = test_make_purchase_and_claim_payment(
             purchase=purchase, plan=base.ProPlan.OneMonth, user_ctx=user_ctx, ctx=ctx
         )
 
@@ -6418,7 +6378,6 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             payment_status=base.PaymentStatus.Redeemed,
             auto_renew=True,
             grace_duration=base.duration_from_ms(test_product_details.grace_period.milliseconds),
-            redeemed_ts_ms_rounded=redeemed_ts_ms_rounded,
             platform_refund_expires_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
@@ -6431,7 +6390,6 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             payment_status=base.PaymentStatus.Expired,
             auto_renew=True,
             grace_duration=base.duration_from_ms(test_product_details.grace_period.milliseconds),
-            redeemed_ts_ms_rounded=redeemed_ts_ms_rounded,
             platform_refund_expires_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
@@ -6447,7 +6405,6 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             payment_status=base.PaymentStatus.Expired,
             auto_renew=False,
             grace_duration=base.duration_from_ms(test_product_details.grace_period.milliseconds),
-            redeemed_ts_ms_rounded=redeemed_ts_ms_rounded,
             platform_refund_expires_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
@@ -6650,7 +6607,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
 
         assert_clean_state(ctx)
         """1. User resubscribed"""
-        tx_subscribe, platform_refund_expiry_unix_tx_ms, redeemed_ts_ms_rounded = test_make_purchase_and_claim_payment(
+        tx_subscribe, platform_refund_expiry_unix_tx_ms = test_make_purchase_and_claim_payment(
             purchase=purchase, plan=base.ProPlan.OneMonth, user_ctx=user_ctx, ctx=ctx
         )
 
@@ -6662,7 +6619,6 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             payment_status=base.PaymentStatus.Redeemed,
             auto_renew=True,
             grace_duration=base.duration_from_ms(test_product_details.grace_period.milliseconds),
-            redeemed_ts_ms_rounded=redeemed_ts_ms_rounded,
             platform_refund_expires_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
@@ -6676,7 +6632,6 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             payment_status=base.PaymentStatus.Expired,
             auto_renew=True,
             grace_duration=base.duration_from_ms(test_product_details.grace_period.milliseconds),
-            redeemed_ts_ms_rounded=redeemed_ts_ms_rounded,
             platform_refund_expires_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
@@ -6691,7 +6646,6 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             payment_status=base.PaymentStatus.Expired,
             auto_renew=True,
             grace_duration=base.duration_from_ms(test_product_details.grace_period.milliseconds),
-            redeemed_ts_ms_rounded=redeemed_ts_ms_rounded,
             platform_refund_expires_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
@@ -6707,7 +6661,6 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             payment_status=base.PaymentStatus.Expired,
             auto_renew=False,
             grace_duration=base.duration_from_ms(test_product_details.grace_period.milliseconds),
-            redeemed_ts_ms_rounded=redeemed_ts_ms_rounded,
             platform_refund_expires_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
@@ -6873,7 +6826,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
 
         assert_clean_state(ctx)
         """1. User resubscribed"""
-        tx_subscribe, platform_refund_expiry_unix_tx_ms, redeemed_ts_ms_rounded = test_make_purchase_and_claim_payment(
+        tx_subscribe, platform_refund_expiry_unix_tx_ms = test_make_purchase_and_claim_payment(
             purchase=purchase, plan=base.ProPlan.OneMonth, user_ctx=user_ctx, ctx=ctx
         )
 
@@ -6885,7 +6838,6 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             payment_status=base.PaymentStatus.Redeemed,
             auto_renew=True,
             grace_duration=base.duration_from_ms(test_product_details.grace_period.milliseconds),
-            redeemed_ts_ms_rounded=redeemed_ts_ms_rounded,
             platform_refund_expires_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
@@ -6898,7 +6850,6 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             payment_status=base.PaymentStatus.Expired,
             auto_renew=True,
             grace_duration=base.duration_from_ms(test_product_details.grace_period.milliseconds),
-            redeemed_ts_ms_rounded=redeemed_ts_ms_rounded,
             platform_refund_expires_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
@@ -6913,7 +6864,6 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             payment_status=base.PaymentStatus.Expired,
             auto_renew=True,
             grace_duration=base.duration_from_ms(test_product_details.grace_period.milliseconds),
-            redeemed_ts_ms_rounded=redeemed_ts_ms_rounded,
             platform_refund_expires_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
@@ -6946,9 +6896,6 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             payment_status=base.PaymentStatus.Redeemed,
             auto_renew=True,
             grace_duration=base.DEFAULT_GOOGLE_GRACE_PERIOD,
-            redeemed_ts_ms_rounded=base.unix_ms_from_datetime(
-                backend.to_redeemed_at(base.datetime_from_unix_ms(tx.event_ms))
-            ),
             platform_refund_expires_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
@@ -7137,9 +7084,6 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             payment_status=base.PaymentStatus.Redeemed,
             auto_renew=True,
             grace_duration=base.DEFAULT_GOOGLE_GRACE_PERIOD,
-            redeemed_ts_ms_rounded=base.unix_ms_from_datetime(
-                backend.to_redeemed_at(base.datetime_from_unix_ms(tx.event_ms))
-            ),
             platform_refund_expires_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
@@ -7347,10 +7291,8 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
         test_make_purchase_and_claim_payment(purchase=purchase, plan=base.ProPlan.OneMonth, user_ctx=user_ctx, ctx=ctx)
 
         """2. User changes to 3-month plan"""
-        tx_change_plan, platform_refund_expiry_unix_tx_ms, redeemed_ts_ms_rounded = (
-            test_make_purchase_and_claim_payment(
-                purchase=change_plan_a, plan=base.ProPlan.ThreeMonth, user_ctx=user_ctx, ctx=ctx
-            )
+        tx_change_plan, platform_refund_expiry_unix_tx_ms = test_make_purchase_and_claim_payment(
+            purchase=change_plan_a, plan=base.ProPlan.ThreeMonth, user_ctx=user_ctx, ctx=ctx
         )
         test_notification(change_plan_b, ctx)
 
@@ -7362,7 +7304,6 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             payment_status=base.PaymentStatus.Redeemed,
             auto_renew=True,
             grace_duration=base.duration_from_ms(test_product_details.grace_period.milliseconds),
-            redeemed_ts_ms_rounded=redeemed_ts_ms_rounded,
             platform_refund_expires_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
@@ -7376,7 +7317,6 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             payment_status=base.PaymentStatus.Expired,
             auto_renew=True,
             grace_duration=base.duration_from_ms(test_product_details.grace_period.milliseconds),
-            redeemed_ts_ms_rounded=redeemed_ts_ms_rounded,
             platform_refund_expires_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
@@ -7398,9 +7338,6 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             payment_status=base.PaymentStatus.Redeemed,
             auto_renew=True,
             grace_duration=base.DEFAULT_GOOGLE_GRACE_PERIOD,
-            redeemed_ts_ms_rounded=base.unix_ms_from_datetime(
-                backend.to_redeemed_at(base.datetime_from_unix_ms(tx.event_ms))
-            ),
             platform_refund_expires_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
@@ -7647,10 +7584,8 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
         test_make_purchase_and_claim_payment(purchase=purchase, plan=base.ProPlan.OneMonth, user_ctx=user_ctx, ctx=ctx)
 
         """2. User changes to 3-month plan"""
-        tx_change_plan, platform_refund_expiry_unix_tx_ms, redeemed_ts_ms_rounded = (
-            test_make_purchase_and_claim_payment(
-                purchase=change_plan_a, plan=base.ProPlan.ThreeMonth, user_ctx=user_ctx, ctx=ctx
-            )
+        tx_change_plan, platform_refund_expiry_unix_tx_ms = test_make_purchase_and_claim_payment(
+            purchase=change_plan_a, plan=base.ProPlan.ThreeMonth, user_ctx=user_ctx, ctx=ctx
         )
         test_notification(change_plan_b, ctx)
 
@@ -7662,7 +7597,6 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             payment_status=base.PaymentStatus.Redeemed,
             auto_renew=True,
             grace_duration=base.duration_from_ms(test_product_details.grace_period.milliseconds),
-            redeemed_ts_ms_rounded=redeemed_ts_ms_rounded,
             platform_refund_expires_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
@@ -7675,7 +7609,6 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             payment_status=base.PaymentStatus.Expired,
             auto_renew=True,
             grace_duration=base.duration_from_ms(test_product_details.grace_period.milliseconds),
-            redeemed_ts_ms_rounded=redeemed_ts_ms_rounded,
             platform_refund_expires_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
@@ -7690,7 +7623,6 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             payment_status=base.PaymentStatus.Expired,
             auto_renew=True,
             grace_duration=base.duration_from_ms(test_product_details.grace_period.milliseconds),
-            redeemed_ts_ms_rounded=redeemed_ts_ms_rounded,
             platform_refund_expires_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
@@ -7712,9 +7644,6 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             payment_status=base.PaymentStatus.Redeemed,
             auto_renew=True,
             grace_duration=base.DEFAULT_GOOGLE_GRACE_PERIOD,
-            redeemed_ts_ms_rounded=base.unix_ms_from_datetime(
-                backend.to_redeemed_at(base.datetime_from_unix_ms(tx.event_ms))
-            ),
             platform_refund_expires_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
@@ -7961,18 +7890,14 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
         test_make_purchase_and_claim_payment(purchase=purchase, plan=base.ProPlan.OneMonth, user_ctx=user_ctx, ctx=ctx)
 
         """2. User changes to 3-month plan"""
-        tx_change_plan, platform_refund_expiry_unix_tx_ms, redeemed_ts_ms_rounded = (
-            test_make_purchase_and_claim_payment(
-                purchase=change_plan_a, plan=base.ProPlan.ThreeMonth, user_ctx=user_ctx, ctx=ctx
-            )
+        tx_change_plan, platform_refund_expiry_unix_tx_ms = test_make_purchase_and_claim_payment(
+            purchase=change_plan_a, plan=base.ProPlan.ThreeMonth, user_ctx=user_ctx, ctx=ctx
         )
         test_notification(change_plan_b, ctx)
 
         """3. User changes to 1-month plan"""
-        tx_change_plan, platform_refund_expiry_unix_tx_ms, redeemed_ts_ms_rounded = (
-            test_make_purchase_and_claim_payment(
-                purchase=change_plan_back_a, plan=base.ProPlan.OneMonth, user_ctx=user_ctx, ctx=ctx
-            )
+        tx_change_plan, platform_refund_expiry_unix_tx_ms = test_make_purchase_and_claim_payment(
+            purchase=change_plan_back_a, plan=base.ProPlan.OneMonth, user_ctx=user_ctx, ctx=ctx
         )
         test_notification(change_plan_back_b, ctx)
 
@@ -7991,9 +7916,6 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             payment_status=base.PaymentStatus.Redeemed,
             auto_renew=True,
             grace_duration=base.DEFAULT_GOOGLE_GRACE_PERIOD,
-            redeemed_ts_ms_rounded=base.unix_ms_from_datetime(
-                backend.to_redeemed_at(base.datetime_from_unix_ms(tx.event_ms))
-            ),
             platform_refund_expires_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
@@ -8149,7 +8071,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
 
         assert_clean_state(ctx)
         """1. User purchases 1-month subscription"""
-        tx_subscribe, platform_refund_expiry_unix_tx_ms, redeemed_ts_ms_rounded = test_make_purchase_and_claim_payment(
+        tx_subscribe, platform_refund_expiry_unix_tx_ms = test_make_purchase_and_claim_payment(
             purchase=purchase, plan=base.ProPlan.OneMonth, user_ctx=user_ctx, ctx=ctx
         )
 
@@ -8165,7 +8087,6 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             payment_status=base.PaymentStatus.Revoked,
             auto_renew=False,
             grace_duration=base.DEFAULT_GOOGLE_GRACE_PERIOD,
-            redeemed_ts_ms_rounded=redeemed_ts_ms_rounded,
             platform_refund_expires_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
@@ -8350,7 +8271,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
         with ctx.connection() as conn:
             unredeemed_payments = backend.get_unredeemed_payments_list(conn)
         for payment in unredeemed_payments:
-            assert derived_status(payment) == base.PaymentStatus.Unredeemed
+            assert payment.redeemed_at is None
 
         """2. Developer refunds subscription (removing entitlement)"""
         test_notification(refund_a, ctx)

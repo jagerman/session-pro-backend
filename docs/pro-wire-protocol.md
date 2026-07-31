@@ -50,7 +50,7 @@
   `_ms`/`_s` marker. Timestamps take a short **`_ts`** suffix (the redundant `_unix` is dropped — the
   value is just seconds-since-epoch): `expiry_ts`, `effective_ts`, `revoked_ts`, and a request nonce is
   bare `ts`. Durations are named `…_duration` (e.g. `grace_period_duration`). The `_ts`/`_duration`
-  marker stays because the field names are often past participles (`revoked`, `redeemed`) that would
+  marker stays because the field names are often past participles (`revoked`) that would
   otherwise read as booleans; only the *unit* suffix is dropped, never the type marker. A value needing
   finer resolution than a whole second is a JSON **float** (see Time quantities), never a `_ms`-suffixed
   integer — so the unit suffix never reappears.
@@ -66,8 +66,8 @@
   the DB keeps a surrogate int `id`, but the wire *and the signed messages* use the `code`, so no magic
   number ever crosses the wire and new values are additive `INSERT`s):
   - `payment_provider`: `"google_play"`, `"app_store"`, `"rangeproof"`
-  - `status`: the per-**item** *payment* status — `"unredeemed"`, `"redeemed"`, `"expired"`, `"revoked"` —
-    where **`"revoked"`** is the terminal revoked state (refund/chargeback/protocol kill). There is no
+  - `status`: the per-**item** *payment* status — `"redeemed"`, `"expired"`, `"revoked"` — where
+    **`"revoked"`** is the terminal revoked state (refund/chargeback/protocol kill). There is no
     `"refunded"` status.
     (The account-level *Pro* status is a **separate** field, `user_status` — values `"never"`/`"active"`/
     `"expired"` — not this per-item `status`; see §5.2.)
@@ -312,7 +312,7 @@ The two read endpoints return these `result` shapes:
   account's total payment count; `next_cursor` (§5.3) is the pagination token, or `null` at end-of-data.
 
 Each **payment item** carries: `status` (payment `code`), `plan`, `payment_provider`, `auto_renewing`,
-`purchased_ts` (float), `redeemed_ts`, `expiry_ts`, `grace_period_duration`, `platform_refund_expiry_ts`,
+`purchased_ts` (float), `expiry_ts`, `grace_period_duration`, `platform_refund_expiry_ts`,
 `revoked_ts` (float), and the opaque `payment_id` — a backend-owned identifier the client stores and
 compares for equality but never parses.
 
