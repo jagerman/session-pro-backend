@@ -1,7 +1,27 @@
 '''
-The base layer contains common utilities that is useful to other files in the project and should
-have no dependency on any project files, only, native Python packages. Typically useful to share
-functionality from the testing suite and the project but not limited to.
+Common utilities shared by the rest of the project (and by the test suite).
+
+This module must not import any other project module — that keeps it at the bottom of the dependency
+graph, so anything may import it without risking a cycle. Third-party packages are fair game.
+
+Instants and durations here are pendulum's `DateTime` and `Duration`, NOT the stdlib's, because stdlib
+`aware_datetime + timedelta` cannot express what we mean and cannot be made to:
+
+  - It is **wall-clock arithmetic** — the clock fields advance and the tzinfo is carried over untouched
+    ("no time zone adjustments are done even if the input is an aware object", per the stdlib docs). So
+    whenever the span crosses a DST transition the real elapsed time is not the duration you added. This
+    is not a large-duration problem: adding 2 hours across a spring-forward advances 1 real hour, and
+    adding 90 minutes can land on a local time that does not exist that day. It fails silently in all
+    of these cases.
+  - And you **cannot dodge it by choosing units**, because `timedelta` force-normalises on construction
+    to (days, seconds, microseconds) and keeps nothing else: `timedelta(hours=24)` *is*
+    `timedelta(days=1)` — equal, same repr — and `timedelta(hours=25)` is `days=1, seconds=3600`. No
+    record of the original denomination survives, so there is nothing for the arithmetic to honour.
+
+Pendulum keeps that denomination, so the distinction becomes expressible: adding a `Duration` built from
+hours or smaller moves an exact span, while one built from days or larger moves a calendar step. Every
+duration in this codebase is a span, so they are all built from hours or smaller — see HOUR/DAY below,
+and note that scaling (`29 * DAY`) always yields an exact span.
 '''
 
 import dataclasses
@@ -13,6 +33,7 @@ import logging
 import math
 import os
 import pathlib
+import pendulum
 import sys
 import threading
 import time
@@ -42,22 +63,34 @@ SECONDS_IN_YEAR: int = SECONDS_IN_DAY * 365
 #
 # It is a protocol constant, not merely a server-side check: the backend's revocation-skip math
 # (revoke_payments_by_id_internal) depends on the same skew bound, so both must read this one value.
-DEFAULT_TIMESTAMP_TOLERANCE: datetime.timedelta = datetime.timedelta(seconds=70)
+DEFAULT_TIMESTAMP_TOLERANCE: pendulum.Duration = pendulum.duration(seconds=70)
+
+# Exact-span building blocks, for composing the durations below as `29 * DAY` rather than repeating an
+# hours= arithmetic expression. Built from hours because that is what makes them true elapsed time: a
+# Duration built with `days=` or larger is a CALENDAR step, which a DST transition stretches or shrinks by
+# an hour (module docstring). Scaling always yields an exact span, so DAY is 24 real hours and `29 * DAY`
+# is 696 of them — never "the same clock time 29 days later".
+HOUR: pendulum.Duration = pendulum.duration(hours=1)
+DAY: pendulum.Duration = 24 * HOUR
 
 # --- Revocation-list timings (wire spec §4). ---
+# The re-poll cadence we recommend to clients, served as the list's `retry_in`. It bounds how long a
+# client can go without seeing a new entry, so REVOCATION_EFFECTIVE_DELAY below is derived from it.
+REVOCATION_POLL_INTERVAL: pendulum.Duration = 1 * DAY
 # How long after we RECORD a revocation peers begin rejecting proofs carrying its tag. Anchored to our
 # processing instant, never to the store's `revocationDate`: a stale notification (a backlog drained after
 # an outage) would otherwise arrive with the delay already elapsed, so peers would enforce before the
 # revoked sender could possibly have learnt of it — exactly the compose-then-truncate gap this delay
-# exists to prevent. 26 h = the 24 h client poll cadence (`retry_in`) + 2 h of slack for a client that
-# missed a poll (e.g. because *we* were down).
-REVOCATION_EFFECTIVE_DELAY: datetime.timedelta = datetime.timedelta(hours=26)
+# exists to prevent. One poll interval is the floor (a client that polls on schedule sees the entry inside
+# it), and the margin on top covers a poll that lands while we are down: it can be retried and still beat
+# the deadline.
+REVOCATION_EFFECTIVE_DELAY: pendulum.Duration = REVOCATION_POLL_INTERVAL + 2 * HOUR
 # How long a revocation entry is kept (by clients, and by our own served list). Must be at least the
 # maximum proof lifetime so an entry is never dropped while a proof carrying its tag could still verify
 # (asserted below, once the proof-expiry shape is defined).
-REVOCATION_RETAIN_FOR: datetime.timedelta = datetime.timedelta(days=31)
+REVOCATION_RETAIN_FOR: pendulum.Duration = 31 * DAY
 
-# Every instant in this codebase is a tz-aware UTC `datetime` and every duration a `timedelta`. Integer
+# Every instant in this codebase is a tz-aware pendulum `DateTime` and every duration a `Duration`. Integer
 # epochs live ONLY in the converters below, at two kinds of boundary with distinct units:
 #   - MILLISECONDS: the payment providers (Apple/Google App Store APIs) genuinely speak ms, so their
 #     ingest/egress uses the `*_ms` pair.
@@ -67,82 +100,74 @@ REVOCATION_RETAIN_FOR: datetime.timedelta = datetime.timedelta(days=31)
 #     the provider's sub-second precision as a float via `unix_seconds_float_from_datetime` — see the
 #     wire spec §1. Nothing hashed is ever a float.
 # The two never mix: a value crossing the provider boundary is ms, a value crossing our wire is seconds.
-EPOCH: datetime.datetime = datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
+EPOCH: pendulum.DateTime = pendulum.datetime(1970, 1, 1)
 
 
-def datetime_from_unix_ms(unix_ms: int) -> datetime.datetime:
-    return EPOCH + datetime.timedelta(milliseconds=unix_ms)
+def datetime_from_unix_ms(unix_ms: int) -> pendulum.DateTime:
+    return EPOCH + pendulum.duration(milliseconds=unix_ms)
 
 
-def unix_ms_from_datetime(value: datetime.datetime) -> int:
+def unix_ms_from_datetime(value: pendulum.DateTime) -> int:
     # Exact integer milliseconds via integer division — never float `.timestamp()` truncation.
-    return (value - EPOCH) // datetime.timedelta(milliseconds=1)
+    return (value - EPOCH) // pendulum.duration(milliseconds=1)
 
 
-def timedelta_from_ms(ms: int) -> datetime.timedelta:
-    return datetime.timedelta(milliseconds=ms)
+def duration_from_ms(ms: int) -> pendulum.Duration:
+    return pendulum.duration(milliseconds=ms)
 
 
-def ms_from_timedelta(value: datetime.timedelta) -> int:
-    return value // datetime.timedelta(milliseconds=1)
+def ms_from_duration(value: pendulum.Duration) -> int:
+    return value // pendulum.duration(milliseconds=1)
 
 
-def datetime_from_unix_seconds(unix_s: int) -> datetime.datetime:
-    return EPOCH + datetime.timedelta(seconds=unix_s)
+def datetime_from_unix_seconds(unix_s: int) -> pendulum.DateTime:
+    return EPOCH + pendulum.duration(seconds=unix_s)
 
 
-def unix_seconds_from_datetime(value: datetime.datetime) -> int:
+def unix_seconds_from_datetime(value: pendulum.DateTime) -> int:
     # Exact integer seconds via integer division — never float `.timestamp()` truncation. Sub-second
     # precision (a provider ms value) is floored: our wire is second-resolution by spec.
-    return (value - EPOCH) // datetime.timedelta(seconds=1)
+    return (value - EPOCH) // pendulum.duration(seconds=1)
 
 
-def timedelta_from_seconds(s: int) -> datetime.timedelta:
-    return datetime.timedelta(seconds=s)
+def duration_from_seconds(s: int) -> pendulum.Duration:
+    return pendulum.duration(seconds=s)
 
 
-def seconds_from_timedelta(value: datetime.timedelta) -> int:
-    return value // datetime.timedelta(seconds=1)
+def seconds_from_duration(value: pendulum.Duration) -> int:
+    return value // pendulum.duration(seconds=1)
 
 
-def utc_now() -> datetime.datetime:
+def utc_now() -> pendulum.DateTime:
     '''The backend's own wall clock, as a tz-aware UTC instant.
 
     Deliberately distinct from the provider-supplied instants that ride inside a store notification
     (`revocationDate`, `event_ts_ms`, ...): this answers "when did *we* handle it", which is what a
     broadcast anchor must key off. Funnelled through one function so a test can pin it.
     '''
-    return datetime.datetime.now(datetime.timezone.utc)
+    return pendulum.now(pendulum.UTC)
 
 
-def unix_seconds_float_from_datetime(value: datetime.datetime) -> float:
+def unix_seconds_float_from_datetime(value: pendulum.DateTime) -> float:
     # Fractional UNIX seconds (true division) — preserves the sub-second precision of an upstream
     # provider instant on the wire. ONLY for the enumerated float display fields (wire spec §1); never
     # for a hashed value, which must be integer seconds via `unix_seconds_from_datetime`.
-    return (value - EPOCH) / datetime.timedelta(seconds=1)
+    return (value - EPOCH) / pendulum.duration(seconds=1)
 
 
-# NOTE: Default grace period we add to the subscription payments because in real world situations
-# no payment processor/billing cycle is going to bill exactly on the dot due to real-world
-# extenuating circumstances. In those cases we provide a small but reasonable grace period of 1
-# hour to cover that.
-#
-# For Google we are not informed of the user's grace period until they enter the renewing state.
-# What this means then is if the user is observing their Pro state at the boundary of expiry they
-# may witness their account flicker from Pro to not-pro, to Pro again once they enter the renewal
-# phase (and that the Session Pro Backend server is awaiting for the notification from Google which
-# tells us of their _real_ grace period).
-#
-# In this situation having a small, temporary grace period of 1 hour prevents that edge case.
-#
-# For Apple no grace period is configured but again due to extenuating circumstances the time at
-# which the billing for the end of the subscription cycle is executed can vary and similarly, users
-# may encounter that they lose Pro because the billing was late. The 1 hour grace period looks to
-# minimise that.
-DEFAULT_APPLE_GRACE_PERIOD: datetime.timedelta = datetime.timedelta(hours=1)
+# Grace periods added to a subscription's paid-through instant, because no billing cycle charges exactly
+# on the dot: without one, a renewal that lands minutes late reads as a lapse and the user loses Pro.
+# Per-provider policy — the providers behave differently, so each has its own value.
 
-# NOTE: Always the same as Apple, unless we're in a testing environment where this gets changed
-DEFAULT_GOOGLE_GRACE_PERIOD: datetime.timedelta = DEFAULT_APPLE_GRACE_PERIOD
+# Apple configures no grace period at all, so this is entirely ours: it absorbs the variance in when the
+# end-of-cycle billing actually executes, so a late charge doesn't cost the user their Pro status.
+DEFAULT_APPLE_GRACE_PERIOD: pendulum.Duration = 1 * HOUR
+
+# Google has a real grace period but doesn't report it until the subscriber enters the renewing state;
+# this stands in until that notification arrives. Without it, a user watching their Pro state across the
+# expiry boundary sees it flicker Pro → not-Pro → Pro as the renewal lands. A provider testing environment
+# overrides this at runtime with Google's much shorter test value (providers/google_play/mule.py).
+DEFAULT_GOOGLE_GRACE_PERIOD: pendulum.Duration = 1 * HOUR
 
 # NOTE: Global variables
 DB_URL = ''
@@ -170,17 +195,17 @@ class ProofExpiryShape:
     reasoning behind each.
     '''
 
-    clamp: datetime.timedelta  # rolling cap: how far ahead a proof may reach while the sub outlives it
-    renewal_lead: datetime.timedelta  # keeps a renewing client's attempt on the far side of `true`
-    grid: datetime.timedelta  # expiry grid period; the per-account offset spans exactly one of these
+    clamp: pendulum.Duration  # rolling cap: how far ahead a proof may reach while the sub outlives it
+    renewal_lead: pendulum.Duration  # keeps a renewing client's attempt on the far side of `true`
+    grid: pendulum.Duration  # expiry grid period; the per-account offset spans exactly one of these
 
     @property
     def offset_range(self) -> int:
         '''Exclusive upper bound on `users.proof_expiry_offset`, in seconds.'''
-        return seconds_from_timedelta(self.grid)
+        return seconds_from_duration(self.grid)
 
     @property
-    def max_proof_lifetime(self) -> datetime.timedelta:
+    def max_proof_lifetime(self) -> pendulum.Duration:
         '''Strict upper bound on how far past its request instant a proof can reach. Not attained (the
         round-up adds strictly less than `grid`), so it is safe as an inclusive bound.'''
         return self.clamp + self.renewal_lead + self.grid
@@ -188,7 +213,7 @@ class ProofExpiryShape:
 
 # The real-world shape. `clamp` is 29 d rather than 30 so that the whole expression stays just over 30 d.
 PROOF_EXPIRY_SHAPE: ProofExpiryShape = ProofExpiryShape(
-    clamp=datetime.timedelta(days=29), renewal_lead=datetime.timedelta(seconds=3660), grid=datetime.timedelta(days=1)
+    clamp=29 * DAY, renewal_lead=pendulum.duration(seconds=3660), grid=1 * DAY
 )
 
 # The same shape scaled to the compressed clock a provider testing environment runs on (Google's license
@@ -201,9 +226,9 @@ PROOF_EXPIRY_SHAPE: ProofExpiryShape = ProofExpiryShape(
 # the payment provider — the grid is per ACCOUNT, and an account can hold payments from several — which is
 # harmless because the flag is only ever set in a dedicated test deployment.
 PROVIDER_TESTING_PROOF_EXPIRY_SHAPE: ProofExpiryShape = ProofExpiryShape(
-    clamp=datetime.timedelta(seconds=290),  # 29 compressed days
-    renewal_lead=datetime.timedelta(seconds=1),
-    grid=datetime.timedelta(seconds=10),  # one compressed day
+    clamp=pendulum.duration(seconds=290),  # 29 compressed days
+    renewal_lead=pendulum.duration(seconds=1),
+    grid=pendulum.duration(seconds=10),  # one compressed day
 )
 
 
@@ -479,9 +504,9 @@ def hex_to_bytes(hex: str, label: str, hex_len: int, err: ErrorSink | None = Non
     return b''
 
 
-def readable(value: datetime.datetime) -> str:
+def readable(value: pendulum.DateTime) -> str:
     # Compact UTC timestamp for logs, millisecond precision (no strftime %f-slice hack).
-    return value.astimezone(datetime.timezone.utc).isoformat(sep=' ', timespec='milliseconds')
+    return value.astimezone(pendulum.UTC).isoformat(sep=' ', timespec='milliseconds')
 
 
 def print_unicode_table(rows: list[list[str]]) -> None:
@@ -529,20 +554,19 @@ def print_unicode_table(rows: list[list[str]]) -> None:
     print(bottom)
 
 
-def round_datetime_to_start_of_day(value: datetime.datetime) -> datetime.datetime:
-    return value.astimezone(datetime.timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+def round_datetime_to_start_of_day(value: pendulum.DateTime) -> pendulum.DateTime:
+    return value.astimezone(pendulum.UTC).replace(hour=0, minute=0, second=0, microsecond=0)
 
 
-def round_datetime_to_next_day(value: datetime.datetime) -> datetime.datetime:
-    # Ceil to the next UTC midnight; a value already exactly at midnight stays put (matches the old
-    # `(ms + DAY-1)//DAY*DAY` ceil semantics).
+def round_datetime_to_next_day(value: pendulum.DateTime) -> pendulum.DateTime:
+    # Ceil to the next UTC midnight; a value already exactly at midnight stays put.
     start = round_datetime_to_start_of_day(value)
-    return start if start == value else start + datetime.timedelta(days=1)
+    return start if start == value else start + 1 * DAY
 
 
 def round_datetime_up_onto_offset_grid(
-    value: datetime.datetime, period: datetime.timedelta, offset_seconds: int
-) -> datetime.datetime:
+    value: pendulum.DateTime, period: pendulum.Duration, offset_seconds: int
+) -> pendulum.DateTime:
     '''Ceil `value` onto the grid `{ EPOCH + offset_seconds + k * period }`.
 
     EPOCH is itself a UTC midnight, so with a one-day period this is "the next UTC midnight shifted by
@@ -551,8 +575,8 @@ def round_datetime_up_onto_offset_grid(
     so an offset drawn against a wider period (a database written before the period changed) still names a
     real grid point. The result is always a whole second, since both the origin and the period are.
     '''
-    origin = EPOCH + datetime.timedelta(seconds=offset_seconds % seconds_from_timedelta(period))
-    units = -((-(value - origin)) // period)  # ceil-divide the timedelta
+    origin = EPOCH + pendulum.duration(seconds=offset_seconds % seconds_from_duration(period))
+    units = -((-(value - origin)) // period)  # ceil-divide the duration
     return origin + units * period
 
 

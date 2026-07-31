@@ -12,6 +12,10 @@
 # Dev/test-only extras (pytest, a pip uWSGI for the local example) live in requirements-dev.txt.
 flask
 pynacl
+# Instants and durations are pendulum's, not the stdlib's — see base.py's module docstring. Bounded to
+# 3.x: `Duration`/`Interval` and the exact-vs-calendar arithmetic this depends on are 3.x semantics.
+# Debian ships 3.0 (trixie) / 3.2 (sid) as python3-pendulum, so the server install skips this.
+pendulum~=3.0
 psycopg~=3.1
 psycopg-pool~=3.2
 app-store-server-library~=1.9

@@ -15,6 +15,7 @@ local image = docker_base + 'debian-sid';
 local app_deb_deps = [
   'python3-flask',
   'python3-nacl',
+  'python3-pendulum',
   'python3-psycopg',
   'python3-psycopg-pool',
   'python3-googleapi',

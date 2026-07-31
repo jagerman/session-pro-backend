@@ -4,7 +4,7 @@ asynchronous fetching operation from Google to monitor for new payments, parsing
 payments into the database layer (backend.py)
 '''
 
-import datetime
+import pendulum
 import json
 import traceback
 import logging
@@ -561,7 +561,7 @@ def thread_entry_point(
 def _update_payment_renewal_info(
     tx_payment: base.PaymentProviderTransaction,
     auto_renewing: bool | None,
-    grace_period: datetime.timedelta | None,
+    grace_period: pendulum.Duration | None,
     tx: db.SQLTransaction,
     err: base.ErrorSink,
 ) -> bool:
@@ -585,7 +585,7 @@ def set_payment_auto_renew(
 
 def set_purchase_grace_period_duration(
     tx_payment: base.PaymentProviderTransaction,
-    grace_period: datetime.timedelta,
+    grace_period: pendulum.Duration,
     tx: db.SQLTransaction,
     err: base.ErrorSink,
 ):
@@ -734,7 +734,7 @@ def handle_subscription_notification(
                     assert plan_details is not None
                     set_purchase_grace_period_duration(
                         tx_payment=tx_payment,
-                        grace_period=base.timedelta_from_ms(plan_details.grace_period.milliseconds),
+                        grace_period=base.duration_from_ms(plan_details.grace_period.milliseconds),
                         tx=tx,
                         err=err,
                     )

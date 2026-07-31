@@ -18,8 +18,8 @@ Overview
 '''
 
 import collections.abc
+import pendulum
 import contextlib
-import datetime
 import enum
 import flask
 import json
@@ -197,11 +197,11 @@ def get_pro_revocations():
     get_json = get_json_from_flask_request(flask.request)
     ticket: int = base.json_dict_require_int(get_json, 'ticket')
 
-    RETRY_IN = base.SECONDS_IN_DAY
+    RETRY_IN = base.seconds_from_duration(base.REVOCATION_POLL_INTERVAL)
     # List-level window (≥ the max proof validity) after which a client drops a seen entry from its
     # in-memory revocation list (wire spec §4). Memory-only aging: a dropped entry can't reactivate
     # anything, so this has no correctness dependence.
-    RETAIN_FOR = base.seconds_from_timedelta(base.REVOCATION_RETAIN_FOR)
+    RETAIN_FOR = base.seconds_from_duration(base.REVOCATION_RETAIN_FOR)
     now = base.datetime_from_unix_ms(int(time_now() * 1000))
     revocation_items: list[dict[str, str | int]] = []
     revocation_ticket: int = 0
@@ -213,7 +213,7 @@ def get_pro_revocations():
                     # Served list = revoked generations still inside the retention window (`revoked_at >
                     # now - retain_for`). Filtering by the window (rather than depending on a prune) keeps
                     # the answer independent of whether housekeeping has run; the token IS the wire tag.
-                    retain_cutoff = now - datetime.timedelta(seconds=RETAIN_FOR)
+                    retain_cutoff = now - pendulum.duration(seconds=RETAIN_FOR)
                     for row in db.query(
                         tx.conn,
                         "SELECT token, revoked_at FROM generations WHERE revoked_at IS NOT NULL AND revoked_at > %s",
@@ -222,8 +222,8 @@ def get_pro_revocations():
                         token, revoked_at = row
                         # `revoked_at` is when the BACKEND recorded the revocation (not the store's own
                         # refund date — see revoke_master_pkey_proofs_and_allocate_new_gen_id), so this
-                        # delay is always fully ahead of the client that has to learn of it. Its own
-                        # constant, not `retry_in`: that one is a poll-cadence hint, this one is the
+                        # delay is always fully ahead of the client that has to learn of it. Derived from
+                        # `retry_in` but deliberately larger: that one is a poll-cadence hint, this is the
                         # guarantee that a revoked sender sees its tag before peers start rejecting it.
                         effective_at = revoked_at + base.REVOCATION_EFFECTIVE_DELAY
                         # Per-entry wire shape (spec §4): revocation_tag + effective_ts only.
@@ -249,7 +249,7 @@ def get_pro_revocations():
 MAX_PAYMENT_DETAILS_PAGE = 100  # server-side cap on a get-payment-details page (client `limit` is clamped)
 
 
-def _check_read_replay_window(request_at: datetime.datetime) -> None:
+def _check_read_replay_window(request_at: pendulum.DateTime) -> None:
     # Timestamp anti-replay window (wire nonce is integer seconds). Out of window → stale_request. (We
     # _could_ track recent nonces to reject replays outright, but the onion transport already masks replay
     # ability for a read-only query.)
@@ -269,7 +269,7 @@ def _verify_master_sig(master_pkey_nacl: nacl.signing.VerifyKey, master_sig_byte
 
 
 def _payment_item_wire(
-    payment: backend.PaymentRow, request_at: datetime.datetime
+    payment: backend.PaymentRow, request_at: pendulum.DateTime
 ) -> dict[str, str | int | float | bool]:
     # Wire seconds (wire spec §1/§5): integer everywhere the backend computes/rounds the value; the two
     # upstream provider event instants — `purchased_ts` and `revoked_ts` — are floats carrying the
@@ -283,7 +283,7 @@ def _payment_item_wire(
         'redeemed_ts': base.unix_seconds_from_datetime(payment.redeemed_at) if payment.redeemed_at else 0,
         'expiry_ts': base.unix_seconds_from_datetime(payment.expires_at),
         'grace_period_duration': (
-            base.seconds_from_timedelta(payment.grace_period) if payment.grace_period is not None else 0
+            base.seconds_from_duration(payment.grace_period) if payment.grace_period is not None else 0
         ),
         'platform_refund_expiry_ts': base.unix_seconds_from_datetime(payment.platform_refund_expires_at),
         'revoked_ts': base.unix_seconds_float_from_datetime(payment.revoked_at) if payment.revoked_at else 0.0,
@@ -333,11 +333,11 @@ def get_pro_status():
                 user = backend.get_user(tx.conn, master_pkey_nacl)
                 if user.found:
                     auto_renewing = user.auto_renewing
-                    # Egress: user datetimes/timedelta → integer-seconds wire values. This is the account's
+                    # Egress: user instants/durations → integer-seconds wire values. This is the account's
                     # TRUE expiry, straight from the store, so any sub-second part is floored (wire spec §1)
                     # — unlike the proof's expiry, which lands on a whole second by construction (§2.3).
                     expiry_ts = base.unix_seconds_from_datetime(user.expires_at)
-                    grace_period_duration = base.seconds_from_timedelta(user.grace_period)
+                    grace_period_duration = base.seconds_from_duration(user.grace_period)
 
                     # Status decided against the *request* clock (signed, anti-replay-bounded to ≈now) —
                     # the same clock the latest item's derived status uses, never a second time.time().

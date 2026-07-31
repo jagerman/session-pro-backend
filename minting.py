@@ -12,7 +12,7 @@ Nothing here is reachable from a production uWSGI worker.
 '''
 
 import dataclasses
-import datetime
+import pendulum
 import uuid
 
 import nacl.signing
@@ -31,15 +31,15 @@ class MintedPayment:
     # holder's next authenticated request.
     payment_id: str = ''
     plan: base.ProPlan = base.ProPlan.Nil
-    expires_at: datetime.datetime = base.EPOCH
+    expires_at: pendulum.DateTime = base.EPOCH
     redeemed: bool = False
 
 
 # Nominal length of each billing period, used when the caller does not override the duration outright.
-PLAN_DEFAULT_DURATION: dict[base.ProPlan, datetime.timedelta] = {
-    base.ProPlan.OneMonth: datetime.timedelta(days=30),
-    base.ProPlan.ThreeMonth: datetime.timedelta(days=90),
-    base.ProPlan.TwelveMonth: datetime.timedelta(days=365),
+PLAN_DEFAULT_DURATION: dict[base.ProPlan, pendulum.Duration] = {
+    base.ProPlan.OneMonth: 30 * base.DAY,
+    base.ProPlan.ThreeMonth: 90 * base.DAY,
+    base.ProPlan.TwelveMonth: 365 * base.DAY,
 }
 
 # The operator-facing plan labels (CLI flags, dev-route JSON). Deliberately NOT ProPlan.from_string:
@@ -61,8 +61,8 @@ def plan_from_label(label: str) -> base.ProPlan | None:
     return None if result == base.ProPlan.Nil else result
 
 
-def duration_from_seconds(seconds: int | None) -> datetime.timedelta | None:
-    '''Turn an operator-supplied duration in seconds into a timedelta, or None when it was omitted
+def duration_from_seconds(seconds: int | None) -> pendulum.Duration | None:
+    '''Turn an operator-supplied duration in seconds into a Duration, or None when it was omitted
     (meaning "use the plan's nominal length").
 
     Zero and negatives are rejected rather than clamped: both would mint a payment that is already
@@ -73,7 +73,7 @@ def duration_from_seconds(seconds: int | None) -> datetime.timedelta | None:
         return None
     if seconds <= 0:
         raise base.FailError('duration must be a positive integer number of seconds')
-    return datetime.timedelta(seconds=seconds)
+    return pendulum.duration(seconds=seconds)
 
 
 @db.transactional
@@ -82,8 +82,8 @@ def mint_payment(
     master_pkey: nacl.signing.VerifyKey,
     provider: base.PaymentProvider,
     plan: base.ProPlan,
-    now: datetime.datetime,
-    duration: datetime.timedelta | None = None,
+    now: pendulum.DateTime,
+    duration: pendulum.Duration | None = None,
     redeem: bool = True,
 ) -> MintedPayment:
     '''Create a payment that no payment provider ever witnessed, bound to `master_pkey`, and (by
@@ -101,9 +101,9 @@ def mint_payment(
     '''
     if plan == base.ProPlan.Nil:
         raise base.FailError('Cannot mint a payment for the nil plan')
-    # Callers should arrive via duration_from_seconds; this guards the timedelta boundary itself so a
+    # Callers should arrive via duration_from_seconds; this guards the duration boundary itself so a
     # caller building one directly cannot mint a payment that is expired the moment it exists.
-    if duration is not None and duration <= datetime.timedelta(0):
+    if duration is not None and duration <= pendulum.duration():
         raise base.FailError('duration must be positive')
 
     master_pkey_bytes: bytes = bytes(master_pkey)
@@ -131,7 +131,7 @@ def mint_payment(
         case _:
             raise base.FailError(f'Cannot mint a payment for payment provider: {provider}')
 
-    expires_at: datetime.datetime = now + (duration if duration is not None else PLAN_DEFAULT_DURATION[plan])
+    expires_at: pendulum.DateTime = now + (duration if duration is not None else PLAN_DEFAULT_DURATION[plan])
 
     err = base.ErrorSink()
     backend.add_unredeemed_payment(

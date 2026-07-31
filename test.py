@@ -23,6 +23,7 @@ import nacl.bindings
 import nacl.public
 import os
 import pathlib
+import pendulum
 import pytest
 import re
 import time
@@ -33,7 +34,6 @@ import enum
 import psycopg
 import psycopg_pool
 import traceback
-import datetime
 
 from providers import google_play
 from providers.google_play.types import GoogleDuration, SubscriptionProductDetails
@@ -75,7 +75,7 @@ def pk_hex(pk: bytes | nacl.signing.VerifyKey | None) -> str:
     return 'None' if pk is None else bytes(pk).hex()
 
 
-def derived_status(payment: backend.PaymentRow, at: datetime.datetime | None = None) -> base.PaymentStatus:
+def derived_status(payment: backend.PaymentRow, at: pendulum.DateTime | None = None) -> base.PaymentStatus:
     """A payment's status is derived from its timestamps, not stored (see backend.derive_payment_status).
 
     These assertions check the *latched* facts — redeemed / revoked / unredeemed — which do not depend
@@ -102,6 +102,7 @@ class TestingContext:
     flask_client: werkzeug.Client
     provider_testing_env: bool = False
     db_url_factory: typing.Callable[[], str] | None = None
+    saved_google_grace_period: pendulum.Duration = base.DEFAULT_GOOGLE_GRACE_PERIOD
 
     def __init__(self, db_url_factory: typing.Callable[[], str], provider_testing_env: bool = False):
         self.db_url_factory = db_url_factory
@@ -109,8 +110,9 @@ class TestingContext:
 
     def __enter__(self):
         base.PROVIDER_TESTING_ENV = self.provider_testing_env
+        self.saved_google_grace_period = base.DEFAULT_GOOGLE_GRACE_PERIOD
         if base.PROVIDER_TESTING_ENV:
-            base.DEFAULT_GOOGLE_GRACE_PERIOD = base.timedelta_from_ms(google_play.api.testing_grace_period_duration_ms)
+            base.DEFAULT_GOOGLE_GRACE_PERIOD = base.duration_from_ms(google_play.api.testing_grace_period_duration_ms)
 
         # Mint a fresh database on the ephemeral PostgreSQL cluster
         assert self.db_url_factory is not None
@@ -135,7 +137,7 @@ class TestingContext:
     ):
         self.db_engine.close()
         base.PROVIDER_TESTING_ENV = False
-        base.DEFAULT_GOOGLE_GRACE_PERIOD = base.DEFAULT_APPLE_GRACE_PERIOD
+        base.DEFAULT_GOOGLE_GRACE_PERIOD = self.saved_google_grace_period
         return False
 
     @contextlib.contextmanager
@@ -144,8 +146,92 @@ class TestingContext:
             yield conn
 
 
+def test_db_instants_are_pendulum_and_arithmetic_is_exact(pg_database):
+    # Postgres hands back timestamptz in the session's TimeZone, which is not UTC in general, so a loaded
+    # instant can carry a zone that has DST transitions. Adding a span to one must move real elapsed time.
+    with db.open_database(pg_database()) as pool, db.connection(pool) as conn:
+        conn.execute("CREATE TABLE t (ts timestamptz NOT NULL, iv interval NOT NULL)")
+        conn.execute("SET TIME ZONE 'America/Halifax'")  # spring-forward at 2026-03-08 02:00 local
+        conn.execute("INSERT INTO t VALUES ('2026-03-08 01:59:59-04', '1 hour')")
+        row = conn.execute("SELECT ts, iv FROM t").fetchone()
+        assert row is not None
+        loaded_at, grace = row
+
+        assert isinstance(loaded_at, pendulum.DateTime)
+        assert isinstance(grace, pendulum.Duration)
+        assert loaded_at.utcoffset() == -4 * base.HOUR  # the zone really is in effect, pre-transition
+
+        for span in (1 * base.DAY, 26 * base.HOUR, base.REVOCATION_EFFECTIVE_DELAY):
+            moved = loaded_at + span
+            elapsed = moved.astimezone(pendulum.UTC) - loaded_at.astimezone(pendulum.UTC)
+            assert elapsed.total_seconds() == span.total_seconds(), span
+
+        # And the wire conversions still work on a loaded instant (they divide by a Duration, which a
+        # stdlib timedelta divisor cannot do against pendulum's Interval). Same instant, written as UTC.
+        assert base.unix_seconds_from_datetime(loaded_at) == base.unix_seconds_from_datetime(
+            pendulum.datetime(2026, 3, 8, 5, 59, 59)
+        )
+
+
+def test_duration_constants_are_exact_spans():
+    # A Duration built from days= or larger is a CALENDAR step, and it is indistinguishable from an exact
+    # span by repr, by ==, or by .days/.seconds — only by adding it across a DST transition. So assert that
+    # property directly for every duration the codebase exports, whatever it was spelled as.
+    anchor = pendulum.datetime(2026, 3, 8, 1, 59, 59, tz='America/Halifax')  # 1s before spring-forward
+    shape = base.PROOF_EXPIRY_SHAPE
+    named: list[tuple[str, pendulum.Duration]] = [
+        (name, value)
+        for name, value in sorted(vars(base).items())
+        if isinstance(value, pendulum.Duration) and not name.startswith('_')
+    ]
+    named += [
+        (f'{shape_name}.{field}', getattr(shape_value, field))
+        for shape_name, shape_value in (
+            ('PROOF_EXPIRY_SHAPE', base.PROOF_EXPIRY_SHAPE),
+            ('PROVIDER_TESTING_PROOF_EXPIRY_SHAPE', base.PROVIDER_TESTING_PROOF_EXPIRY_SHAPE),
+        )
+        for field in ('clamp', 'renewal_lead', 'grid')
+    ]
+    named += [('PROOF_EXPIRY_SHAPE.max_proof_lifetime', shape.max_proof_lifetime)]
+    assert len(named) >= 10, named  # a rename must not silently empty this out
+
+    for name, span in named:
+        elapsed = (anchor + span).astimezone(pendulum.UTC) - anchor.astimezone(pendulum.UTC)
+        assert elapsed.total_seconds() == span.total_seconds(), f'{name} is a calendar step, not a span'
+
+
+def test_no_stdlib_datetime_arithmetic_in_source():
+    # Enforce what review cannot see: a calendar-denominated Duration is identical to an exact span by
+    # repr, by == and by .days/.seconds, so nothing but a scan catches one. The stdlib types are allowed
+    # only where a value is a naive local wall clock (log lines, backup filenames) or at the psycopg
+    # boundary that converts into pendulum.
+    #
+    # The needles are assembled from fragments so this scan does not match its own source.
+    stdlib_allowed = {'base.py', 'db.py'}
+    calendar_units = ('days', 'weeks', 'months', 'years')
+    banned_anywhere = [('duration(' + unit + '=', 'denominate in hours or smaller') for unit in calendar_units]
+    banned_outside_allowlist = [
+        ('datetime.' + 'timedelta', 'use a pendulum Duration'),
+        ('datetime.' + 'datetime', 'use pendulum.DateTime'),
+    ]
+    skip_dirs = {'vendor', '__pycache__', '.venv', '.git'}
+
+    violations: list[str] = []
+    for path in sorted(pathlib.Path('.').glob('**/*.py')):
+        if skip_dirs & set(path.parts):
+            continue
+        allowed = str(path) in stdlib_allowed
+        for lineno, line in enumerate(path.read_text().splitlines(), start=1):
+            code = line.split('#', 1)[0]
+            checks = banned_anywhere if allowed else banned_anywhere + banned_outside_allowlist
+            for needle, advice in checks:
+                if needle in code:
+                    violations.append(f'{path}:{lineno}: {needle} — {advice}')
+    assert not violations, 'stdlib datetime / calendar-duration usage:\n' + '\n'.join(violations)
+
+
 def test_dry_run_backup_rotation():
-    now = datetime.datetime(2025, 6, 1, 12, 0, 0)
+    now = pendulum.DateTime(2025, 6, 1, 12, 0, 0)
     files = [
         "/b/2025-05-30_100000_a.sql",
         "/b/2025-01-01_000000_b.sql",
@@ -566,7 +652,7 @@ def test_reconcile_pending_payments(pg_database):
 
     master = nacl.signing.SigningKey.generate()
     other = nacl.signing.SigningKey.generate()
-    now = base.round_datetime_to_next_day(datetime.datetime.now(datetime.timezone.utc))
+    now = base.round_datetime_to_next_day(base.utc_now())
 
     def seed_google(conn, master_vk):
         tx = base.PaymentProviderTransaction()
@@ -579,7 +665,7 @@ def test_reconcile_pending_payments(pg_database):
             payment_tx=tx,
             plan=base.ProPlan.OneMonth,
             purchased_at=now,
-            expires_at=now + datetime.timedelta(days=30),
+            expires_at=now + 30 * base.DAY,
             platform_refund_expires_at=base.EPOCH,
             platform_obfuscated_account_id=bytes(master_vk),
             err=err,
@@ -610,7 +696,7 @@ def test_generate_pro_proof_auto_redeems(pg_database):
     backend_key = nacl.signing.SigningKey.generate()
     master_key = nacl.signing.SigningKey.generate()
     rotating_key = nacl.signing.SigningKey.generate()
-    now = base.round_datetime_to_next_day(datetime.datetime.now(datetime.timezone.utc))
+    now = base.round_datetime_to_next_day(base.utc_now())
 
     with db.connection(pool) as conn:
         # A mule-registered, unredeemed Google payment bound to the master key.
@@ -624,7 +710,7 @@ def test_generate_pro_proof_auto_redeems(pg_database):
             payment_tx=seed_tx,
             plan=base.ProPlan.OneMonth,
             purchased_at=now,
-            expires_at=now + datetime.timedelta(days=30),
+            expires_at=now + 30 * base.DAY,
             platform_refund_expires_at=base.EPOCH,
             platform_obfuscated_account_id=bytes(master_key.verify_key),
             err=err,
@@ -660,7 +746,7 @@ def test_grant_rangeproof(pg_database):
     backend_key = nacl.signing.SigningKey.generate()
     master_key = nacl.signing.SigningKey.generate()
     rotating_key = nacl.signing.SigningKey.generate()
-    now = base.round_datetime_to_next_day(datetime.datetime.now(datetime.timezone.utc))
+    now = base.round_datetime_to_next_day(base.utc_now())
 
     with db.connection(pool) as conn:
         assert not backend.get_user(conn, master_key.verify_key).found
@@ -672,7 +758,7 @@ def test_grant_rangeproof(pg_database):
             request_at=now,
             redeemed_at=now,
             plan=base.ProPlan.OneMonth,
-            expires_at=now + datetime.timedelta(days=30),
+            expires_at=now + 30 * base.DAY,
         )
         # The proof verifies against the backend key, and the key is now an entitled user.
         proof_hash = backend.build_proof_message(proof.revocation_tag, proof.rotating_pkey, proof.expires_at)
@@ -690,8 +776,8 @@ def test_proof_reports_account_expiry(pg_database):
     backend_key = nacl.signing.SigningKey.generate()
     master_key = nacl.signing.SigningKey.generate()
     rotating_key = nacl.signing.SigningKey.generate()
-    now = base.round_datetime_to_next_day(datetime.datetime.now(datetime.timezone.utc))
-    account_expiry = now + datetime.timedelta(days=365)
+    now = base.round_datetime_to_next_day(base.utc_now())
+    account_expiry = now + 365 * base.DAY
 
     with db.connection(pool) as conn:
         proof = backend.grant_rangeproof(
@@ -734,8 +820,8 @@ def test_expired_proof_fail_carries_account_expiry(pg_database):
     backend_key = nacl.signing.SigningKey.generate()
     master_key = nacl.signing.SigningKey.generate()
     rotating_key = nacl.signing.SigningKey.generate()
-    granted_at = base.round_datetime_to_next_day(datetime.datetime.now(datetime.timezone.utc))
-    account_expiry = granted_at + datetime.timedelta(hours=1)
+    granted_at = base.round_datetime_to_next_day(base.utc_now())
+    account_expiry = granted_at + pendulum.duration(hours=1)
 
     with db.connection(pool) as conn:
         # Grant a short entitlement (valid at grant time).
@@ -801,18 +887,13 @@ def test_proof_expiry_offset_is_random_per_account_and_per_cycle(pg_database):
     assert pool
     backend_key = nacl.signing.SigningKey.generate()
     rotating_key = nacl.signing.SigningKey.generate()
-    now = datetime.datetime.now(datetime.timezone.utc)
+    now = base.utc_now()
     shape = base.proof_expiry_shape()
 
     with db.connection(pool) as conn:
         across_accounts = [
             _grant_and_get_offset(
-                conn,
-                backend_key,
-                nacl.signing.SigningKey.generate(),
-                rotating_key,
-                now,
-                now + datetime.timedelta(days=30),
+                conn, backend_key, nacl.signing.SigningKey.generate(), rotating_key, now, now + 30 * base.DAY
             )
             for _ in range(24)
         ]
@@ -823,9 +904,7 @@ def test_proof_expiry_offset_is_random_per_account_and_per_cycle(pg_database):
         # and so re-draws the offset.
         master_key = nacl.signing.SigningKey.generate()
         across_cycles = [
-            _grant_and_get_offset(
-                conn, backend_key, master_key, rotating_key, now, now + datetime.timedelta(days=30 + cycle)
-            )
+            _grant_and_get_offset(conn, backend_key, master_key, rotating_key, now, now + (30 + cycle) * base.DAY)
             for cycle in range(24)
         ]
         assert all(0 <= offset < shape.offset_range for offset in across_cycles)
@@ -844,20 +923,14 @@ def test_proof_is_identical_for_requests_in_the_same_grid_period(pg_database):
     backend_key = nacl.signing.SigningKey.generate()
     master_key = nacl.signing.SigningKey.generate()
     rotating_key = nacl.signing.SigningKey.generate()
-    now = datetime.datetime.now(datetime.timezone.utc)
+    now = base.utc_now()
     shape = base.proof_expiry_shape()
 
     with db.connection(pool) as conn:
         # A year-long plan, so every request below sits in the sliding arm where the expiry would otherwise
         # track the request instant -- the arm the grid has to collapse.
         offset = _grant_and_get_offset(
-            conn,
-            backend_key,
-            master_key,
-            rotating_key,
-            now,
-            now + datetime.timedelta(days=365),
-            plan=base.ProPlan.TwelveMonth,
+            conn, backend_key, master_key, rotating_key, now, now + 365 * base.DAY, plan=base.ProPlan.TwelveMonth
         )
         # Aim at the grid point one period past the nearest one, so `first_at` is safely after the grant
         # whatever the drawn offset, and 5 minutes below the boundary so none of the requests straddle it.
@@ -867,11 +940,11 @@ def test_proof_is_identical_for_requests_in_the_same_grid_period(pg_database):
             )
             + shape.grid
         )
-        first_at = target - shape.clamp - shape.renewal_lead - datetime.timedelta(minutes=5)
+        first_at = target - shape.clamp - shape.renewal_lead - pendulum.duration(minutes=5)
         assert first_at > now
 
         proofs = [
-            _prove_at(conn, backend_key, master_key, rotating_key, first_at + datetime.timedelta(seconds=delay))
+            _prove_at(conn, backend_key, master_key, rotating_key, first_at + pendulum.duration(seconds=delay))
             for delay in (0, 1, 7, 59, 299)
         ]
         assert proofs[0].expires_at == target
@@ -882,7 +955,7 @@ def test_proof_is_identical_for_requests_in_the_same_grid_period(pg_database):
         # The last instant that still maps here agrees too; one second later steps by exactly one period.
         latest = target - shape.clamp - shape.renewal_lead
         assert _prove_at(conn, backend_key, master_key, rotating_key, latest).to_dict() == proofs[0].to_dict()
-        stepped = _prove_at(conn, backend_key, master_key, rotating_key, latest + datetime.timedelta(seconds=1))
+        stepped = _prove_at(conn, backend_key, master_key, rotating_key, latest + pendulum.duration(seconds=1))
         assert stepped.expires_at == target + shape.grid
 
         # The grid belongs to the ACCOUNT, not to a key: a different rotating key gets the same expiry, just
@@ -908,12 +981,10 @@ def test_proof_expiry_offset_redraws_only_when_true_expiry_moves(monkeypatch, pg
     backend_key = nacl.signing.SigningKey.generate()
     master_key = nacl.signing.SigningKey.generate()
     rotating_key = nacl.signing.SigningKey.generate()
-    now = datetime.datetime.now(datetime.timezone.utc)
+    now = base.utc_now()
 
     with db.connection(pool) as conn:
-        offset = _grant_and_get_offset(
-            conn, backend_key, master_key, rotating_key, now, now + datetime.timedelta(days=30)
-        )
+        offset = _grant_and_get_offset(conn, backend_key, master_key, rotating_key, now, now + 30 * base.DAY)
 
         # A refresh from the same payment list recomputes the same expiry -> the offset must NOT move. Called
         # directly because it IS the clause under test: both writers of users.expires_at share it, and going
@@ -930,7 +1001,7 @@ def test_proof_expiry_offset_redraws_only_when_true_expiry_moves(monkeypatch, pg
             request_at=now,
             redeemed_at=now,
             plan=base.ProPlan.OneMonth,
-            expires_at=now + datetime.timedelta(days=60),
+            expires_at=now + 60 * base.DAY,
         )
         assert backend.get_user(conn, master_key.verify_key).proof_expiry_offset != offset
     pool.close()
@@ -945,46 +1016,40 @@ def test_proof_expiry_lands_on_the_account_grid(pg_database):
     assert pool
     backend_key = nacl.signing.SigningKey.generate()
     rotating_key = nacl.signing.SigningKey.generate()
-    now = datetime.datetime.now(datetime.timezone.utc)
+    now = base.utc_now()
     shape = base.proof_expiry_shape()
 
     with db.connection(pool) as conn:
         # Sliding arm: a year-long plan, so the `min` always takes the clamp.
         sliding_key = nacl.signing.SigningKey.generate()
         offset = _grant_and_get_offset(
-            conn,
-            backend_key,
-            sliding_key,
-            rotating_key,
-            now,
-            now + datetime.timedelta(days=365),
-            plan=base.ProPlan.TwelveMonth,
+            conn, backend_key, sliding_key, rotating_key, now, now + 365 * base.DAY, plan=base.ProPlan.TwelveMonth
         )
         expiry = base.round_datetime_up_onto_offset_grid(
             now + shape.clamp + shape.renewal_lead, period=shape.grid, offset_seconds=offset
         )
         assert _prove_at(conn, backend_key, sliding_key, rotating_key, now).expires_at == expiry
         # On the grid, hence an exact whole second (nothing sub-second reaches the signed message).
-        assert (expiry - base.EPOCH) % shape.grid == datetime.timedelta(seconds=offset)
+        assert (expiry - base.EPOCH) % shape.grid == pendulum.duration(seconds=offset)
 
         # Every request up to the last instant that still maps here agrees; one second later steps by
         # exactly one period.
         latest = expiry - shape.clamp - shape.renewal_lead
         assert latest >= now
         assert _prove_at(conn, backend_key, sliding_key, rotating_key, latest).expires_at == expiry
-        stepped = _prove_at(conn, backend_key, sliding_key, rotating_key, latest + datetime.timedelta(seconds=1))
+        stepped = _prove_at(conn, backend_key, sliding_key, rotating_key, latest + pendulum.duration(seconds=1))
         assert stepped.expires_at == expiry + shape.grid
 
         # Pinned arm: an entitlement inside the clamp, so the `min` takes the true expiry and the expiry
         # stops moving with the request entirely -- the same value however long the client waits.
         pinned_key = nacl.signing.SigningKey.generate()
-        true_expiry = now + datetime.timedelta(days=5)
+        true_expiry = now + 5 * base.DAY
         pinned_offset = _grant_and_get_offset(conn, backend_key, pinned_key, rotating_key, now, true_expiry)
         pinned = base.round_datetime_up_onto_offset_grid(
             true_expiry + shape.renewal_lead, period=shape.grid, offset_seconds=pinned_offset
         )
         assert _prove_at(conn, backend_key, pinned_key, rotating_key, now).expires_at == pinned
-        later = _prove_at(conn, backend_key, pinned_key, rotating_key, now + datetime.timedelta(hours=13))
+        later = _prove_at(conn, backend_key, pinned_key, rotating_key, now + pendulum.duration(hours=13))
         assert later.expires_at == pinned
         # The over-provision is bounded by the lead plus one period, and never rounds an expiry DOWN (which
         # would advertise an end before the entitlement's, with the renewal payment possibly not yet in).
@@ -1002,8 +1067,8 @@ def test_lapsed_account_keeps_proofs_through_the_over_provision(pg_database):
     backend_key = nacl.signing.SigningKey.generate()
     master_key = nacl.signing.SigningKey.generate()
     rotating_key = nacl.signing.SigningKey.generate()
-    now = datetime.datetime.now(datetime.timezone.utc)
-    true_expiry = now + datetime.timedelta(hours=1)
+    now = base.utc_now()
+    true_expiry = now + pendulum.duration(hours=1)
     shape = base.proof_expiry_shape()
 
     with db.connection(pool) as conn:
@@ -1014,7 +1079,7 @@ def test_lapsed_account_keeps_proofs_through_the_over_provision(pg_database):
         assert expiry > true_expiry
 
         # Past the true expiry but inside the over-provision: still served, and the expiry has not budged.
-        lapsed = _prove_at(conn, backend_key, master_key, rotating_key, true_expiry + datetime.timedelta(minutes=30))
+        lapsed = _prove_at(conn, backend_key, master_key, rotating_key, true_expiry + pendulum.duration(minutes=30))
         assert lapsed.expires_at == expiry
         # account_expiry_ts reads back the proof's expiry here (it is the later of the two), so the client is
         # never told its subscription ended while a proof we signed still verifies.
@@ -1023,7 +1088,7 @@ def test_lapsed_account_keeps_proofs_through_the_over_provision(pg_database):
 
         # Spent: now it lapses, reporting the TRUE expiry and never the over-provisioned one.
         with pytest.raises(base.FailError) as excinfo:
-            _prove_at(conn, backend_key, master_key, rotating_key, expiry + datetime.timedelta(seconds=1))
+            _prove_at(conn, backend_key, master_key, rotating_key, expiry + pendulum.duration(seconds=1))
         assert excinfo.value.code == base.ErrorCode.subscription_expired
         assert excinfo.value.data == {'account_expiry_ts': base.unix_seconds_from_datetime(true_expiry)}
     pool.close()
@@ -1040,9 +1105,9 @@ def test_revocation_effective_ts_is_anchored_to_processing_time(monkeypatch, pg_
     assert pool
     err = base.ErrorSink()
     master_key = nacl.signing.SigningKey.generate()
-    recorded_at = datetime.datetime.now(datetime.timezone.utc)
+    recorded_at = base.utc_now()
     monkeypatch.setattr(base, 'utc_now', lambda: recorded_at)
-    stale_revoke_at = recorded_at - datetime.timedelta(days=5)  # as if we had been down for five days
+    stale_revoke_at = recorded_at - 5 * base.DAY  # as if we had been down for five days
 
     def seed_google(conn, expires_at):
         tx = base.PaymentProviderTransaction()
@@ -1065,8 +1130,8 @@ def test_revocation_effective_ts_is_anchored_to_processing_time(monkeypatch, pg_
     with db.connection(pool) as conn:
         # Two payments so a surviving one keeps the account entitled: the refunded (longer) one is what a
         # live proof would have been clamped to, so revoking it really does need broadcasting.
-        seed_google(conn, recorded_at + datetime.timedelta(days=3))
-        refunded = seed_google(conn, recorded_at + datetime.timedelta(days=40))
+        seed_google(conn, recorded_at + 3 * base.DAY)
+        refunded = seed_google(conn, recorded_at + 40 * base.DAY)
         assert backend.reconcile_pending_payments(conn, master_key.verify_key, redeemed_at=recorded_at) == 2
 
         with db.transaction(conn) as tx:
@@ -1107,7 +1172,7 @@ def test_renewal_binds_by_identifier_not_account_id(pg_database):
     assert pool
     owner = nacl.signing.SigningKey.generate()  # the payment's stored account-id
     binder = nacl.signing.SigningKey.generate()  # who we actually bind it to
-    now = base.round_datetime_to_next_day(datetime.datetime.now(datetime.timezone.utc))
+    now = base.round_datetime_to_next_day(base.utc_now())
 
     def seed_google(conn, account_id_key):
         tx = base.PaymentProviderTransaction()
@@ -1120,7 +1185,7 @@ def test_renewal_binds_by_identifier_not_account_id(pg_database):
             payment_tx=tx,
             plan=base.ProPlan.OneMonth,
             purchased_at=now,
-            expires_at=now + datetime.timedelta(days=30),
+            expires_at=now + 30 * base.DAY,
             platform_refund_expires_at=base.EPOCH,
             platform_obfuscated_account_id=bytes(account_id_key.verify_key),
             err=err,
@@ -1223,7 +1288,7 @@ def test_stale_revocation_is_not_served(pg_database):
     pool = backend.bootstrap_db(database_url=pg_database())
     assert pool
 
-    RETAIN_FOR = base.seconds_from_timedelta(base.REVOCATION_RETAIN_FOR)
+    RETAIN_FOR = base.seconds_from_duration(base.REVOCATION_RETAIN_FOR)
     now = base.datetime_from_unix_seconds(1_700_000_000)
     master_pkey = nacl.signing.SigningKey.generate().verify_key
     with db.connection(pool) as conn:
@@ -1238,13 +1303,13 @@ def test_stale_revocation_is_not_served(pg_database):
             db.query(
                 tx.conn,
                 "UPDATE generations SET revoked_at = %s WHERE id = %s",
-                now - datetime.timedelta(seconds=1),
+                now - pendulum.duration(seconds=1),
                 gen_recent,
             )
             db.query(
                 tx.conn,
                 "UPDATE generations SET revoked_at = %s WHERE id = %s",
-                now - datetime.timedelta(seconds=RETAIN_FOR + 1),
+                now - pendulum.duration(seconds=RETAIN_FOR + 1),
                 gen_stale,
             )
 
@@ -1253,7 +1318,7 @@ def test_stale_revocation_is_not_served(pg_database):
         assert backend.is_generation_revoked(conn, gen_stale, now) is True
 
         # The served list applies the retention window: recent is in, stale is filtered out.
-        retain_cutoff = now - datetime.timedelta(seconds=RETAIN_FOR)
+        retain_cutoff = now - pendulum.duration(seconds=RETAIN_FOR)
         with db.transaction(conn) as tx:
             served = {
                 bytes(row[0])
@@ -1300,7 +1365,7 @@ def test_provider_dry_run_redeems_google_without_egress(monkeypatch, pg_database
     backend_key = nacl.signing.SigningKey.generate()
     master_key = nacl.signing.SigningKey.generate()
     rotating_key = nacl.signing.SigningKey.generate()
-    now = datetime.datetime.now(datetime.timezone.utc)
+    now = base.utc_now()
     redeemed_at = base.round_datetime_to_next_day(now)
 
     db_conn = db_engine.getconn()
@@ -1315,7 +1380,7 @@ def test_provider_dry_run_redeems_google_without_egress(monkeypatch, pg_database
             payment_tx=seed_tx,
             plan=base.ProPlan.OneMonth,
             purchased_at=now,
-            expires_at=redeemed_at + datetime.timedelta(days=30),
+            expires_at=redeemed_at + 30 * base.DAY,
             platform_refund_expires_at=base.EPOCH,
             platform_obfuscated_account_id=bytes(master_key.verify_key),
             err=err,
@@ -1352,8 +1417,8 @@ def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_d
     backend_key: nacl.signing.SigningKey = nacl.signing.SigningKey.generate()
     master_key: nacl.signing.SigningKey = nacl.signing.SigningKey.generate()
     rotating_key: nacl.signing.SigningKey = nacl.signing.SigningKey.generate()
-    now: datetime.datetime = datetime.datetime.now(datetime.timezone.utc)
-    redeemed_at: datetime.datetime = base.round_datetime_to_next_day(now)
+    now: pendulum.DateTime = base.utc_now()
+    redeemed_at: pendulum.DateTime = base.round_datetime_to_next_day(now)
 
     @dataclasses.dataclass
     class Scenario:
@@ -1362,24 +1427,24 @@ def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_d
         plan: base.ProPlan = base.ProPlan.Nil
         proof: backend.ProSubscriptionProof = dataclasses.field(default_factory=backend.ProSubscriptionProof)
         payment_provider: base.PaymentProvider = base.PaymentProvider.Nil
-        expires_at: datetime.datetime = base.EPOCH
-        grace_period: datetime.timedelta = datetime.timedelta(0)
+        expires_at: pendulum.DateTime = base.EPOCH
+        grace_period: pendulum.Duration = pendulum.duration()
 
     scenarios: list[Scenario] = [
         Scenario(
             google_payment_token=os.urandom(backend.BLAKE2B_DIGEST_SIZE).hex(),
             google_order_id='DEV.' + os.urandom(backend.BLAKE2B_DIGEST_SIZE).hex(),
             plan=base.ProPlan.OneMonth,
-            expires_at=redeemed_at + datetime.timedelta(days=30),
-            grace_period=datetime.timedelta(0),
+            expires_at=redeemed_at + 30 * base.DAY,
+            grace_period=pendulum.duration(),
             payment_provider=base.PaymentProvider.GooglePlayStore,
         ),
         Scenario(
             google_payment_token=os.urandom(backend.BLAKE2B_DIGEST_SIZE).hex(),
             google_order_id='DEV.' + os.urandom(backend.BLAKE2B_DIGEST_SIZE).hex(),
             plan=base.ProPlan.TwelveMonth,
-            expires_at=redeemed_at + datetime.timedelta(days=31),
-            grace_period=datetime.timedelta(0),
+            expires_at=redeemed_at + 31 * base.DAY,
+            grace_period=pendulum.duration(),
             payment_provider=base.PaymentProvider.GooglePlayStore,
         ),
     ]
@@ -1506,7 +1571,7 @@ def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_d
     payment_tx.provider = scenarios[1].payment_provider
     payment_tx.google_payment_token = scenarios[1].google_payment_token
     payment_tx.google_order_id = scenarios[1].google_order_id
-    new_grace_period = datetime.timedelta(milliseconds=10000)
+    new_grace_period = pendulum.duration(milliseconds=10000)
     updated: bool = backend.update_payment_renewal_info(
         db_conn, payment_tx=payment_tx, grace_period=new_grace_period, auto_renewing=False, err=err
     )
@@ -1571,16 +1636,16 @@ def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_d
             google_payment_token=auto_redeem_google_payment_token,
             google_order_id='DEV.' + os.urandom(backend.BLAKE2B_DIGEST_SIZE).hex(),
             plan=base.ProPlan.OneMonth,
-            expires_at=redeemed_at + datetime.timedelta(days=30),
-            grace_period=datetime.timedelta(0),
+            expires_at=redeemed_at + 30 * base.DAY,
+            grace_period=pendulum.duration(),
             payment_provider=base.PaymentProvider.GooglePlayStore,
         ),
         Scenario(
             google_payment_token=auto_redeem_google_payment_token,
             google_order_id='DEV.' + os.urandom(backend.BLAKE2B_DIGEST_SIZE).hex(),
             plan=base.ProPlan.TwelveMonth,
-            expires_at=redeemed_at + datetime.timedelta(days=31),
-            grace_period=datetime.timedelta(0),
+            expires_at=redeemed_at + 31 * base.DAY,
+            grace_period=pendulum.duration(),
             payment_provider=base.PaymentProvider.GooglePlayStore,
         ),
     ]
@@ -1686,12 +1751,12 @@ def test_revocation_cutting_refund_rolls_generation(monkeypatch, pg_database):
     backend_key = nacl.signing.SigningKey.generate()
     master_key = nacl.signing.SigningKey.generate()
     rotating_key = nacl.signing.SigningKey.generate()
-    now = datetime.datetime.now(datetime.timezone.utc)
+    now = base.utc_now()
     redeemed_at = base.round_datetime_to_next_day(now)
 
     db_conn = db_engine.getconn()
 
-    def seed_and_redeem(expires_at: datetime.datetime) -> str:
+    def seed_and_redeem(expires_at: pendulum.DateTime) -> str:
         seed_tx = base.PaymentProviderTransaction()
         seed_tx.provider = base.PaymentProvider.GooglePlayStore
         seed_tx.google_payment_token = os.urandom(backend.BLAKE2B_DIGEST_SIZE).hex()
@@ -1712,8 +1777,8 @@ def test_revocation_cutting_refund_rolls_generation(monkeypatch, pg_database):
     try:
         # Two stacked payments on one shared generation: a long one we will refund and a short
         # survivor that leaves only ~5 days of entitlement — less than the ~30-day reach of a live proof.
-        long_token = seed_and_redeem(redeemed_at + datetime.timedelta(days=90))
-        seed_and_redeem(redeemed_at + datetime.timedelta(days=5))
+        long_token = seed_and_redeem(redeemed_at + 90 * base.DAY)
+        seed_and_redeem(redeemed_at + 5 * base.DAY)
 
         with db.transaction(db_conn) as tx:
             user_before = backend.get_user_and_payments(tx, master_key.verify_key).user
@@ -1751,11 +1816,11 @@ def test_apple_refund_reversal_reinstates_and_rolls_generation(pg_database):
     backend_key = nacl.signing.SigningKey.generate()
     master_key = nacl.signing.SigningKey.generate()
     rotating_key = nacl.signing.SigningKey.generate()
-    now = datetime.datetime.now(datetime.timezone.utc)
+    now = base.utc_now()
     redeemed_at = base.round_datetime_to_next_day(now)
     original_tx = os.urandom(8).hex()
     tx_id = os.urandom(8).hex()
-    expires_at = redeemed_at + datetime.timedelta(days=90)
+    expires_at = redeemed_at + 90 * base.DAY
 
     db_conn = db_engine.getconn()
     try:
@@ -1836,7 +1901,7 @@ def test_payment_binding_rejects_mismatched_master_key(pg_database):
     assert db_engine
     owner = nacl.signing.SigningKey.generate()
     attacker = nacl.signing.SigningKey.generate()
-    now = datetime.datetime.now(datetime.timezone.utc)
+    now = base.utc_now()
     redeemed_at = base.round_datetime_to_next_day(now)
 
     db_conn = db_engine.getconn()
@@ -1849,7 +1914,7 @@ def test_payment_binding_rejects_mismatched_master_key(pg_database):
                 payment_tx=seed_tx,
                 plan=base.ProPlan.OneMonth,
                 purchased_at=now,
-                expires_at=redeemed_at + datetime.timedelta(days=30),
+                expires_at=redeemed_at + 30 * base.DAY,
                 platform_refund_expires_at=base.EPOCH,
                 platform_obfuscated_account_id=owner_tag,
                 err=err,
@@ -1941,7 +2006,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
         payment_tx=payment_tx,
         plan=base.ProPlan.OneMonth,
         purchased_at=request_at,
-        expires_at=next_day_at + datetime.timedelta(days=90),
+        expires_at=next_day_at + 90 * base.DAY,
         platform_refund_expires_at=base.EPOCH,
         platform_obfuscated_account_id=bytes(master_key.verify_key),
         err=err,
@@ -2163,7 +2228,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
         payment_tx=new_payment_tx,
         plan=base.ProPlan.OneMonth,
         purchased_at=request_at,
-        expires_at=request_at + datetime.timedelta(days=30),
+        expires_at=request_at + 30 * base.DAY,
         platform_refund_expires_at=base.EPOCH,
         platform_obfuscated_account_id=bytes(master_key.verify_key),
         err=err,
@@ -2275,7 +2340,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
     result_retry_in = base.json_dict_require_int(d=result_json, key='retry_in', err=err)
     assert not err.msg_list, '{err.msg_list}'
     assert result_ticket == 0
-    assert result_retry_in == base.SECONDS_IN_DAY
+    assert result_retry_in == base.seconds_from_duration(base.REVOCATION_POLL_INTERVAL)
     curr_revocation_ticket = result_ticket
 
     # Check that the server returned an empty revocation list, we no longer revoke the old
@@ -2342,8 +2407,8 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
     assert not err.msg_list, '{err.msg_list}'
     # The non-cutting refund produced NO revocation entry, so the ticket is unchanged.
     assert result_ticket == 0
-    assert result_retry_in == base.SECONDS_IN_DAY
-    assert result_retain_for == base.seconds_from_timedelta(base.REVOCATION_RETAIN_FOR)
+    assert result_retry_in == base.seconds_from_duration(base.REVOCATION_POLL_INTERVAL)
+    assert result_retain_for == base.seconds_from_duration(base.REVOCATION_RETAIN_FOR)
     curr_revocation_ticket = result_ticket
     assert not result_items
 
@@ -2392,8 +2457,8 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
     assert not err.msg_list, '{err.msg_list}'
     # The non-cutting refund above created no revocation entry, so the ticket is still 0.
     assert result_ticket == 0, f'Response was: {json.dumps(response_json, indent=2)}'
-    assert result_retry_in == base.SECONDS_IN_DAY
-    assert result_retain_for == base.seconds_from_timedelta(base.REVOCATION_RETAIN_FOR)
+    assert result_retry_in == base.seconds_from_duration(base.REVOCATION_POLL_INTERVAL)
+    assert result_retain_for == base.seconds_from_duration(base.REVOCATION_RETAIN_FOR)
 
     # List should be empty because we passed in the newest revocation
     # ticket. There are no changes to the revocation list so the backend
@@ -2587,7 +2652,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
     # NOTE: Verify that there is no grace period set first
     with db.transaction(db_conn) as tx:
         get_user = backend.get_user_and_payments(tx, master_key.verify_key)
-        assert get_user.user.grace_period == datetime.timedelta(0)
+        assert get_user.user.grace_period == pendulum.duration()
 
     # NOTE: Grab the latest expiring payment so that we have access to the payment details
     last_payment = backend.PaymentRow()
@@ -2604,7 +2669,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
     payment_tx.google_payment_token = last_payment.google_payment_token
     payment_tx.google_order_id = last_payment.google_order_id
     backend.update_payment_renewal_info(
-        db_conn, payment_tx, grace_period=base.timedelta_from_ms(10 * 1000), auto_renewing=True, err=err
+        db_conn, payment_tx, grace_period=base.duration_from_ms(10 * 1000), auto_renewing=True, err=err
     )
     assert not err.has()
 
@@ -2612,7 +2677,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
     pro_proof_deadline_unix_ts_ms = 0
     with db.transaction(db_conn) as tx:
         get_user = backend.get_user_and_payments(tx, master_key.verify_key)
-        assert get_user.user.grace_period > datetime.timedelta(0)
+        assert get_user.user.grace_period > pendulum.duration()
         pro_proof_deadline_unix_ts_ms = base.unix_ms_from_datetime(get_user.user.expires_at)
 
     # NOTE: Try to generate a proof on the deadline timestamp (which includes grace), should be permitted
@@ -2640,7 +2705,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
     # NOTE: Generating a proof once the deadline AND the proof over-provision are both spent must fail —
     # entitlement expired → FailError. The over-provision (renewal lead + the account's offset, ≤ ~25 h) is
     # what a proof issued at the deadline already certifies, so we honour re-fetches until it runs out.
-    unix_ts_ms = pro_proof_deadline_unix_ts_ms + base.ms_from_timedelta(base.proof_expiry_shape().max_proof_lifetime)
+    unix_ts_ms = pro_proof_deadline_unix_ts_ms + base.ms_from_duration(base.proof_expiry_shape().max_proof_lifetime)
     hash_to_sign = backend.make_generate_pro_proof_message(
         master_pkey=master_key.verify_key,
         rotating_pkey=rotating_key.verify_key,
@@ -2878,15 +2943,15 @@ def test_apple_grace_period_stores_duration_not_absolute_date(pg_database):
 
             decoded = app_store.DecodedNotification(body=body, tx_info=tx_info, renewal_info=renewal_info)
             handled = app_store.handle_notification(
-                decoded_notification=decoded, conn=conn, notification_retry_duration=datetime.timedelta(0), err=err
+                decoded_notification=decoded, conn=conn, notification_retry_duration=pendulum.duration(), err=err
             )
             assert not err.has(), err.msg_list
             assert handled
 
-            # Then the stored value is the grace DURATION (timedelta), not the absolute date,
+            # Then the stored value is the grace DURATION, not the absolute date,
             payment_list = backend.get_payments_list(conn)
             assert len(payment_list) == 1
-            assert payment_list[0].grace_period == base.timedelta_from_ms(grace_len_ms)
+            assert payment_list[0].grace_period == base.duration_from_ms(grace_len_ms)
             # and `expiry + grace` resolves to exactly gracePeriodExpiresDate (the absolute instant).
             assert payment_list[0].expires_at + payment_list[0].grace_period == base.datetime_from_unix_ms(
                 renewal_info.gracePeriodExpiresDate
@@ -3008,7 +3073,7 @@ def test_platform_apple(pg_database):
         err = base.ErrorSink()
         with test.connection() as conn:
             app_store.handle_notification(
-                decoded_notification=notification, conn=conn, notification_retry_duration=datetime.timedelta(0), err=err
+                decoded_notification=notification, conn=conn, notification_retry_duration=pendulum.duration(), err=err
             )
             assert not err.has(), err.msg_list
 
@@ -3147,7 +3212,7 @@ def test_platform_apple(pg_database):
             app_store.handle_notification(
                 decoded_notification=decoded_notification,
                 conn=conn,
-                notification_retry_duration=datetime.timedelta(0),
+                notification_retry_duration=pendulum.duration(),
                 err=err,
             )
             assert not err.has(), err.msg_list
@@ -3273,7 +3338,7 @@ def test_platform_apple(pg_database):
             app_store.handle_notification(
                 decoded_notification=decoded_notification,
                 conn=conn,
-                notification_retry_duration=datetime.timedelta(0),
+                notification_retry_duration=pendulum.duration(),
                 err=err,
             )
             assert not err.has(), err.msg_list
@@ -3399,7 +3464,7 @@ def test_platform_apple(pg_database):
             app_store.handle_notification(
                 decoded_notification=decoded_notification,
                 conn=conn,
-                notification_retry_duration=datetime.timedelta(0),
+                notification_retry_duration=pendulum.duration(),
                 err=err,
             )
             assert not err.has(), err.msg_list
@@ -3427,7 +3492,7 @@ def test_platform_apple(pg_database):
         # NOTE: Now expire the payment
         with test.connection() as conn:
             backend.expire_payments_revocations_and_users(
-                conn=conn, now=payment_list[0].expires_at + datetime.timedelta(milliseconds=1)
+                conn=conn, now=payment_list[0].expires_at + pendulum.duration(milliseconds=1)
             )
 
             # NOTE: Now check that the payments were marked expired
@@ -4167,7 +4232,7 @@ def test_platform_apple(pg_database):
             app_store.handle_notification(
                 decoded_notification=e00_sub_to_3_months_decoded_notification,
                 conn=conn,
-                notification_retry_duration=datetime.timedelta(0),
+                notification_retry_duration=pendulum.duration(),
                 err=err,
             )
             assert not err.has(), err.msg_list
@@ -4232,7 +4297,7 @@ def test_platform_apple(pg_database):
             app_store.handle_notification(
                 decoded_notification=e01_upgrade_to_1wk_decoded_notification,
                 conn=conn,
-                notification_retry_duration=datetime.timedelta(0),
+                notification_retry_duration=pendulum.duration(),
                 err=err,
             )
             assert not err.has(), err.msg_list
@@ -4303,7 +4368,7 @@ def test_platform_apple(pg_database):
             app_store.handle_notification(
                 decoded_notification=e02_disable_auto_renew_decoded_notification,
                 conn=conn,
-                notification_retry_duration=datetime.timedelta(0),
+                notification_retry_duration=pendulum.duration(),
                 err=err,
             )
             assert not err.has(), err.msg_list
@@ -4319,7 +4384,7 @@ def test_platform_apple(pg_database):
             app_store.handle_notification(
                 decoded_notification=e03_queue_downgrade_to_3_months_decoded_notification,
                 conn=conn,
-                notification_retry_duration=datetime.timedelta(0),
+                notification_retry_duration=pendulum.duration(),
                 err=err,
             )
             assert not err.has(), err.msg_list
@@ -4360,7 +4425,7 @@ def test_platform_apple(pg_database):
             app_store.handle_notification(
                 decoded_notification=e04_cancel_downgrade_to_3_months_decoded_notification,
                 conn=conn,
-                notification_retry_duration=datetime.timedelta(0),
+                notification_retry_duration=pendulum.duration(),
                 err=err,
             )
             assert not err.has(), err.msg_list
@@ -4415,7 +4480,7 @@ def test_platform_apple(pg_database):
             app_store.handle_notification(
                 decoded_notification=e05_disable_auto_renew_decoded_notification,
                 conn=conn,
-                notification_retry_duration=datetime.timedelta(0),
+                notification_retry_duration=pendulum.duration(),
                 err=err,
             )
             assert not err.has(), err.msg_list
@@ -4430,7 +4495,7 @@ def test_platform_apple(pg_database):
             app_store.handle_notification(
                 decoded_notification=e06_expire_voluntary_decoded_notification,
                 conn=conn,
-                notification_retry_duration=datetime.timedelta(0),
+                notification_retry_duration=pendulum.duration(),
                 err=err,
             )
             assert not err.has(), err.msg_list
@@ -4581,7 +4646,7 @@ def test_platform_apple(pg_database):
             app_store.handle_notification(
                 decoded_notification=e00_sub_to_3_months_decoded_notification,
                 conn=conn,
-                notification_retry_duration=datetime.timedelta(0),
+                notification_retry_duration=pendulum.duration(),
                 err=err,
             )
             assert not err.has(), err.msg_list
@@ -4689,7 +4754,7 @@ def test_platform_apple(pg_database):
             app_store.handle_notification(
                 decoded_notification=e01_consumption_req_decoded_notification,
                 conn=conn,
-                notification_retry_duration=datetime.timedelta(0),
+                notification_retry_duration=pendulum.duration(),
                 err=err,
             )
             assert not err.has(), err.msg_list
@@ -4795,7 +4860,7 @@ def test_platform_apple(pg_database):
             app_store.handle_notification(
                 decoded_notification=e02_apple_refund_decoded_notification,
                 conn=conn,
-                notification_retry_duration=datetime.timedelta(0),
+                notification_retry_duration=pendulum.duration(),
                 err=err,
             )
             assert not err.has(), err.msg_list
@@ -4995,7 +5060,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
                     assert unredeemed_payment.payment_provider == base.PaymentProvider.GooglePlayStore
                     assert unredeemed_payment.redeemed_at is None
                     assert unredeemed_payment.expires_at == base.datetime_from_unix_ms(tx.expires_at)
-                    assert unredeemed_payment.grace_period == datetime.timedelta(0)
+                    assert unredeemed_payment.grace_period == pendulum.duration()
                     assert unredeemed_payment.platform_refund_expires_at == base.datetime_from_unix_ms(
                         platform_refund_expires_at
                     )
@@ -5055,7 +5120,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
         pro_status: server.UserProStatus,
         payment_status: base.PaymentStatus,
         auto_renew: bool,
-        grace_duration: datetime.timedelta,
+        grace_duration: pendulum.Duration,
         redeemed_ts_ms_rounded: int,
         platform_refund_expires_at: int,
         user_ctx: TestUserCtx,
@@ -5105,7 +5170,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
         assert item_expiry_ts == to_s(tx.expires_at), res_latest
         # Google `payment_id` is the opaque `token|order_id` composite (backend-owned; §5.2).
         assert item_payment_id == f'{tx.purchase_token}|{tx.order_id}'
-        assert item_grace_duration == base.seconds_from_timedelta(grace_duration)
+        assert item_grace_duration == base.seconds_from_duration(grace_duration)
         assert item_payment_provider == base.PaymentProvider.GooglePlayStore
         assert item_platform_refund_expiry_ts == to_s(platform_refund_expires_at)
         assert item_redeemed_ts == to_s(redeemed_ts_ms_rounded)
@@ -5580,7 +5645,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             pro_status=server.UserProStatus.Active,
             payment_status=base.PaymentStatus.Redeemed,
             auto_renew=True,
-            grace_duration=base.timedelta_from_ms(test_product_details.grace_period.milliseconds),
+            grace_duration=base.duration_from_ms(test_product_details.grace_period.milliseconds),
             redeemed_ts_ms_rounded=redeemed_ts_ms_rounded,
             platform_refund_expires_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
@@ -5596,7 +5661,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             pro_status=server.UserProStatus.Expired,
             payment_status=base.PaymentStatus.Expired,
             auto_renew=True,
-            grace_duration=base.timedelta_from_ms(test_product_details.grace_period.milliseconds),
+            grace_duration=base.duration_from_ms(test_product_details.grace_period.milliseconds),
             redeemed_ts_ms_rounded=redeemed_ts_ms_rounded,
             platform_refund_expires_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
@@ -6130,7 +6195,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             pro_status=server.UserProStatus.Active,
             payment_status=base.PaymentStatus.Redeemed,
             auto_renew=True,
-            grace_duration=base.timedelta_from_ms(test_product_details.grace_period.milliseconds),
+            grace_duration=base.duration_from_ms(test_product_details.grace_period.milliseconds),
             redeemed_ts_ms_rounded=redeemed_ts_ms_rounded,  # TODO: This is not a good design, should not use real-time timestamps
             platform_refund_expires_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
@@ -6144,7 +6209,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             pro_status=server.UserProStatus.Expired,
             payment_status=base.PaymentStatus.Expired,
             auto_renew=True,
-            grace_duration=base.timedelta_from_ms(test_product_details.grace_period.milliseconds),
+            grace_duration=base.duration_from_ms(test_product_details.grace_period.milliseconds),
             redeemed_ts_ms_rounded=redeemed_ts_ms_rounded,
             platform_refund_expires_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
@@ -6159,7 +6224,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             pro_status=server.UserProStatus.Expired,
             payment_status=base.PaymentStatus.Expired,
             auto_renew=True,
-            grace_duration=base.timedelta_from_ms(test_product_details.grace_period.milliseconds),
+            grace_duration=base.duration_from_ms(test_product_details.grace_period.milliseconds),
             redeemed_ts_ms_rounded=redeemed_ts_ms_rounded,
             platform_refund_expires_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
@@ -6175,7 +6240,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             pro_status=server.UserProStatus.Expired,
             payment_status=base.PaymentStatus.Expired,
             auto_renew=False,
-            grace_duration=base.timedelta_from_ms(test_product_details.grace_period.milliseconds),
+            grace_duration=base.duration_from_ms(test_product_details.grace_period.milliseconds),
             redeemed_ts_ms_rounded=redeemed_ts_ms_rounded,
             platform_refund_expires_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
@@ -6352,7 +6417,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             pro_status=server.UserProStatus.Active,
             payment_status=base.PaymentStatus.Redeemed,
             auto_renew=True,
-            grace_duration=base.timedelta_from_ms(test_product_details.grace_period.milliseconds),
+            grace_duration=base.duration_from_ms(test_product_details.grace_period.milliseconds),
             redeemed_ts_ms_rounded=redeemed_ts_ms_rounded,
             platform_refund_expires_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
@@ -6365,7 +6430,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             pro_status=server.UserProStatus.Expired,
             payment_status=base.PaymentStatus.Expired,
             auto_renew=True,
-            grace_duration=base.timedelta_from_ms(test_product_details.grace_period.milliseconds),
+            grace_duration=base.duration_from_ms(test_product_details.grace_period.milliseconds),
             redeemed_ts_ms_rounded=redeemed_ts_ms_rounded,
             platform_refund_expires_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
@@ -6381,7 +6446,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             pro_status=server.UserProStatus.Expired,
             payment_status=base.PaymentStatus.Expired,
             auto_renew=False,
-            grace_duration=base.timedelta_from_ms(test_product_details.grace_period.milliseconds),
+            grace_duration=base.duration_from_ms(test_product_details.grace_period.milliseconds),
             redeemed_ts_ms_rounded=redeemed_ts_ms_rounded,
             platform_refund_expires_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
@@ -6596,7 +6661,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             pro_status=server.UserProStatus.Active,
             payment_status=base.PaymentStatus.Redeemed,
             auto_renew=True,
-            grace_duration=base.timedelta_from_ms(test_product_details.grace_period.milliseconds),
+            grace_duration=base.duration_from_ms(test_product_details.grace_period.milliseconds),
             redeemed_ts_ms_rounded=redeemed_ts_ms_rounded,
             platform_refund_expires_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
@@ -6610,7 +6675,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             pro_status=server.UserProStatus.Expired,
             payment_status=base.PaymentStatus.Expired,
             auto_renew=True,
-            grace_duration=base.timedelta_from_ms(test_product_details.grace_period.milliseconds),
+            grace_duration=base.duration_from_ms(test_product_details.grace_period.milliseconds),
             redeemed_ts_ms_rounded=redeemed_ts_ms_rounded,
             platform_refund_expires_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
@@ -6625,7 +6690,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             pro_status=server.UserProStatus.Expired,
             payment_status=base.PaymentStatus.Expired,
             auto_renew=True,
-            grace_duration=base.timedelta_from_ms(test_product_details.grace_period.milliseconds),
+            grace_duration=base.duration_from_ms(test_product_details.grace_period.milliseconds),
             redeemed_ts_ms_rounded=redeemed_ts_ms_rounded,
             platform_refund_expires_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
@@ -6641,7 +6706,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             pro_status=server.UserProStatus.Expired,
             payment_status=base.PaymentStatus.Expired,
             auto_renew=False,
-            grace_duration=base.timedelta_from_ms(test_product_details.grace_period.milliseconds),
+            grace_duration=base.duration_from_ms(test_product_details.grace_period.milliseconds),
             redeemed_ts_ms_rounded=redeemed_ts_ms_rounded,
             platform_refund_expires_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
@@ -6819,7 +6884,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             pro_status=server.UserProStatus.Active,
             payment_status=base.PaymentStatus.Redeemed,
             auto_renew=True,
-            grace_duration=base.timedelta_from_ms(test_product_details.grace_period.milliseconds),
+            grace_duration=base.duration_from_ms(test_product_details.grace_period.milliseconds),
             redeemed_ts_ms_rounded=redeemed_ts_ms_rounded,
             platform_refund_expires_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
@@ -6832,7 +6897,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             pro_status=server.UserProStatus.Expired,
             payment_status=base.PaymentStatus.Expired,
             auto_renew=True,
-            grace_duration=base.timedelta_from_ms(test_product_details.grace_period.milliseconds),
+            grace_duration=base.duration_from_ms(test_product_details.grace_period.milliseconds),
             redeemed_ts_ms_rounded=redeemed_ts_ms_rounded,
             platform_refund_expires_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
@@ -6847,7 +6912,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             pro_status=server.UserProStatus.Expired,
             payment_status=base.PaymentStatus.Expired,
             auto_renew=True,
-            grace_duration=base.timedelta_from_ms(test_product_details.grace_period.milliseconds),
+            grace_duration=base.duration_from_ms(test_product_details.grace_period.milliseconds),
             redeemed_ts_ms_rounded=redeemed_ts_ms_rounded,
             platform_refund_expires_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
@@ -7296,7 +7361,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             pro_status=server.UserProStatus.Active,
             payment_status=base.PaymentStatus.Redeemed,
             auto_renew=True,
-            grace_duration=base.timedelta_from_ms(test_product_details.grace_period.milliseconds),
+            grace_duration=base.duration_from_ms(test_product_details.grace_period.milliseconds),
             redeemed_ts_ms_rounded=redeemed_ts_ms_rounded,
             platform_refund_expires_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
@@ -7310,7 +7375,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             pro_status=server.UserProStatus.Expired,
             payment_status=base.PaymentStatus.Expired,
             auto_renew=True,
-            grace_duration=base.timedelta_from_ms(test_product_details.grace_period.milliseconds),
+            grace_duration=base.duration_from_ms(test_product_details.grace_period.milliseconds),
             redeemed_ts_ms_rounded=redeemed_ts_ms_rounded,
             platform_refund_expires_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
@@ -7596,7 +7661,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             pro_status=server.UserProStatus.Active,
             payment_status=base.PaymentStatus.Redeemed,
             auto_renew=True,
-            grace_duration=base.timedelta_from_ms(test_product_details.grace_period.milliseconds),
+            grace_duration=base.duration_from_ms(test_product_details.grace_period.milliseconds),
             redeemed_ts_ms_rounded=redeemed_ts_ms_rounded,
             platform_refund_expires_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
@@ -7609,7 +7674,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             pro_status=server.UserProStatus.Expired,
             payment_status=base.PaymentStatus.Expired,
             auto_renew=True,
-            grace_duration=base.timedelta_from_ms(test_product_details.grace_period.milliseconds),
+            grace_duration=base.duration_from_ms(test_product_details.grace_period.milliseconds),
             redeemed_ts_ms_rounded=redeemed_ts_ms_rounded,
             platform_refund_expires_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
@@ -7624,7 +7689,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             pro_status=server.UserProStatus.Expired,
             payment_status=base.PaymentStatus.Expired,
             auto_renew=True,
-            grace_duration=base.timedelta_from_ms(test_product_details.grace_period.milliseconds),
+            grace_duration=base.duration_from_ms(test_product_details.grace_period.milliseconds),
             redeemed_ts_ms_rounded=redeemed_ts_ms_rounded,
             platform_refund_expires_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,

@@ -7,7 +7,7 @@ flows to receive, parse and process payment information into the database layer 
 # Apple documentation about life-cycle triggers as implemented in this file:
 # https://developer.apple.com/documentation/appstoreservernotifications/notificationtype#Handle-use-cases-for-in-app-purchase-life-cycle-events  # noqa: E501
 
-import datetime
+import pendulum
 import flask
 import json
 import typing
@@ -70,7 +70,7 @@ class Core:
     app_store_server_api_client: AppleAppStoreServerAPIClient
     signed_data_verifier: AppleSignedDataVerifier
     sandbox: bool = False
-    notification_retry_duration: datetime.timedelta = datetime.timedelta(0)
+    notification_retry_duration: pendulum.Duration = pendulum.duration()
     max_history_lookup_in_days: int = 0
 
 
@@ -119,7 +119,7 @@ def init(
     # NOTE: Then add a 30min buffer just in-case
     if not result.sandbox:
         # Apple retries at 1, 12, 24, 48, 72 hours after the previous attempt; + a 30-min buffer.
-        result.notification_retry_duration = datetime.timedelta(hours=1 + 12 + 24 + 48 + 72, minutes=30)
+        result.notification_retry_duration = pendulum.duration(hours=1 + 12 + 24 + 48 + 72, minutes=30)
     return result
 
 
@@ -168,7 +168,7 @@ def require_field(field: typing.Any, msg: str, err: base.ErrorSink | None) -> bo
     return result
 
 
-def get_platform_refund_expires_at(tx: AppleJWSTransactionDecodedPayload) -> datetime.datetime:
+def get_platform_refund_expires_at(tx: AppleJWSTransactionDecodedPayload) -> pendulum.DateTime:
     # TODO: It's unclear from the Apple documentation whether or not there is a deadline that a user
     # has to submit a refund request directly through Apple. There are some various off-hand
     # comments on the internet that state this is 90 days but cannot be corroborated on the actual
@@ -198,7 +198,7 @@ def uuid_from_master_pk(master_pk: bytes) -> str:
 def handle_notification_tx(
     decoded_notification: DecodedNotification,
     sql_tx: db.SQLTransaction,
-    notification_retry_duration: datetime.timedelta,
+    notification_retry_duration: pendulum.Duration,
     err: base.ErrorSink,
 ) -> bool:
     if err.has():
@@ -952,7 +952,7 @@ def handle_notification_tx(
                     )
                     if have_expiry and have_grace:
                         assert renewal.gracePeriodExpiresDate is not None and tx.expiresDate is not None
-                        grace_period = base.timedelta_from_ms(renewal.gracePeriodExpiresDate - tx.expiresDate)
+                        grace_period = base.duration_from_ms(renewal.gracePeriodExpiresDate - tx.expiresDate)
                         log.debug(
                             f'{notif_type} for {payment_tx_id_label(payment_tx)}: '
                             f'Auto-renewing = true, grace period expires = {renewal.gracePeriodExpiresDate}, '
@@ -1096,7 +1096,7 @@ def handle_notification_tx(
 def handle_notification(
     decoded_notification: DecodedNotification,
     conn: psycopg.Connection,
-    notification_retry_duration: datetime.timedelta,
+    notification_retry_duration: pendulum.Duration,
     err: base.ErrorSink,
 ) -> bool:
     result = False
@@ -1218,7 +1218,7 @@ def catchup_on_missed_notifications(core: Core, sql_conn: psycopg.Connection, en
         # processes racing to try and execute this
         # The checkpoint is stored as a timestamptz global; Apple's history API speaks ms, so convert at
         # this boundary (an epoch checkpoint means "never checkpointed").
-        checkpoint_at: datetime.datetime = backend.get_global_datetime(tx.conn, 'apple_notification_checkpoint_at')
+        checkpoint_at: pendulum.DateTime = backend.get_global_datetime(tx.conn, 'apple_notification_checkpoint_at')
         checkpoint_ms: int = base.unix_ms_from_datetime(checkpoint_at)
         ms_since_last_catchup: int = end_unix_ts_ms - checkpoint_ms
         ms_between_catchup: int = (60 * 30) * 1000  # 30 minutes

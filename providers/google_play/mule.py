@@ -57,7 +57,7 @@ def run() -> None:
     notifications.log.handlers.clear()
     notifications.log.addHandler(handler)
     if base.PROVIDER_TESTING_ENV:
-        base.DEFAULT_GOOGLE_GRACE_PERIOD = base.timedelta_from_ms(api.testing_grace_period_duration_ms)
+        base.DEFAULT_GOOGLE_GRACE_PERIOD = base.duration_from_ms(api.testing_grace_period_duration_ms)
     context = notifications.start_subscriber(
         cloud_project_id=parsed.google_cloud_project_id,
         package_name=parsed.google_package_name,

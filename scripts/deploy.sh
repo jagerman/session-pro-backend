@@ -73,7 +73,7 @@ log() { printf '\n=== %s ===\n' "$*"; }
 # 1. Packages
 # --------------------------------------------------------------------------------------
 # Prefer Debian-shipped libraries (leaner, security-updated, no compiler needed). flask, pynacl,
-# psycopg2 and uWSGI come from apt; only the deps Debian lacks go in the venv.
+# pendulum, psycopg and uWSGI come from apt; only the deps Debian lacks go in the venv.
 log "Installing packages"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
@@ -105,7 +105,7 @@ fi
 apt-get install -y \
     ca-certificates curl git gnupg lsb-release rsync \
     python3 python3-venv python3-pip \
-    python3-flask python3-nacl python3-psycopg2 \
+    python3-flask python3-nacl python3-pendulum python3-psycopg python3-psycopg-c python3-psycopg-pool \
     uwsgi-emperor uwsgi-plugin-python3 \
     postgresql postgresql-contrib pgbackrest \
     python3-session-util \
