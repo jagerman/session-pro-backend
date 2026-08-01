@@ -3982,3 +3982,94 @@ def test_google_upgrade_broadcasts_a_revocation_for_an_account_that_never_lapsed
         with ctx.connection() as conn:
             _redeem_and_prove(conn, ctx.backend_key, master_key, rotating_key, upgraded_at)
             assert backend.get_user(conn, master_key.verify_key).expiry_at > upgraded_at
+
+
+def test_google_upgrade_revocation_depends_on_physical_row_order(monkeypatch, pg_database):
+    # CHARACTERISATION of finding 3.4, and the companion to the test above: the SAME upgrade, differing only
+    # by an entitlement-neutral write to one already-expired cycle, publishes NO revocation where the test
+    # above publishes one.
+    #
+    # The revoke SELECT in add_google_revocation carries no ORDER BY, so it returns rows in heap order --
+    # which approximates least-recently-updated, because an UPDATE writes a new tuple version that migrates.
+    # revoke_payments_by_id_internal keeps only the LAST row's expiry per account, and that single value
+    # drives the day-boundary early-out. So whichever cycle was written to least recently decides whether an
+    # upgrading subscriber gets revoked.
+    #
+    # The write below (`grace_period = grace_period`) is exactly the shape of the ones
+    # set_purchase_grace_period_duration and set_payment_auto_renew perform routinely.
+    #
+    # Neither branch is right: this one skips the broadcast only because a long-dead cycle happened to sort
+    # last, not because the account was found to be covered. This test dies with the reconcile rewrite.
+    with TestingContext(pg_database) as ctx:
+        master_key = nacl.signing.SigningKey(_UPGRADE_ACCOUNT_SEED)
+        rotating_key = nacl.signing.SigningKey.generate()
+        account_id = bytes(master_key.verify_key)
+        oldest_order_id = 'GPA.9000-0000-0000-00001'
+
+        for index, (order_id, expiry, event_ms) in enumerate(
+            [
+                (oldest_order_id, '2026-02-01T00:00:00.000Z', 1767225600000),
+                ('GPA.9000-0000-0000-00001..0', '2026-03-01T00:00:00.000Z', 1769904000000),
+                ('GPA.9000-0000-0000-00001..1', '2026-04-01T00:00:00.000Z', 1772323200000),
+            ]
+        ):
+            handled, err = _drive_google_rtdn(
+                monkeypatch,
+                ctx,
+                notification_type=4 if index == 0 else 2,
+                purchase_token='tok-monthly',
+                event_ms=event_ms,
+                snapshot=_google_snapshot(
+                    state='SUBSCRIPTION_STATE_ACTIVE',
+                    expiry=expiry,
+                    order_id=order_id,
+                    obfuscated_account_id=account_id,
+                ),
+            )
+            assert handled and not err.has()
+
+        with ctx.connection() as conn:
+            _redeem_and_prove(
+                conn, ctx.backend_key, master_key, rotating_key, base.datetime_from_unix_ms(1773187200000)
+            )
+            db.query(
+                conn,
+                '''UPDATE payments SET grace_period = grace_period
+                   WHERE id IN (SELECT payment_id FROM google_play_payment_details WHERE order_id = %(order_id)s)''',
+                order_id=oldest_order_id,
+            )
+            conn.commit()
+            # Unordered on purpose -- this mirrors the revoke's own SELECT, so it observes heap order.
+            # Pinned so that a storage-layer change surfaces here, naming the mechanism, rather than as an
+            # unexplained flip in the assertion below.
+            order = [
+                row[0]
+                for row in db.query(
+                    conn,
+                    f'SELECT gd.order_id FROM {backend.PAYMENTS_FROM} WHERE gd.payment_token = %(token)s',
+                    token='tok-monthly',
+                ).fetchall()
+            ]
+            assert order[-1] == oldest_order_id, 'the touched row now sorts last'
+
+        handled, err = _drive_google_rtdn(
+            monkeypatch,
+            ctx,
+            notification_type=4,
+            purchase_token='tok-annual',
+            event_ms=1773532800000,
+            snapshot=_google_snapshot(
+                state='SUBSCRIPTION_STATE_ACTIVE',
+                expiry='2027-03-15T00:00:00.000Z',
+                order_id='GPA.8000-0000-0000-00002',
+                obfuscated_account_id=account_id,
+                base_plan='session-pro-12-months',
+                linked_purchase_token='tok-monthly',
+            ),
+        )
+        assert handled and not err.has()
+
+        with ctx.connection() as conn:
+            assert not backend.get_revocations_list(conn), 'no broadcast, purely because of row placement'
+            # The lapsed expiry from the test above is NOT order-dependent: it happens on both branches.
+            assert backend.get_user(conn, master_key.verify_key).expiry_at == base.datetime_from_unix_ms(1773532800000)
