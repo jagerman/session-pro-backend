@@ -329,34 +329,65 @@ def thread_entry_point(
 
     sorted_msg_list: list[SortedMessage] = []
 
-    # NOTE Load unhandled messages from the DB and insert it in to the list of messages to start off
-    with db.connection() as conn:
-        with db.transaction(conn) as tx:
-            db_it: collections.abc.Iterator[backend.GoogleUnhandledNotificationIterator] = (
-                backend.google_get_unhandled_notification_iterator(tx)
-            )
-            for row in db_it:
-                message_id = row[0]
-                payload: str | None = row[1]
-                if not payload:
-                    continue
-
-                raw_msg = typing.cast(
-                    google.pubsub_v1.types.ReceivedMessage, google.pubsub_v1.types.ReceivedMessage.from_json(payload)
+    # NOTE Load unhandled messages from the DB and insert it in to the list of messages to start off.
+    #
+    # The whole drain is guarded because this thread is started once per mule and is a daemon: an exception
+    # escaping here kills it silently, and the mule then runs on with Google notification processing off
+    # until somebody reloads it. Loading less than everything is survivable in a way that not running is
+    # not — every message missed here is still unacked, so Google redelivers it.
+    try:
+        with db.connection() as conn:
+            with db.transaction(conn) as tx:
+                db_it: collections.abc.Iterator[backend.GoogleUnhandledNotificationIterator] = (
+                    backend.google_get_unhandled_notification_iterator(tx)
                 )
-                message_data = json.loads(raw_msg.message.data)
-                tmp_err = base.ErrorSink()
-                parse = parse_notification(message_data, tmp_err)
+                for row in db_it:
+                    message_id = row[0]
+                    payload: str | None = row[1]
+                    if not payload:
+                        continue
 
-                sorted_msg_list.append(
-                    SortedMessage(
-                        event_unix_ts_ms=parse.event_time_ms,
-                        message_id=message_id,
-                        parse=parse,
-                        ack_id=raw_msg.ack_id,
-                        raw=raw_msg,
+                    # Per row as well as per drain, for the same reason the pull loop decodes per message:
+                    # one unreadable stored payload must not cost us the rest of the backlog.
+                    tmp_err = base.ErrorSink()
+                    try:
+                        raw_msg = typing.cast(
+                            google.pubsub_v1.types.ReceivedMessage,
+                            google.pubsub_v1.types.ReceivedMessage.from_json(payload),
+                        )
+                    except Exception:
+                        log.warning(
+                            f'Skipping stored notification {message_id}: its envelope no longer decodes.\n'
+                            f'Reason was:\n{traceback.format_exc()}'
+                        )
+                        continue
+
+                    parse = decode_notification(raw_msg.message.data, f'stored notification {message_id}', tmp_err)
+                    if parse is None or tmp_err.has():
+                        # Leave it unhandled in the DB rather than queueing it. A parse that failed carries
+                        # payload_type Nil, which handle_parsed_notification treats as nothing-to-do and so
+                        # reports as SUCCESS — the message would be acked and the row marked handled, which
+                        # is how a notification we never understood would have disappeared silently.
+                        log.warning(
+                            f'Skipping stored notification {message_id}, leaving it unhandled: '
+                            f'{tmp_err.build() if tmp_err.has() else "payload could not be decoded"}'
+                        )
+                        continue
+
+                    sorted_msg_list.append(
+                        SortedMessage(
+                            event_unix_ts_ms=parse.event_time_ms,
+                            message_id=message_id,
+                            parse=parse,
+                            ack_id=raw_msg.ack_id,
+                            raw=raw_msg,
+                        )
                     )
-                )
+    except Exception:
+        log.error(
+            f'Failed to load the unhandled notification backlog; continuing with the '
+            f'{len(sorted_msg_list)} loaded so far. Reason was:\n{traceback.format_exc()}'
+        )
 
     # NOTE: Then connect to Google and start pulling messages
     log.info(f'Loaded {len(sorted_msg_list)} unhandled messages from the DB')
