@@ -18,7 +18,14 @@ import base
 import server
 import db
 
-from tests.helpers import derived_status, TestingContext, _google_subscription_parse, _redeem_and_prove, _prove_at
+from tests.helpers import (
+    derived_status,
+    TestingContext,
+    _google_subscription_parse,
+    _redeem_and_prove,
+    _prove_at,
+    _grant_voucher,
+)
 
 
 def test_google_handle_parsed_notification_fetch_failure(monkeypatch, pg_database):
@@ -4444,3 +4451,59 @@ def test_shrinking_the_expiry_never_serves_a_later_proof_in_the_pinned_arm(monke
             assert before.expiry_at > request_at + shape.clamp, 'fixture: sliding before'
             assert after.expiry_at <= request_at + shape.clamp, 'fixture: pinned after'
             assert served_after <= served_before, 'a shrink must never serve a later proof'
+
+
+def test_a_late_refund_does_not_shove_a_credits_anchor_forward(monkeypatch, pg_database):
+    # The clamp's reach into the credit ledger, which is the one interaction it changes beyond the account
+    # expiry itself. Credits extend the LATER of the subscription coverage and the drain checkpoint, so
+    # whatever a revoked payment contributes to that max is also the base every remaining credit day stacks
+    # on. While a revoked row reported the revoke instant, refunding a long-lapsed subscription dragged that
+    # base forward and handed the voucher-holder the whole dead interval on top of their credit.
+    #
+    # With the clamp the base is the coverage actually paid for, so the refund moves nothing: the credit is
+    # worth the same before and after, which is the point of a credit that stacks rather than competes.
+    with TestingContext(pg_database) as ctx:
+        master_key = nacl.signing.SigningKey(_UPGRADE_ACCOUNT_SEED)
+        rotating_key = nacl.signing.SigningKey.generate()
+        account_id = bytes(master_key.verify_key)
+        lapses_at = base.datetime_from_unix_ms(1769904000000)  # 2026-02-01
+        claimed_at = base.datetime_from_unix_ms(1767830400000)  # 2026-01-08
+
+        handled, err = _drive_google_rtdn(
+            monkeypatch,
+            ctx,
+            notification_type=4,
+            purchase_token='tok-credit-holder',
+            event_ms=1767225600000,
+            snapshot=_google_snapshot(
+                state='SUBSCRIPTION_STATE_ACTIVE',
+                expiry='2026-02-01T00:00:00.000Z',
+                order_id='GPA.7700-0000-0000-00012',
+                obfuscated_account_id=account_id,
+            ),
+        )
+        assert handled and not err.has()
+
+        with ctx.connection() as conn:
+            _grant_voucher(conn, master_key, at=claimed_at, duration=30 * base.DAY)
+            _redeem_and_prove(conn, ctx.backend_key, master_key, rotating_key, claimed_at)
+            before = backend.get_user(conn, master_key.verify_key)
+            assert before.expiry_at is not None
+            # Subscription coverage wins the max over the drain checkpoint, and the credit stacks on top.
+            assert before.expiry_at > lapses_at
+
+            # Refunded four months after it lapsed.
+            refunded_at = base.datetime_from_unix_ms(1780272000000)  # 2026-06-01
+            sink = base.ErrorSink()
+            with db.transaction(conn) as tx:
+                backend.add_google_revocation(
+                    tx, google_payment_token='tok-credit-holder', revoke_at=refunded_at, err=sink
+                )
+            assert not sink.has()
+
+            after = backend.get_user(conn, master_key.verify_key)
+            assert after.expiry_at is not None
+            # The credit is untouched by the refund: it still runs from the coverage that was really paid
+            # for. Losing the subscription's grace period is the only movement, and that is a reduction.
+            assert after.expiry_at <= before.expiry_at
+            assert after.expiry_at < refunded_at, 'the refund must not become the credit base'
