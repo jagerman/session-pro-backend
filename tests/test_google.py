@@ -10,6 +10,7 @@ import nacl.public
 import os
 import pendulum
 import time
+import typing
 import dataclasses
 from providers import google_play
 from providers.google_play.types import GoogleDuration, SubscriptionProductDetails
@@ -5009,3 +5010,76 @@ def test_refunding_a_payment_that_was_not_the_driver_broadcasts_nothing(monkeypa
             assert after.expiry_at == before.expiry_at, 'the driver still sets the expiry, so nothing moved'
             assert not backend.get_revocations_list(conn), 'and so there is nothing to announce'
             assert after.current_generation_id == before.current_generation_id
+
+
+def test_the_owned_line_item_is_chosen_not_the_first_one(monkeypatch, pg_database):
+    # A deferred change makes Google send a SECOND line item, for the product being replaced *to*, and that
+    # item is documented as carrying no latestSuccessfulOrderId because the user does not own it yet. Taking
+    # position 0 therefore read whichever the response happened to list first -- and picking the incoming one
+    # yields an item with no order id, which is the identity every payment row is keyed by.
+    #
+    # Ownership is the honest filter, and it is Google's own field semantics. The incoming item is listed
+    # FIRST here, which is exactly the arrangement position 0 gets wrong.
+    monkeypatch.setattr('providers.google_play.api.package_name', 'network.loki.messenger')
+    account_id = bytes(nacl.signing.SigningKey(_UPGRADE_ACCOUNT_SEED).verify_key)
+
+    snapshot = _google_snapshot(
+        state='SUBSCRIPTION_STATE_ACTIVE',
+        expiry='2026-02-01T00:00:00.000Z',
+        order_id='GPA.3131-3131-3131-31311',
+        obfuscated_account_id=account_id,
+    )
+    incoming = {
+        'productId': 'session_pro',
+        'expiryTime': '2026-03-01T00:00:00.000Z',
+        'autoRenewingPlan': {'autoRenewEnabled': True, 'recurringPrice': {'currencyCode': 'AUD', 'units': '99'}},
+        'offerDetails': {'basePlanId': 'session-pro-12-months', 'offerTags': []},
+        # No latestSuccessfulOrderId: the user has not been charged for this one yet.
+    }
+    owned_items = snapshot['lineItems']
+    assert isinstance(owned_items, list)
+    snapshot['lineItems'] = [typing.cast(base.JSONValue, incoming), *owned_items]
+
+    err = base.ErrorSink()
+    details = google_play.api.parse_get_subscription_v2_response(snapshot, err)
+    assert not err.has() and details is not None
+    assert len(details.line_items) == 2
+
+    chosen = google_play.api.parse_line_item(details, err)
+    assert not err.has(), err.msg_list
+    assert chosen is not None
+    assert chosen.latest_successful_order_id == 'GPA.3131-3131-3131-31311', 'the item the user owns'
+    assert chosen.offer_details.base_plan_id == 'session-pro-1-month', 'not the one being deferred to'
+
+
+def test_a_subscription_with_no_owned_line_item_is_reported(pg_database):
+    # A resource describing a subscription nobody has been charged for yet -- a pending signup -- has no
+    # owned item. That is not a malformed response and not something to key a payment on, so it is reported
+    # rather than asserted, and the caller's existing sink guard stops it.
+    err = base.ErrorSink()
+    details = google_play.api.parse_get_subscription_v2_response(
+        {
+            'kind': 'androidpublisher#subscriptionPurchaseV2',
+            'startTime': '2026-01-01T00:00:00.000Z',
+            'regionCode': 'AU',
+            'subscriptionState': 'SUBSCRIPTION_STATE_PENDING',
+            'testPurchase': {},
+            'acknowledgementState': 'ACKNOWLEDGEMENT_STATE_PENDING',
+            'lineItems': [
+                {
+                    'productId': 'session_pro',
+                    'expiryTime': '2026-02-01T00:00:00.000Z',
+                    'autoRenewingPlan': {
+                        'autoRenewEnabled': True,
+                        'recurringPrice': {'currencyCode': 'AUD', 'units': '16'},
+                    },
+                    'offerDetails': {'basePlanId': 'session-pro-1-month', 'offerTags': []},
+                }
+            ],
+        },
+        err,
+    )
+    assert not err.has() and details is not None
+
+    assert google_play.api.parse_line_item(details, err) is None
+    assert err.has() and any('no owned line item' in msg for msg in err.msg_list), err.msg_list

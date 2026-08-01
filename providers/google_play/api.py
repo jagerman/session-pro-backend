@@ -3,6 +3,7 @@ Functionality to query the Google APIs and parse it
 '''
 
 import dataclasses
+import logging
 import typing
 import base
 from base import (
@@ -55,6 +56,8 @@ from .types import (
     json_dict_require_google_money,
     json_dict_require_google_timestamp,
 )
+
+log = logging.Logger('GOOGLE')
 
 # NOTE: Globals specifically for interacting with the Google APIs
 credentials: service_account.Credentials | None = None
@@ -532,19 +535,48 @@ def fetch_subscription_details_for_base_plan_id(base_plan_id: str, err: ErrorSin
     return result
 
 
-def parse_line_item(details: SubscriptionV2Data) -> SubscriptionV2DataLineItem:
-    assert len(details.line_items) > 0
-    return details.line_items[0]
+def parse_line_item(details: SubscriptionV2Data, err: ErrorSink) -> SubscriptionV2DataLineItem | None:
+    '''The line item the user actually OWNS, or None with the reason recorded.
+
+    Chosen rather than assumed. This used to take `line_items[0]`, which is only correct while a
+    subscription has exactly one item. Google sends a second during a deferred change — for the product
+    being replaced *to* — and documents that item as having no `latestSuccessfulOrderId`, precisely because
+    the user does not own it yet. Taking position 0 therefore reads whichever the response happened to list
+    first, and picking the incoming one yields an item with no order id: the identity every payment row is
+    keyed by.
+
+    Ownership is the honest filter, and it is the same one Google's own field semantics imply. Among owned
+    items — a multi-item subscription is legal, though nothing we sell produces one — the furthest expiry is
+    the one that decides entitlement, so that is the tie-break.
+    '''
+    owned = [item for item in details.line_items if item.latest_successful_order_id is not None]
+    if not owned:
+        # Distinguished from "several": no owned item at all means the resource describes a subscription
+        # the user has not been charged for yet (a pending signup), which is not something to key a payment
+        # on and not an error in the response.
+        err.msg_list.append(
+            f'Subscription resource has no owned line item ({len(details.line_items)} present); '
+            f'nothing to attribute a payment to'
+        )
+        return None
+
+    if len(owned) > 1:
+        log.warning(
+            f'Subscription resource has {len(owned)} owned line items; taking the furthest expiry. '
+            f'Nothing we sell produces this, so it is worth understanding.'
+        )
+    return max(owned, key=lambda item: item.expiry_time.unix_milliseconds)
 
 
 def parse_valid_order_id(details: SubscriptionV2Data, err: ErrorSink) -> str:
-    result = ""
-    line_item = parse_line_item(details)
-    if line_item.latest_successful_order_id is None:
-        err.msg_list.append("Order id is None is subscription but was required!")
-    else:
-        result = line_item.latest_successful_order_id
-    return result
+    # Owning an item and having an order id are the same fact, so parse_line_item's filter already
+    # guarantees this; the check remains because the type does not.
+    line_item = parse_line_item(details, err)
+    if line_item is None or line_item.latest_successful_order_id is None:
+        if not err.has():
+            err.msg_list.append("Order id is None is subscription but was required!")
+        return ""
+    return line_item.latest_successful_order_id
 
 
 @dataclasses.dataclass
@@ -598,7 +630,24 @@ def pro_plan_from_base_plan_id(base_plan_id: str, err: ErrorSink) -> ProPlan:
 def parse_subscription_plan_event_tx(
     details: SubscriptionV2Data, event_ts_ms: int, notification: SubscriptionNotificationType, err: ErrorSink
 ) -> SubscriptionPlanEventTransaction:
-    line_item: SubscriptionV2DataLineItem = parse_line_item(details)
+    line_item = parse_line_item(details, err)
+    if line_item is None:
+        # The sink carries the reason; hand back a zero-valued tx so the caller's `err.has()` guard is what
+        # stops it, matching how every other parse failure here behaves.
+        return SubscriptionPlanEventTransaction(
+            base_plan_id='',
+            # Never read: the populated sink is what stops the caller. Borrowed from the first item rather
+            # than fabricated, because GoogleTimestamp parses RFC3339 and there is always at least one item
+            # (parse_get_subscription_v2_response rejects an empty lineItems).
+            expiry_time=details.line_items[0].expiry_time,
+            pro_plan=ProPlan.Nil,
+            event_ts_ms=event_ts_ms,
+            notification=notification,
+            subscription_state=details.subscription_state,
+            linked_purchase_token=details.linked_purchase_token,
+            purchase_acknowledged=details.acknowledgement_state,
+            obfuscated_external_account_id=details.obfuscated_external_account_id,
+        )
     result = SubscriptionPlanEventTransaction(
         base_plan_id=line_item.offer_details.base_plan_id,
         expiry_time=line_item.expiry_time,
