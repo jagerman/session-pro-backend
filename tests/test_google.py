@@ -4507,3 +4507,39 @@ def test_a_late_refund_does_not_shove_a_credits_anchor_forward(monkeypatch, pg_d
             # for. Losing the subscription's grace period is the only movement, and that is a reduction.
             assert after.expiry_at <= before.expiry_at
             assert after.expiry_at < refunded_at, 'the refund must not become the credit base'
+
+
+def test_an_unknown_base_plan_is_reported_not_asserted(monkeypatch, pg_database):
+    # A base plan added in Play Console is external input. It used to hit `assert result != ProPlan.Nil`,
+    # which sent an AssertionError through the handler's blanket except, so the reason was buried in a
+    # traceback rather than carried in the ErrorSink. (Under `python -O` the assert vanished and the old code
+    # behaved exactly as it does now: the caller has always guarded on the sink, so Nil never reached a
+    # write.)
+    #
+    # Now it is reported: no row is written, the notification is not acked, and the message names the plan.
+    # Leaving it unacked is right -- we cannot invent an entitlement for a plan we do not know -- and
+    # recovery is open-ended, since the payload is stored before handling and only handled rows are pruned.
+    with TestingContext(pg_database) as ctx:
+        account_id = bytes(nacl.signing.SigningKey(_UPGRADE_ACCOUNT_SEED).verify_key)
+
+        handled, err = _drive_google_rtdn(
+            monkeypatch,
+            ctx,
+            notification_type=4,
+            purchase_token='tok-unknown-plan',
+            event_ms=1767225600000,
+            snapshot=_google_snapshot(
+                state='SUBSCRIPTION_STATE_ACTIVE',
+                expiry='2026-02-01T00:00:00.000Z',
+                order_id='GPA.8800-0000-0000-00013',
+                obfuscated_account_id=account_id,
+                base_plan='session-pro-6-months',  # plausible, and not one we know
+            ),
+        )
+        assert handled is False, 'not acked, so Google redelivers once we understand the plan'
+        assert err.has() and any('session-pro-6-months' in msg for msg in err.msg_list), err.msg_list
+        assert not _payment_rows(ctx), 'and nothing is written from a plan we cannot map'
+        # The point of the change, and the only part the assertions above could not distinguish: the
+        # failure is REPORTED. Previously the sink carried the message and an AssertionError traceback
+        # behind it, having unwound through the blanket except on the way.
+        assert not any('AssertionError' in msg for msg in err.msg_list), err.msg_list

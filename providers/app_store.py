@@ -156,8 +156,10 @@ def pro_plan_from_product_id(product_id: str, err: base.ErrorSink) -> base.ProPl
         case 'com.getsession.org.pro_sub_12_months':
             result = base.ProPlan.TwelveMonth
         case _:
+            # Reported, never asserted — see pro_plan_from_base_plan_id in the Google provider for the
+            # reasoning; a product added in App Store Connect is external input, not a broken invariant.
+            # Every caller here already guards on the sink before using the result.
             err.msg_list.append(f'Invalid apple plan_id, unable to determine plan variant: {product_id}')
-            assert False, f'Invalid apple plan_id: {product_id}'
 
     return result
 

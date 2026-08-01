@@ -577,9 +577,21 @@ def pro_plan_from_base_plan_id(base_plan_id: str, err: ErrorSink) -> ProPlan:
         case "session-pro-12-months":
             result = ProPlan.TwelveMonth
         case _:
+            # Reported, never asserted: a base plan added in Play Console is EXTERNAL INPUT, not a broken
+            # invariant, so it must reach the caller as an error it can act on. Asserting sent an
+            # AssertionError through the handler's blanket except instead, losing the message text into a
+            # traceback. (Under `python -O` the assert vanished, leaving exactly the behaviour written here
+            # — the caller has always guarded on the sink, so `Nil` never reached a write either way.)
+            #
+            # The caller declines to write and leaves the notification unacked, which is the right answer:
+            # we cannot invent an entitlement for a plan we do not know. Recovery is open-ended rather than
+            # racing a deadline — the payload is durably stored before handling, the prune only removes
+            # handled rows, and the startup drain reloads the rest — so deploying support for the plan
+            # registers the purchase whenever that happens. Pub/Sub's retention bounds only Google's own
+            # redelivery, which stops mattering once the payload is ours. It is still an emergency: the
+            # subscriber has paid and has no Pro until that deploy.
             err.msg_list.append(f'Invalid google base_plan_id, unable to determine plan variant: {base_plan_id}')
 
-    assert result != ProPlan.Nil
     return result
 
 
