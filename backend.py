@@ -2799,6 +2799,106 @@ def google_clear_needs_ack(tx: db.SQLTransaction, payment_token: str) -> None:
     )
 
 
+@dataclasses.dataclass
+class GoogleReconcileClaim:
+    '''A purchase token leased for reconciliation, with how many consecutive failures precede this try.'''
+
+    payment_token: str = ''
+    attempts: int = 0
+
+
+@db.transactional
+def google_enqueue_reconcile(tx: db.SQLTransaction, payment_token: str, due_at: pendulum.DateTime) -> None:
+    """Record that `payment_token` owes a reconcile against Google's current subscription resource.
+
+    Idempotent by construction: the token is the primary key, so a burst of notifications for one
+    subscription collapses into one piece of work. That is the whole point of keying on the token — the
+    resource is fetched at reconcile time, so whatever the tenth notification would have told us is already
+    in the snapshot the first fetch returns.
+
+    A repeat enqueue pulls the work EARLIER (`LEAST`) and never later, so a fresh notification for a token
+    already waiting out a backoff is acted on promptly rather than inheriting the wait. `attempts` is
+    deliberately left alone: a new notification arriving says nothing about whether the reason the last
+    attempt failed has gone away, and resetting it would let a permanently stuck token retry at full speed
+    forever.
+    """
+    db.query(
+        tx.conn,
+        '''
+        INSERT INTO google_reconcile_queue (payment_token, due_at)
+        VALUES      (%(token)s, %(due_at)s)
+        ON CONFLICT (payment_token) DO UPDATE
+        SET         due_at = LEAST(google_reconcile_queue.due_at, EXCLUDED.due_at)
+    ''',
+        token=payment_token,
+        due_at=due_at,
+    )
+
+
+@db.transactional
+def google_claim_due_reconciles(
+    tx: db.SQLTransaction, now: pendulum.DateTime, lease_until: pendulum.DateTime, limit: int
+) -> list[GoogleReconcileClaim]:
+    """Lease up to `limit` tokens that are due, and return them.
+
+    A lease rather than the claim-and-process-in-one-transaction shape the credit drain uses, because
+    reconciling makes a NETWORK CALL to Google: holding row locks across that would pin a transaction open
+    for the length of an external request. So the claim pushes `due_at` out to `lease_until` and commits,
+    and the work happens outside any transaction. A worker that dies mid-fetch simply lets the lease lapse
+    and the token comes due again — no in-progress state to clean up, and no way to lose the work.
+
+    `lease_until` therefore has to exceed the longest a reconcile can take (the API call carries its own
+    socket timeout), or a slow fetch would be re-leased while it is still running. SKIP LOCKED keeps two
+    runners from contending on the same rows.
+    """
+    rows = db.query(
+        tx.conn,
+        '''
+        UPDATE google_reconcile_queue
+        SET    due_at = %(lease_until)s
+        WHERE  payment_token IN (
+                   SELECT   payment_token
+                   FROM     google_reconcile_queue
+                   WHERE    due_at <= %(now)s
+                   ORDER BY due_at
+                   FOR UPDATE SKIP LOCKED
+                   LIMIT    %(limit)s
+               )
+        RETURNING payment_token, attempts
+    ''',
+        now=now,
+        lease_until=lease_until,
+        limit=limit,
+    )
+    return [GoogleReconcileClaim(payment_token=row[0], attempts=row[1]) for row in rows.fetchall()]
+
+
+@db.transactional
+def google_reconcile_done(tx: db.SQLTransaction, payment_token: str) -> None:
+    """Drop a token from the queue: its state matches the resource as of the snapshot just applied.
+
+    Deleting rather than marking done is right because the row is an OBLIGATION, not a record. The
+    notification history keeps what arrived; this table only ever answers "what still owes work".
+    """
+    db.query(tx.conn, '''DELETE FROM google_reconcile_queue WHERE payment_token = %s''', payment_token)
+
+
+@db.transactional
+def google_reconcile_failed(tx: db.SQLTransaction, payment_token: str, retry_at: pendulum.DateTime, error: str) -> None:
+    """Push a failed token out to `retry_at` and record why, overriding the lease taken at claim time."""
+    db.query(
+        tx.conn,
+        '''
+        UPDATE google_reconcile_queue
+        SET    due_at = %(retry_at)s, attempts = attempts + 1, last_error = %(error)s
+        WHERE  payment_token = %(token)s
+    ''',
+        token=payment_token,
+        retry_at=retry_at,
+        error=error,
+    )
+
+
 def _get_date_group_expr_sql(column: str, period: ReportPeriod) -> str:
     """Group a `timestamptz` column into a UTC calendar-period label."""
     utc = f"({column} AT TIME ZONE 'UTC')"  # timestamptz → UTC wall-clock, so buckets are UTC-stable
