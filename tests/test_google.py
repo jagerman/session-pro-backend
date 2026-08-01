@@ -4308,7 +4308,9 @@ def test_proof_expiry_offset_holds_when_the_account_expiry_shrinks(monkeypatch, 
             assert after.expiry_at < before.expiry_at, 'precondition: the account expiry shrank'
             assert after.proof_expiry_offset == before.proof_expiry_offset, 'the offset is held across a shrink'
 
-            # The observable consequence: the served expiry never moved later.
+            # Both expiries here sit far beyond the rolling clamp, so both proofs are slide-capped and this
+            # holds by equality. It is a sanity check, not the regression pin -- the assert above is. The
+            # arm where the overshoot actually manifests is the PINNED one, covered by the next test.
             served_after = _prove_at(conn, ctx.backend_key, master_key, rotating_key, claimed_at).expiry_at
             assert served_after <= served_before
 
@@ -4371,3 +4373,74 @@ def test_proof_expiry_offset_redraws_when_a_revocation_rolls_the_generation(monk
             assert after.expiry_at is not None and before.expiry_at is not None
             assert after.expiry_at < before.expiry_at, 'precondition: and it was a shrink'
             assert after.proof_expiry_offset != before.proof_expiry_offset, 'so the offset must NOT carry over'
+
+
+def test_shrinking_the_expiry_never_serves_a_later_proof_in_the_pinned_arm(monkeypatch, pg_database):
+    # The arm the defect actually lived in. When the true expiry is inside the rolling clamp the served
+    # value TRACKS it, so a shrink must visibly pull the served expiry earlier (or leave it, if both land in
+    # one grid cell) -- never push it later. In the sliding arm the clamp hides the whole question.
+    #
+    # The window is narrow and is computed rather than hard-coded, so it follows the shape constants: the
+    # survivor has to outlast every outstanding proof (or the revocation broadcasts and mints a fresh
+    # generation, which re-draws by design) while still falling inside the clamp at request time. That needs
+    # the request to sit at least a grid period plus the renewal lead after the revocation.
+    shape = base.proof_expiry_shape()
+    with TestingContext(pg_database) as ctx:
+        master_key = nacl.signing.SigningKey(_UPGRADE_ACCOUNT_SEED)
+        rotating_key = nacl.signing.SigningKey.generate()
+        account_id = bytes(master_key.verify_key)
+
+        purchased_at = base.datetime_from_unix_ms(1767225600000)  # 2026-01-01
+        revoked_at = purchased_at + 3 * base.DAY
+        request_at = revoked_at + 2 * base.DAY
+        survivor_expiry = revoked_at + base.DEFAULT_TIMESTAMP_TOLERANCE + shape.max_proof_lifetime + 1 * base.HOUR
+        doomed_expiry = survivor_expiry + 5 * base.DAY
+        assert survivor_expiry <= request_at + shape.clamp, 'fixture: the survivor must be in the pinned arm'
+
+        def iso(at: pendulum.DateTime) -> str:
+            return at.in_timezone('UTC').strftime('%Y-%m-%dT%H:%M:%S.000Z')
+
+        for token, order_id, expiry in (
+            ('tok-pinned-doomed', 'GPA.5500-0000-0000-00010', doomed_expiry),
+            ('tok-pinned-survivor', 'GPA.5600-0000-0000-00011', survivor_expiry),
+        ):
+            handled, err = _drive_google_rtdn(
+                monkeypatch,
+                ctx,
+                notification_type=4,
+                purchase_token=token,
+                event_ms=base.unix_ms_from_datetime(purchased_at),
+                snapshot=_google_snapshot(
+                    state='SUBSCRIPTION_STATE_ACTIVE',
+                    expiry=iso(expiry),
+                    order_id=order_id,
+                    obfuscated_account_id=account_id,
+                ),
+            )
+            assert handled and not err.has()
+
+        with ctx.connection() as conn:
+            _redeem_and_prove(conn, ctx.backend_key, master_key, rotating_key, purchased_at + 1 * base.DAY)
+            before = backend.get_user(conn, master_key.verify_key)
+            served_before = _prove_at(conn, ctx.backend_key, master_key, rotating_key, request_at).expiry_at
+
+            sink = base.ErrorSink()
+            with db.transaction(conn) as tx:
+                backend.add_google_revocation(
+                    tx, google_payment_token='tok-pinned-doomed', revoke_at=revoked_at, err=sink
+                )
+            assert not sink.has()
+
+            after = backend.get_user(conn, master_key.verify_key)
+            assert not backend.get_revocations_list(conn), 'fixture: enough survived, so the generation held'
+            assert after.proof_expiry_offset == before.proof_expiry_offset
+            assert after.expiry_at is not None and before.expiry_at is not None
+            assert after.expiry_at < before.expiry_at, 'fixture: the account expiry shrank'
+
+            served_after = _prove_at(conn, ctx.backend_key, master_key, rotating_key, request_at).expiry_at
+            # The crossover: slide-capped before the refund, pinned to the true expiry after it. So unlike
+            # the previous test this is a real comparison, and the post-shrink side is the one that would
+            # have overshot on a fresh draw.
+            assert before.expiry_at > request_at + shape.clamp, 'fixture: sliding before'
+            assert after.expiry_at <= request_at + shape.clamp, 'fixture: pinned after'
+            assert served_after <= served_before, 'a shrink must never serve a later proof'

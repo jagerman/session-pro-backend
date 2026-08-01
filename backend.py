@@ -291,7 +291,8 @@ class UserRow:
     grace_period: pendulum.Duration = pendulum.duration()
     auto_renewing: bool = False
     # This account's private proof-expiry grid: expiries land on `UTC midnight + this + k * one day`.
-    # Re-drawn whenever `expiry_at` moves. See new_proof_expiry_offset / _build_proof_clamped_expiry_time.
+    # Re-drawn when `expiry_at` EXTENDS, and whenever a generation is minted; a shrink keeps it. See
+    # _offset_redrawn_if_expiry_extends for why, and _build_proof_clamped_expiry_time for what it buys.
     proof_expiry_offset: int = 0
 
 
@@ -899,7 +900,10 @@ def _offset_redrawn_if_expiry_extends(expiry: pendulum.DateTime | None) -> str:
     Keeping it on a shrink costs no privacy: the offset is not secret — the served expiry IS a grid point,
     so its time-of-day is the offset (test_proof_expiry_lands_on_the_account_grid asserts exactly that). What
     the offset hides is the true expiry within one period, and that only degrades under repeated independent
-    draws against an UNCHANGED expiry, which is the case this still excludes.
+    draws against a MATERIALLY UNCHANGED expiry, which is the case this still excludes. (Strictly, an
+    extension smaller than one period — a grace-duration edit moving `expiry + grace` by minutes — also
+    re-draws against a near-identical value, but that happens a handful of times in a subscription's life,
+    nowhere near enough for the minimum to converge.)
 
     ONE EXCEPTION, applied by the caller rather than here: minting a generation forces a re-draw regardless.
     A broadcast revocation is a shrink, and it is also the moment the revocation_tag rolls — the one point at
