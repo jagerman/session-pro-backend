@@ -18,7 +18,7 @@ import base
 import server
 import db
 
-from tests.helpers import derived_status, TestingContext, _google_subscription_parse, _redeem_and_prove
+from tests.helpers import derived_status, TestingContext, _google_subscription_parse, _redeem_and_prove, _prove_at
 
 
 def test_google_handle_parsed_notification_fetch_failure(monkeypatch, pg_database):
@@ -552,7 +552,10 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
         revoked = payment_status == base.PaymentStatus.Revoked
         if revoked:
             assert revoke_unix_ts_ms is not None
-            assert res_expiry_ts == to_s(revoke_unix_ts_ms)
+            # A revocation only ever pulls the end EARLIER, so a payment refunded after it had already
+            # lapsed keeps its own expiry. This scenario hits that: in the compressed testing env its
+            # expiry precedes the refund by a fifth of a "day".
+            assert res_expiry_ts == to_s(min(tx.expiry_at, revoke_unix_ts_ms))
         else:
             expiry_at = res_expiry_ts
             if res_auto_renewing:
@@ -4177,22 +4180,19 @@ def test_google_deferred_notification_wedges_forever(monkeypatch, pg_database):
         assert err.has() and any('unsupported' in msg for msg in err.msg_list)
 
 
-def test_revoking_a_lapsed_payment_extends_the_account(monkeypatch, pg_database):
-    # CHARACTERISATION of finding 3.7a, which an earlier draft wrongly called unobservable. The fold assigns
-    # `expiry_at = revoked_at` for a revoked row rather than taking the MINIMUM of the two, and that value
-    # becomes users.expiry_at -- the wire's expiry_ts, the Active/Expired decision in get_pro_status, and the
-    # ceiling a signed proof is clamped against.
+def test_revoking_a_lapsed_payment_does_not_extend_the_account(monkeypatch, pg_database):
+    # REGRESSION for finding 3.7a. The fold clamps a revoked row to `min(expiry_at, revoked_at)`; before that
+    # it assigned `revoked_at` outright, and that value becomes users.expiry_at -- the wire's expiry_ts, the
+    # Active/Expired decision in get_pro_status, and the ceiling a signed proof is clamped against.
     #
-    # So revoking a payment that had ALREADY LAPSED moves the account's expiry FORWARD, from the true lapse
-    # instant to the revocation instant: the account reports coverage across a gap it never had, and can
-    # mint fresh proofs from the refund instant. Nothing was consumable during the gap itself -- the
-    # extension only exists once the refund is processed -- so the real grant is the prospective one.
+    # So revoking a payment that had ALREADY LAPSED used to move the account's expiry FORWARD, reporting
+    # coverage across a gap it never had and letting it mint fresh proofs from the refund instant. Nothing
+    # was consumable during the gap itself, since the extension only existed once the refund was processed,
+    # so the grant was the prospective one -- bounded by the over-provision window, and unannounced, because
+    # the day-boundary early-out sees the payment's own expiry sitting well before the revoke instant,
+    # concludes it was expiring anyway, and skips the broadcast.
     #
-    # The account does not even get a revocation broadcast to cut the resulting proofs short: the
-    # day-boundary early-out sees the payment's own expiry sitting well before the revoke instant, concludes
-    # it was expiring anyway, and skips. So the extension stands unannounced.
-    #
-    # Demonstrated on the Google fixture because it is cheap to build. The live path is APPLE's: a REFUND
+    # Driven through the Google fixture because it is cheap to build. The live path was APPLE's: a REFUND
     # carries Apple's revocationDate straight into revoke_at (providers/app_store.py), and Apple can process
     # a refund long after the subscription lapsed.
     with TestingContext(pg_database) as ctx:
@@ -4234,8 +4234,76 @@ def test_revoking_a_lapsed_payment_extends_the_account(monkeypatch, pg_database)
 
         with ctx.connection() as conn:
             user = backend.get_user(conn, master_key.verify_key)
-            assert user.expiry_at == refunded_at, 'the refund moved the account expiry FORWARD by four months'
-            assert not backend.get_revocations_list(conn), 'and nothing was broadcast to cut it short'
-            # The payment row itself keeps the honest pair; only the fold conflates them.
+            # The account keeps the expiry it actually paid for -- NOT the refund instant four months later.
+            # It loses the grace period, because revoking clears auto_renewing and only a renewing payment
+            # carries grace, which is a reduction and therefore fine.
+            assert user.expiry_at == lapses_at
+            assert user.expiry_at < refunded_at, 'a refund must never move the account expiry forward'
+            assert not backend.get_revocations_list(conn), 'nothing to broadcast: it was already expired'
+            # The payment row keeps both facts, each meaning its own thing.
             row = db.query_one(conn, 'SELECT expiry_at, revoked_at FROM payments ORDER BY id DESC LIMIT 1')
-            assert row[0] == lapses_at and row[1] == refunded_at
+            assert row is not None and row[0] == lapses_at and row[1] == refunded_at
+
+
+def test_proof_expiry_offset_holds_when_the_account_expiry_shrinks(monkeypatch, pg_database):
+    # A reduction in entitlement must only ever reduce -- the same rule as the clamp above, applied to the
+    # obfuscation grid. The served expiry is the true one rounded UP onto `EPOCH + offset + k*grid`, so it
+    # lands in [true, true + grid). Re-drawing the offset on a SHRINK would place the new grid point without
+    # reference to the old one, so any shrink smaller than one grid period could serve a LATER expiry than
+    # before: a revocation handing out coverage.
+    #
+    # Holding the offset keeps the grid fixed, and rounding up is monotonic on a fixed grid, so a smaller
+    # true expiry cannot produce a larger served one. Extensions still re-draw
+    # (test_proof_expiry_offset_redraws_only_when_true_expiry_moves), which is what stops an observer
+    # collecting repeated independent samples against one unchanged expiry.
+    with TestingContext(pg_database) as ctx:
+        master_key = nacl.signing.SigningKey(_UPGRADE_ACCOUNT_SEED)
+        rotating_key = nacl.signing.SigningKey.generate()
+        account_id = bytes(master_key.verify_key)
+        claimed_at = base.datetime_from_unix_ms(1767830400000)  # 2026-01-08
+
+        # Two subscriptions on one account -- the second device / second Google account case. The account's
+        # expiry is the later of the two, and refunding THAT one is what makes the expiry shrink while
+        # leaving live coverage behind, which is what lets a proof still be minted afterwards.
+        for token, order_id, expiry in (
+            ('tok-shrink-long', 'GPA.4000-0000-0000-00006', '2026-06-01T00:00:00.000Z'),
+            ('tok-shrink-short', 'GPA.3000-0000-0000-00007', '2026-03-01T00:00:00.000Z'),
+        ):
+            handled, err = _drive_google_rtdn(
+                monkeypatch,
+                ctx,
+                notification_type=4,
+                purchase_token=token,
+                event_ms=1767225600000,
+                snapshot=_google_snapshot(
+                    state='SUBSCRIPTION_STATE_ACTIVE',
+                    expiry=expiry,
+                    order_id=order_id,
+                    obfuscated_account_id=account_id,
+                ),
+            )
+            assert handled and not err.has()
+
+        with ctx.connection() as conn:
+            _redeem_and_prove(conn, ctx.backend_key, master_key, rotating_key, claimed_at)
+            before = backend.get_user(conn, master_key.verify_key)
+            served_before = _prove_at(conn, ctx.backend_key, master_key, rotating_key, claimed_at).expiry_at
+
+            # Refund the LONGER one, well before it would have expired: the account's expiry shrinks back to
+            # the shorter subscription, which is still live.
+            revoked_at = base.datetime_from_unix_ms(1769904000000)  # 2026-02-01, inside the paid term
+            sink = base.ErrorSink()
+            with db.transaction(conn) as tx:
+                backend.add_google_revocation(
+                    tx, google_payment_token='tok-shrink-long', revoke_at=revoked_at, err=sink
+                )
+            assert not sink.has()
+
+            after = backend.get_user(conn, master_key.verify_key)
+            assert after.expiry_at is not None and before.expiry_at is not None
+            assert after.expiry_at < before.expiry_at, 'precondition: the account expiry shrank'
+            assert after.proof_expiry_offset == before.proof_expiry_offset, 'the offset is held across a shrink'
+
+            # The observable consequence: the served expiry never moved later.
+            served_after = _prove_at(conn, ctx.backend_key, master_key, rotating_key, claimed_at).expiry_at
+            assert served_after <= served_before

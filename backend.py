@@ -882,17 +882,31 @@ def new_proof_expiry_offset() -> int:
     return int.from_bytes(nacl.utils.random(8), 'big') % base.proof_expiry_shape().offset_range
 
 
-# Re-draw `users.proof_expiry_offset` exactly when the account's true expiry MOVES. Both users of this
-# clause set expiry_at from the payment list, so "moved" is the honest trigger for a new subscription
-# cycle: it covers a redeem, a renewal, a stacked purchase and a revocation, and skips a no-op refresh (a
-# flag-only touch, a re-reconcile that claims nothing). That precision matters in both directions — never
-# re-drawing against a fixed anniversary instant would leave a stable per-account fingerprint, while
-# re-drawing on every touch would hand an observer repeated samples of the same true expiry, whose minimum
-# converges straight back onto it.
-_REDRAW_OFFSET_IF_EXPIRY_MOVED = (
-    "proof_expiry_offset = CASE WHEN expiry_at IS DISTINCT FROM %(expiry)s"
-    " THEN %(proof_random_offset)s ELSE proof_expiry_offset END"
-)
+def _offset_redrawn_if_expiry_extends(expiry: pendulum.DateTime | None) -> str:
+    '''The SQL value for `users.proof_expiry_offset`: a fresh draw when the account's true expiry EXTENDS,
+    the stored one otherwise. Both callers set expiry_at from the payment list, so an extension is the
+    honest trigger for a new subscription cycle — a redeem, a renewal, a stacked purchase.
+
+    Precision matters in three directions. Never re-drawing would leave a stable per-account fingerprint
+    against a fixed anniversary instant. Re-drawing on a no-op refresh (a flag-only touch, a re-reconcile
+    that claims nothing) would hand an observer repeated samples of one true expiry, whose minimum converges
+    straight back onto it. And re-drawing on a SHRINK would let a reduction in entitlement hand out MORE
+    coverage: the served expiry is the true one rounded up onto `EPOCH + offset + k*grid`, so an independent
+    new offset lands anywhere in the following period and can overshoot what the longer expiry served. Keep
+    the offset and the grid is unchanged, so rounding up a smaller value can only give a smaller result.
+
+    Keeping it on a shrink costs no privacy: the offset is not secret — the served expiry IS a grid point,
+    so its time-of-day is the offset (test_proof_expiry_lands_on_the_account_grid asserts exactly that). What
+    the offset hides is the true expiry within one period, and that only degrades under repeated independent
+    draws against an UNCHANGED expiry, which is the case this still excludes.
+    '''
+    # A shrink to "no expiry at all" is still a shrink, so the degenerate case is just: keep it.
+    if expiry is None:
+        return 'proof_expiry_offset'
+    return (
+        'CASE WHEN expiry_at IS NULL OR %(expiry)s > expiry_at'
+        ' THEN %(proof_random_offset)s ELSE proof_expiry_offset END'
+    )
 
 
 @db.transactional
@@ -910,7 +924,7 @@ def _update_user_expiry_grace_and_renew_flag_from_payment_list(
         UPDATE users
         SET    expiry_at = %(expiry)s, grace_period = %(grace)s,
                auto_renewing = %(renewing)s,
-               {_REDRAW_OFFSET_IF_EXPIRY_MOVED}
+               proof_expiry_offset = {_offset_redrawn_if_expiry_extends(lookup.best_expiry)}
         WHERE  master_pkey = %(pkey)s
     ''',
         expiry=lookup.best_expiry,
@@ -1481,11 +1495,17 @@ def _lookup_user_expiry(tx: db.SQLTransaction, master_pkey: nacl.signing.VerifyK
         # revoked_at set), never a flattened status. Whether a payment has *expired* is a separate,
         # now-relative concern handled downstream (get_pro_status / proof-expiry clamping) — it must
         # not gate what expiry the user is *entitled* to, so no wall-clock enters here.
+        #
+        # A clamp, never an assignment: a revocation stops entitlement, so it can only ever pull the end
+        # EARLIER. A payment refunded after it had already lapsed keeps its own expiry — assigning would
+        # instead hand the account coverage from its lapse up to the refund, and this value becomes
+        # users.expiry_at, i.e. the wire's expiry_ts and the ceiling a proof is clamped against. Apple
+        # reaches that case whenever it processes a refund for a subscription that has already ended.
         assert expiry_at is not None, 'a row reaching the max has an expiry: live credits are summed above'
         if revoked_at is not None:
             assert not auto_renewing
-            payment_expiry_at = revoked_at
-            expiry_at = revoked_at
+            expiry_at = min(expiry_at, revoked_at)
+            payment_expiry_at = expiry_at
         else:
             payment_expiry_at = expiry_at + grace if auto_renewing else expiry_at
 
@@ -2050,7 +2070,7 @@ def _ensure_active_generation(
                expiry_at                   = %(expiry)s,
                grace_period                 = %(grace)s,
                auto_renewing                = %(auto_renewing)s,
-               {_REDRAW_OFFSET_IF_EXPIRY_MOVED}
+               proof_expiry_offset          = {_offset_redrawn_if_expiry_extends(lookup.best_expiry)}
         WHERE  id = %(user_id)s
     ''',
         gen_id=result.generation_id,
