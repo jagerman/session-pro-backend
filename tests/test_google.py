@@ -4184,7 +4184,9 @@ def test_revoking_a_lapsed_payment_extends_the_account(monkeypatch, pg_database)
     # ceiling a signed proof is clamped against.
     #
     # So revoking a payment that had ALREADY LAPSED moves the account's expiry FORWARD, from the true lapse
-    # instant to the revocation instant. A refund grants entitlement.
+    # instant to the revocation instant: the account reports coverage across a gap it never had, and can
+    # mint fresh proofs from the refund instant. Nothing was consumable during the gap itself -- the
+    # extension only exists once the refund is processed -- so the real grant is the prospective one.
     #
     # The account does not even get a revocation broadcast to cut the resulting proofs short: the
     # day-boundary early-out sees the payment's own expiry sitting well before the revoke instant, concludes
