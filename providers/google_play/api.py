@@ -66,6 +66,11 @@ package_name: str = ''
 subscription_product_id: str = ''
 refund_deadline_duration_ms: int = base.MILLISECONDS_IN_DAY * 2
 
+# Every Play API call is bounded by this (see notifications.init, which builds the transport). Named because
+# the reconcile lease has to be derived from it: a lease shorter than a batch's worst-case runtime expires
+# under the worker still holding it.
+SOCKET_TIMEOUT_S: int = 15
+
 # NOTE: In the testing environment on Google, 1 day gets shortened to 10s. This means the default
 # grace period which at this time is set to 1hr is going to largely overrun the subscription's
 # testing duration, this causes weird/difficult to explain things to happen that we can avoid by
@@ -636,10 +641,15 @@ def parse_subscription_plan_event_tx(
         # stops it, matching how every other parse failure here behaves.
         return SubscriptionPlanEventTransaction(
             base_plan_id='',
-            # Never read: the populated sink is what stops the caller. Borrowed from the first item rather
-            # than fabricated, because GoogleTimestamp parses RFC3339 and there is always at least one item
-            # (parse_get_subscription_v2_response rejects an empty lineItems).
-            expiry_time=details.line_items[0].expiry_time,
+            # Never read: the populated sink is what stops the caller. Borrowed rather than fabricated,
+            # because GoogleTimestamp parses RFC3339. A parsed resource always has at least one item
+            # (parse_get_subscription_v2_response rejects an empty lineItems), but the PROVIDER_DRY_RUN
+            # synthetic is built by hand with none, so the guard is not decorative.
+            expiry_time=(
+                details.line_items[0].expiry_time
+                if details.line_items
+                else GoogleTimestamp('1970-01-01T00:00:00Z', ErrorSink())
+            ),
             pro_plan=ProPlan.Nil,
             event_ts_ms=event_ts_ms,
             notification=notification,

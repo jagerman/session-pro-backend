@@ -2818,6 +2818,7 @@ def google_converge_payment(
     auto_renewing: bool,
     grace_period: pendulum.Duration,
     needs_ack: bool,
+    at: pendulum.DateTime,
     err: base.ErrorSink,
 ) -> bool:
     """Bring an existing payment row into line with what Google's subscription resource now says, and report
@@ -2888,8 +2889,15 @@ def google_converge_payment(
 
     # Only a claimed payment has an account whose entitlement could have moved; an unclaimed one is folded
     # in when its owner's next request reconciles it.
+    #
+    # Through the SAME rule the revoke path uses, not a bare recompute. Converging is one of the ways an
+    # entitlement FALLS — a term the store shortened, or a revoke we never received a notification for,
+    # whose resource now reads back-dated — and a fall that nobody judges leaves every outstanding proof
+    # certifying a horizon the account no longer has. Safe on the paths where nothing fell: the rule claims
+    # pending payments before deciding, so an upgrade's replacement is bound first, the delta gate sees no
+    # fall, and it returns without announcing anything.
     if row[0] is not None:
-        _update_user_expiry_grace_and_renew_flag_from_payment_list(tx, nacl.signing.VerifyKey(bytes(row[0])))
+        refresh_entitlement_and_revoke_overreaching_proofs(tx, nacl.signing.VerifyKey(bytes(row[0])), at=at)
     return True
 
 
@@ -2999,7 +3007,17 @@ def google_reconcile_done(tx: db.SQLTransaction, claim: GoogleReconcileClaim) ->
         token=claim.payment_token,
         revision=claim.revision,
     )
-    return rows.fetchone() is not None
+    if rows.fetchone() is not None:
+        return True
+
+    # A newer obligation stands, so the row survives — but this worker is done with it, and leaving the
+    # lease standing would make the fresh notification wait out however much of it remains for nothing.
+    db.query(
+        tx.conn,
+        '''UPDATE google_reconcile_queue SET leased_until = NULL WHERE payment_token = %s''',
+        claim.payment_token,
+    )
+    return False
 
 
 @db.transactional

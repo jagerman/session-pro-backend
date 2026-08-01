@@ -4793,7 +4793,9 @@ def test_a_voided_purchase_with_unset_types_is_reported_not_asserted(monkeypatch
         assert any('not handled' in msg for msg in err.msg_list), err.msg_list
 
 
-def _converge(ctx, token: str, order_id: str, *, expiry, auto_renewing=True, grace=None, needs_ack=False) -> bool:
+def _converge(
+    ctx, token: str, order_id: str, *, expiry, auto_renewing=True, grace=None, needs_ack=False, at=None
+) -> bool:
     payment_tx = base.PaymentProviderTransaction(
         provider=base.PaymentProvider.GooglePlayStore, google_payment_token=token, google_order_id=order_id
     )
@@ -4807,6 +4809,7 @@ def _converge(ctx, token: str, order_id: str, *, expiry, auto_renewing=True, gra
                 auto_renewing=auto_renewing,
                 grace_period=grace if grace is not None else base.DEFAULT_GOOGLE_GRACE_PERIOD,
                 needs_ack=needs_ack,
+                at=at if at is not None else base.utc_now(),
                 err=err,
             )
     assert not err.has(), err.msg_list
@@ -5197,3 +5200,62 @@ def test_reconciling_is_indifferent_to_the_order_notifications_arrive_in(monkeyp
         rows = _payment_rows(ctx)
         assert len(rows) == 1, 'three reconciles, one cycle'
         assert rows[0][1] == base.datetime_from_unix_ms(1772323200000)
+
+
+def test_a_fall_discovered_by_converging_is_announced(monkeypatch, pg_database):
+    # Convergence is one of the ways an entitlement FALLS -- a term the store shortened, or a revoke whose
+    # notification we never received, whose resource now reads back-dated. Refreshing the account without
+    # judging it would leave every outstanding proof certifying a horizon the account no longer has, and
+    # nothing would announce it: the client keeps presenting a proof we signed, and peers keep honouring it.
+    #
+    # So converge routes its recompute through the same rule the revoke path uses, rather than a bare
+    # refresh. Same question, whatever moved the rows underneath.
+    monkeypatch.setattr('providers.google_play.api.subscription_v1_acknowledge', lambda *a, **k: None)
+    with TestingContext(pg_database) as ctx:
+        master_key = nacl.signing.SigningKey(_UPGRADE_ACCOUNT_SEED)
+        rotating_key = nacl.signing.SigningKey.generate()
+        account_id = bytes(master_key.verify_key)
+        token, order_id = 'tok-shortened', 'GPA.7171-7171-7171-71711'
+
+        handled, err = _drive_google_rtdn(
+            monkeypatch,
+            ctx,
+            notification_type=4,
+            purchase_token=token,
+            event_ms=1767225600000,
+            snapshot=_google_snapshot(
+                state='SUBSCRIPTION_STATE_ACTIVE',
+                expiry='2026-06-01T00:00:00.000Z',
+                order_id=order_id,
+                obfuscated_account_id=account_id,
+            ),
+        )
+        assert handled and not err.has()
+
+        claimed_at = base.datetime_from_unix_ms(1767830400000)  # 2026-01-08
+        with ctx.connection() as conn:
+            _redeem_and_prove(conn, ctx.backend_key, master_key, rotating_key, claimed_at)
+            before = backend.get_user(conn, master_key.verify_key)
+            assert not backend.get_revocations_list(conn)
+
+        # Google now says the term ended back in January -- what a revoke looks like in the resource, and
+        # what a missed REVOKED notification leaves behind for convergence to discover.
+        # `at` is the instant the reconcile runs, and must sit inside the fixture's timeline: judged against
+        # the real clock the account would read as long expired, and the day-boundary gate would rightly
+        # decline to announce anything.
+        assert (
+            _converge(
+                ctx,
+                token,
+                order_id,
+                expiry=base.datetime_from_unix_ms(1767830400000),
+                at=base.datetime_from_unix_ms(1768003200000),  # 2026-01-10
+            )
+            is True
+        )
+
+        with ctx.connection() as conn:
+            after = backend.get_user(conn, master_key.verify_key)
+            assert after.expiry_at is not None and before.expiry_at is not None
+            assert after.expiry_at < before.expiry_at, 'the entitlement fell'
+            assert len(backend.get_revocations_list(conn)) == 1, 'and it was announced'

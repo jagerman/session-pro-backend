@@ -662,9 +662,13 @@ def require_obfuscated_external_account_id(tx_event: SubscriptionPlanEventTransa
 # calls a single pass can make; the rest simply wait for the next one.
 RECONCILE_BATCH_LIMIT = 32
 
-# How long a claimed token is held. Must exceed the longest a single reconcile can take -- the Play API call
-# carries a 15 s socket timeout (see init) -- or a slow fetch would be re-leased while it is still running.
-RECONCILE_LEASE = pendulum.duration(minutes=5)
+# How long a claimed token is held. DERIVED, not chosen: the pass is serial, so its worst case is every
+# token in the batch taking a full socket timeout, and a lease shorter than that expires under the worker
+# still holding it -- handing live tokens to the next pass, which is the exact race the lease exists to
+# prevent. Doubled for the DB work between fetches and for a slow host. Change either input and this
+# follows; pick them independently and they drift apart silently, which is how the first version of this
+# ended up with a 5 minute lease over an 8 minute worst case.
+RECONCILE_LEASE = pendulum.duration(seconds=2 * RECONCILE_BATCH_LIMIT * api.SOCKET_TIMEOUT_S)
 
 # Backoff after a failed reconcile, doubling per consecutive failure to a ceiling. The ceiling matters more
 # than the curve: a token that is permanently unreconcilable must not consume a claim slot on every pass,
@@ -790,6 +794,7 @@ def reconcile_google_subscription(
         auto_renewing=auto_renewing,
         grace_period=grace_period,
         needs_ack=needs_ack,
+        at=at,
         err=err,
     )
     if err.has():
