@@ -149,6 +149,13 @@ class SubscriptionNotificationType(IntEnum):
     # step-up is required.
     PRICE_STEP_UP_CONSENT_UPDATED = 22
 
+    # Any notificationType Google introduces that this table does not list yet. Parsing maps an
+    # unrecognised value here rather than rejecting the message, which is what lets it be STORED and
+    # retried: rejecting at parse discards it before it is written down, so it redelivers until Pub/Sub's
+    # retention lapses and is then gone. Retaining it means a deploy that adds the type can still apply it.
+    # -1 cannot collide with a real value, which Google draws from the non-negative ints.
+    UNKNOWN = -1
+
 
 class ProductType(IntEnum):  # Product types for voided purchases
     NIL = 0  # Sentinel value, never used except for zero-initialised objects

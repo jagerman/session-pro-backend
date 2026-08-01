@@ -4716,3 +4716,77 @@ def test_voided_notifications_reach_their_handler(monkeypatch, pg_database):
             with db.transaction(conn) as tx:
                 assert google_play.handle_parsed_notification(tx, voided(product_type=2, refund_type=1), err) is False
         assert err.has() and any('unsupported' in msg for msg in err.msg_list), err.msg_list
+
+
+def test_a_notification_type_google_adds_later_is_retained_not_discarded(monkeypatch, pg_database):
+    # The default arm in handle_subscription_notification is meant to catch a type Google introduces after
+    # us. It could not: an unrecognised notificationType is an unrecognised INT, and the shared enum
+    # coercion errs on those -- so the message died at parse, in the pull loop's discard branch, before it
+    # was ever written down. It would then redeliver until Pub/Sub's retention lapsed and be lost, which is
+    # worse than either option in the wedge-vs-ack question the default arm was written to answer.
+    #
+    # Parsing now maps an unknown value to UNKNOWN, so the message is storable and reaches the arm that can
+    # report what it was -- which is what makes "retained until a deploy understands it" true rather than
+    # aspirational.
+    monkeypatch.setattr('providers.google_play.api.package_name', 'network.loki.messenger')
+    err = base.ErrorSink()
+    decoded = google_play.decode_notification(
+        json.dumps(
+            {
+                'version': '1.0',
+                'packageName': 'network.loki.messenger',
+                'eventTimeMillis': '1767225600000',
+                'subscriptionNotification': {
+                    'version': '1.0',
+                    'notificationType': 9999,  # not a value this backend knows
+                    'purchaseToken': 'tok-future',
+                    'subscriptionId': 'session_pro',
+                },
+            }
+        ),
+        'future type',
+        err,
+    )
+    # Parsed cleanly, so the pull loop stores it rather than discarding it.
+    assert decoded is not None and not err.has(), err.msg_list
+    assert decoded.sub_type == google_play.types.SubscriptionNotificationType.UNKNOWN
+    assert decoded.payload_type == google_play.ParsedNotificationPayloadType.Subscription
+    assert decoded.purchase_token == 'tok-future'
+
+
+def test_a_voided_purchase_with_unset_types_is_reported_not_asserted(monkeypatch, pg_database):
+    # NIL is 0 and IS an enum member, so `productType: 0` coerces cleanly at parse and arrives intact. The
+    # asserts that used to guard handle_voided_notification were therefore reachable from the wire, not the
+    # impossible-state guards they were written as -- harmless only while the whole function was unreachable
+    # dead code, and live the moment the dispatch typo was fixed.
+    monkeypatch.setattr('providers.google_play.api.package_name', 'network.loki.messenger')
+    err = base.ErrorSink()
+    decoded = google_play.decode_notification(
+        json.dumps(
+            {
+                'version': '1.0',
+                'packageName': 'network.loki.messenger',
+                'eventTimeMillis': '1767225600000',
+                'voidedPurchaseNotification': {
+                    'purchaseToken': 'tok-nil-types',
+                    'orderId': 'GPA.4444-4444-4444-44444',
+                    'productType': 0,  # NIL, which coerces fine
+                    'refundType': 0,
+                },
+            }
+        ),
+        'nil types',
+        err,
+    )
+    assert decoded is not None and not err.has(), err.msg_list
+
+    with TestingContext(pg_database) as ctx:
+        err = base.ErrorSink()
+        with ctx.connection() as conn:
+            with db.transaction(conn) as tx:
+                # Reported and skipped, rather than raising an AssertionError that the branch's except
+                # would bury in a traceback.
+                assert google_play.handle_parsed_notification(tx, decoded, err) is False
+        assert err.has()
+        assert not any('AssertionError' in msg for msg in err.msg_list), err.msg_list
+        assert any('not handled' in msg for msg in err.msg_list), err.msg_list

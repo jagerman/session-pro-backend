@@ -36,12 +36,12 @@ Keep this in sync with the code — it describes real branches, not intentions.
 
 | Feature / notification | Enabled in Play Console by… | Current behaviour if hit | Consequence | Fails |
 |---|---|---|---|---|
-| **One-time (managed) product** — `voidedPurchaseNotification` `productType=ONE_TIME` | offering any one-time / managed product SKU | `handle_voided_notification` appends `unsupported!` → RTDN retry-loop + purchase-token error state | refunded one-time purchase keeps full Pro (over-entitlement) | loud-ish |
+| **One-time (managed) product** — `voidedPurchaseNotification` `productType=ONE_TIME` | offering any one-time / managed product SKU | `handle_voided_notification` appends `unsupported!` → `tx.cancel` → RTDN retry-loop | refunded one-time purchase keeps full Pro (over-entitlement) | loud-ish |
 | **One-time product purchase** — `OneTimeProduct` notification | offering any one-time / managed product SKU | mapped to `Nil` → silent no-op (the explicit `OneTimeProduct` error branch is dead code) | one-time purchase grants no Pro (paid-but-no-Pro) | silent |
 | **Prepaid base plan** — `prepaidPlan` line item (`platform_google_api.py`) | adding a prepaid (non-auto-renewing) base plan to a subscription | `handle_not_implemented('prepaidPlan')` → error propagates → RTDN retry-loop + purchase-token error state | prepaid subscriber's purchase never registers (paid-but-no-Pro); notification loops forever | silent |
-| **Subscription pause** — `PAUSED` / `PAUSE_SCHEDULE_CHANGED` notifications | enabling **pause** on any base plan | appends `unsupported!` → `tx.cancel` → RTDN retry-loop + token error state | paused user may stay entitled; notification stuck | silent |
+| **Subscription pause** — `PAUSED` / `PAUSE_SCHEDULE_CHANGED` notifications | enabling **pause** on any base plan | appends `unsupported!` → `tx.cancel` → RTDN retry-loop | paused user may stay entitled; notification stuck | silent |
 | **Deferred billing / recurrence change** — `DEFERRED` notification | issuing a deferred upgrade/downgrade or recurrence-date extension | same as pause (retry-loop + token error) | deferred renewal mis-timed; notification stuck | silent |
-| **Partial / quantity-based refund** — `voidedPurchaseNotification` `refundType=QUANTITY_BASED_PARTIAL_REFUND` | issuing a partial refund (only possible on multi-quantity purchases) | `handle_voided_notification` appends `unsupported!` → RTDN retry-loop + purchase-token error state | partial refund not reflected in entitlement | loud-ish |
+| **Partial / quantity-based refund** — `voidedPurchaseNotification` `refundType=QUANTITY_BASED_PARTIAL_REFUND` | issuing a partial refund (only possible on multi-quantity purchases) | `handle_voided_notification` appends `unsupported!` → `tx.cancel` → RTDN retry-loop | partial refund not reflected in entitlement | loud-ish |
 | **New / changed base plan** — `pro_plan_from_base_plan_id` | adding any base plan beyond the three known ones* | reported to the ErrorSink; the caller declines to write and the notification is retried | any purchase of the new plan registers no Pro until the plan is supported — recoverable, since the payload is retained and a later deploy applies it | loud-ish |
 
 \* known base plans: `session-pro-{1-month,3-months,12-months}`.
@@ -60,9 +60,18 @@ Keep this in sync with the code — it describes real branches, not intentions.
   the moment either feature is enabled — the notification is retried and retained instead of acked away.
   That is the intended trade: a wedged notification is recoverable once a handler exists, whereas the
   silent ack it replaced let a refunded purchase keep Pro with nobody told.
-- An unknown `SubscriptionNotificationType` — one Google adds later — is likewise reported rather than
-  falling through as a silent no-op. If a new *benign* type starts arriving in volume, add it to the no-op
-  list above; do not soften the default.
+- A `SubscriptionNotificationType` Google adds later is reported rather than falling through as a silent
+  no-op, and — because parsing maps an unrecognised value to `UNKNOWN` instead of rejecting it — the
+  message is *stored* first, so a deploy that adds the type applies the backlog. If a new *benign* type
+  starts arriving in volume, add it to the no-op list above; do not soften the default.
+
+**A note on what "retry-loop" does and does not mean.** A failure inside a *handler* sets `tx.cancel`,
+which rolls back the whole per-message transaction — **including the `user_error` row written in it**. So a
+handler-stage failure leaves **no persistent error state**: every retry re-adds and re-rolls back the same
+row, and nothing appears in the account's `error_report`. A persistent `user_error` forms only for
+*fetch/parse-stage* failures, whose early returns skip the tail and let the transaction commit (the prepaid
+row above is one). For everything else, the only signal is retry noise in the logs — which is a good deal
+weaker than "loud-ish" suggests, and is why nothing here substitutes for the loud-guard.
 
 ---
 

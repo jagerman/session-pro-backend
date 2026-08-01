@@ -936,21 +936,35 @@ def handle_subscription_notification(
 
 
 def handle_voided_notification(tx: VoidedPurchaseTxFields, err: base.ErrorSink):
-    assert tx.product_type != ProductType.NIL
+    # Reported, never asserted, and with a default arm on each match — the same treatment the plan mappers
+    # and the subscription match received. It matters more here than it looks: NIL is 0 and IS an enum
+    # member, so `productType: 0` coerces cleanly at parse and arrives intact, which made the asserts this
+    # replaced reachable from the wire rather than being the impossible-state guards they were written as.
+    # They were harmless only while the whole function was unreachable dead code.
     match tx.product_type:
         case ProductType.SUBSCRIPTION:
-            assert tx.refund_type != RefundType.NIL
             match tx.refund_type:
                 case RefundType.FULL_REFUND:
-                    # TODO: investigate if we need to implement anything here
+                    # A deliberate no-op: subscription revocation arrives separately, as SUBSCRIPTION_REVOKED.
                     pass
                 case RefundType.QUANTITY_BASED_PARTIAL_REFUND:
                     err.msg_list.append(f'voided purchase refundType {reflect_enum(tx.refund_type)} is unsupported!')
+                case _:
+                    err.msg_list.append(
+                        f'voided purchase of a subscription has refundType {reflect_enum(tx.refund_type)}, '
+                        f'which is not handled!'
+                    )
         case ProductType.ONE_TIME:
             err.msg_list.append(f'voided purchase productType {reflect_enum(tx.product_type)} is unsupported!')
+        case _:
+            err.msg_list.append(f'voided purchase productType {reflect_enum(tx.product_type)} is not handled!')
 
     if err.has():
-        err.msg_list.append(f'Failed to handle {reflect_enum(tx.refund_type)}')
+        # Labelled by the pair, not by the refund type alone: a ONE_TIME failure is a product-type problem
+        # and used to be reported under whatever refund type happened to accompany it.
+        err.msg_list.append(
+            f'Failed to handle voided purchase ' f'({reflect_enum(tx.product_type)}, {reflect_enum(tx.refund_type)})'
+        )
 
 
 def decode_notification(data: str | bytes, label: str, err: base.ErrorSink) -> ParsedNotification | None:
@@ -1007,10 +1021,21 @@ def parse_notification(body: JSONObject, err: base.ErrorSink) -> ParsedNotificat
     if subscription is not None:
         result.purchase_token = json_dict_require_str(subscription, "purchaseToken", err)
         result.payload_version = json_dict_require_str(subscription, "version", err)
-        result.sub_type = typing.cast(
-            SubscriptionNotificationType,
-            json_dict_require_int_coerce_to_enum(subscription, "notificationType", SubscriptionNotificationType, err),
+        # Coerced by hand rather than through json_dict_require_int_coerce_to_enum, which ERRS on a value
+        # it does not recognise. Erring here would reject a notificationType Google adds later before the
+        # message is written down, so it would redeliver until retention lapsed and then be lost — and the
+        # default arm in handle_subscription_notification, whose whole purpose is to catch exactly this,
+        # would never see it. Mapping to UNKNOWN keeps the message storable and lets it fail loudly at the
+        # place that can report what it was.
+        raw_sub_type = base.json_dict_require_int(subscription, "notificationType", err)
+        result.sub_type = SubscriptionNotificationType._value2member_map_.get(  # type: ignore[assignment]
+            raw_sub_type, SubscriptionNotificationType.UNKNOWN
         )
+        if result.sub_type == SubscriptionNotificationType.UNKNOWN:
+            log.warning(
+                f'Google sent subscription notificationType {raw_sub_type}, which this backend does not '
+                f'know. Retained for retry; it will apply itself once the type is supported.'
+            )
         result.payload_type = ParsedNotificationPayloadType.Subscription
 
     elif voided_purchase is not None:
