@@ -1011,6 +1011,16 @@ def refresh_entitlement_and_revoke_overreaching_proofs(
     reconcile_pending_payments(tx, master_pkey, redeemed_at=to_redeemed_at(base.utc_now()))
     _update_user_expiry_grace_and_renew_flag_from_payment_list(tx, master_pkey)
 
+    # The honest question is the DELTA, so ask it first and exactly: if the account ends up covering at
+    # least what it covered before, nothing already signed can overstate it, whatever moved underneath.
+    # Both gates below test absolutes, which is nearly always the same thing and occasionally is not —
+    # refunding a payment that was NOT the account's entitlement driver leaves `surviving` unchanged and far
+    # out, clears the day boundary, and yet falls short of the 30-day cap, so without this it would revoke
+    # every proof of an account whose entitlement never moved.
+    surviving_now = _lookup_user_expiry(tx, master_pkey).best_expiry
+    if surviving_now is not None and prior_expiry is not None and surviving_now >= prior_expiry:
+        return False
+
     # An account that was expiring within the day anyway is not worth an entry in the revocation list every
     # client fetches. A proof built against it can reach the renewal lead plus a whole grid period (≤ ~25 h)
     # past that boundary, so one can outlive this early-out by that much: accepted, because the entitlement
@@ -1025,8 +1035,7 @@ def refresh_entitlement_and_revoke_overreaching_proofs(
     # request instant, and a request is only accepted within the clock tolerance, so nothing issued up to
     # now goes beyond this. If what survives covers that, every proof we have signed is still honest and
     # there is nothing to announce.
-    surviving = _lookup_user_expiry(tx, master_pkey).best_expiry
-    if surviving is not None and surviving >= at + base.DEFAULT_TIMESTAMP_TOLERANCE + (
+    if surviving_now is not None and surviving_now >= at + base.DEFAULT_TIMESTAMP_TOLERANCE + (
         base.proof_expiry_shape().max_proof_lifetime
     ):
         return False
@@ -2886,14 +2895,20 @@ def google_converge_payment(
 
 @dataclasses.dataclass
 class GoogleReconcileClaim:
-    '''A purchase token leased for reconciliation, with how many consecutive failures precede this try.'''
+    '''A purchase token leased for reconciliation.
+
+    `revision` is the obligation this worker picked up. It must be handed back to `google_reconcile_done` or
+    `google_reconcile_failed`, which use it to tell whether a notification arrived while the fetch was in
+    flight — one that describes a state the fetch cannot have seen, and so must not be cleared by it.
+    '''
 
     payment_token: str = ''
     attempts: int = 0
+    revision: int = 0
 
 
 @db.transactional
-def google_enqueue_reconcile(tx: db.SQLTransaction, payment_token: str, due_at: pendulum.DateTime) -> None:
+def google_enqueue_reconcile(tx: db.SQLTransaction, payment_token: str, eligible_at: pendulum.DateTime) -> None:
     """Record that `payment_token` owes a reconcile against Google's current subscription resource.
 
     Idempotent by construction: the token is the primary key, so a burst of notifications for one
@@ -2910,13 +2925,14 @@ def google_enqueue_reconcile(tx: db.SQLTransaction, payment_token: str, due_at: 
     db.query(
         tx.conn,
         '''
-        INSERT INTO google_reconcile_queue (payment_token, due_at)
-        VALUES      (%(token)s, %(due_at)s)
+        INSERT INTO google_reconcile_queue (payment_token, eligible_at)
+        VALUES      (%(token)s, %(eligible_at)s)
         ON CONFLICT (payment_token) DO UPDATE
-        SET         due_at = LEAST(google_reconcile_queue.due_at, EXCLUDED.due_at)
+        SET         eligible_at   = LEAST(google_reconcile_queue.eligible_at, EXCLUDED.eligible_at),
+                    revision = google_reconcile_queue.revision + 1
     ''',
         token=payment_token,
-        due_at=due_at,
+        eligible_at=eligible_at,
     )
 
 
@@ -2928,7 +2944,7 @@ def google_claim_due_reconciles(
 
     A lease rather than the claim-and-process-in-one-transaction shape the credit drain uses, because
     reconciling makes a NETWORK CALL to Google: holding row locks across that would pin a transaction open
-    for the length of an external request. So the claim pushes `due_at` out to `lease_until` and commits,
+    for the length of an external request. So the claim pushes `eligible_at` out to `lease_until` and commits,
     and the work happens outside any transaction. A worker that dies mid-fetch simply lets the lease lapse
     and the token comes due again — no in-progress state to clean up, and no way to lose the work.
 
@@ -2940,45 +2956,76 @@ def google_claim_due_reconciles(
         tx.conn,
         '''
         UPDATE google_reconcile_queue
-        SET    due_at = %(lease_until)s
+        SET    leased_until = %(lease_until)s
         WHERE  payment_token IN (
                    SELECT   payment_token
                    FROM     google_reconcile_queue
-                   WHERE    due_at <= %(now)s
-                   ORDER BY due_at
+                   WHERE    eligible_at <= %(now)s
+                     AND    (leased_until IS NULL OR leased_until <= %(now)s)
+                   ORDER BY eligible_at
                    FOR UPDATE SKIP LOCKED
                    LIMIT    %(limit)s
                )
-        RETURNING payment_token, attempts
+        RETURNING payment_token, attempts, revision
     ''',
         now=now,
         lease_until=lease_until,
         limit=limit,
     )
-    return [GoogleReconcileClaim(payment_token=row[0], attempts=row[1]) for row in rows.fetchall()]
+    return [GoogleReconcileClaim(payment_token=row[0], attempts=row[1], revision=row[2]) for row in rows.fetchall()]
 
 
 @db.transactional
-def google_reconcile_done(tx: db.SQLTransaction, payment_token: str) -> None:
-    """Drop a token from the queue: its state matches the resource as of the snapshot just applied.
+def google_reconcile_done(tx: db.SQLTransaction, claim: GoogleReconcileClaim) -> bool:
+    """Drop a token from the queue if the obligation just discharged is still the current one, and report
+    whether it went.
 
-    Deleting rather than marking done is right because the row is an OBLIGATION, not a record. The
-    notification history keeps what arrived; this table only ever answers "what still owes work".
+    Deleting rather than marking done is right because the row is an OBLIGATION, not a record: the
+    notification history keeps what arrived, and this table only ever answers "what still owes work".
+
+    Conditional on `revision` because a notification arriving mid-fetch describes a state the fetch cannot
+    have seen. Deleting unconditionally would discard that newer obligation on the strength of an older
+    snapshot, and the change would sit unapplied until some later event happened to touch the token. Note
+    that comparing `eligible_at` would NOT catch this: enqueue only ever lowers it, and a token being worked on
+    is already due, so the new notification would leave the value untouched.
     """
-    db.query(tx.conn, '''DELETE FROM google_reconcile_queue WHERE payment_token = %s''', payment_token)
+    rows = db.query(
+        tx.conn,
+        '''
+        DELETE FROM google_reconcile_queue
+        WHERE  payment_token = %(token)s AND revision = %(revision)s
+        RETURNING payment_token
+    ''',
+        token=claim.payment_token,
+        revision=claim.revision,
+    )
+    return rows.fetchone() is not None
 
 
 @db.transactional
-def google_reconcile_failed(tx: db.SQLTransaction, payment_token: str, retry_at: pendulum.DateTime, error: str) -> None:
-    """Push a failed token out to `retry_at` and record why, overriding the lease taken at claim time."""
+def google_reconcile_failed(
+    tx: db.SQLTransaction, claim: GoogleReconcileClaim, retry_at: pendulum.DateTime, error: str
+) -> None:
+    """Record a failed attempt, release the lease, and back the token off to `retry_at`.
+
+    The failure itself is always recorded — it happened, whatever else has changed. The BACK-OFF is not:
+    if a notification arrived while the fetch was in flight, its obligation is newer than this failure and
+    keeps the due time it asked for. Otherwise a token whose reconcile is failing would have every fresh
+    notification's urgency stomped by the backoff from an attempt that predates it, which contradicts
+    enqueue's rule that new information only ever pulls work earlier.
+    """
     db.query(
         tx.conn,
         '''
         UPDATE google_reconcile_queue
-        SET    due_at = %(retry_at)s, attempts = attempts + 1, last_error = %(error)s
+        SET    attempts     = attempts + 1,
+               last_error   = %(error)s,
+               leased_until = NULL,
+               eligible_at       = CASE WHEN revision = %(revision)s THEN %(retry_at)s ELSE eligible_at END
         WHERE  payment_token = %(token)s
     ''',
-        token=payment_token,
+        token=claim.payment_token,
+        revision=claim.revision,
         retry_at=retry_at,
         error=error,
     )

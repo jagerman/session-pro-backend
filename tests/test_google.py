@@ -4953,3 +4953,59 @@ def test_converging_an_unknown_payment_reports_rather_than_inventing_one(pg_data
     with TestingContext(pg_database) as ctx:
         assert _converge(ctx, 'tok-never-seen', 'GPA.0000-0000-0000-00000', expiry=base.utc_now()) is False
         assert not _payment_rows(ctx)
+
+
+def test_refunding_a_payment_that_was_not_the_driver_broadcasts_nothing(monkeypatch, pg_database):
+    # The delta gate. Refund a subscription that was NOT setting the account's expiry: a longer one survives,
+    # so the entitlement does not move and every proof already signed is still honest.
+    #
+    # Both other gates test absolutes and would let this through -- the survivor clears the day boundary, and
+    # it also falls short of the 30-day proof cap -- so without a delta check we would revoke every
+    # outstanding proof of an account whose entitlement never changed. The old inline decision got this right
+    # only by accident, because it happened to read the refunded payment's own expiry.
+    with TestingContext(pg_database) as ctx:
+        master_key = nacl.signing.SigningKey(_UPGRADE_ACCOUNT_SEED)
+        rotating_key = nacl.signing.SigningKey.generate()
+        account_id = bytes(master_key.verify_key)
+
+        # The driver runs 20 days out; the other ends within the day. Deliberately inside the ~30-day proof
+        # cap, which is what makes the surviving-coverage gate insufficient on its own.
+        for token, order_id, expiry in (
+            ('tok-driver', 'GPA.2323-2323-2323-23231', '2026-01-21T00:00:00.000Z'),
+            ('tok-sidecar', 'GPA.2424-2424-2424-24241', '2026-01-01T18:00:00.000Z'),
+        ):
+            handled, err = _drive_google_rtdn(
+                monkeypatch,
+                ctx,
+                notification_type=4,
+                purchase_token=token,
+                event_ms=1766966400000,  # 2025-12-29
+                snapshot=_google_snapshot(
+                    state='SUBSCRIPTION_STATE_ACTIVE',
+                    expiry=expiry,
+                    order_id=order_id,
+                    obfuscated_account_id=account_id,
+                ),
+            )
+            assert handled and not err.has()
+
+        with ctx.connection() as conn:
+            _redeem_and_prove(
+                conn, ctx.backend_key, master_key, rotating_key, base.datetime_from_unix_ms(1767139200000)
+            )
+            before = backend.get_user(conn, master_key.verify_key)
+
+            sink = base.ErrorSink()
+            with db.transaction(conn) as tx:
+                backend.add_google_revocation(
+                    tx,
+                    google_payment_token='tok-sidecar',
+                    revoke_at=base.datetime_from_unix_ms(1767261600000),  # 2026-01-01 10:00, inside its last day
+                    err=sink,
+                )
+            assert not sink.has()
+
+            after = backend.get_user(conn, master_key.verify_key)
+            assert after.expiry_at == before.expiry_at, 'the driver still sets the expiry, so nothing moved'
+            assert not backend.get_revocations_list(conn), 'and so there is nothing to announce'
+            assert after.current_generation_id == before.current_generation_id
