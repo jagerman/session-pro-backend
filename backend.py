@@ -973,64 +973,66 @@ def revoke_payments_by_id_internal(tx: db.SQLTransaction, rows: typing.Any, revo
             id=id,
         )
 
-    revoke_at_next_day = round_datetime_to_next_day_with_provider_testing_support(base.PaymentProvider.Nil, revoke_at)
-
-    # The furthest into the future any outstanding proof can certify: a proof reaches at most
-    # `max_proof_lifetime` past its request instant (_build_proof_clamped_expiry_time) and a request_at is
-    # only accepted within DEFAULT_TIMESTAMP_TOLERANCE of the server clock, so no proof issued up to the
-    # revoke instant reaches beyond this. Anchoring to `revoke_at` assumes we process the refund promptly: a
-    # notification that reaches us late — a backlog drained after an outage — leaves any proof issued in the
-    # interim outside this bound.
-    max_outstanding_proof_expiry = (
-        revoke_at + base.DEFAULT_TIMESTAMP_TOLERANCE + base.proof_expiry_shape().max_proof_lifetime
-    )
-
+    # Every revoke UPDATE above has landed, so each affected account can now be recomputed and judged from
+    # what it actually holds. Deliberately not per-payment: a refund is only one of several ways an
+    # entitlement can fall, and they all reduce to the same question about outstanding proofs.
     for it in master_pkey_dict:
-        master_pkey = nacl.signing.VerifyKey(it)
-
-        # Bind any payment the mule has registered for this key that the owner has not claimed yet, BEFORE
-        # judging below whether this refund needs broadcasting. `_lookup_user_expiry` is user-scoped and a
-        # user_id is set only at redemption, so an unclaimed-but-live survivor is invisible to that judgement:
-        # we would broadcast a revocation, and revoke every outstanding proof, for an account whose paid
-        # coverage never actually lapsed. Claim-all and idempotent — the same bind the owner's next request
-        # performs, just early. Deliberately AFTER the revoke UPDATE above, since reconcile only claims rows
-        # with `revoked_at IS NULL` and so can never claim the payment being revoked. Stamped with OUR clock,
-        # never `revoke_at`: the store's refund date can be days old (same reasoning as
-        # revoke_master_pkey_proofs_and_allocate_new_gen_id below).
-        reconcile_pending_payments(tx, master_pkey, redeemed_at=to_redeemed_at(base.utc_now()))
-
-        # NOTE: For each user we revoked a payment for, we have modified their 'auto_renewing' value
-        # on the payment, we need to go and update their user row to track the, new, next best
-        # expiry time so that the backend knows the new time-frame in which the user is allowed to
-        # generate a Session Pro proof (now that one or more of their payments get revoked)
-        _update_user_expiry_grace_and_renew_flag_from_payment_list(tx, master_pkey)
-
-        # NOTE: A payment at or past the end of the current day is on its way out anyway, so revoking it is
-        # not worth an entry in the (network-costly, every-client-fetches-it) revocation list. A proof built
-        # against such a payment can reach the renewal lead plus a whole grid period (≤ ~25 h) past that
-        # boundary, so an outstanding proof for a nearly-expired, then-refunded payment can outlive this
-        # early-out by that much. Accepted: it takes a refund of the account's *longest* payment inside that
-        # payment's final day, and the outcome is bounded extra Pro on an entitlement that was ending anyway.
-        #
-        # For different platforms in their testing environments, they have different timespans
-        # for a day, for example in Google 1 day is 10s. We handle that explicitly here.
-        expiry_at = master_pkey_dict[it]
-        if expiry_at is not None and expiry_at <= revoke_at_next_day:
-            continue
-
-        # Even when the revoked payment's own proof would outlive the day boundary, a broadcast revocation
-        # + generation roll is only needed if the refund drops the user's *remaining* entitlement below
-        # something an outstanding proof already certifies. If enough paid time survives the refund
-        # (aggregate expiry at or beyond the furthest a live proof can reach) every outstanding proof stays
-        # honest, so we skip the revocation entirely. The revocation list is fetched by every client, so
-        # keeping it minimal is the point.
-        post_refund_expiry = _lookup_user_expiry(tx, master_pkey).best_expiry
-        if post_refund_expiry is not None and post_refund_expiry >= max_outstanding_proof_expiry:
-            continue
-
-        revoke_master_pkey_proofs_and_allocate_new_gen_id(tx, master_pkey, created_at=revoke_at)
+        refresh_entitlement_and_revoke_overreaching_proofs(tx, nacl.signing.VerifyKey(it), at=revoke_at)
 
     return result
+
+
+@db.transactional
+def refresh_entitlement_and_revoke_overreaching_proofs(
+    tx: db.SQLTransaction, master_pkey: nacl.signing.VerifyKey, at: pendulum.DateTime
+) -> bool:
+    """Recompute what an account is entitled to, and revoke its outstanding proofs if they now claim more
+    than it has. Returns whether a revocation was broadcast.
+
+    WHY the entitlement fell is deliberately not an input. A refund, a store-side revoke that back-dates the
+    term, a downgrade, a supersession by an upgraded subscription, a shortened term — they differ only in
+    what moved the payment rows, and by the time this runs the rows already say what they say. The single
+    question left is whether anything we have already signed now overstates the account, and that has one
+    answer regardless of cause.
+
+    Ordering is the point: every write lands first, then the account is recomputed, then the decision is
+    taken from the recomputed state. Judging mid-write is what made the old inline version depend on rows
+    that had not been inserted yet, and on which row an unordered SELECT happened to return last.
+    """
+    # Before anything moves. `users.expiry_at` is only written by the recompute below, so this is still the
+    # pre-change value even though the payment rows have already been updated.
+    prior_expiry = get_user(tx.conn, master_pkey).expiry_at
+
+    # Bind any payment the mule registered that the owner has not claimed yet, BEFORE judging.
+    # `_lookup_user_expiry` is user-scoped and `user_id` is set only at redemption, so an unclaimed-but-live
+    # payment is invisible to that judgement: we would revoke every outstanding proof for an account whose
+    # coverage never actually lapsed. Claim-all and idempotent — the same bind the owner's next request
+    # performs, just early. Stamped with OUR clock, never `at`: a store's instant can be days old.
+    reconcile_pending_payments(tx, master_pkey, redeemed_at=to_redeemed_at(base.utc_now()))
+    _update_user_expiry_grace_and_renew_flag_from_payment_list(tx, master_pkey)
+
+    # An account that was expiring within the day anyway is not worth an entry in the revocation list every
+    # client fetches. A proof built against it can reach the renewal lead plus a whole grid period (≤ ~25 h)
+    # past that boundary, so one can outlive this early-out by that much: accepted, because the entitlement
+    # was ending regardless and the outcome is bounded. Testing environments compress a "day" (Google: 10 s),
+    # hence the provider-aware rounding.
+    if prior_expiry is not None and prior_expiry <= round_datetime_to_next_day_with_provider_testing_support(
+        base.PaymentProvider.Nil, at
+    ):
+        return False
+
+    # The furthest any outstanding proof can reach: a proof reaches at most `max_proof_lifetime` past its
+    # request instant, and a request is only accepted within the clock tolerance, so nothing issued up to
+    # now goes beyond this. If what survives covers that, every proof we have signed is still honest and
+    # there is nothing to announce.
+    surviving = _lookup_user_expiry(tx, master_pkey).best_expiry
+    if surviving is not None and surviving >= at + base.DEFAULT_TIMESTAMP_TOLERANCE + (
+        base.proof_expiry_shape().max_proof_lifetime
+    ):
+        return False
+
+    revoke_master_pkey_proofs_and_allocate_new_gen_id(tx, master_pkey, created_at=at)
+    return True
 
 
 @db.transactional

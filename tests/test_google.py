@@ -3994,22 +3994,20 @@ def test_google_upgrade_broadcasts_a_revocation_for_an_account_that_never_lapsed
             assert backend.get_user(conn, master_key.verify_key).expiry_at > upgraded_at
 
 
-def test_google_upgrade_revocation_depends_on_physical_row_order(monkeypatch, pg_database):
-    # CHARACTERISATION of finding 3.4, and the companion to the test above: the SAME upgrade, differing only
-    # by an entitlement-neutral write to one already-expired cycle, publishes NO revocation where the test
-    # above publishes one.
+def test_google_upgrade_revocation_does_not_depend_on_physical_row_order(monkeypatch, pg_database):
+    # REGRESSION for finding 3.4, and the companion to the test above: the SAME upgrade, differing only by an
+    # entitlement-neutral write to one already-expired cycle, must now reach the SAME outcome.
     #
-    # The revoke SELECT in add_google_revocation carries no ORDER BY, so it returns rows in heap order --
-    # which approximates least-recently-updated, because an UPDATE writes a new tuple version that migrates.
-    # revoke_payments_by_id_internal keeps only the LAST row's expiry per account, and that single value
-    # drives the day-boundary early-out. So whichever cycle was written to least recently decides whether an
-    # upgrading subscriber gets revoked.
+    # It used to differ. The revoke SELECT has no ORDER BY, so rows arrive in heap order -- which
+    # approximates least-recently-updated, since an UPDATE writes a new tuple version that migrates -- and
+    # revoke_payments_by_id_internal kept only the LAST row's expiry per account to drive its day-boundary
+    # early-out. Whichever cycle had been written to least recently therefore decided whether an upgrading
+    # subscriber got revoked, and neither answer was reached for a good reason.
     #
-    # The write below (`grace_period = grace_period`) is exactly the shape of the ones
+    # The decision no longer takes a payment row as input at all: every write lands, the account is
+    # recomputed, and the question asked is whether what survives still covers the proofs already signed.
+    # The write below (`grace_period = grace_period`) is the shape of the ones
     # set_purchase_grace_period_duration and set_payment_auto_renew perform routinely.
-    #
-    # Neither branch is right: this one skips the broadcast only because a long-dead cycle happened to sort
-    # last, not because the account was found to be covered. This test dies with the reconcile rewrite.
     with TestingContext(pg_database) as ctx:
         master_key = nacl.signing.SigningKey(_UPGRADE_ACCOUNT_SEED)
         rotating_key = nacl.signing.SigningKey.generate()
@@ -4080,8 +4078,10 @@ def test_google_upgrade_revocation_depends_on_physical_row_order(monkeypatch, pg
         assert handled and not err.has()
 
         with ctx.connection() as conn:
-            assert not backend.get_revocations_list(conn), 'no broadcast, purely because of row placement'
-            # The lapsed expiry from the test above is NOT order-dependent: it happens on both branches.
+            # Identical to the companion test, which runs the same upgrade without the extra write. That the
+            # broadcast still happens is finding 3.5, which the reconcile rewrite fixes by not judging an
+            # account before its replacement payment exists -- a separate defect from this one.
+            assert len(backend.get_revocations_list(conn)) == 1, 'the same outcome, whatever the row order'
             assert backend.get_user(conn, master_key.verify_key).expiry_at == base.datetime_from_unix_ms(1773532800000)
 
 
