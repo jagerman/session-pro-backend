@@ -4594,3 +4594,72 @@ def test_one_token_is_one_subscription_whatever_its_order_ids_look_like(monkeypa
             # Only the newest cycle counts. Under prefix matching the December row survived as a second
             # "subscription" and won the max, entitling the account nine months past its actual term.
             assert user.expiry_at == shortened_to + base.DEFAULT_GOOGLE_GRACE_PERIOD
+
+
+def test_a_bad_message_cannot_take_the_batch_down_with_it(monkeypatch, pg_database):
+    # Notifications are unrelated events, so CLAUDE.md's rule is that a failure is logged and skipped rather
+    # than aborting the batch -- "so isolate the decode too". It was not isolated: json.loads raises on a
+    # malformed payload, and parse_notification asserts on a voided block missing the fields it requires,
+    # and both sat under the pull loop's single try around the WHOLE iteration. One bad message therefore
+    # took the parsing, processing and acking of every other message in that pull with it, and they all
+    # redelivered into the same message next time round.
+    #
+    # decode_notification draws the boundary at the message. This is a unit test rather than a loop test
+    # because the loop needs google-cloud-pubsub, which is imported lazily precisely so the rest of the
+    # module works without it.
+    monkeypatch.setattr('providers.google_play.api.package_name', 'network.loki.messenger')
+
+    # Malformed JSON: raises inside json.loads.
+    err = base.ErrorSink()
+    assert google_play.decode_notification(b'{"not really js', 'malformed', err) is None
+
+    # Structurally valid JSON whose voided block is missing the fields parse_notification asserts on.
+    err = base.ErrorSink()
+    assert (
+        google_play.decode_notification(
+            json.dumps(
+                {
+                    'version': '1.0',
+                    'packageName': 'network.loki.messenger',
+                    'eventTimeMillis': '1767225600000',
+                    'voidedPurchaseNotification': {'purchaseToken': 'tok'},  # no orderId/productType/refundType
+                }
+            ),
+            'half a voided block',
+            err,
+        )
+        is None
+    )
+
+    # And the distinction that matters: a payload that DECODES but is not one we accept comes back as a
+    # parse carrying the reason, not as None. Only the un-decodable case is dropped here; this one is
+    # reported by the caller with its own message.
+    err = base.ErrorSink()
+    decoded = google_play.decode_notification(
+        json.dumps({'version': '1.0', 'packageName': 'network.loki.messenger', 'eventTimeMillis': '1'}),
+        'no notification block',
+        err,
+    )
+    assert decoded is not None and err.has()
+
+    # A good one still parses.
+    err = base.ErrorSink()
+    decoded = google_play.decode_notification(
+        json.dumps(
+            {
+                'version': '1.0',
+                'packageName': 'network.loki.messenger',
+                'eventTimeMillis': '1767225600000',
+                'subscriptionNotification': {
+                    'version': '1.0',
+                    'notificationType': 4,
+                    'purchaseToken': 'tok-fine',
+                    'subscriptionId': 'session_pro',
+                },
+            }
+        ),
+        'good',
+        err,
+    )
+    assert decoded is not None and not err.has()
+    assert decoded.purchase_token == 'tok-fine'

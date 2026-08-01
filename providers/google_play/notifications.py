@@ -413,9 +413,11 @@ def thread_entry_point(
                     ack_ids: list[str] = []
                     for index, it in enumerate(result.received_messages):
                         err = base.ErrorSink()
-                        message_data = json.loads(it.message.data)
                         published = base.readable(base.datetime_from_unix_ms(it.message.publish_time.ToMilliseconds()))
-                        parse = parse_notification(message_data, err)
+                        decoded = decode_notification(it.message.data, f'#{index} (published at {published})', err)
+                        if decoded is None:
+                            continue
+                        parse = decoded
                         message_id = it.message.message_id  # Pub/Sub ids are opaque strings — never int()-cast
                         if err.has():
                             log.warning(
@@ -899,6 +901,27 @@ def handle_voided_notification(tx: VoidedPurchaseTxFields, err: base.ErrorSink):
 
     if err.has():
         err.msg_list.append(f'Failed to handle {reflect_enum(tx.refund_type)}')
+
+
+def decode_notification(data: str | bytes, label: str, err: base.ErrorSink) -> ParsedNotification | None:
+    '''JSON-decode and parse one RTDN payload, or None if it could not be decoded at all.
+
+    The decode gets its OWN guard rather than sharing the pull loop's batch handler, because both halves
+    raise on bad input: `json.loads` on a malformed payload, and `parse_notification` on a voided block
+    missing the fields its asserts require. Unguarded, one bad message unwinds to the batch handler and takes
+    the parsing, processing and acking of every other message in that pull with it — and they then redeliver
+    and meet the same message again. Notifications are unrelated events, so a failure is logged and skipped
+    rather than allowed to hold back its neighbours.
+
+    Returning None is distinct from returning a parse with `err` set: the latter decoded fine and simply is
+    not a notification we accept. Neither is acked, so Google redelivers and a transient cause gets another
+    chance, while a permanently undecodable message keeps failing here in isolation.
+    '''
+    try:
+        return parse_notification(json.loads(data), err)
+    except Exception:
+        log.warning(f'Discarding message {label}: could not decode it.\nReason was:\n{traceback.format_exc()}')
+        return None
 
 
 def parse_notification(body: JSONObject, err: base.ErrorSink) -> ParsedNotification:
