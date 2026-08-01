@@ -4663,3 +4663,56 @@ def test_a_bad_message_cannot_take_the_batch_down_with_it(monkeypatch, pg_databa
     )
     assert decoded is not None and not err.has()
     assert decoded.purchase_token == 'tok-fine'
+
+
+def test_voided_notifications_reach_their_handler(monkeypatch, pg_database):
+    # parse_notification tagged every voidedPurchaseNotification as `Test`, a one-word typo that made
+    # handle_voided_notification unreachable. Live impact was nil, because a subscription full refund is an
+    # intentional no-op there (SUBSCRIPTION_REVOKED does that work) -- but it also meant the dormant
+    # one-time and partial-refund branches, and any loud guard placed in them, could never run.
+    #
+    # It was accidentally protective: Test-dispatch quietly acked the voids the real handler wedges on. That
+    # trade is worth losing. A refunded one-time purchase keeping Pro is an over-entitlement nobody is told
+    # about; a wedged notification is loud, retained, and recoverable once the handler exists.
+    monkeypatch.setattr('providers.google_play.api.package_name', 'network.loki.messenger')
+
+    def voided(product_type: int, refund_type: int) -> google_play.ParsedNotification:
+        err = base.ErrorSink()
+        decoded = google_play.decode_notification(
+            json.dumps(
+                {
+                    'version': '1.0',
+                    'packageName': 'network.loki.messenger',
+                    'eventTimeMillis': '1767225600000',
+                    'voidedPurchaseNotification': {
+                        'purchaseToken': 'tok-voided',
+                        'orderId': 'GPA.9999-9999-9999-99999',
+                        'productType': product_type,
+                        'refundType': refund_type,
+                    },
+                }
+            ),
+            'voided',
+            err,
+        )
+        assert decoded is not None and not err.has(), err.msg_list
+        return decoded
+
+    # Dispatch now reaches the voided handler rather than being mistaken for a test ping.
+    subscription_full = voided(product_type=1, refund_type=1)
+    assert subscription_full.payload_type == google_play.ParsedNotificationPayloadType.Voided
+
+    # A subscription's full refund stays a deliberate no-op: SUBSCRIPTION_REVOKED carries that work.
+    with TestingContext(pg_database) as ctx:
+        err = base.ErrorSink()
+        with ctx.connection() as conn:
+            with db.transaction(conn) as tx:
+                assert google_play.handle_parsed_notification(tx, subscription_full, err) is True
+        assert not err.has(), err.msg_list
+
+        # A one-time product's refund is dormant, and now says so out loud instead of being acked away.
+        err = base.ErrorSink()
+        with ctx.connection() as conn:
+            with db.transaction(conn) as tx:
+                assert google_play.handle_parsed_notification(tx, voided(product_type=2, refund_type=1), err) is False
+        assert err.has() and any('unsupported' in msg for msg in err.msg_list), err.msg_list

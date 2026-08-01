@@ -215,10 +215,17 @@ def handle_parsed_notification(tx: db.SQLTransaction, parse: ParsedNotification,
             try:
                 handle_voided_notification(parse.voided, err)
             except Exception:
-                err.msg_list.append("Handling notification failed: {traceback.format_exc()}")
+                err.msg_list.append(f"Handling notification failed: {traceback.format_exc()}")
+            # The subscription path cancels from inside its own handler; this one has to do it here, and
+            # the tail below asserts that it happened. Missing while the branch was unreachable dead code
+            # (see the payload_type typo it was hiding behind), it would have turned the first unsupported
+            # void into an AssertionError instead of the reported skip it is meant to be.
+            if err.has():
+                tx.cancel = True
 
         case ParsedNotificationPayloadType.OneTimeProduct:
             err.msg_list.append('One time product is not supported!')
+            tx.cancel = True
 
         case ParsedNotificationPayloadType.Test:
             pass
@@ -907,6 +914,18 @@ def handle_subscription_notification(
         ):
             pass
 
+        case _:
+            # A type Google adds later. Reported rather than ignored, which means it is retried and its
+            # payload retained: the same bargain as an unrecognised base plan, where keeping the message
+            # until we understand it is what makes a later deploy able to apply it. Ignoring would be
+            # cheaper in log noise and would lose anything that mattered, permanently and silently.
+            #
+            # If a new BENIGN type ever starts arriving in volume, the fix is to add it to the no-op arm
+            # above, not to soften this one.
+            err.msg_list.append(
+                f'Unknown subscription notificationType {reflect_enum(tx_event.notification)}, not handled!'
+            )
+
     if err.has():
         # Purchase token logging is included in the wrapper function
         err.msg_list.append(
@@ -1015,7 +1034,7 @@ def parse_notification(body: JSONObject, err: base.ErrorSink) -> ParsedNotificat
             product_type=product_type,
             refund_type=refund_type,
         )
-        result.payload_type = ParsedNotificationPayloadType.Test
+        result.payload_type = ParsedNotificationPayloadType.Voided
 
     elif one_time_product is not None:
         result.payload_type = ParsedNotificationPayloadType.Nil
