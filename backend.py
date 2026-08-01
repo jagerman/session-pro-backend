@@ -873,7 +873,8 @@ def new_proof_expiry_offset() -> int:
 
     Two properties are load-bearing, both for the same reason — an observer reads the offset off any proof
     and is trying to work backwards from it (see `_build_proof_clamped_expiry_time` for what the offset
-    buys, and `schema/003_proof_expiry_offset.sql` for why it is stored and re-drawn per cycle):
+    buys, `_offset_redrawn_if_expiry_extends` for when it is re-drawn, and
+    `schema/003_proof_expiry_offset.sql` for why it is stored rather than derived):
     UNPREDICTABLE, so it must come from the CSPRNG and never from the clock or the account key; and
     UNIFORM over the full period, since a skew re-clusters the expiry times the offset exists to scatter.
     '''
@@ -899,6 +900,11 @@ def _offset_redrawn_if_expiry_extends(expiry: pendulum.DateTime | None) -> str:
     so its time-of-day is the offset (test_proof_expiry_lands_on_the_account_grid asserts exactly that). What
     the offset hides is the true expiry within one period, and that only degrades under repeated independent
     draws against an UNCHANGED expiry, which is the case this still excludes.
+
+    ONE EXCEPTION, applied by the caller rather than here: minting a generation forces a re-draw regardless.
+    A broadcast revocation is a shrink, and it is also the moment the revocation_tag rolls — the one point at
+    which the design unlinks an account's proofs — so an offset carried across it would be a ~16-bit
+    fingerprint defeating exactly that (docs/limitations.md).
     '''
     # A shrink to "no expiry at all" is still a shrink, so the degenerate case is just: keep it.
     if expiry is None:
@@ -2057,10 +2063,18 @@ def _ensure_active_generation(
     user = get_user(tx.conn, master_pkey)
     assert user.found, "user must exist before allocating a generation"
 
-    if is_generation_revoked(tx.conn, user.current_generation_id, issued_at):
+    minted = is_generation_revoked(tx.conn, user.current_generation_id, issued_at)
+    if minted:
         result.generation_id, result.token = mint_generation(tx, user.id, issued_at)
     else:
         result.generation_id, result.token = user.current_generation_id, user.token
+
+    # A minted generation ALWAYS re-draws the offset, whatever the expiry did. The revocation that rolls the
+    # tag is a shrink, so the extension-only rule alone would carry the offset across the one moment the
+    # design deliberately unlinks an account's proofs — and the offset is ~16 bits, readable off every proof
+    # (docs/limitations.md, "adds no cross-roll linkage"). Nothing is lost: monotonicity across a roll would
+    # be protecting proofs that were just revoked, so there is no served expiry left to undercut.
+    offset_value = '%(proof_random_offset)s' if minted else _offset_redrawn_if_expiry_extends(lookup.best_expiry)
 
     db.query(
         tx.conn,
@@ -2070,7 +2084,7 @@ def _ensure_active_generation(
                expiry_at                   = %(expiry)s,
                grace_period                 = %(grace)s,
                auto_renewing                = %(auto_renewing)s,
-               proof_expiry_offset          = {_offset_redrawn_if_expiry_extends(lookup.best_expiry)}
+               proof_expiry_offset          = {offset_value}
         WHERE  id = %(user_id)s
     ''',
         gen_id=result.generation_id,
@@ -2259,8 +2273,9 @@ def _build_proof_clamped_expiry_time(
       matching change here, or its attempts start landing before the renewal can have resolved.
 
     The cost is over-provisioning: an account is honoured for up to one period past `true + renewal_lead`.
-    That is deliberate (it also buffers a late store notification), and the per-cycle re-draw keeps the luck
-    from settling on the same accounts. `shape.max_proof_lifetime` bounds the resulting proof lifetime.
+    That is deliberate (it also buffers a late store notification), and re-drawing the offset on every
+    extension keeps the luck from settling on the same accounts. `shape.max_proof_lifetime` bounds the
+    resulting proof lifetime.
     '''
     shape = base.proof_expiry_shape()
     # The stored column's own range (a day — the schema CHECK), NOT the current shape's: a database written

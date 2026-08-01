@@ -4265,9 +4265,12 @@ def test_proof_expiry_offset_holds_when_the_account_expiry_shrinks(monkeypatch, 
         # Two subscriptions on one account -- the second device / second Google account case. The account's
         # expiry is the later of the two, and refunding THAT one is what makes the expiry shrink while
         # leaving live coverage behind, which is what lets a proof still be minted afterwards.
+        # Both run far enough out that the survivor still covers every outstanding proof, so the revocation
+        # below does NOT roll the generation -- which is the case this test is about. The rolling case is
+        # test_proof_expiry_offset_redraws_when_a_revocation_rolls_the_generation.
         for token, order_id, expiry in (
-            ('tok-shrink-long', 'GPA.4000-0000-0000-00006', '2026-06-01T00:00:00.000Z'),
-            ('tok-shrink-short', 'GPA.3000-0000-0000-00007', '2026-03-01T00:00:00.000Z'),
+            ('tok-shrink-long', 'GPA.4000-0000-0000-00006', '2027-06-01T00:00:00.000Z'),
+            ('tok-shrink-short', 'GPA.3000-0000-0000-00007', '2027-01-01T00:00:00.000Z'),
         ):
             handled, err = _drive_google_rtdn(
                 monkeypatch,
@@ -4300,6 +4303,7 @@ def test_proof_expiry_offset_holds_when_the_account_expiry_shrinks(monkeypatch, 
             assert not sink.has()
 
             after = backend.get_user(conn, master_key.verify_key)
+            assert not backend.get_revocations_list(conn), 'precondition: enough survived, so no roll'
             assert after.expiry_at is not None and before.expiry_at is not None
             assert after.expiry_at < before.expiry_at, 'precondition: the account expiry shrank'
             assert after.proof_expiry_offset == before.proof_expiry_offset, 'the offset is held across a shrink'
@@ -4307,3 +4311,63 @@ def test_proof_expiry_offset_holds_when_the_account_expiry_shrinks(monkeypatch, 
             # The observable consequence: the served expiry never moved later.
             served_after = _prove_at(conn, ctx.backend_key, master_key, rotating_key, claimed_at).expiry_at
             assert served_after <= served_before
+
+
+def test_proof_expiry_offset_redraws_when_a_revocation_rolls_the_generation(monkeypatch, pg_database):
+    # The exception to the extension-only rule, and it is load-bearing. A broadcast revocation is a SHRINK,
+    # so extension-only alone would carry the offset across the very moment the revocation_tag rolls -- the
+    # one point at which the design unlinks an account's proofs. The offset is ~16 bits and readable off
+    # every proof (expiry_ts modulo the grid), so an observer could stitch the two generations together.
+    #
+    # Minting a generation therefore forces a re-draw regardless of what the expiry did. Nothing is given up:
+    # monotonicity across a roll would be protecting proofs that were revoked in the same breath.
+    with TestingContext(pg_database) as ctx:
+        master_key = nacl.signing.SigningKey(_UPGRADE_ACCOUNT_SEED)
+        rotating_key = nacl.signing.SigningKey.generate()
+        account_id = bytes(master_key.verify_key)
+        claimed_at = base.datetime_from_unix_ms(1767830400000)  # 2026-01-08
+
+        # A survivor is required: _ensure_active_generation returns early when no usable payment is left, so
+        # revoking an account's ONLY payment mints nothing and there is no roll to link across. The survivor
+        # is deliberately short enough that it does not cover the outstanding proofs, which is what makes the
+        # revocation worth broadcasting.
+        for token, order_id, expiry in (
+            ('tok-rolled', 'GPA.2000-0000-0000-00008', '2026-06-01T00:00:00.000Z'),
+            ('tok-rolled-survivor', 'GPA.1000-0000-0000-00009', '2026-03-01T00:00:00.000Z'),
+        ):
+            handled, err = _drive_google_rtdn(
+                monkeypatch,
+                ctx,
+                notification_type=4,
+                purchase_token=token,
+                event_ms=1767225600000,
+                snapshot=_google_snapshot(
+                    state='SUBSCRIPTION_STATE_ACTIVE',
+                    expiry=expiry,
+                    order_id=order_id,
+                    obfuscated_account_id=account_id,
+                ),
+            )
+            assert handled and not err.has()
+
+        with ctx.connection() as conn:
+            _redeem_and_prove(conn, ctx.backend_key, master_key, rotating_key, claimed_at)
+            before = backend.get_user(conn, master_key.verify_key)
+
+            # Refund mid-term: enough entitlement is destroyed that the generation is rolled and an entry
+            # published, which is exactly the unlinking moment.
+            sink = base.ErrorSink()
+            with db.transaction(conn) as tx:
+                backend.add_google_revocation(
+                    tx,
+                    google_payment_token='tok-rolled',
+                    revoke_at=base.datetime_from_unix_ms(1769904000000),  # 2026-02-01
+                    err=sink,
+                )
+            assert not sink.has()
+
+            after = backend.get_user(conn, master_key.verify_key)
+            assert len(backend.get_revocations_list(conn)) == 1, 'precondition: the tag rolled'
+            assert after.expiry_at is not None and before.expiry_at is not None
+            assert after.expiry_at < before.expiry_at, 'precondition: and it was a shrink'
+            assert after.proof_expiry_offset != before.proof_expiry_offset, 'so the offset must NOT carry over'

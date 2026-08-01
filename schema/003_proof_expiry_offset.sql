@@ -13,10 +13,12 @@
 -- cross-generation fingerprint, and determinism buys nothing here. It is stored rather than drawn per
 -- request because a fresh draw per request would break multi-device convergence (two devices must be able
 -- to agree on an expiry) and would let an observer recover the true expiry as the minimum of repeated
--- samples. It is re-drawn whenever the account's true expiry moves (a payment, a renewal, a revocation) —
--- both because a fixed offset against a fixed purchase anniversary is itself a stable fingerprint, and
--- because the offset hands out up to ~1 day of over-provisioned Pro, which should not perpetually favour
--- the same accounts.
+-- samples. It is re-drawn whenever the account's true expiry EXTENDS (a payment, a renewal), and whenever a
+-- generation is minted — both because a fixed offset against a fixed purchase anniversary is itself a
+-- stable fingerprint, and because the offset hands out up to ~1 day of over-provisioned Pro, which should
+-- not perpetually favour the same accounts. A shrink deliberately keeps it, so that reducing an
+-- entitlement cannot serve a later expiry than it did before; see backend's
+-- `_offset_redrawn_if_expiry_extends`.
 ALTER TABLE users ADD COLUMN IF NOT EXISTS proof_expiry_offset INTEGER;
 
 -- Backfill one INDEPENDENT draw per pre-existing row (`random()` is volatile, so it is evaluated per row)

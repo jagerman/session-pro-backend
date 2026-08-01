@@ -146,8 +146,17 @@ end, and can bound the true expiry to within ~25 h. Don't oversell the fix as mo
   resilience. Judged not worth it.
 - **The grid offset itself is readable** (`expiry_ts` modulo 24 h) and that's fine: it is a uniform random
   per-cycle value that leaves the true expiry bounded to the same ~24 h window either way, and it is less
-  identifying than the per-generation `revocation_tag` already in the proof. Because a revocation moves the
-  true expiry, the offset re-draws in the same moment the tag rolls, so it adds no cross-roll linkage.
+  identifying than the per-generation `revocation_tag` already in the proof. **Minting a generation always
+  re-draws the offset**, so it adds no cross-roll linkage — this is load-bearing rather than incidental, and
+  it is forced at the mint site precisely because the re-draw is otherwise extension-only (a revocation is a
+  *shrink*, which keeps the offset so that reducing an entitlement cannot serve a later expiry than before).
+  Where the generation persists, the unchanged tag already links those proofs, so a held offset adds nothing.
+- **A served-expiry step-down is an unambiguous shrink signal.** With the offset held across a shrink, the
+  grid is fixed, so a conversation partner who sees `expiry_ts` move earlier learns the entitlement was
+  reduced, where a re-draw would have blurred the direction. The same fixed grid also means a shrink landing
+  inside one grid cell is invisible where a re-draw would have signalled *something* changed. Both are
+  accepted: shrinks are rare (refunds, early-out revocations), and the alternative reintroduces the
+  monotonicity break above.
 - **Decision: accept the residual slide-vs-pin shape as a known limitation.**
 
 Note the *distinct* subscription-**cadence** leak (an observer watching how often the `revocation_tag`
