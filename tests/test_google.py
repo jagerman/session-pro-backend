@@ -4790,3 +4790,166 @@ def test_a_voided_purchase_with_unset_types_is_reported_not_asserted(monkeypatch
         assert err.has()
         assert not any('AssertionError' in msg for msg in err.msg_list), err.msg_list
         assert any('not handled' in msg for msg in err.msg_list), err.msg_list
+
+
+def _converge(ctx, token: str, order_id: str, *, expiry, auto_renewing=True, grace=None, needs_ack=False) -> bool:
+    payment_tx = base.PaymentProviderTransaction(
+        provider=base.PaymentProvider.GooglePlayStore, google_payment_token=token, google_order_id=order_id
+    )
+    err = base.ErrorSink()
+    with ctx.connection() as conn:
+        with db.transaction(conn) as tx:
+            converged = backend.google_converge_payment(
+                tx,
+                payment_tx=payment_tx,
+                expiry_at=expiry,
+                auto_renewing=auto_renewing,
+                grace_period=grace if grace is not None else base.DEFAULT_GOOGLE_GRACE_PERIOD,
+                needs_ack=needs_ack,
+                err=err,
+            )
+    assert not err.has(), err.msg_list
+    return converged
+
+
+def test_converging_revises_a_term_the_store_has_changed(monkeypatch, pg_database):
+    # The write half of "the notification is a hint, the resource is the truth". expiry_at used to be
+    # written once at insert, so the only way a new expiry could reach the database was a new order id --
+    # which made a deferred change, or any shortening, structurally invisible. Convergence takes the term
+    # as the store now states it.
+    with TestingContext(pg_database) as ctx:
+        master_key = nacl.signing.SigningKey(_UPGRADE_ACCOUNT_SEED)
+        rotating_key = nacl.signing.SigningKey.generate()
+        account_id = bytes(master_key.verify_key)
+        token, order_id = 'tok-converge', 'GPA.1212-1212-1212-12121'
+
+        handled, err = _drive_google_rtdn(
+            monkeypatch,
+            ctx,
+            notification_type=4,
+            purchase_token=token,
+            event_ms=1767225600000,
+            snapshot=_google_snapshot(
+                state='SUBSCRIPTION_STATE_ACTIVE',
+                expiry='2026-02-01T00:00:00.000Z',
+                order_id=order_id,
+                obfuscated_account_id=account_id,
+            ),
+        )
+        assert handled and not err.has()
+        with ctx.connection() as conn:
+            _redeem_and_prove(
+                conn, ctx.backend_key, master_key, rotating_key, base.datetime_from_unix_ms(1767830400000)
+            )
+
+        # Extended, as a recurrence-date extension would do without issuing a new order.
+        extended_to = base.datetime_from_unix_ms(1772323200000)  # 2026-03-01
+        assert _converge(ctx, token, order_id, expiry=extended_to) is True
+        assert _payment_rows(ctx)[0][1] == extended_to
+        with ctx.connection() as conn:
+            assert backend.get_user(conn, master_key.verify_key).expiry_at == (
+                extended_to + base.DEFAULT_GOOGLE_GRACE_PERIOD
+            )
+
+        # And shortened, which the write-once column could never express at all.
+        shortened_to = base.datetime_from_unix_ms(1769904000000)  # 2026-02-01
+        assert _converge(ctx, token, order_id, expiry=shortened_to) is True
+        assert _payment_rows(ctx)[0][1] == shortened_to
+
+
+def test_converging_is_a_true_no_op_so_the_offset_survives_it(monkeypatch, pg_database):
+    # Idempotency here is load-bearing rather than an optimisation. Every convergence pass rewrites these
+    # columns, and if writing identical values registered as movement in users.expiry_at, the account's
+    # proof-expiry offset would re-draw on every pass -- handing an observer repeated independent samples
+    # against one unchanged true expiry, whose minimum converges onto it. That is precisely the attack the
+    # offset exists to defeat.
+    with TestingContext(pg_database) as ctx:
+        master_key = nacl.signing.SigningKey(_UPGRADE_ACCOUNT_SEED)
+        rotating_key = nacl.signing.SigningKey.generate()
+        account_id = bytes(master_key.verify_key)
+        token, order_id = 'tok-idempotent', 'GPA.1313-1313-1313-13131'
+        expiry = base.datetime_from_unix_ms(1769904000000)
+
+        handled, err = _drive_google_rtdn(
+            monkeypatch,
+            ctx,
+            notification_type=4,
+            purchase_token=token,
+            event_ms=1767225600000,
+            snapshot=_google_snapshot(
+                state='SUBSCRIPTION_STATE_ACTIVE',
+                expiry='2026-02-01T00:00:00.000Z',
+                order_id=order_id,
+                obfuscated_account_id=account_id,
+            ),
+        )
+        assert handled and not err.has()
+        with ctx.connection() as conn:
+            _redeem_and_prove(
+                conn, ctx.backend_key, master_key, rotating_key, base.datetime_from_unix_ms(1767830400000)
+            )
+            before = backend.get_user(conn, master_key.verify_key)
+
+        for _ in range(5):
+            assert _converge(ctx, token, order_id, expiry=expiry) is True
+
+        with ctx.connection() as conn:
+            after = backend.get_user(conn, master_key.verify_key)
+        assert after.expiry_at == before.expiry_at
+        assert after.proof_expiry_offset == before.proof_expiry_offset, 'five passes, no re-draw'
+
+
+def test_converging_leaves_a_revoked_payment_alone(monkeypatch, pg_database):
+    # Google reports a refunded subscription as expired, but never reports that money came BACK -- that is
+    # the void feed's job. So converging a revoked row on the resource would quietly undo a refund we had
+    # already recorded, and could push its expiry past the instant entitlement actually stopped. Terminal
+    # means terminal: the row reports "nothing to converge".
+    with TestingContext(pg_database) as ctx:
+        master_key = nacl.signing.SigningKey(_UPGRADE_ACCOUNT_SEED)
+        rotating_key = nacl.signing.SigningKey.generate()
+        account_id = bytes(master_key.verify_key)
+        token, order_id = 'tok-revoked', 'GPA.1414-1414-1414-14141'
+        revoked_at = base.datetime_from_unix_ms(1769904000000)  # 2026-02-01
+
+        handled, err = _drive_google_rtdn(
+            monkeypatch,
+            ctx,
+            notification_type=4,
+            purchase_token=token,
+            event_ms=1767225600000,
+            snapshot=_google_snapshot(
+                state='SUBSCRIPTION_STATE_ACTIVE',
+                expiry='2026-06-01T00:00:00.000Z',
+                order_id=order_id,
+                obfuscated_account_id=account_id,
+            ),
+        )
+        assert handled and not err.has()
+        with ctx.connection() as conn:
+            _redeem_and_prove(
+                conn, ctx.backend_key, master_key, rotating_key, base.datetime_from_unix_ms(1767830400000)
+            )
+            sink = base.ErrorSink()
+            with db.transaction(conn) as tx:
+                backend.add_google_revocation(tx, google_payment_token=token, revoke_at=revoked_at, err=sink)
+            assert not sink.has()
+            user_after_revoke = backend.get_user(conn, master_key.verify_key)
+
+        # The store still describes this subscription, and a converge is now told it runs a further year.
+        # Neither the row nor the account may move.
+        assert _converge(ctx, token, order_id, expiry=base.datetime_from_unix_ms(1798761600000)) is False
+
+        _, expiry_at, revoked = _payment_rows(ctx)[0]
+        assert revoked == revoked_at, 'still revoked'
+        assert expiry_at == base.datetime_from_unix_ms(1780272000000), 'and its own term is untouched'
+        with ctx.connection() as conn:
+            assert backend.get_user(conn, master_key.verify_key).expiry_at == user_after_revoke.expiry_at
+
+
+def test_converging_an_unknown_payment_reports_rather_than_inventing_one(pg_database):
+    # Convergence adjusts the terms of a payment that exists; it is not a second way to create one. A token
+    # we have never seen means the notification that would have registered it was lost, which is a
+    # different problem with a different answer.
+    with TestingContext(pg_database) as ctx:
+        assert _converge(ctx, 'tok-never-seen', 'GPA.0000-0000-0000-00000', expiry=base.utc_now()) is False
+        assert not _payment_rows(ctx)

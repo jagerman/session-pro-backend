@@ -2799,6 +2799,89 @@ def google_clear_needs_ack(tx: db.SQLTransaction, payment_token: str) -> None:
     )
 
 
+@db.transactional
+def google_converge_payment(
+    tx: db.SQLTransaction,
+    payment_tx: base.PaymentProviderTransaction,
+    expiry_at: pendulum.DateTime,
+    auto_renewing: bool,
+    grace_period: pendulum.Duration,
+    needs_ack: bool,
+    err: base.ErrorSink,
+) -> bool:
+    """Bring an existing payment row into line with what Google's subscription resource now says, and report
+    whether a row was there to converge.
+
+    This is the write half of "the notification is a hint, the resource is the truth". The store owns these
+    values, so they are taken as stated rather than merged: a term Google has shortened, extended or deferred
+    is simply what it now says. That is only possible because `expiry_at` is revisable — it used to be
+    written once at insert, so the only way a new expiry could reach the database was a new order id, and a
+    change that moved an expiry without starting a billing cycle was invisible.
+
+    Two things the snapshot does NOT get to overrule:
+
+    * A REVOKED row is terminal and is left entirely alone. Google reports a refunded subscription as
+      expired, but it does not report *that money came back* — that is the void feed's job — so converging a
+      revoked row on the resource would quietly undo a refund we already recorded, and could extend its
+      expiry past the instant entitlement actually stopped.
+    * A CLAIMED row's ownership. Convergence adjusts the terms of a payment, never who holds it.
+
+    Idempotency is the load-bearing property, not an optimisation: re-running this against an unchanged
+    snapshot must leave `users.expiry_at` untouched, because a move there re-draws the account's
+    proof-expiry offset, and a convergence pass that "changed" nothing on every run would hand an observer
+    repeated samples against one true expiry — the exact attack the offset exists to prevent. Writing the
+    same values is genuinely a no-op here, so the recompute below sees no movement.
+    """
+    verify_payment_provider_tx(payment_tx, err)
+    if err.has():
+        return False
+
+    assert payment_tx.provider == base.PaymentProvider.GooglePlayStore, 'Google-only: keyed on (token, order id)'
+
+    rows = db.query(
+        tx.conn,
+        '''
+        UPDATE payments p
+        SET    expiry_at     = %(expiry_at)s,
+               auto_renewing = %(auto_renewing)s,
+               grace_period  = %(grace_period)s
+        FROM   google_play_payment_details gd
+        WHERE  gd.payment_id = p.id
+          AND  gd.payment_token = %(token)s AND gd.order_id = %(order_id)s
+          AND  p.revoked_at IS NULL
+        RETURNING (SELECT master_pkey FROM users WHERE users.id = p.user_id)
+    ''',
+        token=payment_tx.google_payment_token,
+        order_id=payment_tx.google_order_id,
+        expiry_at=expiry_at,
+        auto_renewing=auto_renewing,
+        grace_period=grace_period,
+    )
+
+    # RETURNING breaks rowcount (see update_payment_renewal_info), so the fetch is what tells us whether a
+    # row matched. Absent means either no such payment or a revoked one; both are "nothing to converge".
+    row = typing.cast(tuple[bytes | None] | None, rows.fetchone())
+    if row is None:
+        return False
+
+    db.query(
+        tx.conn,
+        '''
+        UPDATE google_play_payment_details SET needs_ack = %(needs_ack)s
+        WHERE  payment_token = %(token)s AND order_id = %(order_id)s
+    ''',
+        token=payment_tx.google_payment_token,
+        order_id=payment_tx.google_order_id,
+        needs_ack=needs_ack,
+    )
+
+    # Only a claimed payment has an account whose entitlement could have moved; an unclaimed one is folded
+    # in when its owner's next request reconciles it.
+    if row[0] is not None:
+        _update_user_expiry_grace_and_renew_flag_from_payment_list(tx, nacl.signing.VerifyKey(bytes(row[0])))
+    return True
+
+
 @dataclasses.dataclass
 class GoogleReconcileClaim:
     '''A purchase token leased for reconciliation, with how many consecutive failures precede this try.'''
