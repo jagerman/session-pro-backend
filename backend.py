@@ -1379,7 +1379,7 @@ def _lookup_user_expiry(tx: db.SQLTransaction, master_pkey: nacl.signing.VerifyK
         tx.conn,
         '''
         SELECT    p.expiry_at, p.grace_period, p.auto_renewing, p.redeemed_at,
-                  p.payment_provider, ad.original_tx_id, gd.order_id, rd.order_id, p.revoked_at,
+                  p.payment_provider, ad.original_tx_id, gd.payment_token, rd.order_id, p.revoked_at,
                   p.credit_remaining, u.credits_checkpoint_at
         FROM      payments p
                   JOIN users u ON u.id = p.user_id
@@ -1406,7 +1406,7 @@ def _lookup_user_expiry(tx: db.SQLTransaction, master_pkey: nacl.signing.VerifyK
     # nothing else covers the account, which is exactly when it is the truthful answer.
     credit_total = pendulum.duration()
 
-    used_google_order_ids: list[str] = []
+    used_google_tokens: set[str] = set()
     used_apple_orig_tx_ids: set[int] = set()
     used_stf_order_ids: set[str] = set()
 
@@ -1423,7 +1423,7 @@ def _lookup_user_expiry(tx: db.SQLTransaction, master_pkey: nacl.signing.VerifyK
             redeemed_at,
             payment_provider,
             apple_original_tx_id,
-            google_order_id,
+            google_payment_token,
             stf_order_id,
             revoked_at,
             credit_remaining,
@@ -1440,35 +1440,23 @@ def _lookup_user_expiry(tx: db.SQLTransaction, master_pkey: nacl.signing.VerifyK
                 credit_total += credit_remaining
             continue
 
-        # NOTE: Consecutive subscription payments are added to the DB under _roughly_ the same
-        # transaction ID (this differs between platforms). We only want to consider that latest
-        # subscription payment as the user's "best" payment that we should show as their entitlement
+        # One row per billing cycle, but a subscription's cycles must not each contribute to the max — only
+        # its most recent one is the entitlement. So collapse by whatever identifies the SUBSCRIPTION on
+        # each provider: Google's `payment_token`, Apple's `original_transaction_id`, and for a directly
+        # granted payment the order id, which has no cycles. Rows arrive newest-first (the SELECT orders by
+        # id DESC), so the first of each group seen is the one that counts.
         #
-        # For google they do an <order_id> but then append a suffix to disambiguate such as
-        # <order_id>, <order_id>..0, <order_id>..1 and so forth
-        #
-        # For apple they have a <original_transaction_id> that is shared across all transactions for
-        # a given subscription.
-        #
-        # Our SQL query sorts the user's payments by insertion order and looks for the _latest_
-        # instance of the transactions associated with the user and selects those.
+        # Google's per-cycle order ids happen to encode the subscription in a prefix (`GPA.x`, `GPA.x..0`,
+        # `GPA.x..1`), and this once grouped by parsing that. The token says the same thing without
+        # depending on the format, is already joined here, and is not confused by a subscription whose
+        # order-id base changes mid-life — which the prefix match would have split into two competing
+        # subscriptions.
         seen_before = False
         if payment_provider == base.PaymentProvider.GooglePlayStore.value:
-            order_split: list[str] = google_order_id.split('..')
-            if len(order_split) <= 0:
-                log.warning(
-                    f"Failed to split order google order ID by '..' for {base.maybe_obfuscate_bytes(master_pkey)}: "
-                    f"{base.maybe_obfuscate(google_order_id)}"
-                )
-                continue
-
-            for used_it in used_google_order_ids:
-                if used_it.startswith(order_split[0]):
-                    seen_before = True
-                    break
-
-            if not seen_before:
-                used_google_order_ids.append(google_order_id)
+            if google_payment_token in used_google_tokens:
+                seen_before = True
+            else:
+                used_google_tokens.add(google_payment_token)
         elif payment_provider == base.PaymentProvider.iOSAppStore.value:
             if apple_original_tx_id in used_apple_orig_tx_ids:
                 seen_before = True

@@ -4543,3 +4543,54 @@ def test_an_unknown_base_plan_is_reported_not_asserted(monkeypatch, pg_database)
         # failure is REPORTED. Previously the sink carried the message and an AssertionError traceback
         # behind it, having unwound through the blanket except on the way.
         assert not any('AssertionError' in msg for msg in err.msg_list), err.msg_list
+
+
+def test_one_token_is_one_subscription_whatever_its_order_ids_look_like(monkeypatch, pg_database):
+    # The fold collapses a subscription's billing cycles so only its latest contributes to the max. It used
+    # to do that by parsing Google's renewal-suffix convention -- splitting the order id on '..' and
+    # prefix-matching the base -- while the purchase token, which IS the subscription's identity, sat
+    # unselected in a table the query already joined.
+    #
+    # Grouping by token costs nothing on the ordinary shape and is right on this one: a subscription whose
+    # order-id base changes mid-life. Prefix matching sees two unrelated bases, treats them as two competing
+    # subscriptions, and lets the stale cycle keep the account entitled to an expiry it no longer has.
+    with TestingContext(pg_database) as ctx:
+        master_key = nacl.signing.SigningKey(_UPGRADE_ACCOUNT_SEED)
+        rotating_key = nacl.signing.SigningKey.generate()
+        account_id = bytes(master_key.verify_key)
+        shortened_to = base.datetime_from_unix_ms(1772323200000)  # 2026-03-01
+
+        for index, (order_id, expiry, event_ms) in enumerate(
+            [
+                # The first cycle runs to December...
+                ('GPA.1234-1234-1234-12341', '2026-12-01T00:00:00.000Z', 1767225600000),
+                # ...and the next one, under a wholly different base, runs only to March.
+                ('GPA.9876-9876-9876-98769', '2026-03-01T00:00:00.000Z', 1769904000000),
+            ]
+        ):
+            handled, err = _drive_google_rtdn(
+                monkeypatch,
+                ctx,
+                notification_type=4 if index == 0 else 2,
+                purchase_token='tok-one-subscription',
+                event_ms=event_ms,
+                snapshot=_google_snapshot(
+                    state='SUBSCRIPTION_STATE_ACTIVE',
+                    expiry=expiry,
+                    order_id=order_id,
+                    obfuscated_account_id=account_id,
+                ),
+            )
+            assert handled and not err.has()
+
+        assert len(_payment_rows(ctx)) == 2, 'two cycles, since (token, order_id) differ'
+
+        with ctx.connection() as conn:
+            _redeem_and_prove(
+                conn, ctx.backend_key, master_key, rotating_key, base.datetime_from_unix_ms(1770000000000)
+            )
+            user = backend.get_user(conn, master_key.verify_key)
+            assert user.expiry_at is not None
+            # Only the newest cycle counts. Under prefix matching the December row survived as a second
+            # "subscription" and won the max, entitling the account nine months past its actual term.
+            assert user.expiry_at == shortened_to + base.DEFAULT_GOOGLE_GRACE_PERIOD
