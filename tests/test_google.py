@@ -18,7 +18,7 @@ import base
 import server
 import db
 
-from tests.helpers import derived_status, TestingContext, _google_subscription_parse
+from tests.helpers import derived_status, TestingContext, _google_subscription_parse, _redeem_and_prove
 
 
 def test_google_handle_parsed_notification_fetch_failure(monkeypatch, pg_database):
@@ -3695,3 +3695,290 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
         test_notification(refund_b, ctx)
         for payment in unredeemed_payments:
             assert derived_status(payment) == base.PaymentStatus.Revoked
+
+
+# ----------------------------------------------------------------------------------------------------
+# Characterisation of the convergence defects (see the simplify-google-processing findings).
+#
+# These pin what the type-dispatching handler does TODAY, including where that is wrong. Each one names
+# the defect it captures; the reconcile rewrite is expected to invert them deliberately, not by accident.
+# ----------------------------------------------------------------------------------------------------
+
+_UPGRADE_ACCOUNT_SEED = bytes([0x42] * 32)
+
+
+def _google_snapshot(
+    *,
+    state: str,
+    expiry: str,
+    order_id: str,
+    obfuscated_account_id: bytes,
+    base_plan: str = 'session-pro-1-month',
+    auto_renew: bool = True,
+    linked_purchase_token: str | None = None,
+    start_time: str = '2026-01-01T00:00:00.000Z',
+) -> base.JSONObject:
+    """One `purchases.subscriptionsv2.get` response body, as the handler would fetch it."""
+    result: base.JSONObject = {
+        'kind': 'androidpublisher#subscriptionPurchaseV2',
+        'startTime': start_time,
+        'regionCode': 'AU',
+        'subscriptionState': state,
+        'latestOrderId': order_id,
+        'testPurchase': {},
+        'acknowledgementState': 'ACKNOWLEDGEMENT_STATE_ACKNOWLEDGED',
+        'externalAccountIdentifiers': {'obfuscatedExternalAccountId': obfuscated_account_id.hex()},
+        'lineItems': [
+            {
+                'productId': 'session_pro',
+                'expiryTime': expiry,
+                'autoRenewingPlan': {
+                    'autoRenewEnabled': auto_renew,
+                    'recurringPrice': {'currencyCode': 'AUD', 'units': '16', 'nanos': 990000000},
+                },
+                'offerDetails': {'basePlanId': base_plan, 'offerTags': ['tag']},
+                'latestSuccessfulOrderId': order_id,
+            }
+        ],
+    }
+    if linked_purchase_token is not None:
+        result['linkedPurchaseToken'] = linked_purchase_token
+    return result
+
+
+def _drive_google_rtdn(
+    monkeypatch, ctx, *, notification_type: int, purchase_token: str, event_ms: int, snapshot: base.JSONObject
+) -> tuple[bool, base.ErrorSink]:
+    """Push one subscription RTDN through handle_parsed_notification against `snapshot`.
+
+    Unlike the driver inside test_google_platform_handle_notification this does NOT assert success: these
+    tests are about the paths where handling silently does nothing, or fails and wedges.
+    """
+    monkeypatch.setattr('providers.google_play.api.package_name', 'network.loki.messenger')
+    err_parse = base.ErrorSink()
+    details = google_play.api.parse_get_subscription_v2_response(snapshot, err_parse)
+    assert not err_parse.has() and details is not None
+    monkeypatch.setattr('providers.google_play.api.fetch_subscription_v2_details', lambda *a, **k: details)
+    monkeypatch.setattr('providers.google_play.api.subscription_v1_acknowledge', lambda *a, **k: None)
+
+    rtdn: base.JSONObject = {
+        'version': '1.0',
+        'packageName': 'network.loki.messenger',
+        'eventTimeMillis': str(event_ms),
+        'subscriptionNotification': {
+            'version': '1.0',
+            'notificationType': notification_type,
+            'purchaseToken': purchase_token,
+            'subscriptionId': 'session_pro',
+        },
+    }
+    err = base.ErrorSink()
+    parse = google_play.parse_notification(rtdn, err)
+    with ctx.connection() as conn:
+        with db.transaction(conn) as tx:
+            handled = google_play.handle_parsed_notification(tx, parse, err)
+    return handled, err
+
+
+def _payment_rows(ctx) -> list[tuple]:
+    with ctx.connection() as conn:
+        return db.query(
+            conn,
+            '''
+            SELECT gd.order_id, p.expiry_at, p.revoked_at
+            FROM   payments p JOIN google_play_payment_details gd ON gd.payment_id = p.id
+            ORDER BY p.id
+            ''',
+        ).fetchall()
+
+
+def test_google_purchase_against_a_stale_state_is_silently_dropped(monkeypatch, pg_database):
+    # CHARACTERISATION of finding 3.1. The PURCHASED branch gates on the state of a FRESHLY FETCHED
+    # snapshot (notifications.py), while the notification type comes from the message. Process a PURCHASED
+    # once the store already reads CANCELED -- the user bought, then turned auto-renew off, and our
+    # subscriber was down in between -- and the guard fails, so the branch is skipped ENTIRELY.
+    #
+    # The damning part is the two asserts on `handled`/`err`: nothing is recorded, yet handling reports
+    # success, so the pull loop acks the message and Google never redelivers it. A purchase token is the one
+    # fact in this system that cannot be re-fetched (no endpoint enumerates subscribers), so this is an
+    # unrecoverable paid-but-no-Pro.
+    #
+    # The follow-up CANCELED then wedges: its own guard matches, but the UPDATE it performs finds no row,
+    # which is reported as failure -> tx.cancel -> never acked -> retried with backoff forever, waiting on a
+    # row that can never appear.
+    with TestingContext(pg_database) as ctx:
+        account_id = bytes(nacl.signing.SigningKey(_UPGRADE_ACCOUNT_SEED).verify_key)
+        token = 'tok-purchased-then-cancelled'
+        snapshot = _google_snapshot(
+            state='SUBSCRIPTION_STATE_CANCELED',
+            expiry='2026-02-01T00:00:00.000Z',
+            order_id='GPA.1111-2222-3333-44444',
+            obfuscated_account_id=account_id,
+            auto_renew=False,
+        )
+
+        handled, err = _drive_google_rtdn(
+            monkeypatch, ctx, notification_type=4, purchase_token=token, event_ms=1767225600000, snapshot=snapshot
+        )
+        assert not _payment_rows(ctx), 'the purchase was dropped -- this is the defect being pinned'
+        assert handled is True, 'and reported as handled, so the pull loop acks it and it is gone for good'
+        assert not err.has(), 'silently: no error is raised for the operator to see'
+
+        # The cancellation for the same token now has nothing to update.
+        handled, err = _drive_google_rtdn(
+            monkeypatch, ctx, notification_type=3, purchase_token=token, event_ms=1767312000000, snapshot=snapshot
+        )
+        assert handled is False and err.has(), 'so this one fails and is retried forever'
+
+
+def test_google_upgrade_revokes_every_consumed_cycle(monkeypatch, pg_database):
+    # CHARACTERISATION of findings 3.3 and 3.6. A monthly subscriber who switches plans gets a NEW purchase
+    # token, and the new subscription's snapshot names the old one in linkedPurchaseToken. The handler
+    # responds by calling add_google_revocation on the old token -- whose SELECT carries no ORDER BY and no
+    # LIMIT, so it revokes EVERY cycle ever recorded under that token, not the live one.
+    #
+    # Consumed cycles that ended months earlier are therefore stamped revoked_at = the upgrade instant, and
+    # get_payment_details reports them to the client as `revoked`. Nothing was refunded. That is revoked_at
+    # coming to mean "this payment never existed", which CLAUDE.md's invariant forbids.
+    #
+    # Its comment claims to "Select the newest google transaction"; it does not.
+    with TestingContext(pg_database) as ctx:
+        account_id = bytes(nacl.signing.SigningKey(_UPGRADE_ACCOUNT_SEED).verify_key)
+        old_token = 'tok-monthly'
+        cycles = [
+            ('GPA.9000-0000-0000-00001', '2026-02-01T00:00:00.000Z', 1767225600000),
+            ('GPA.9000-0000-0000-00001..0', '2026-03-01T00:00:00.000Z', 1769904000000),
+            ('GPA.9000-0000-0000-00001..1', '2026-04-01T00:00:00.000Z', 1772323200000),
+        ]
+        for index, (order_id, expiry, event_ms) in enumerate(cycles):
+            handled, err = _drive_google_rtdn(
+                monkeypatch,
+                ctx,
+                notification_type=4 if index == 0 else 2,  # PURCHASED, then RENEWED
+                purchase_token=old_token,
+                event_ms=event_ms,
+                snapshot=_google_snapshot(
+                    state='SUBSCRIPTION_STATE_ACTIVE',
+                    expiry=expiry,
+                    order_id=order_id,
+                    obfuscated_account_id=account_id,
+                ),
+            )
+            assert handled and not err.has()
+        assert len(_payment_rows(ctx)) == 3
+
+        # The switch: one PURCHASED, on a new token, naming the old one.
+        handled, err = _drive_google_rtdn(
+            monkeypatch,
+            ctx,
+            notification_type=4,
+            purchase_token='tok-annual',
+            event_ms=1773532800000,  # 2026-03-15, mid-way through the third month
+            snapshot=_google_snapshot(
+                state='SUBSCRIPTION_STATE_ACTIVE',
+                expiry='2027-03-15T00:00:00.000Z',
+                order_id='GPA.8000-0000-0000-00002',
+                obfuscated_account_id=account_id,
+                base_plan='session-pro-12-months',
+                linked_purchase_token=old_token,
+            ),
+        )
+        assert handled and not err.has()
+
+        rows = _payment_rows(ctx)
+        assert len(rows) == 4
+        revoked = {order_id: revoked_at for order_id, _, revoked_at in rows}
+        assert revoked['GPA.8000-0000-0000-00002'] is None, 'the replacement itself survives'
+        # All three monthly cycles are revoked, including the two that had already run to completion.
+        assert all(revoked[order_id] is not None for order_id, _, _ in cycles)
+        consumed = revoked['GPA.9000-0000-0000-00001']
+        assert consumed is not None
+        expired_at = [expiry_at for order_id, expiry_at, _ in rows if order_id == 'GPA.9000-0000-0000-00001'][0]
+        assert consumed > expired_at, 'revoked at the upgrade instant, long after this cycle actually ended'
+
+
+def test_google_upgrade_broadcasts_a_revocation_for_an_account_that_never_lapsed(monkeypatch, pg_database):
+    # CHARACTERISATION of findings 3.4 and 3.5. Same upgrade as above, but with the subscription CLAIMED, so
+    # the payments carry a user_id and the revocation path actually reaches its broadcast decision.
+    #
+    # That decision runs BEFORE the replacement payment is inserted (the linked-token revoke is the first
+    # statement in the PURCHASED branch, the insert comes after), so it judges an account that appears to
+    # have nothing left -- and rolls the generation, invalidating every outstanding proof, and publishes an
+    # entry into the revocation list that every client downloads for the 31-day retention. The account's
+    # coverage never lapsed for an instant: it upgraded.
+    #
+    # Which of the two branches is taken is decided by the LAST row of an unordered SELECT (finding 3.4), so
+    # the value pinned below is the one this fixture produces; it is not a guarantee of the code's shape.
+    with TestingContext(pg_database) as ctx:
+        master_key = nacl.signing.SigningKey(_UPGRADE_ACCOUNT_SEED)
+        rotating_key = nacl.signing.SigningKey.generate()
+        account_id = bytes(master_key.verify_key)
+        old_token = 'tok-monthly'
+
+        for index, (order_id, expiry, event_ms) in enumerate(
+            [
+                ('GPA.9000-0000-0000-00001', '2026-02-01T00:00:00.000Z', 1767225600000),
+                ('GPA.9000-0000-0000-00001..0', '2026-03-01T00:00:00.000Z', 1769904000000),
+                ('GPA.9000-0000-0000-00001..1', '2026-04-01T00:00:00.000Z', 1772323200000),
+            ]
+        ):
+            handled, err = _drive_google_rtdn(
+                monkeypatch,
+                ctx,
+                notification_type=4 if index == 0 else 2,
+                purchase_token=old_token,
+                event_ms=event_ms,
+                snapshot=_google_snapshot(
+                    state='SUBSCRIPTION_STATE_ACTIVE',
+                    expiry=expiry,
+                    order_id=order_id,
+                    obfuscated_account_id=account_id,
+                ),
+            )
+            assert handled and not err.has()
+
+        # Claim the subscription: the account now has a generation, and outstanding proofs to protect.
+        claimed_at = base.datetime_from_unix_ms(1773187200000)  # 2026-03-11, inside the third cycle
+        with ctx.connection() as conn:
+            _redeem_and_prove(conn, ctx.backend_key, master_key, rotating_key, claimed_at)
+            generation_before = backend.get_user(conn, master_key.verify_key).current_generation_id
+            assert not backend.get_revocations_list(conn)
+
+        handled, err = _drive_google_rtdn(
+            monkeypatch,
+            ctx,
+            notification_type=4,
+            purchase_token='tok-annual',
+            event_ms=1773532800000,  # 2026-03-15
+            snapshot=_google_snapshot(
+                state='SUBSCRIPTION_STATE_ACTIVE',
+                expiry='2027-03-15T00:00:00.000Z',
+                order_id='GPA.8000-0000-0000-00002',
+                obfuscated_account_id=account_id,
+                base_plan='session-pro-12-months',
+                linked_purchase_token=old_token,
+            ),
+        )
+        assert handled and not err.has()
+
+        upgraded_at = base.datetime_from_unix_ms(1773532800000)
+        with ctx.connection() as conn:
+            user = backend.get_user(conn, master_key.verify_key)
+            revocations = backend.get_revocations_list(conn)
+            assert len(revocations) == 1, 'an entry every client downloads for the 31-day retention'
+            assert revocations[0].generation_id == generation_before, 'the generation the account was using'
+
+            # No replacement generation is allocated, because at that instant the account has no usable
+            # payment: the old cycles were just revoked and the annual one has not been inserted yet. So the
+            # account is left POINTING AT a revoked generation, with every outstanding proof invalidated.
+            assert user.current_generation_id == generation_before
+
+            # And its expiry is left at the upgrade instant -- the account reads as lapsed. The replacement
+            # payment is inserted unredeemed, and _lookup_user_expiry filters on user_id, so the recompute
+            # inside the revoke path cannot see it; it sees only the coverage it just revoked.
+            assert user.expiry_at == upgraded_at
+
+        # It self-heals on the account's next request, which claims the replacement before recomputing.
+        with ctx.connection() as conn:
+            _redeem_and_prove(conn, ctx.backend_key, master_key, rotating_key, upgraded_at)
+            assert backend.get_user(conn, master_key.verify_key).expiry_at > upgraded_at
