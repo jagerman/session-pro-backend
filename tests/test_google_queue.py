@@ -213,3 +213,120 @@ def test_a_failure_records_itself_but_does_not_stomp_a_newer_obligation(pg_datab
         token, eligible_at, attempts, last_error = _queue(ctx)[0]
         assert attempts == 1 and last_error == 'boom', 'the failure is recorded either way'
         assert eligible_at == now, 'but the newer notification keeps its urgency'
+
+
+def _snapshot(order_id: str, expiry: str, account_id: bytes) -> base.JSONObject:
+    from tests.test_google import _google_snapshot
+
+    return _google_snapshot(
+        state='SUBSCRIPTION_STATE_ACTIVE', expiry=expiry, order_id=order_id, obfuscated_account_id=account_id
+    )
+
+
+def test_the_drain_reconciles_what_it_claims_and_clears_it(monkeypatch, pg_database):
+    # The whole loop: claim, fetch outside any transaction, converge, clear. The fetch being outside is the
+    # reason the lease exists -- holding row locks across a Play API call would pin a transaction open for
+    # the length of an external request.
+    import nacl.signing
+    from providers import google_play
+
+    monkeypatch.setattr('providers.google_play.api.package_name', 'network.loki.messenger')
+    monkeypatch.setattr('providers.google_play.api.subscription_v1_acknowledge', lambda *a, **k: None)
+    with TestingContext(pg_database) as ctx:
+        account_id = bytes(nacl.signing.SigningKey(bytes([0x42] * 32)).verify_key)
+        at = base.datetime_from_unix_ms(1767225600000)
+
+        err = base.ErrorSink()
+        details = google_play.api.parse_get_subscription_v2_response(
+            _snapshot('GPA.6161-6161-6161-61611', '2026-02-01T00:00:00.000Z', account_id), err
+        )
+        assert not err.has() and details is not None
+        monkeypatch.setattr('providers.google_play.api.fetch_subscription_v2_details', lambda *a, **k: details)
+
+        with ctx.connection() as conn:
+            with db.transaction(conn) as tx:
+                backend.google_enqueue_reconcile(tx, 'tok-drained', at)
+
+        assert google_play.drain_due_reconciles(at=at) == 1
+        assert _queue(ctx) == [], 'the obligation is discharged'
+
+        with ctx.connection() as conn:
+            rows = db.query(conn, 'SELECT payment_token FROM google_play_payment_details').fetchall()
+        assert [row[0] for row in rows] == ['tok-drained']
+
+
+def test_a_failing_token_backs_off_and_stops_crowding_out_fresh_work(monkeypatch, pg_database):
+    # The reason the backoff earns its column. The claim is ORDER BY eligible_at LIMIT n, so a token that
+    # stays eligible at its original instant sorts ahead of every later arrival and consumes a slot on every
+    # pass. Pushing a failure into the future is what moves it BEHIND new work.
+    from providers import google_play
+
+    monkeypatch.setattr('providers.google_play.api.package_name', 'network.loki.messenger')
+
+    def boom(package_name, purchase_token, err):
+        err.msg_list.append('injected fetch failure')
+        return None
+
+    monkeypatch.setattr('providers.google_play.api.fetch_subscription_v2_details', boom)
+    with TestingContext(pg_database) as ctx:
+        at = base.datetime_from_unix_ms(1767225600000)
+        with ctx.connection() as conn:
+            with db.transaction(conn) as tx:
+                backend.google_enqueue_reconcile(tx, 'tok-stuck', at)
+
+        assert google_play.drain_due_reconciles(at=at) == 1
+
+        token, eligible_at, attempts, last_error = _queue(ctx)[0]
+        assert attempts == 1
+        assert 'injected fetch failure' in last_error
+        assert eligible_at == at + google_play.notifications.reconcile_retry_delay(0), 'backed off'
+
+        # A notification arriving now is eligible immediately, and the stuck token is not.
+        with ctx.connection() as conn:
+            with db.transaction(conn) as tx:
+                backend.google_enqueue_reconcile(tx, 'tok-fresh', at + pendulum.duration(seconds=1))
+            with db.transaction(conn) as tx:
+                claimed = backend.google_claim_due_reconciles(
+                    tx, now=at + pendulum.duration(seconds=1), lease_until=at + pendulum.duration(minutes=5), limit=32
+                )
+        assert [c.payment_token for c in claimed] == ['tok-fresh'], 'the stuck token waits its turn'
+
+
+def test_one_failing_token_does_not_cost_the_rest_of_the_batch(monkeypatch, pg_database):
+    # Unrelated subscriptions that happen to be due at the same moment. CLAUDE.md's rule for provider
+    # notifications applies unchanged: each gets its own transaction, and a failure is logged and skipped.
+    import nacl.signing
+    from providers import google_play
+
+    monkeypatch.setattr('providers.google_play.api.package_name', 'network.loki.messenger')
+    monkeypatch.setattr('providers.google_play.api.subscription_v1_acknowledge', lambda *a, **k: None)
+    with TestingContext(pg_database) as ctx:
+        account_id = bytes(nacl.signing.SigningKey(bytes([0x42] * 32)).verify_key)
+        at = base.datetime_from_unix_ms(1767225600000)
+
+        err = base.ErrorSink()
+        good = google_play.api.parse_get_subscription_v2_response(
+            _snapshot('GPA.6262-6262-6262-62621', '2026-02-01T00:00:00.000Z', account_id), err
+        )
+        assert not err.has() and good is not None
+
+        def fetch(package_name, purchase_token, err):
+            if purchase_token == 'tok-bad':
+                raise RuntimeError('Google fell over for this one')
+            return good
+
+        monkeypatch.setattr('providers.google_play.api.fetch_subscription_v2_details', fetch)
+
+        with ctx.connection() as conn:
+            for token in ('tok-bad', 'tok-ok'):
+                with db.transaction(conn) as tx:
+                    backend.google_enqueue_reconcile(tx, token, at)
+
+        assert google_play.drain_due_reconciles(at=at) == 2
+
+        remaining = _queue(ctx)
+        assert [row[0] for row in remaining] == ['tok-bad'], 'the good one cleared, the bad one is retained'
+        assert 'Google fell over' in remaining[0][3]
+        with ctx.connection() as conn:
+            rows = db.query(conn, 'SELECT payment_token FROM google_play_payment_details').fetchall()
+        assert [row[0] for row in rows] == ['tok-ok']

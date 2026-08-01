@@ -658,6 +658,79 @@ def require_obfuscated_external_account_id(tx_event: SubscriptionPlanEventTransa
     return result
 
 
+# How many tokens one drain pass claims. Bounds the DB read and, more importantly, the number of Google API
+# calls a single pass can make; the rest simply wait for the next one.
+RECONCILE_BATCH_LIMIT = 32
+
+# How long a claimed token is held. Must exceed the longest a single reconcile can take -- the Play API call
+# carries a 15 s socket timeout (see init) -- or a slow fetch would be re-leased while it is still running.
+RECONCILE_LEASE = pendulum.duration(minutes=5)
+
+# Backoff after a failed reconcile, doubling per consecutive failure to a ceiling. The ceiling matters more
+# than the curve: a token that is permanently unreconcilable must not consume a claim slot on every pass,
+# because the claim is ordered by eligible_at and a limited batch would otherwise let stuck tokens crowd out
+# newly-arrived work indefinitely.
+RECONCILE_RETRY_MIN = pendulum.duration(minutes=1)
+RECONCILE_RETRY_MAX = pendulum.duration(hours=6)
+
+
+def reconcile_retry_delay(attempts: int) -> pendulum.Duration:
+    """Exponential backoff, bounded. `attempts` counts failures BEFORE this one."""
+    doubled = RECONCILE_RETRY_MIN * (2 ** min(attempts, 16))
+    return doubled if doubled < RECONCILE_RETRY_MAX else RECONCILE_RETRY_MAX
+
+
+def drain_due_reconciles(at: pendulum.DateTime) -> int:
+    """Reconcile every token whose turn has come, and report how many were attempted.
+
+    The claim and the work are deliberately in SEPARATE transactions. Reconciling makes a Play API call, and
+    holding row locks across an external request would pin a transaction open for its duration; the lease
+    taken at claim time is what protects the token instead. A pass that dies mid-fetch therefore leaves the
+    lease to lapse and the token comes due again on its own.
+
+    Each token then gets its own transaction, so one failure is logged and skipped rather than costing the
+    batch — the same rule the notification handlers follow, and for the same reason: these are unrelated
+    subscriptions that happen to be due at the same moment.
+    """
+    with db.connection() as conn:
+        with db.transaction(conn) as tx:
+            claims = backend.google_claim_due_reconciles(
+                tx, now=at, lease_until=at + RECONCILE_LEASE, limit=RECONCILE_BATCH_LIMIT
+            )
+
+    for claim in claims:
+        err = base.ErrorSink()
+        try:
+            # Outside any transaction, on purpose. See above.
+            details = api.fetch_subscription_v2_details(api.package_name, claim.payment_token, err)
+            if err.has() or details is None:
+                err.msg_list.append('Failed to fetch subscription V2 details from Google')
+            else:
+                with db.connection() as conn:
+                    with db.transaction(conn) as tx:
+                        reconcile_google_subscription(
+                            tx, purchase_token=claim.payment_token, details=details, at=at, err=err
+                        )
+                        if err.has():
+                            tx.cancel = True
+        except Exception:
+            err.msg_list.append(f'Reconcile raised: {traceback.format_exc()}')
+
+        with db.connection() as conn:
+            with db.transaction(conn) as tx:
+                if err.has():
+                    retry_at = at + reconcile_retry_delay(claim.attempts)
+                    log.error(
+                        f'Reconcile failed for {base.maybe_obfuscate(claim.payment_token)} '
+                        f'(attempt {claim.attempts + 1}, retrying at {base.readable(retry_at)}): {err.build()}'
+                    )
+                    backend.google_reconcile_failed(tx, claim, retry_at=retry_at, error=err.build())
+                else:
+                    backend.google_reconcile_done(tx, claim)
+
+    return len(claims)
+
+
 def reconcile_google_subscription(
     tx: db.SQLTransaction, purchase_token: str, details: SubscriptionV2Data, at: pendulum.DateTime, err: base.ErrorSink
 ) -> None:
