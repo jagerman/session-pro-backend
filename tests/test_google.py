@@ -5083,3 +5083,117 @@ def test_a_subscription_with_no_owned_line_item_is_reported(pg_database):
 
     assert google_play.api.parse_line_item(details, err) is None
     assert err.has() and any('no owned line item' in msg for msg in err.msg_list), err.msg_list
+
+
+def _reconcile(ctx, token: str, snapshot: base.JSONObject, at) -> base.ErrorSink:
+    err = base.ErrorSink()
+    details = google_play.api.parse_get_subscription_v2_response(snapshot, err)
+    assert not err.has() and details is not None
+    with ctx.connection() as conn:
+        with db.transaction(conn) as tx:
+            google_play.reconcile_google_subscription(tx, purchase_token=token, details=details, at=at, err=err)
+    return err
+
+
+def test_reconciling_registers_a_purchase_whatever_state_it_has_reached(monkeypatch, pg_database):
+    # The defect that started all of this, gone by construction. The old PURCHASED branch required the
+    # freshly fetched snapshot to still read ACTIVE and silently did nothing otherwise -- so a purchase
+    # followed quickly by the user turning auto-renew off registered NOTHING, was reported handled, and was
+    # acked away forever.
+    #
+    # Reconciling does not ask why it was woken. It writes down what the store says, and the store says
+    # this subscription exists, is paid through February, and is not renewing.
+    monkeypatch.setattr('providers.google_play.api.package_name', 'network.loki.messenger')
+    monkeypatch.setattr('providers.google_play.api.subscription_v1_acknowledge', lambda *a, **k: None)
+    with TestingContext(pg_database) as ctx:
+        account_id = bytes(nacl.signing.SigningKey(_UPGRADE_ACCOUNT_SEED).verify_key)
+        at = base.datetime_from_unix_ms(1767225600000)
+
+        err = _reconcile(
+            ctx,
+            'tok-cancelled-already',
+            _google_snapshot(
+                state='SUBSCRIPTION_STATE_CANCELED',
+                expiry='2026-02-01T00:00:00.000Z',
+                order_id='GPA.5151-5151-5151-51511',
+                obfuscated_account_id=account_id,
+                auto_renew=False,
+            ),
+            at,
+        )
+        assert not err.has(), err.msg_list
+
+        rows = _payment_rows(ctx)
+        assert len(rows) == 1, 'the purchase is recorded, where the old branch dropped it'
+        assert rows[0][0] == 'GPA.5151-5151-5151-51511'
+        assert rows[0][1] == base.datetime_from_unix_ms(1769904000000)
+
+
+def test_reconciling_a_superseded_token_marks_the_old_one_dirty(monkeypatch, pg_database):
+    # An upgrade issues a NEW token and names the old one in linkedPurchaseToken. Google sends no further
+    # notification for a token it has replaced, so that field is our only chance to learn the old
+    # subscription needs revisiting -- but its own resource is the authority on what became of it, exactly
+    # as this one is. So it is marked dirty rather than acted on.
+    #
+    # The old path revoked it inline instead, mid-write and before the replacement payment existed, which is
+    # what revoked a subscriber for the crime of upgrading.
+    monkeypatch.setattr('providers.google_play.api.package_name', 'network.loki.messenger')
+    monkeypatch.setattr('providers.google_play.api.subscription_v1_acknowledge', lambda *a, **k: None)
+    with TestingContext(pg_database) as ctx:
+        account_id = bytes(nacl.signing.SigningKey(_UPGRADE_ACCOUNT_SEED).verify_key)
+        at = base.datetime_from_unix_ms(1767225600000)
+
+        err = _reconcile(
+            ctx,
+            'tok-new',
+            _google_snapshot(
+                state='SUBSCRIPTION_STATE_ACTIVE',
+                expiry='2027-01-01T00:00:00.000Z',
+                order_id='GPA.5252-5252-5252-52521',
+                obfuscated_account_id=account_id,
+                base_plan='session-pro-12-months',
+                linked_purchase_token='tok-old',
+            ),
+            at,
+        )
+        assert not err.has(), err.msg_list
+
+        with ctx.connection() as conn:
+            queued = db.query(conn, 'SELECT payment_token, eligible_at FROM google_reconcile_queue').fetchall()
+        assert [row[0] for row in queued] == ['tok-old'], 'the superseded token owes a look, nothing more'
+        assert queued[0][1] == at
+
+        # And nothing was revoked on the strength of a resource describing a different subscription.
+        assert all(row[2] is None for row in _payment_rows(ctx))
+        with ctx.connection() as conn:
+            assert not backend.get_revocations_list(conn)
+
+
+def test_reconciling_is_indifferent_to_the_order_notifications_arrive_in(monkeypatch, pg_database):
+    # Nothing here applies a delta, so replaying an older view after a newer one cannot undo it: each
+    # reconcile fetches and writes the CURRENT resource. This is the property the sorted queue, the
+    # event-time sort and the retry backoff were all built to approximate.
+    monkeypatch.setattr('providers.google_play.api.package_name', 'network.loki.messenger')
+    monkeypatch.setattr('providers.google_play.api.subscription_v1_acknowledge', lambda *a, **k: None)
+    with TestingContext(pg_database) as ctx:
+        account_id = bytes(nacl.signing.SigningKey(_UPGRADE_ACCOUNT_SEED).verify_key)
+        token, order_id = 'tok-any-order', 'GPA.5353-5353-5353-53531'
+
+        def snapshot(expiry: str, auto_renew: bool) -> base.JSONObject:
+            return _google_snapshot(
+                state='SUBSCRIPTION_STATE_ACTIVE' if auto_renew else 'SUBSCRIPTION_STATE_CANCELED',
+                expiry=expiry,
+                order_id=order_id,
+                obfuscated_account_id=account_id,
+                auto_renew=auto_renew,
+            )
+
+        # Whatever woke us, the resource is the same one, so the result is the same.
+        for _ in range(3):
+            assert not _reconcile(
+                ctx, token, snapshot('2026-03-01T00:00:00.000Z', auto_renew=False), base.utc_now()
+            ).has()
+
+        rows = _payment_rows(ctx)
+        assert len(rows) == 1, 'three reconciles, one cycle'
+        assert rows[0][1] == base.datetime_from_unix_ms(1772323200000)

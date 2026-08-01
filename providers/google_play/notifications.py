@@ -658,6 +658,107 @@ def require_obfuscated_external_account_id(tx_event: SubscriptionPlanEventTransa
     return result
 
 
+def reconcile_google_subscription(
+    tx: db.SQLTransaction, purchase_token: str, details: SubscriptionV2Data, at: pendulum.DateTime, err: base.ErrorSink
+) -> None:
+    """Bring our record of one purchase token into line with the subscription resource Google just gave us.
+
+    The whole of the type dispatch collapses into this. A notification says only "something about this
+    subscription changed"; the resource says what it now IS, and every field the old per-type branches wrote
+    is in it — the term, whether it renews, whether it still owes an acknowledgement, which plan it is on.
+    So there is nothing for a PURCHASED branch to do that a RENEWED branch would not, and nothing for either
+    to do that is not simply "write down what the store says".
+
+    Consequences worth stating, because they are what the old shape got wrong:
+
+    * A notification arriving for a state that has since moved on is harmless. It triggers a fetch, the fetch
+      returns the CURRENT resource, and we converge on that. Order stops mattering, because nothing here
+      applies a delta.
+    * A purchase is never dropped for arriving late. The old PURCHASED branch required the snapshot to still
+      read ACTIVE and silently did nothing otherwise, so a purchase followed quickly by a cancellation
+      registered nothing at all.
+    * A revoked row stays revoked: `google_converge_payment` will not touch one, so a resource that still
+      describes the subscription cannot resurrect it.
+
+    `linked_purchase_token` is handled by marking the OLD token dirty rather than acting on it here. Its
+    resource is the authority on what became of it, exactly as this one is, and we are not holding it.
+    """
+    line_item = api.parse_line_item(details, err)
+    payment_tx = api.parse_subscription_purchase_tx(purchase_token=purchase_token, details=details, err=err)
+    tx_event = api.parse_subscription_plan_event_tx(
+        details, base.unix_ms_from_datetime(at), SubscriptionNotificationType.UNKNOWN, err=err
+    )
+    if err.has() or line_item is None:
+        err.msg_list.append('Failed to read the subscription resource well enough to reconcile it')
+        return
+
+    # Straight from the resource rather than inferred from why we were woken: a plan that does not renew
+    # says so here, and a plan that is not auto-renewing at all (prepaid) has no such block.
+    auto_renewing = line_item.auto_renewing_plan is not None and line_item.auto_renewing_plan.auto_renew_enabled
+
+    # The grace period is a property of the base plan, and only worth an extra API call when the store says
+    # the subscription is actually in it. Everywhere else the configured default is what the old
+    # per-notification branches used.
+    grace_period = base.DEFAULT_GOOGLE_GRACE_PERIOD
+    if tx_event.subscription_state == SubscriptionsV2State.IN_GRACE_PERIOD:
+        plan_details = api.fetch_subscription_details_for_base_plan_id(base_plan_id=tx_event.base_plan_id, err=err)
+        if err.has() or plan_details is None:
+            err.msg_list.append(f'Failed to read the grace period for base plan {tx_event.base_plan_id}')
+            return
+        grace_period = base.duration_from_ms(plan_details.grace_period.milliseconds)
+
+    needs_ack = tx_event.purchase_acknowledged != SubscriptionsV2AcknowledgementState.ACKNOWLEDGED
+    expiry_at = base.datetime_from_unix_ms(tx_event.expiry_time.unix_milliseconds)
+
+    converged = backend.google_converge_payment(
+        tx,
+        payment_tx=payment_tx,
+        expiry_at=expiry_at,
+        auto_renewing=auto_renewing,
+        grace_period=grace_period,
+        needs_ack=needs_ack,
+        err=err,
+    )
+    if err.has():
+        return
+
+    if not converged:
+        # No row for this (token, order id): either a cycle we have never seen, or one whose row is revoked
+        # and therefore terminal. add_unredeemed_payment dedups on the same pair, so the revoked case is a
+        # no-op rather than a resurrection.
+        obfuscated_external_account_id = require_obfuscated_external_account_id(tx_event, err)
+        if err.has():
+            return
+        backend.add_unredeemed_payment(
+            tx,
+            payment_tx=payment_tx,
+            plan=tx_event.pro_plan,
+            expiry_at=expiry_at,
+            # `at` stands in for the instant the cycle was bought. A snapshot does not carry a per-cycle
+            # purchase time — only the subscription's own start_time — so reconciling a cycle whose
+            # notification we never saw dates it from when we noticed. It feeds the refund deadline and the
+            # payment's displayed purchase date, never entitlement, which comes from expiry_at.
+            purchased_at=at,
+            platform_refund_expiry_at=base.datetime_from_unix_ms(
+                base.unix_ms_from_datetime(at) + api.refund_deadline_duration_ms
+            ),
+            platform_obfuscated_account_id=obfuscated_external_account_id,
+            err=err,
+            needs_ack=needs_ack,
+            auto_renewing=auto_renewing,
+        )
+        if err.has():
+            return
+
+    if tx_event.linked_purchase_token is not None:
+        # Superseded, not refunded. The old token's own resource is the authority on what became of it, and
+        # it is the only place that says so — Google sends no further notification for a token it has
+        # replaced, so this marker is our sole chance to learn the subscription needs revisiting. Enqueued
+        # rather than acted on inline, because judging an account mid-write is what made the old path revoke
+        # a subscriber for upgrading.
+        backend.google_enqueue_reconcile(tx, payment_token=tx_event.linked_purchase_token, eligible_at=at)
+
+
 def handle_subscription_notification(
     tx_payment: base.PaymentProviderTransaction,
     tx_event: SubscriptionPlanEventTransaction,
