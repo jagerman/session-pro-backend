@@ -4073,3 +4073,167 @@ def test_google_upgrade_revocation_depends_on_physical_row_order(monkeypatch, pg
             assert not backend.get_revocations_list(conn), 'no broadcast, purely because of row placement'
             # The lapsed expiry from the test above is NOT order-dependent: it happens on both branches.
             assert backend.get_user(conn, master_key.verify_key).expiry_at == base.datetime_from_unix_ms(1773532800000)
+
+
+def test_google_expiry_is_never_revised_after_insert(monkeypatch, pg_database):
+    # CHARACTERISATION of finding 3.7. A store payment's expiry_at is written once, at insert, and no code
+    # path ever revises it: every other UPDATE on payments touches revoked_at, redeemed_at, user_id,
+    # auto_renewing or grace_period, and the only write to expiry_at is the credit drain's latch, which never
+    # applies to a Google payment.
+    #
+    # So re-processing the same cycle against a snapshot that now reports a LATER expiry -- what a deferred
+    # recurrence change or a recurrence-time extension produces, since Google moves the expiry without
+    # issuing a new order -- leaves the stored value untouched. add_unredeemed_payment dedups on
+    # (token, order_id) and takes the row as it already stands.
+    #
+    # This is why convergence needs expiry_at to become mutable: today the only way a new expiry can reach
+    # the DB is a new order id, i.e. a new row.
+    with TestingContext(pg_database) as ctx:
+        account_id = bytes(nacl.signing.SigningKey(_UPGRADE_ACCOUNT_SEED).verify_key)
+        token, order_id = 'tok-extended', 'GPA.7000-0000-0000-00003'
+
+        handled, err = _drive_google_rtdn(
+            monkeypatch,
+            ctx,
+            notification_type=4,
+            purchase_token=token,
+            event_ms=1767225600000,
+            snapshot=_google_snapshot(
+                state='SUBSCRIPTION_STATE_ACTIVE',
+                expiry='2026-02-01T00:00:00.000Z',
+                order_id=order_id,
+                obfuscated_account_id=account_id,
+            ),
+        )
+        assert handled and not err.has()
+        assert _payment_rows(ctx)[0][1] == base.datetime_from_unix_ms(1769904000000)  # 2026-02-01
+
+        # Google now reports the cycle running a month longer, under the SAME order id.
+        handled, err = _drive_google_rtdn(
+            monkeypatch,
+            ctx,
+            notification_type=1,  # RECOVERED, which shares the RENEWED branch
+            purchase_token=token,
+            event_ms=1769000000000,
+            snapshot=_google_snapshot(
+                state='SUBSCRIPTION_STATE_ACTIVE',
+                expiry='2026-03-01T00:00:00.000Z',
+                order_id=order_id,
+                obfuscated_account_id=account_id,
+            ),
+        )
+        assert handled and not err.has()
+
+        rows = _payment_rows(ctx)
+        assert len(rows) == 1, 'same (token, order_id): deduped, no second row'
+        assert rows[0][1] == base.datetime_from_unix_ms(1769904000000), 'and the extension is discarded'
+
+
+def test_google_deferred_notification_wedges_forever(monkeypatch, pg_database):
+    # CHARACTERISATION of finding 3.8. DEFERRED shares an explicitly-unsupported arm with PAUSED and
+    # PAUSE_SCHEDULE_CHANGED: it appends `unsupported!` and cancels the transaction, so the message is never
+    # acked and is retried with backoff indefinitely, carrying a user_error on the token that surfaces in
+    # that account's error_report.
+    #
+    # Gratuitous, because the snapshot already carries everything needed: the current expiry, and the
+    # incoming product under deferredItemReplacement. A handler that converges on the snapshot has nothing to
+    # do here -- the deferral changes nothing yet -- and entitlement self-corrects at the next RENEWED
+    # regardless. The wedge exists purely because dispatch is on notification type.
+    with TestingContext(pg_database) as ctx:
+        account_id = bytes(nacl.signing.SigningKey(_UPGRADE_ACCOUNT_SEED).verify_key)
+        token, order_id = 'tok-deferred', 'GPA.6000-0000-0000-00004'
+
+        handled, err = _drive_google_rtdn(
+            monkeypatch,
+            ctx,
+            notification_type=4,
+            purchase_token=token,
+            event_ms=1767225600000,
+            snapshot=_google_snapshot(
+                state='SUBSCRIPTION_STATE_ACTIVE',
+                expiry='2026-02-01T00:00:00.000Z',
+                order_id=order_id,
+                obfuscated_account_id=account_id,
+            ),
+        )
+        assert handled and not err.has()
+
+        # The subscription is unchanged -- a deferral takes effect at the next renewal, so the snapshot still
+        # reads ACTIVE with the same expiry. There is nothing here that needed handling.
+        handled, err = _drive_google_rtdn(
+            monkeypatch,
+            ctx,
+            notification_type=9,  # DEFERRED
+            purchase_token=token,
+            event_ms=1768000000000,
+            snapshot=_google_snapshot(
+                state='SUBSCRIPTION_STATE_ACTIVE',
+                expiry='2026-02-01T00:00:00.000Z',
+                order_id=order_id,
+                obfuscated_account_id=account_id,
+            ),
+        )
+        assert handled is False, 'never acked -> Google redelivers -> retried with backoff forever'
+        assert err.has() and any('unsupported' in msg for msg in err.msg_list)
+
+
+def test_revoking_a_lapsed_payment_extends_the_account(monkeypatch, pg_database):
+    # CHARACTERISATION of finding 3.7a, which an earlier draft wrongly called unobservable. The fold assigns
+    # `expiry_at = revoked_at` for a revoked row rather than taking the MINIMUM of the two, and that value
+    # becomes users.expiry_at -- the wire's expiry_ts, the Active/Expired decision in get_pro_status, and the
+    # ceiling a signed proof is clamped against.
+    #
+    # So revoking a payment that had ALREADY LAPSED moves the account's expiry FORWARD, from the true lapse
+    # instant to the revocation instant. A refund grants entitlement.
+    #
+    # The account does not even get a revocation broadcast to cut the resulting proofs short: the
+    # day-boundary early-out sees the payment's own expiry sitting well before the revoke instant, concludes
+    # it was expiring anyway, and skips. So the extension stands unannounced.
+    #
+    # Demonstrated on the Google fixture because it is cheap to build. The live path is APPLE's: a REFUND
+    # carries Apple's revocationDate straight into revoke_at (providers/app_store.py), and Apple can process
+    # a refund long after the subscription lapsed.
+    with TestingContext(pg_database) as ctx:
+        master_key = nacl.signing.SigningKey(_UPGRADE_ACCOUNT_SEED)
+        rotating_key = nacl.signing.SigningKey.generate()
+        account_id = bytes(master_key.verify_key)
+        lapses_at = base.datetime_from_unix_ms(1769904000000)  # 2026-02-01
+
+        handled, err = _drive_google_rtdn(
+            monkeypatch,
+            ctx,
+            notification_type=4,
+            purchase_token='tok-lapsed',
+            event_ms=1767225600000,
+            snapshot=_google_snapshot(
+                state='SUBSCRIPTION_STATE_ACTIVE',
+                expiry='2026-02-01T00:00:00.000Z',
+                order_id='GPA.5000-0000-0000-00005',
+                obfuscated_account_id=account_id,
+            ),
+        )
+        assert handled and not err.has()
+        with ctx.connection() as conn:
+            _redeem_and_prove(
+                conn, ctx.backend_key, master_key, rotating_key, base.datetime_from_unix_ms(1767830400000)
+            )
+            # Auto-renewing, so the published expiry carries the grace period on top.
+            assert (
+                backend.get_user(conn, master_key.verify_key).expiry_at == lapses_at + base.DEFAULT_GOOGLE_GRACE_PERIOD
+            )
+
+        # Four months after it lapsed, the payment is refunded.
+        refunded_at = base.datetime_from_unix_ms(1780272000000)  # 2026-06-01
+        err = base.ErrorSink()
+        with ctx.connection() as conn:
+            with db.transaction(conn) as tx:
+                backend.add_google_revocation(tx, google_payment_token='tok-lapsed', revoke_at=refunded_at, err=err)
+        assert not err.has()
+
+        with ctx.connection() as conn:
+            user = backend.get_user(conn, master_key.verify_key)
+            assert user.expiry_at == refunded_at, 'the refund moved the account expiry FORWARD by four months'
+            assert not backend.get_revocations_list(conn), 'and nothing was broadcast to cut it short'
+            # The payment row itself keeps the honest pair; only the fold conflates them.
+            row = db.query_one(conn, 'SELECT expiry_at, revoked_at FROM payments ORDER BY id DESC LIMIT 1')
+            assert row[0] == lapses_at and row[1] == refunded_at
