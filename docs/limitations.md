@@ -36,29 +36,33 @@ Keep this in sync with the code — it describes real branches, not intentions.
 
 | Feature / notification | Enabled in Play Console by… | Current behaviour if hit | Consequence | Fails |
 |---|---|---|---|---|
-| **One-time (managed) product** — `voidedPurchaseNotification` `productType=ONE_TIME` | offering any one-time / managed product SKU | `handle_voided_notification` appends `unsupported!` (and today is unreachable — see the `.Test` bug below — so it's a silent no-op) | refunded one-time purchase keeps full Pro (over-entitlement) | silent |
+| **One-time (managed) product** — `voidedPurchaseNotification` `productType=ONE_TIME` | offering any one-time / managed product SKU | `handle_voided_notification` appends `unsupported!` → RTDN retry-loop + purchase-token error state | refunded one-time purchase keeps full Pro (over-entitlement) | loud-ish |
 | **One-time product purchase** — `OneTimeProduct` notification | offering any one-time / managed product SKU | mapped to `Nil` → silent no-op (the explicit `OneTimeProduct` error branch is dead code) | one-time purchase grants no Pro (paid-but-no-Pro) | silent |
 | **Prepaid base plan** — `prepaidPlan` line item (`platform_google_api.py`) | adding a prepaid (non-auto-renewing) base plan to a subscription | `handle_not_implemented('prepaidPlan')` → error propagates → RTDN retry-loop + purchase-token error state | prepaid subscriber's purchase never registers (paid-but-no-Pro); notification loops forever | silent |
 | **Subscription pause** — `PAUSED` / `PAUSE_SCHEDULE_CHANGED` notifications | enabling **pause** on any base plan | appends `unsupported!` → `tx.cancel` → RTDN retry-loop + token error state | paused user may stay entitled; notification stuck | silent |
 | **Deferred billing / recurrence change** — `DEFERRED` notification | issuing a deferred upgrade/downgrade or recurrence-date extension | same as pause (retry-loop + token error) | deferred renewal mis-timed; notification stuck | silent |
-| **Partial / quantity-based refund** — `voidedPurchaseNotification` `refundType=QUANTITY_BASED_PARTIAL_REFUND` | issuing a partial refund (only possible on multi-quantity purchases) | `handle_voided_notification` appends `unsupported!` (unreachable today via the `.Test` bug → silent no-op) | partial refund not reflected in entitlement | silent |
+| **Partial / quantity-based refund** — `voidedPurchaseNotification` `refundType=QUANTITY_BASED_PARTIAL_REFUND` | issuing a partial refund (only possible on multi-quantity purchases) | `handle_voided_notification` appends `unsupported!` → RTDN retry-loop + purchase-token error state | partial refund not reflected in entitlement | loud-ish |
+| **New / changed base plan** — `pro_plan_from_base_plan_id` | adding any base plan beyond the three known ones* | reported to the ErrorSink; the caller declines to write and the notification is retried | any purchase of the new plan registers no Pro until the plan is supported — recoverable, since the payload is retained and a later deploy applies it | loud-ish |
+
+\* known base plans: `session-pro-{1-month,3-months,12-months}`.
 
 **Handled / intentionally safe (no action needed):**
 - **Subscription full refund / revoke** — `voidedPurchaseNotification` `SUBSCRIPTION`+`FULL_REFUND` is an
   intentional **no-op** because subscription revocation is handled by the separate **`SUBSCRIPTION_REVOKED`**
-  RTDN. (This is *why* the `.Test` dispatch bug below has no live subscription impact today.)
+  RTDN. (This is *why* the dispatch typo noted below had no live subscription impact.)
 - **Price-change / pending-purchase notifications** — `PRICE_CHANGE_CONFIRMED`/`PRICE_CHANGE_UPDATED`/
   `PENDING_PURCHASE_CANCELED`/`PRICE_STEP_UP_CONSENT_UPDATED` are benign no-ops (no entitlement action).
 
-**Bug (not merely dormant), coupled to the above:**
-- **Voided RTDNs are mis-dispatched.** `parse_notification` tags every `voidedPurchaseNotification` as
-  `payload_type = Test` instead of `Voided` (a one-word typo), so `handle_voided_notification` is
-  **unreachable dead code**. Live impact today is nil (subscription refunds go via `SUBSCRIPTION_REVOKED`;
-  one-time/partial are dormant per above), but it must be fixed **together** with wiring the `ONE_TIME`/
-  partial handlers — otherwise any handler/loud-guard placed there never runs. Tracked in the bug ledger +
-  Phase 4.
-- **No `case _:` default** in `handle_subscription_notification`'s `match` — a *future* Google
-  `SubscriptionNotificationType` would fall through as a silent no-op. Add a default that hits the loud-guard.
+**Dispatch reaches these branches now, which changes what "dormant" costs:**
+- Voided RTDNs were mis-dispatched as `payload_type = Test` rather than `Voided` (a one-word typo), so
+  `handle_voided_notification` was unreachable dead code and every void was quietly acked. It is now
+  reachable, which means the `ONE_TIME` and partial-refund rows above **fail loudly rather than silently**
+  the moment either feature is enabled — the notification is retried and retained instead of acked away.
+  That is the intended trade: a wedged notification is recoverable once a handler exists, whereas the
+  silent ack it replaced let a refunded purchase keep Pro with nobody told.
+- An unknown `SubscriptionNotificationType` — one Google adds later — is likewise reported rather than
+  falling through as a silent no-op. If a new *benign* type starts arriving in volume, add it to the no-op
+  list above; do not soften the default.
 
 ---
 
@@ -71,7 +75,7 @@ Keep this in sync with the code — it describes real branches, not intentions.
 | **Promotional offers / offer codes / win-back offers** — `OFFER_REDEEMED` | configuring any offer for the subscription group | `assert isinstance(expiresDate, str)` — but `expiresDate` is an int → **AssertionError** | offer redemption crashes the handler → paid-but-no-Pro | crash (500) |
 | **External purchases / alternative marketplaces** — `EXTERNAL_PURCHASE_TOKEN` | enabling the External Purchase entitlement | appends `we do not support 3rd party stores` → 500; Apple retries, then catch-up logs+skips it each pass | 3rd-party-store purchase never handled | loud-ish |
 | **Renewal-date extensions** — `RENEWAL_EXTENSION` / `RENEWAL_EXTENDED` | requesting a subscription renewal-date extension (e.g. outage compensation) | appends `we don't handle … extension` → 500; Apple retries, then catch-up logs+skips it each pass | extension never applied | loud-ish |
-| **New / changed subscription SKU** — `pro_plan_from_product_id` | adding any product id beyond the three known SKUs* | `assert False, 'Invalid apple plan_id'` → crash | any purchase of the new SKU crashes the handler (paid-but-no-Pro) | crash (500) |
+| **New / changed subscription SKU** — `pro_plan_from_product_id` | adding any product id beyond the three known SKUs* | reported to the ErrorSink; the caller declines to write | any purchase of the new SKU registers no Pro until the SKU is supported | loud-ish |
 
 \* known SKUs: `com.getsession.org.pro_sub_{1_month,3_months,12_months}`.
 
