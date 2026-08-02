@@ -149,7 +149,10 @@ compute, just an opaque stored random value.
 
 ### 2.2 `account_expiry_ts` (advisory, unsigned)
 The account's **true entitlement end** in integer seconds — the same value `get_pro_status` reports as
-`expiry_ts` (grace-inclusive). It is **not** part of the signed message `M` and carries no signature of
+`expiry_ts`. This is the end of the term that was *paid for*: it carries neither the store's grace period
+nor the backend's renewal-latency allowance, both of which describe how long service continues past that
+point rather than what the subscription ran to. It is **not** part of the signed message `M` and carries no
+signature of
 its own: a verifier reconstructs `M` from `version`/`revocation_tag`/`rotating_pkey`/`expiry_ts` only and
 MUST NOT feed `account_expiry_ts` into that check. It is **distinct from the proof's `expiry_ts`**, which
 is the clamped, rolling (~30 d) proof-validity window; `account_expiry_ts` is the subscription horizon
@@ -157,10 +160,13 @@ and may be far later. It rides on the proof response so a proof fetch also refre
 expiry; treat it as display state, not an entitlement authority (the signed proof + revocation list are
 authoritative).
 
-`expiry_ts ≤ account_expiry_ts` always holds. In the final stretch of a subscription the proof's expiry
-overtakes the true entitlement end (§2.3), and there `account_expiry_ts` reports the proof's expiry rather
-than the true end — so it is exact everywhere except that closing window, where it reads up to ~25 h
-generous. The `subscription_expired` failure (§5.1) carries the true, now-past end instead.
+**`expiry_ts ≤ account_expiry_ts` does NOT hold**, and a client must not assume it. The two answer
+different questions and are allowed to cross: in the final stretch of a subscription the proof's expiry
+overtakes the account's true end (§2.3), and a proof issued during a store grace period or the backend's
+renewal-latency allowance runs past it by construction. `account_expiry_ts` is exact in every case — it is
+the one value here with no over-provision and no random offset on it, which is what makes it the right
+thing to show a user and the wrong thing to make a serving decision on. The `subscription_expired`
+failure (§5.1) carries the same value, then in the past.
 
 ### 2.3 `expiry_ts` (proof validity)
 The proof's own validity window, and **nothing else**. It is the earlier of the subscription end and a

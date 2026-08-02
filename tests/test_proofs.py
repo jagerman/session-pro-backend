@@ -296,10 +296,11 @@ def test_lapsed_account_keeps_proofs_through_the_over_provision(pg_database):
         # Past the true expiry but inside the over-provision: still served, and the expiry has not budged.
         lapsed = _prove_at(conn, backend_key, master_key, rotating_key, true_expiry + pendulum.duration(minutes=30))
         assert lapsed.expiry_at == expiry
-        # account_expiry_ts reads back the proof's expiry here (it is the later of the two), so the client is
-        # never told its subscription ended while a proof we signed still verifies.
-        assert lapsed.account_expiry_at == expiry
-        assert lapsed.expiry_at <= lapsed.account_expiry_at
+        # account_expiry_ts is the TRUE end of the paid term and does NOT read back the proof's expiry: the
+        # two answer different questions, and the old `max` bought self-consistency by handing the owner a
+        # date carrying the proof's random grid offset. So the proof deliberately outlives it here.
+        assert lapsed.account_expiry_at == true_expiry
+        assert lapsed.expiry_at > lapsed.account_expiry_at
 
         # Spent: now it lapses, reporting the TRUE expiry and never the over-provisioned one.
         with pytest.raises(base.FailError) as excinfo:

@@ -319,7 +319,15 @@ def get_pro_status():
 
                 # Status decided against the *request* clock (signed, anti-replay-bounded to ≈now) —
                 # the same clock the latest item's derived status uses, never a second time.time().
-                user_pro_status = UserProStatus.Active if request_at <= user.expiry_at else UserProStatus.Expired
+                #
+                # Against COVERAGE rather than the expiry reported above, so the answer agrees with what
+                # the proof path will actually do: an account inside the store's grace or our allowance is
+                # still being served, and reporting it Expired while proofs mint for it is a contradiction
+                # a client would have to reconcile. This also preserves the behaviour from when the stored
+                # expiry was itself grace-inclusive — it is the reported VALUE that changes here, not the
+                # threshold.
+                coverage_end = backend.account_coverage_end(user)
+                user_pro_status = UserProStatus.Active if request_at <= coverage_end else UserProStatus.Expired
                 if backend.is_generation_revoked(tx.conn, user.current_generation_id, request_at):
                     user_pro_status = UserProStatus.Expired
 
