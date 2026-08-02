@@ -29,11 +29,9 @@ import googleapiclient.discovery
 
 from .types import (
     GoogleTimestamp,
-    Monetizationv3SubscriptionData,
     ProductType,
     RefundType,
     SubscriptionNotificationType,
-    SubscriptionProductDetails,
     SubscriptionV2Data,
     SubscriptionV2DataAutoRenewingPlan,
     SubscriptionV2DataLineItem,
@@ -52,7 +50,6 @@ from .types import (
     SubscriptionsV2PausedState,
     SubscriptionsV2State,
     json_dict_optional_google_empty_object_bool,
-    json_dict_require_google_duration,
     json_dict_require_google_money,
     json_dict_require_google_timestamp,
 )
@@ -461,84 +458,6 @@ def subscription_v1_acknowledge(purchase_token: str, err: ErrorSink):
         err.msg_list.append(
             f'Failed to acknowledge purchase for purchase_token: {base.maybe_obfuscate(purchase_token)}'
         )
-
-
-def fetch_monetizationv3_subscriptions_for_product_id(
-    package_name: str, product_id: str, err: ErrorSink
-) -> Monetizationv3SubscriptionData | None:
-    """
-    Call the Google monetizationv3.subscriptions.get endpoint:
-    https://developers.google.com/android-publisher/api-ref/rest/v3/monetization.subscriptions/get
-    """
-    if base.PROVIDER_DRY_RUN:
-        # Dry-run: no call to Google. This is only reached via the notification subscriber, which does not
-        # start under dry-run (see notifications.start_subscriber), so this is belt-and-suspenders.
-        return Monetizationv3SubscriptionData(base_plans=[])
-
-    service = get_publisher_service()
-    result = None
-    response = service.monetization().subscriptions().get(packageName=package_name, productId=product_id).execute()
-
-    if isinstance(response, dict):
-        base_plans = json_dict_require_array(response, "basePlans", err)
-        if not err.has():
-            result = Monetizationv3SubscriptionData(base_plans=base_plans)
-    else:
-        err.msg_list.append(
-            f'Subscription info response is not a valid dict: {safe_dump_arbitrary_value_or_type(response)}'
-        )
-
-    assert result is None if err.has() else isinstance(result, Monetizationv3SubscriptionData)
-    return result
-
-
-def fetch_subscription_details_for_base_plan_id(base_plan_id: str, err: ErrorSink) -> SubscriptionProductDetails | None:
-    """
-    Internally calls the Google monetization v3 api
-    """
-    result = None
-
-    subscriptions = fetch_monetizationv3_subscriptions_for_product_id(
-        package_name=package_name, product_id=subscription_product_id, err=err
-    )
-
-    if err.has():
-        err.msg_list.append(f'Failed to get subscription details for {package_name} and {subscription_product_id}')
-        return result
-
-    assert subscriptions is not None
-
-    result = None
-    for plan in subscriptions.base_plans:
-        assert plan is not None
-
-        if not isinstance(plan, dict):
-            err.msg_list.append(f'Plan is not a dict: {type(plan)}')
-            continue
-
-        result_base_plan_id = json_dict_require_str(plan, "basePlanId", err)
-
-        if result_base_plan_id != base_plan_id:
-            continue
-
-        auto_renewing_base_plan_type = json_dict_require_obj(plan, "autoRenewingBasePlanType", err)
-        grace_period = json_dict_require_google_duration(auto_renewing_base_plan_type, "gracePeriodDuration", err)
-        billing_period = json_dict_require_google_duration(auto_renewing_base_plan_type, "billingPeriodDuration", err)
-
-        if err.has():
-            continue
-
-        result = SubscriptionProductDetails(billing_period=billing_period, grace_period=grace_period)
-        break
-
-    if result is None:
-        err.msg_list.append(
-            f'Unable to find plan details for plan_id "{base_plan_id}", plan_details was {subscriptions.base_plans}'
-        )
-
-    assert result is None if err.has() else isinstance(result, SubscriptionProductDetails)
-
-    return result
 
 
 def parse_line_item(details: SubscriptionV2Data, err: ErrorSink) -> SubscriptionV2DataLineItem | None:

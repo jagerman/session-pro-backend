@@ -553,7 +553,10 @@ def test_platform_apple(pg_database):
             assert unredeemed_list[0].purchased_at == base.datetime_from_unix_ms(tx_info.purchaseDate)
             assert unredeemed_list[0].redeemed_at is None
             assert unredeemed_list[0].expiry_at == base.datetime_from_unix_ms(tx_info.expiresDate)
-            assert unredeemed_list[0].grace_period == base.RENEWAL_LATENCY_ALLOWANCE
+            # A subscribe declares no store grace, so the column stays absent. Apple sets it only on a
+            # DID_FAIL_TO_RENEW carrying the GRACE_PERIOD subtype, and our own renewal-latency allowance is
+            # never stored at all.
+            assert unredeemed_list[0].grace_period is None
             assert unredeemed_list[0].platform_refund_expiry_at == base.datetime_from_unix_ms(tx_info.expiresDate)
             assert unredeemed_list[0].revoked_at is None
         assert unredeemed_list[0].apple.original_tx_id == tx_info.originalTransactionId
@@ -678,7 +681,7 @@ def test_platform_apple(pg_database):
             assert payment_list[0].purchased_at == base.datetime_from_unix_ms(tx_info.purchaseDate)
             assert payment_list[0].redeemed_at is None
             assert payment_list[0].expiry_at == base.datetime_from_unix_ms(tx_info.expiresDate)
-            assert payment_list[0].grace_period == base.RENEWAL_LATENCY_ALLOWANCE
+            assert payment_list[0].grace_period is None
             assert payment_list[0].platform_refund_expiry_at == base.datetime_from_unix_ms(tx_info.expiresDate)
             assert payment_list[0].revoked_at is None
         assert payment_list[0].apple.original_tx_id == tx_info.originalTransactionId
@@ -805,7 +808,7 @@ def test_platform_apple(pg_database):
             assert payment_list[0].purchased_at == base.datetime_from_unix_ms(tx_info.purchaseDate)
             assert payment_list[0].redeemed_at is None
             assert payment_list[0].expiry_at == base.datetime_from_unix_ms(tx_info.expiresDate)
-            assert payment_list[0].grace_period == base.RENEWAL_LATENCY_ALLOWANCE
+            assert payment_list[0].grace_period is None
             assert payment_list[0].platform_refund_expiry_at == base.datetime_from_unix_ms(tx_info.expiresDate)
             assert payment_list[0].revoked_at is None
             assert payment_list[0].apple.original_tx_id == tx_info.originalTransactionId
@@ -828,7 +831,7 @@ def test_platform_apple(pg_database):
             assert payment_list[0].purchased_at == base.datetime_from_unix_ms(tx_info.purchaseDate)
             assert payment_list[0].redeemed_at is None
             assert payment_list[0].expiry_at == base.datetime_from_unix_ms(tx_info.expiresDate)
-            assert payment_list[0].grace_period == base.RENEWAL_LATENCY_ALLOWANCE
+            assert payment_list[0].grace_period is None
             assert payment_list[0].platform_refund_expiry_at == base.datetime_from_unix_ms(tx_info.expiresDate)
             assert payment_list[0].revoked_at is None
             assert payment_list[0].apple.original_tx_id == tx_info.originalTransactionId
@@ -1572,7 +1575,7 @@ def test_platform_apple(pg_database):
         assert unredeemed_payment_list[0].expiry_at == base.datetime_from_unix_ms(
             e00_sub_to_3_months_tx_info.expiresDate
         )
-        assert unredeemed_payment_list[0].grace_period == base.RENEWAL_LATENCY_ALLOWANCE
+        assert unredeemed_payment_list[0].grace_period is None
         assert unredeemed_payment_list[0].platform_refund_expiry_at == base.datetime_from_unix_ms(
             e00_sub_to_3_months_tx_info.expiresDate
         )
@@ -1601,7 +1604,7 @@ def test_platform_apple(pg_database):
         assert payment_list[0].purchased_at == base.datetime_from_unix_ms(e00_sub_to_3_months_tx_info.purchaseDate)
         assert payment_list[0].redeemed_at is not None
         assert payment_list[0].expiry_at == base.datetime_from_unix_ms(e00_sub_to_3_months_tx_info.expiresDate)
-        assert payment_list[0].grace_period == base.RENEWAL_LATENCY_ALLOWANCE
+        assert payment_list[0].grace_period is None
         assert payment_list[0].platform_refund_expiry_at == base.datetime_from_unix_ms(
             e00_sub_to_3_months_tx_info.expiresDate
         )
@@ -1638,7 +1641,7 @@ def test_platform_apple(pg_database):
             assert payment_list[0].purchased_at == base.datetime_from_unix_ms(e00_sub_to_3_months_tx_info.purchaseDate)
             assert payment_list[0].redeemed_at is not None
             assert payment_list[0].expiry_at == base.datetime_from_unix_ms(e00_sub_to_3_months_tx_info.expiresDate)
-            assert payment_list[0].grace_period == base.RENEWAL_LATENCY_ALLOWANCE
+            assert payment_list[0].grace_period is None
             assert payment_list[0].platform_refund_expiry_at == base.datetime_from_unix_ms(
                 e00_sub_to_3_months_tx_info.expiresDate
             )
@@ -1676,7 +1679,7 @@ def test_platform_apple(pg_database):
                 base.datetime_from_unix_ms(e01_upgrade_to_1wk_tx_info.purchaseDate)
             )
             assert payment_list[1].expiry_at == base.datetime_from_unix_ms(e01_upgrade_to_1wk_tx_info.expiresDate)
-            assert payment_list[1].grace_period == base.RENEWAL_LATENCY_ALLOWANCE
+            assert payment_list[1].grace_period is None
             assert payment_list[1].platform_refund_expiry_at == base.datetime_from_unix_ms(
                 e01_upgrade_to_1wk_tx_info.expiresDate
             )
@@ -1731,7 +1734,7 @@ def test_platform_apple(pg_database):
                 base.datetime_from_unix_ms(e01_upgrade_to_1wk_tx_info.purchaseDate)
             )
             assert payment_list[-1].expiry_at == base.datetime_from_unix_ms(e01_upgrade_to_1wk_tx_info.expiresDate)
-            assert payment_list[-1].grace_period == base.RENEWAL_LATENCY_ALLOWANCE
+            assert payment_list[-1].grace_period is None
             assert payment_list[-1].platform_refund_expiry_at == base.datetime_from_unix_ms(
                 e01_upgrade_to_1wk_tx_info.expiresDate
             )
@@ -1762,7 +1765,7 @@ def test_platform_apple(pg_database):
             assert payment_list[0].purchased_at == base.datetime_from_unix_ms(e00_sub_to_3_months_tx_info.purchaseDate)
             assert payment_list[0].redeemed_at is not None
             assert payment_list[0].expiry_at == base.datetime_from_unix_ms(e00_sub_to_3_months_tx_info.expiresDate)
-            assert payment_list[0].grace_period == base.RENEWAL_LATENCY_ALLOWANCE
+            assert payment_list[0].grace_period is None
             assert payment_list[0].platform_refund_expiry_at == base.datetime_from_unix_ms(
                 e00_sub_to_3_months_tx_info.expiresDate
             )
@@ -1787,7 +1790,7 @@ def test_platform_apple(pg_database):
                 base.datetime_from_unix_ms(e01_upgrade_to_1wk_tx_info.purchaseDate)
             )
             assert payment_list[-1].expiry_at == base.datetime_from_unix_ms(e01_upgrade_to_1wk_tx_info.expiresDate)
-            assert payment_list[-1].grace_period == base.RENEWAL_LATENCY_ALLOWANCE
+            assert payment_list[-1].grace_period is None
             assert payment_list[-1].platform_refund_expiry_at == base.datetime_from_unix_ms(
                 e01_upgrade_to_1wk_tx_info.expiresDate
             )
@@ -1837,7 +1840,7 @@ def test_platform_apple(pg_database):
                 base.datetime_from_unix_ms(e01_upgrade_to_1wk_tx_info.purchaseDate)
             )
             assert payment_list[-1].expiry_at == base.datetime_from_unix_ms(e01_upgrade_to_1wk_tx_info.expiresDate)
-            assert payment_list[-1].grace_period == base.RENEWAL_LATENCY_ALLOWANCE
+            assert payment_list[-1].grace_period is None
             assert payment_list[-1].platform_refund_expiry_at == base.datetime_from_unix_ms(
                 e01_upgrade_to_1wk_tx_info.expiresDate
             )

@@ -465,21 +465,6 @@ class SubscriptionV2Data:
     obfuscated_external_account_id: str | None = None
 
 
-@dataclasses.dataclass
-class Monetizationv3SubscriptionData:
-    """
-    NOTE: only the fields we use are here, the api returns loads of other info we dont need.
-    """
-
-    base_plans: base.JSONArray
-
-
-@dataclasses.dataclass
-class SubscriptionProductDetails:
-    billing_period: GoogleDuration  # Subscription duration
-    grace_period: GoogleDuration  # Duration of entitlement an auto-renewing subscription has after it expires
-
-
 def json_dict_require_google_money(d: dict[str, base.JSONValue], key: str, err: base.ErrorSink):
     price_obj = base.json_dict_require_obj(d, key, err)
 
@@ -497,11 +482,6 @@ def json_dict_require_google_money(d: dict[str, base.JSONValue], key: str, err: 
 def json_dict_require_google_timestamp(d: dict[str, base.JSONValue], key: str, err: base.ErrorSink):
     timestamp_str = base.json_dict_require_str(d, key, err)
     return GoogleTimestamp(timestamp_str, err)
-
-
-def json_dict_require_google_duration(d: dict[str, base.JSONValue], key: str, err: base.ErrorSink):
-    duration_str = base.json_dict_require_str(d, key, err)
-    return GoogleDuration(duration_str, err)
 
 
 def json_dict_optional_google_empty_object_bool(d: dict[str, base.JSONValue], key: str, err: base.ErrorSink) -> bool:

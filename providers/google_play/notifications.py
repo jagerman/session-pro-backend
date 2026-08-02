@@ -591,41 +591,18 @@ def thread_entry_point(
                 _sweep_pending_acks()
 
 
-def _update_payment_renewal_info(
-    tx_payment: base.PaymentProviderTransaction,
-    auto_renewing: bool | None,
-    grace_period: pendulum.Duration | None,
-    tx: db.SQLTransaction,
-    err: base.ErrorSink,
-) -> bool:
-    assert len(tx_payment.google_payment_token) > 0 and len(tx_payment.google_order_id) > 0 and not err.has()
-    return backend.update_payment_renewal_info(
-        tx, payment_tx=tx_payment, grace_period=grace_period, auto_renewing=auto_renewing, err=err
-    )
-
-
 def set_payment_auto_renew(
     tx_payment: base.PaymentProviderTransaction, auto_renewing: bool, tx: db.SQLTransaction, err: base.ErrorSink
 ):
-    success = _update_payment_renewal_info(tx_payment, auto_renewing, None, tx, err)
+    assert len(tx_payment.google_payment_token) > 0 and len(tx_payment.google_order_id) > 0 and not err.has()
+    # No grace period goes with it: `payments.grace_period` records grace a store granted WITHOUT folding it
+    # into its own expiry, and Play folds it in.
+    success = backend.update_payment_renewal_info(
+        tx, payment_tx=tx_payment, grace_period=None, auto_renewing=auto_renewing, err=err
+    )
     if not success:
         err.msg_list.append(
             f'Failed to update auto_renew flag for '
-            f'purchase_token: {base.maybe_obfuscate(tx_payment.google_payment_token)} '
-            f'and order_id: {base.maybe_obfuscate(tx_payment.google_order_id)}'
-        )
-
-
-def set_purchase_grace_period_duration(
-    tx_payment: base.PaymentProviderTransaction,
-    grace_period: pendulum.Duration,
-    tx: db.SQLTransaction,
-    err: base.ErrorSink,
-):
-    success = _update_payment_renewal_info(tx_payment, None, grace_period, tx, err)
-    if not success:
-        err.msg_list.append(
-            f'Failed to update grace period duration for '
             f'purchase_token: {base.maybe_obfuscate(tx_payment.google_payment_token)} '
             f'and order_id: {base.maybe_obfuscate(tx_payment.google_order_id)}'
         )
@@ -773,29 +750,16 @@ def reconcile_google_subscription(
     # says so here, and a plan that is not auto-renewing at all (prepaid) has no such block.
     auto_renewing = line_item.auto_renewing_plan is not None and line_item.auto_renewing_plan.auto_renew_enabled
 
-    # The grace period is a property of the base plan, and only worth an extra API call when the store says
-    # the subscription is actually in it. Everywhere else the configured default is what the old
-    # per-notification branches used.
-    grace_period = base.RENEWAL_LATENCY_ALLOWANCE
-    if tx_event.subscription_state == SubscriptionsV2State.IN_GRACE_PERIOD:
-        plan_details = api.fetch_subscription_details_for_base_plan_id(base_plan_id=tx_event.base_plan_id, err=err)
-        if err.has() or plan_details is None:
-            err.msg_list.append(f'Failed to read the grace period for base plan {tx_event.base_plan_id}')
-            return
-        grace_period = base.duration_from_ms(plan_details.grace_period.milliseconds)
-
+    # Nothing here reads the base plan's grace period. Play applies grace by EXTENDING `expiryTime`, so a
+    # subscription in grace already states its grace-inclusive end above and converging that captures it —
+    # whether or not the notification that woke us was the IN_GRACE_PERIOD one. Fetching the plan to store
+    # the number separately used to make the same span arrive twice, once inside the expiry and once beside
+    # it, with nothing marking which of the two the column held.
     needs_ack = tx_event.purchase_acknowledged != SubscriptionsV2AcknowledgementState.ACKNOWLEDGED
     expiry_at = base.datetime_from_unix_ms(tx_event.expiry_time.unix_milliseconds)
 
     converged = backend.google_converge_payment(
-        tx,
-        payment_tx=payment_tx,
-        expiry_at=expiry_at,
-        auto_renewing=auto_renewing,
-        grace_period=grace_period,
-        needs_ack=needs_ack,
-        at=at,
-        err=err,
+        tx, payment_tx=payment_tx, expiry_at=expiry_at, auto_renewing=auto_renewing, needs_ack=needs_ack, at=at, err=err
     )
     if err.has():
         return
@@ -915,31 +879,17 @@ def handle_subscription_notification(
                         needs_ack=tx_event.purchase_acknowledged != SubscriptionsV2AcknowledgementState.ACKNOWLEDGED,
                     )
 
-                    if not err.has():
-                        set_purchase_grace_period_duration(
-                            tx_payment=tx_payment, tx=tx, grace_period=base.RENEWAL_LATENCY_ALLOWANCE, err=err
-                        )
-
         case SubscriptionNotificationType.IN_GRACE_PERIOD:
+            # Grace arrives inside the resource's `expiryTime`, which Play extends when a renewal fails, so
+            # there is nothing to store beside it and nothing to fetch. Acting on it means converging the
+            # term, which the reconcile path does for every notification type alike.
             if tx_event.subscription_state == SubscriptionsV2State.IN_GRACE_PERIOD:
-                plan_details = api.fetch_subscription_details_for_base_plan_id(
-                    base_plan_id=tx_event.base_plan_id, err=err
-                )
                 payment_label = backend.payment_provider_tx_log_label_safe(tx_payment)
-                grace_ms: int = plan_details.grace_period.milliseconds if plan_details else 0
+                expiry = base.readable(base.datetime_from_unix_ms(tx_event.expiry_time.unix_milliseconds))
                 log.info(
                     f'{tx_event.notification.name}+{tx_event.subscription_state.name}; '
-                    f'(payment={payment_label}, grace period ms={grace_ms})'
+                    f'(payment={payment_label}, expiry={expiry})'
                 )
-
-                if not err.has():
-                    assert plan_details is not None
-                    set_purchase_grace_period_duration(
-                        tx_payment=tx_payment,
-                        grace_period=base.duration_from_ms(plan_details.grace_period.milliseconds),
-                        tx=tx,
-                        err=err,
-                    )
 
         case SubscriptionNotificationType.RECOVERED | SubscriptionNotificationType.RENEWED:
             if tx_event.subscription_state == SubscriptionsV2State.ACTIVE:
@@ -973,11 +923,6 @@ def handle_subscription_notification(
                         # chance Google reports one that isn't.
                         needs_ack=tx_event.purchase_acknowledged != SubscriptionsV2AcknowledgementState.ACKNOWLEDGED,
                     )
-
-                    if not err.has():
-                        set_purchase_grace_period_duration(
-                            tx_payment=tx_payment, tx=tx, grace_period=base.RENEWAL_LATENCY_ALLOWANCE, err=err
-                        )
 
         case SubscriptionNotificationType.CANCELED:
             """

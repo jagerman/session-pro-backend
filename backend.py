@@ -258,6 +258,9 @@ class PaymentRow:
     # None while a live credit's length has not run out: nothing has determined where its coverage ends yet.
     # Set for every store subscription, and latched by the drain when a credit is spent.
     expiry_at: pendulum.DateTime | None = None
+    # A store grace currently in effect that the store declared SEPARATELY from its own expiry — Apple does,
+    # Play instead extends `expiryTime`. None everywhere else, including a payment grace cannot apply to at
+    # all (a credit, a one-shot), which is why this is not derivable from `payment_provider`.
     grace_period: pendulum.Duration | None = None
     platform_refund_expiry_at: pendulum.DateTime = base.EPOCH
     revoked_at: pendulum.DateTime | None = None
@@ -478,7 +481,7 @@ def payment_row_from_dict(row: dict[str, typing.Any]) -> PaymentRow:
     result.purchased_at = row['purchased_at']
     result.redeemed_at = row['redeemed_at']  # NULL until redeemed
     result.expiry_at = row['expiry_at']
-    result.grace_period = row['grace_period']  # nullable
+    result.grace_period = row['grace_period']
     result.platform_refund_expiry_at = row['platform_refund_expiry_at']
     result.revoked_at = row['revoked_at']  # NULL unless revoked
     result.apple.original_tx_id = str(row['apple_original_tx_id']) if row['apple_original_tx_id'] else ''
@@ -2816,7 +2819,6 @@ def google_converge_payment(
     payment_tx: base.PaymentProviderTransaction,
     expiry_at: pendulum.DateTime,
     auto_renewing: bool,
-    grace_period: pendulum.Duration,
     needs_ack: bool,
     at: pendulum.DateTime,
     err: base.ErrorSink,
@@ -2838,6 +2840,14 @@ def google_converge_payment(
       expiry past the instant entitlement actually stopped.
     * A CLAIMED row's ownership. Convergence adjusts the terms of a payment, never who holds it.
 
+    `grace_period` is written as a constant NULL rather than taken from the caller. The column records a
+    store grace declared SEPARATELY from the store's own expiry, and Play instead applies grace by EXTENDING
+    `expiryTime` — so on a Google row the grace is already inside the `expiry_at` above, and a second copy
+    beside it would be counted twice. Writing rather than leaving the column alone is deliberate: a row the
+    retired `IN_GRACE_PERIOD` branch stamped with the base plan's real grace would otherwise keep that day
+    forever, since nothing else would ever write the column again — and it is exactly those rows, the ones
+    in grace when this shipped, that convergence would then double-count.
+
     Idempotency is the load-bearing property, not an optimisation: re-running this against an unchanged
     snapshot must leave `users.expiry_at` untouched, because a move there re-draws the account's
     proof-expiry offset, and a convergence pass that "changed" nothing on every run would hand an observer
@@ -2856,7 +2866,7 @@ def google_converge_payment(
         UPDATE payments p
         SET    expiry_at     = %(expiry_at)s,
                auto_renewing = %(auto_renewing)s,
-               grace_period  = %(grace_period)s
+               grace_period  = NULL
         FROM   google_play_payment_details gd
         WHERE  gd.payment_id = p.id
           AND  gd.payment_token = %(token)s AND gd.order_id = %(order_id)s
@@ -2867,7 +2877,6 @@ def google_converge_payment(
         order_id=payment_tx.google_order_id,
         expiry_at=expiry_at,
         auto_renewing=auto_renewing,
-        grace_period=grace_period,
     )
 
     # RETURNING breaks rowcount (see update_payment_renewal_info), so the fetch is what tells us whether a

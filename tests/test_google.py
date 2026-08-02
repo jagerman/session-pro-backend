@@ -13,7 +13,7 @@ import time
 import typing
 import dataclasses
 from providers import google_play
-from providers.google_play.types import GoogleDuration, SubscriptionProductDetails
+from providers.google_play.types import GoogleDuration
 import backend
 import base
 import server
@@ -305,15 +305,11 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
         )
 
     err = base.ErrorSink()
-    test_product_details = SubscriptionProductDetails(
-        billing_period=GoogleDuration("P30D", err), grace_period=GoogleDuration("P2D", err)
-    )
+    # The grace Play applies in these recorded scenarios. It is NOT stored anywhere -- Play folds grace into
+    # the resource's `expiryTime` -- so this is here only for the tests' own time travel.
+    store_grace = GoogleDuration("P2D", err)
     assert not err.has()
 
-    monkeypatch.setattr(
-        "providers.google_play.api.fetch_subscription_details_for_base_plan_id",
-        lambda *args, **kwargs: test_product_details,
-    )
     monkeypatch.setattr("providers.google_play.api.subscription_v1_acknowledge", lambda *args, **kwargs: None)
 
     @dataclasses.dataclass
@@ -505,7 +501,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
                 redeemed_ts_ms_rounded
             )
             assert payment.expiry_at == base.datetime_from_unix_ms(tx.expiry_at)
-            assert payment.grace_period == base.RENEWAL_LATENCY_ALLOWANCE
+            assert payment.grace_period is None
             assert payment.platform_refund_expiry_at == base.datetime_from_unix_ms(platform_refund_expiry_at)
             assert payment.revoked_at is None
             assert payment.apple == backend.AppleTransaction()
@@ -527,7 +523,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
                 conn, user.current_generation_id, base.datetime_from_unix_ms(tx.event_ms)
             )
             assert len(user.token) == backend.BLAKE2B_DIGEST_SIZE
-            assert user.expiry_at == base.datetime_from_unix_ms(tx.expiry_at) + base.RENEWAL_LATENCY_ALLOWANCE
+            assert user.expiry_at == base.datetime_from_unix_ms(tx.expiry_at)
 
     def assert_payment_details(
         tx: TestTx,
@@ -634,7 +630,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             pro_status=server.UserProStatus.Active,
             payment_status=base.PaymentStatus.Redeemed,
             auto_renew=True,
-            grace_duration=base.RENEWAL_LATENCY_ALLOWANCE,
+            grace_duration=pendulum.duration(),
             platform_refund_expiry_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
@@ -811,7 +807,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             pro_status=server.UserProStatus.Active,
             payment_status=base.PaymentStatus.Redeemed,
             auto_renew=False,
-            grace_duration=base.RENEWAL_LATENCY_ALLOWANCE,
+            grace_duration=pendulum.duration(),
             platform_refund_expiry_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
@@ -824,7 +820,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             pro_status=server.UserProStatus.Active,
             payment_status=base.PaymentStatus.Redeemed,
             auto_renew=True,
-            grace_duration=base.RENEWAL_LATENCY_ALLOWANCE,
+            grace_duration=pendulum.duration(),
             platform_refund_expiry_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
@@ -837,7 +833,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             pro_status=server.UserProStatus.Expired,
             payment_status=base.PaymentStatus.Revoked,
             auto_renew=False,
-            grace_duration=base.RENEWAL_LATENCY_ALLOWANCE,
+            grace_duration=pendulum.duration(),
             platform_refund_expiry_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
@@ -1055,7 +1051,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             pro_status=server.UserProStatus.Active,
             payment_status=base.PaymentStatus.Redeemed,
             auto_renew=True,
-            grace_duration=base.duration_from_ms(test_product_details.grace_period.milliseconds),
+            grace_duration=pendulum.duration(),
             platform_refund_expiry_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
@@ -1070,11 +1066,11 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             pro_status=server.UserProStatus.Expired,
             payment_status=base.PaymentStatus.Expired,
             auto_renew=True,
-            grace_duration=base.duration_from_ms(test_product_details.grace_period.milliseconds),
+            grace_duration=pendulum.duration(),
             platform_refund_expiry_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
-            unix_ts_ms=tx_grace.event_ms + test_product_details.grace_period.milliseconds,
+            unix_ts_ms=tx_grace.event_ms + store_grace.milliseconds,
         )
 
         """3. User renews"""
@@ -1093,7 +1089,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             pro_status=server.UserProStatus.Active,
             payment_status=base.PaymentStatus.Redeemed,
             auto_renew=False,
-            grace_duration=base.RENEWAL_LATENCY_ALLOWANCE,
+            grace_duration=pendulum.duration(),
             platform_refund_expiry_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
@@ -1108,7 +1104,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             pro_status=server.UserProStatus.Active,
             payment_status=base.PaymentStatus.Redeemed,
             auto_renew=False,
-            grace_duration=base.RENEWAL_LATENCY_ALLOWANCE,
+            grace_duration=pendulum.duration(),
             platform_refund_expiry_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
@@ -1121,7 +1117,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             pro_status=server.UserProStatus.Expired,
             payment_status=base.PaymentStatus.Expired,
             auto_renew=False,
-            grace_duration=base.RENEWAL_LATENCY_ALLOWANCE,
+            grace_duration=pendulum.duration(),
             platform_refund_expiry_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
@@ -1536,7 +1532,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             pro_status=server.UserProStatus.Active,
             payment_status=base.PaymentStatus.Redeemed,
             auto_renew=False,
-            grace_duration=base.RENEWAL_LATENCY_ALLOWANCE,
+            grace_duration=pendulum.duration(),
             platform_refund_expiry_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
@@ -1550,7 +1546,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             pro_status=server.UserProStatus.Active,
             payment_status=base.PaymentStatus.Redeemed,
             auto_renew=False,
-            grace_duration=base.RENEWAL_LATENCY_ALLOWANCE,
+            grace_duration=pendulum.duration(),
             platform_refund_expiry_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
@@ -1564,7 +1560,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             pro_status=server.UserProStatus.Expired,
             payment_status=base.PaymentStatus.Expired,
             auto_renew=False,
-            grace_duration=base.RENEWAL_LATENCY_ALLOWANCE,
+            grace_duration=pendulum.duration(),
             platform_refund_expiry_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
@@ -1583,7 +1579,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             pro_status=server.UserProStatus.Active,
             payment_status=base.PaymentStatus.Redeemed,
             auto_renew=True,
-            grace_duration=base.duration_from_ms(test_product_details.grace_period.milliseconds),
+            grace_duration=pendulum.duration(),
             platform_refund_expiry_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
@@ -1596,11 +1592,11 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             pro_status=server.UserProStatus.Expired,
             payment_status=base.PaymentStatus.Expired,
             auto_renew=True,
-            grace_duration=base.duration_from_ms(test_product_details.grace_period.milliseconds),
+            grace_duration=pendulum.duration(),
             platform_refund_expiry_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
-            unix_ts_ms=tx_grace.event_ms + test_product_details.grace_period.milliseconds,
+            unix_ts_ms=tx_grace.event_ms + store_grace.milliseconds,
         )
 
         """8. User fails to renew (enter account hold)"""
@@ -1610,11 +1606,11 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             pro_status=server.UserProStatus.Expired,
             payment_status=base.PaymentStatus.Expired,
             auto_renew=True,
-            grace_duration=base.duration_from_ms(test_product_details.grace_period.milliseconds),
+            grace_duration=pendulum.duration(),
             platform_refund_expiry_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
-            unix_ts_ms=tx_grace.event_ms + test_product_details.grace_period.milliseconds,
+            unix_ts_ms=tx_grace.event_ms + store_grace.milliseconds,
         )
 
         """9. User fails to renew, cancelling and expiring"""
@@ -1625,11 +1621,11 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             pro_status=server.UserProStatus.Expired,
             payment_status=base.PaymentStatus.Expired,
             auto_renew=False,
-            grace_duration=base.duration_from_ms(test_product_details.grace_period.milliseconds),
+            grace_duration=pendulum.duration(),
             platform_refund_expiry_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
-            unix_ts_ms=tx_grace.event_ms + test_product_details.grace_period.milliseconds,
+            unix_ts_ms=tx_grace.event_ms + store_grace.milliseconds,
         )
 
     with TestingContext(pg_database, provider_testing_env=True) as ctx:
@@ -1801,7 +1797,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             pro_status=server.UserProStatus.Active,
             payment_status=base.PaymentStatus.Redeemed,
             auto_renew=True,
-            grace_duration=base.duration_from_ms(test_product_details.grace_period.milliseconds),
+            grace_duration=pendulum.duration(),
             platform_refund_expiry_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
@@ -1813,11 +1809,11 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             pro_status=server.UserProStatus.Expired,
             payment_status=base.PaymentStatus.Expired,
             auto_renew=True,
-            grace_duration=base.duration_from_ms(test_product_details.grace_period.milliseconds),
+            grace_duration=pendulum.duration(),
             platform_refund_expiry_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
-            unix_ts_ms=tx_grace.event_ms + test_product_details.grace_period.milliseconds,
+            unix_ts_ms=tx_grace.event_ms + store_grace.milliseconds,
         )
 
         """3. User cancels, exiting grace period"""
@@ -1828,11 +1824,11 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             pro_status=server.UserProStatus.Expired,
             payment_status=base.PaymentStatus.Expired,
             auto_renew=False,
-            grace_duration=base.duration_from_ms(test_product_details.grace_period.milliseconds),
+            grace_duration=pendulum.duration(),
             platform_refund_expiry_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
-            unix_ts_ms=tx_grace.event_ms + test_product_details.grace_period.milliseconds,
+            unix_ts_ms=tx_grace.event_ms + store_grace.milliseconds,
         )
 
     with TestingContext(pg_database, provider_testing_env=True) as ctx:
@@ -2042,7 +2038,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             pro_status=server.UserProStatus.Active,
             payment_status=base.PaymentStatus.Redeemed,
             auto_renew=True,
-            grace_duration=base.duration_from_ms(test_product_details.grace_period.milliseconds),
+            grace_duration=pendulum.duration(),
             platform_refund_expiry_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
@@ -2055,11 +2051,11 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             pro_status=server.UserProStatus.Expired,
             payment_status=base.PaymentStatus.Expired,
             auto_renew=True,
-            grace_duration=base.duration_from_ms(test_product_details.grace_period.milliseconds),
+            grace_duration=pendulum.duration(),
             platform_refund_expiry_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
-            unix_ts_ms=tx_grace.event_ms + test_product_details.grace_period.milliseconds,
+            unix_ts_ms=tx_grace.event_ms + store_grace.milliseconds,
         )
 
         """3. User fails to renew (enter account hold)"""
@@ -2069,11 +2065,11 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             pro_status=server.UserProStatus.Expired,
             payment_status=base.PaymentStatus.Expired,
             auto_renew=True,
-            grace_duration=base.duration_from_ms(test_product_details.grace_period.milliseconds),
+            grace_duration=pendulum.duration(),
             platform_refund_expiry_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
-            unix_ts_ms=tx_grace.event_ms + test_product_details.grace_period.milliseconds,
+            unix_ts_ms=tx_grace.event_ms + store_grace.milliseconds,
         )
 
         """4. User cancels"""
@@ -2084,11 +2080,11 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             pro_status=server.UserProStatus.Expired,
             payment_status=base.PaymentStatus.Expired,
             auto_renew=False,
-            grace_duration=base.duration_from_ms(test_product_details.grace_period.milliseconds),
+            grace_duration=pendulum.duration(),
             platform_refund_expiry_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
-            unix_ts_ms=tx_grace.event_ms + test_product_details.grace_period.milliseconds,
+            unix_ts_ms=tx_grace.event_ms + store_grace.milliseconds,
         )
 
     with TestingContext(pg_database, provider_testing_env=True) as ctx:
@@ -2261,7 +2257,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             pro_status=server.UserProStatus.Active,
             payment_status=base.PaymentStatus.Redeemed,
             auto_renew=True,
-            grace_duration=base.duration_from_ms(test_product_details.grace_period.milliseconds),
+            grace_duration=pendulum.duration(),
             platform_refund_expiry_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
@@ -2273,11 +2269,11 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             pro_status=server.UserProStatus.Expired,
             payment_status=base.PaymentStatus.Expired,
             auto_renew=True,
-            grace_duration=base.duration_from_ms(test_product_details.grace_period.milliseconds),
+            grace_duration=pendulum.duration(),
             platform_refund_expiry_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
-            unix_ts_ms=tx_grace.event_ms + test_product_details.grace_period.milliseconds,
+            unix_ts_ms=tx_grace.event_ms + store_grace.milliseconds,
         )
 
         """3. User fails to renew (enter account hold)"""
@@ -2287,11 +2283,11 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             pro_status=server.UserProStatus.Expired,
             payment_status=base.PaymentStatus.Expired,
             auto_renew=True,
-            grace_duration=base.duration_from_ms(test_product_details.grace_period.milliseconds),
+            grace_duration=pendulum.duration(),
             platform_refund_expiry_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
-            unix_ts_ms=tx_grace.event_ms + test_product_details.grace_period.milliseconds,
+            unix_ts_ms=tx_grace.event_ms + store_grace.milliseconds,
         )
 
         """4. User renews (SUBSCRIPTION_RECOVERED)"""
@@ -2319,7 +2315,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             pro_status=server.UserProStatus.Active,
             payment_status=base.PaymentStatus.Redeemed,
             auto_renew=True,
-            grace_duration=base.RENEWAL_LATENCY_ALLOWANCE,
+            grace_duration=pendulum.duration(),
             platform_refund_expiry_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
@@ -2507,7 +2503,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             pro_status=server.UserProStatus.Active,
             payment_status=base.PaymentStatus.Redeemed,
             auto_renew=True,
-            grace_duration=base.RENEWAL_LATENCY_ALLOWANCE,
+            grace_duration=pendulum.duration(),
             platform_refund_expiry_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
@@ -2727,7 +2723,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             pro_status=server.UserProStatus.Active,
             payment_status=base.PaymentStatus.Redeemed,
             auto_renew=True,
-            grace_duration=base.duration_from_ms(test_product_details.grace_period.milliseconds),
+            grace_duration=pendulum.duration(),
             platform_refund_expiry_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
@@ -2740,11 +2736,11 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             pro_status=server.UserProStatus.Expired,
             payment_status=base.PaymentStatus.Expired,
             auto_renew=True,
-            grace_duration=base.duration_from_ms(test_product_details.grace_period.milliseconds),
+            grace_duration=pendulum.duration(),
             platform_refund_expiry_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
-            unix_ts_ms=tx_grace.event_ms + test_product_details.grace_period.milliseconds,
+            unix_ts_ms=tx_grace.event_ms + store_grace.milliseconds,
         )
 
         """4. User renews"""
@@ -2761,7 +2757,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             pro_status=server.UserProStatus.Active,
             payment_status=base.PaymentStatus.Redeemed,
             auto_renew=True,
-            grace_duration=base.RENEWAL_LATENCY_ALLOWANCE,
+            grace_duration=pendulum.duration(),
             platform_refund_expiry_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
@@ -3020,7 +3016,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             pro_status=server.UserProStatus.Active,
             payment_status=base.PaymentStatus.Redeemed,
             auto_renew=True,
-            grace_duration=base.duration_from_ms(test_product_details.grace_period.milliseconds),
+            grace_duration=pendulum.duration(),
             platform_refund_expiry_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
@@ -3032,11 +3028,11 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             pro_status=server.UserProStatus.Expired,
             payment_status=base.PaymentStatus.Expired,
             auto_renew=True,
-            grace_duration=base.duration_from_ms(test_product_details.grace_period.milliseconds),
+            grace_duration=pendulum.duration(),
             platform_refund_expiry_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
-            unix_ts_ms=tx_grace.event_ms + test_product_details.grace_period.milliseconds,
+            unix_ts_ms=tx_grace.event_ms + store_grace.milliseconds,
         )
 
         """3. User fails to renew (enter account hold)"""
@@ -3046,11 +3042,11 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             pro_status=server.UserProStatus.Expired,
             payment_status=base.PaymentStatus.Expired,
             auto_renew=True,
-            grace_duration=base.duration_from_ms(test_product_details.grace_period.milliseconds),
+            grace_duration=pendulum.duration(),
             platform_refund_expiry_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
-            unix_ts_ms=tx_grace.event_ms + test_product_details.grace_period.milliseconds,
+            unix_ts_ms=tx_grace.event_ms + store_grace.milliseconds,
         )
 
         """4. User renews"""
@@ -3067,7 +3063,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             pro_status=server.UserProStatus.Active,
             payment_status=base.PaymentStatus.Redeemed,
             auto_renew=True,
-            grace_duration=base.RENEWAL_LATENCY_ALLOWANCE,
+            grace_duration=pendulum.duration(),
             platform_refund_expiry_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
@@ -3339,7 +3335,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             pro_status=server.UserProStatus.Active,
             payment_status=base.PaymentStatus.Redeemed,
             auto_renew=True,
-            grace_duration=base.RENEWAL_LATENCY_ALLOWANCE,
+            grace_duration=pendulum.duration(),
             platform_refund_expiry_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
@@ -3510,7 +3506,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             pro_status=server.UserProStatus.Expired,
             payment_status=base.PaymentStatus.Revoked,
             auto_renew=False,
-            grace_duration=base.RENEWAL_LATENCY_ALLOWANCE,
+            grace_duration=pendulum.duration(),
             platform_refund_expiry_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
@@ -4228,7 +4224,7 @@ def test_revoking_a_lapsed_payment_does_not_extend_the_account(monkeypatch, pg_d
                 conn, ctx.backend_key, master_key, rotating_key, base.datetime_from_unix_ms(1767830400000)
             )
             # Auto-renewing, so the published expiry carries the grace period on top.
-            assert backend.get_user(conn, master_key.verify_key).expiry_at == lapses_at + base.RENEWAL_LATENCY_ALLOWANCE
+            assert backend.get_user(conn, master_key.verify_key).expiry_at == lapses_at
 
         # Four months after it lapsed, the payment is refunded.
         refunded_at = base.datetime_from_unix_ms(1780272000000)  # 2026-06-01
@@ -4592,7 +4588,7 @@ def test_one_token_is_one_subscription_whatever_its_order_ids_look_like(monkeypa
             assert user.expiry_at is not None
             # Only the newest cycle counts. Under prefix matching the December row survived as a second
             # "subscription" and won the max, entitling the account nine months past its actual term.
-            assert user.expiry_at == shortened_to + base.RENEWAL_LATENCY_ALLOWANCE
+            assert user.expiry_at == shortened_to
 
 
 def test_a_bad_message_cannot_take_the_batch_down_with_it(monkeypatch, pg_database):
@@ -4791,9 +4787,7 @@ def test_a_voided_purchase_with_unset_types_is_reported_not_asserted(monkeypatch
         assert any('not handled' in msg for msg in err.msg_list), err.msg_list
 
 
-def _converge(
-    ctx, token: str, order_id: str, *, expiry, auto_renewing=True, grace=None, needs_ack=False, at=None
-) -> bool:
+def _converge(ctx, token: str, order_id: str, *, expiry, auto_renewing=True, needs_ack=False, at=None) -> bool:
     payment_tx = base.PaymentProviderTransaction(
         provider=base.PaymentProvider.GooglePlayStore, google_payment_token=token, google_order_id=order_id
     )
@@ -4805,7 +4799,6 @@ def _converge(
                 payment_tx=payment_tx,
                 expiry_at=expiry,
                 auto_renewing=auto_renewing,
-                grace_period=grace if grace is not None else base.RENEWAL_LATENCY_ALLOWANCE,
                 needs_ack=needs_ack,
                 at=at if at is not None else base.utc_now(),
                 err=err,
@@ -4849,9 +4842,7 @@ def test_converging_revises_a_term_the_store_has_changed(monkeypatch, pg_databas
         assert _converge(ctx, token, order_id, expiry=extended_to) is True
         assert _payment_rows(ctx)[0][1] == extended_to
         with ctx.connection() as conn:
-            assert backend.get_user(conn, master_key.verify_key).expiry_at == (
-                extended_to + base.RENEWAL_LATENCY_ALLOWANCE
-            )
+            assert backend.get_user(conn, master_key.verify_key).expiry_at == (extended_to)
 
         # And shortened, which the write-once column could never express at all.
         shortened_to = base.datetime_from_unix_ms(1769904000000)  # 2026-02-01
