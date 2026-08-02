@@ -106,6 +106,23 @@ class TestingContext:
             yield conn
 
 
+def round_datetime_to_next_day_with_provider_testing_support(
+    payment_provider: base.PaymentProvider, at: pendulum.DateTime
+) -> pendulum.DateTime:
+    """Round `at` up to the next day boundary, honouring a store's compressed testing "day" (Google: 10 s).
+
+    Test scaffolding: it lives here because nothing in production rounds to a day boundary any more. The
+    revocation early-out used to, and now measures in proof-grid periods; the legacy Google dispatch used to,
+    and is gone. Only the recorded RTDN sequences still need it, to place their assertions on the same
+    boundaries the fixtures were captured against."""
+    if base.PROVIDER_TESTING_ENV and payment_provider == base.PaymentProvider.GooglePlayStore:
+        google_day = pendulum.duration(seconds=10)  # in Google's test env, 1 day == 10s
+        elapsed = at - base.EPOCH
+        units = -((-elapsed) // google_day)  # ceil-divide the duration
+        return base.EPOCH + units * google_day
+    return base.round_datetime_to_next_day(at)
+
+
 def _redeem_and_prove(conn, backend_key, master_key, rotating_key, request_at):
     """The reflow's client flow: generate_pro_proof reconciles any pending payments for the key (redeeming
     whatever the mule registered, bound by the master-key-derived account-id) and returns the proof.

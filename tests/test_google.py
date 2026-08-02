@@ -19,7 +19,14 @@ import base
 import server
 import db
 
-from tests.helpers import derived_status, TestingContext, _redeem_and_prove, _prove_at, _grant_voucher
+from tests.helpers import (
+    derived_status,
+    TestingContext,
+    round_datetime_to_next_day_with_provider_testing_support,
+    _redeem_and_prove,
+    _prove_at,
+    _grant_voucher,
+)
 
 
 def test_google_subscription_notification_only_records_that_a_token_owes_a_look(monkeypatch, pg_database):
@@ -446,7 +453,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
 
     def run_prune_at_end_of_day(event_ms: int):
         boundary_ms = base.unix_ms_from_datetime(
-            backend.round_datetime_to_next_day_with_provider_testing_support(
+            round_datetime_to_next_day_with_provider_testing_support(
                 payment_provider=base.PaymentProvider.GooglePlayStore, at=base.datetime_from_unix_ms(event_ms)
             )
         )

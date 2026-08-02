@@ -2470,19 +2470,6 @@ def revoke_master_pkey_proofs_and_allocate_new_gen_id(
     return result
 
 
-def round_datetime_to_next_day_with_provider_testing_support(
-    payment_provider: base.PaymentProvider, at: pendulum.DateTime
-) -> pendulum.DateTime:
-    """Round `at` up to the next day boundary. In some platforms' testing environments a "day" is
-    compressed (Google: 10 seconds); only that case differs from the normal UTC-day rounding."""
-    if base.PROVIDER_TESTING_ENV and payment_provider == base.PaymentProvider.GooglePlayStore:
-        google_day = pendulum.duration(seconds=10)  # in Google's test env, 1 day == 10s
-        elapsed = at - base.EPOCH
-        units = -((-elapsed) // google_day)  # ceil-divide the duration
-        return base.EPOCH + units * google_day
-    return base.round_datetime_to_next_day(at)
-
-
 @db.transactional
 def build_current_entitlement_proof(
     tx: db.SQLTransaction,
