@@ -33,6 +33,13 @@ with_provider_app_store    = false
 with_provider_google_play   = false
 provider_testing_env   = true
 
+; voucher_processing_window: how old an account's voucher checkpoint must be, in SECONDS, before the
+; maintenance mule charges it again. Defaults to 86400 (24h). It does not change how much is charged --
+; that is always the span since the checkpoint, whenever the pass runs -- only how promptly a spent
+; voucher stops entitling the account, and how the write load is spread across the day. Shorten it to
+; exercise vouchers in a test deployment.
+; voucher_processing_window = 86400
+
 ; log_path: file for the app's own logging, used ONLY for non-uWSGI/CLI invocations. Under uWSGI
 ; (the normal deployment) it is IGNORED — the vassal's `logto` captures stdout/stderr to the log
 ; file and rotates it, which also avoids two processes writing/rotating the same file unsafely.

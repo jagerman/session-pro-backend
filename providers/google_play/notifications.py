@@ -322,7 +322,7 @@ def thread_entry_point(
     # grpcio (via google-cloud-pubsub) is imported HERE, not at module scope, deliberately: this is the
     # subscriber thread body and runs only post-fork, inside the mule. A module-level import pulls
     # grpcio's background C threads into the uWSGI master, and the forked mule then segfaults on the
-    # dead inherited threads. DO NOT HOIST these to the top of the file (see docs/refactor-plan.md).
+    # dead inherited threads. DO NOT HOIST these to the top of the file.
     from google.cloud import pubsub_v1  # type: ignore[attr-defined]
     import google.pubsub_v1.types
     import google.api_core.exceptions
@@ -591,16 +591,6 @@ def set_purchase_grace_period_duration(
         )
 
 
-def validate_no_existing_purchase_token_error(purchase_token: str, conn: psycopg.Connection, err: base.ErrorSink):
-    result = backend.has_user_error(
-        conn=conn, payment_provider=base.PaymentProvider.GooglePlayStore, payment_id=purchase_token
-    )
-    if result:
-        err.msg_list.append(
-            f"Received RTDN notification for already errored purchase token: {base.maybe_obfuscate(purchase_token)}"
-        )
-
-
 def require_obfuscated_external_account_id(tx_event: SubscriptionPlanEventTransaction, err: base.ErrorSink) -> bytes:
     # NOTE: Parse the obfuscated_external_account_id into bytes
     result: bytes = b''
@@ -696,9 +686,9 @@ def handle_subscription_notification(
                         tx,
                         payment_tx=tx_payment,
                         plan=tx_event.pro_plan,
-                        expires_at=base.datetime_from_unix_ms(tx_event.expiry_time.unix_milliseconds),
+                        expiry_at=base.datetime_from_unix_ms(tx_event.expiry_time.unix_milliseconds),
                         purchased_at=base.datetime_from_unix_ms(tx_event.event_ts_ms),
-                        platform_refund_expires_at=base.datetime_from_unix_ms(
+                        platform_refund_expiry_at=base.datetime_from_unix_ms(
                             tx_event.event_ts_ms + api.refund_deadline_duration_ms
                         ),
                         platform_obfuscated_account_id=obfuscated_external_account_id,
@@ -753,9 +743,9 @@ def handle_subscription_notification(
                         tx,
                         payment_tx=tx_payment,
                         plan=tx_event.pro_plan,
-                        expires_at=base.datetime_from_unix_ms(tx_event.expiry_time.unix_milliseconds),
+                        expiry_at=base.datetime_from_unix_ms(tx_event.expiry_time.unix_milliseconds),
                         purchased_at=base.datetime_from_unix_ms(tx_event.event_ts_ms),
-                        platform_refund_expires_at=base.datetime_from_unix_ms(
+                        platform_refund_expiry_at=base.datetime_from_unix_ms(
                             tx_event.event_ts_ms + api.refund_deadline_duration_ms
                         ),
                         platform_obfuscated_account_id=obfuscated_external_account_id,
@@ -845,8 +835,11 @@ def handle_subscription_notification(
 
                 if not err.has():
                     assert payment is not None
+                    # A store subscription always states its expiry; only a live credit leaves it open, and
+                    # Google never issues one.
+                    assert payment.expiry_at is not None
                     rounded_expiry_at = backend.round_datetime_to_next_day_with_provider_testing_support(
-                        payment_provider=tx_payment.provider, at=payment.expires_at
+                        payment_provider=tx_payment.provider, at=payment.expiry_at
                     )
                     rounded_event_at = backend.round_datetime_to_next_day_with_provider_testing_support(
                         payment_provider=tx_payment.provider, at=base.datetime_from_unix_ms(tx_event.event_ts_ms)

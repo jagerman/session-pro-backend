@@ -57,8 +57,11 @@ which have been applied. See `schema/README`.
 - `dev_routes.py`: The `/dev/*` routes that mint Pro subscriptions with no payment
 provider involved. Refuses to serve unless `provider_dry_run` is also set.
 
-- `test.py`: Holds the unit tests implemented via pytest (`conftest.py` supplies
-the throwaway PostgreSQL each test runs against).
+- `tests/`: The pytest suite, split by area (`test_google.py`, `test_apple.py`,
+`test_credits.py`, `test_proofs.py`, `test_payments.py`, `test_server.py`,
+`test_maintenance.py`, `test_cli_config.py`, `test_base.py`), with the shared
+Flask/DB scaffolding in `tests/helpers.py`. `conftest.py` at the repo root
+supplies the throwaway PostgreSQL each test runs against.
 
 - `docs/`: Design and operational docs. **`docs/limitations.md` — payment-provider limitations and the
   store-config invariants they depend on; READ IT before enabling any new Google Play Console / App Store
@@ -105,6 +108,12 @@ with_provider_google_play         = false
 # a revocation overlaps with the expiry of a payment. If there's an overlap the backend can skip
 # issuing a revocation (which is an expensive operation).
 provider_testing_env         = false
+
+# How old an account's voucher checkpoint must be, in seconds, before the maintenance mule charges it
+# again (default 86400, i.e. 24h). This does not change how much is charged -- that is always the span
+# since the checkpoint, whenever the pass runs -- only how promptly a spent voucher stops entitling the
+# account, and how the write load is spread across the day.
+# voucher_processing_window = 86400
 
 # By default the backend is configured to strip personal-identifying information (PII) from the
 # logs. Enabling this preserves all information in logs. This should not be used in a
@@ -200,7 +209,7 @@ python -m flask --app main run --debug
 SESH_PRO_BACKEND_DB_URL=postgresql:///session_pro python -m flask --app main run --debug --port 8888
 
 # Run the tests (with printing test names and test output to stdout enabled)
-python -m pytest test.py --verbose --capture=no
+python -m pytest tests --verbose --capture=no
 
 # For running in production we use UWSGI which run multiple instances of the
 # Flask app with process lifecycle management, the following command is
@@ -325,7 +334,7 @@ The `cli.py` tool provides a command-line to query and manipulate the database.
 # Voucher management (requires --config)
 python cli.py --config config.ini voucher --master-pkey 0xabcd... --plan 12M
 # google_play/app_store mint a payment the store never saw, for exercising the per-provider paths;
-# both need provider_dry_run. Omit --provider for the default, rangeproof.
+# both need provider_dry_run. Omit --provider for the default, stf.
 python cli.py --config config.ini voucher --master-pkey 0xabcd... --plan 1M --provider google_play
 
 # User error management (requires --config)

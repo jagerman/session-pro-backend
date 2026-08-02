@@ -273,13 +273,21 @@ all subscriptions plans for the application must not have them enabled:
 
 ### Error Handling
 
-To ensure event order consistency, when an RTDN notification encounters an error, the
-notification's purchase token is added to an error table.
-- any future notifications for that purchase token are ignored and not acknowledged
-- any user requests involving that purchase token return an error message
+When handling an RTDN notification fails, the transaction is rolled back — so the
+notification stays unhandled and nothing it would have written is applied — and the
+notification's purchase token is recorded in an error table.
 
-These errors require developer intervention and will be cleared up automatically
-once the problem code is fixed. 
+- the notification is retried, with an exponential back-off, until it succeeds. It is
+  not acknowledged to Pub/Sub until then, so Google will redeliver it as well.
+- the account's `/get_pro_status` reports `error_report`, which tells the client
+  something about its subscription needs attention. Nothing is blocked: requests
+  continue to be served, and a subsequent notification for the same token is handled
+  normally rather than being held back.
+- a retry that succeeds clears the error record.
+
+Errors that outlast the code fix that resolves them need a developer: the entry can be
+cleared with `cli.py user-error delete`, and a notification can be marked handled with
+`cli.py google-notification handle`.
 
 ## Price Changes
 

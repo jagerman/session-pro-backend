@@ -65,7 +65,8 @@
 - **Enums are transmitted as stable string `code`s, never integers** (backed by lookup tables;
   the DB keeps a surrogate int `id`, but the wire *and the signed messages* use the `code`, so no magic
   number ever crosses the wire and new values are additive `INSERT`s):
-  - `payment_provider`: `"google_play"`, `"app_store"`, `"rangeproof"`
+  - `payment_provider`: `"google_play"`, `"app_store"`, `"stf"` (the Session Foundation, for a payment
+    granted out of band rather than bought from a store)
   - `status`: the per-**item** *payment* status — `"redeemed"`, `"expired"`, `"revoked"` — where
     **`"revoked"`** is the terminal revoked state (refund/chargeback/protocol kill). There is no
     `"refunded"` status.

@@ -12,6 +12,8 @@ import os
 import pathlib
 import sys
 
+import pendulum
+
 import base
 
 log = logging.getLogger('PRO')
@@ -49,6 +51,11 @@ class ParsedArgs:
     provider_dry_run: bool = False
 
     dev_endpoints: bool = False
+
+    # How old an account's voucher checkpoint must be before a maintenance pass charges it again. Does not
+    # affect HOW MUCH is charged -- that is always the span since the checkpoint, whenever the pass runs --
+    # only how promptly a spent voucher stops entitling the account, and how the write load is spread.
+    voucher_processing_window: pendulum.Duration = 1 * base.DAY
 
     session_webhooks: list[SessionWebhook] = dataclasses.field(default_factory=list)
 
@@ -100,6 +107,13 @@ def parse_args() -> ParsedArgs:
         result.provider_dry_run = base_section.getboolean(option='provider_dry_run', fallback=False)
 
         result.dev_endpoints = base_section.getboolean(option='dev_endpoints', fallback=False)
+
+        window_s = base_section.getint(option='voucher_processing_window', fallback=None)
+        if window_s is not None:
+            if window_s < 0:
+                errors.append(f'voucher_processing_window must not be negative, got {window_s}')
+            else:
+                result.voucher_processing_window = base.duration_from_seconds(window_s)
 
         webhook_index = 0
         while True:

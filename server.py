@@ -260,11 +260,11 @@ def _payment_item_wire(
         'payment_provider': payment.payment_provider.value,
         'auto_renewing': payment.auto_renewing,
         'purchased_ts': base.unix_seconds_float_from_datetime(payment.purchased_at),
-        'expiry_ts': base.unix_seconds_from_datetime(payment.expires_at),
+        'expiry_ts': base.unix_seconds_from_datetime(payment.expiry_at) if payment.expiry_at else 0,
         'grace_period_duration': (
             base.seconds_from_duration(payment.grace_period) if payment.grace_period is not None else 0
         ),
-        'platform_refund_expiry_ts': base.unix_seconds_from_datetime(payment.platform_refund_expires_at),
+        'platform_refund_expiry_ts': base.unix_seconds_from_datetime(payment.platform_refund_expiry_at),
         'revoked_ts': base.unix_seconds_float_from_datetime(payment.revoked_at) if payment.revoked_at else 0.0,
         'payment_id': backend.payment_id_from_payment_row(payment),
     }
@@ -314,12 +314,12 @@ def get_pro_status():
                 # Egress: user instants/durations → integer-seconds wire values. This is the account's
                 # TRUE expiry, straight from the store, so any sub-second part is floored (wire spec §1)
                 # — unlike the proof's expiry, which lands on a whole second by construction (§2.3).
-                expiry_ts = base.unix_seconds_from_datetime(user.expires_at)
+                expiry_ts = base.unix_seconds_from_datetime(user.expiry_at)
                 grace_period_duration = base.seconds_from_duration(user.grace_period)
 
                 # Status decided against the *request* clock (signed, anti-replay-bounded to ≈now) —
                 # the same clock the latest item's derived status uses, never a second time.time().
-                user_pro_status = UserProStatus.Active if request_at <= user.expires_at else UserProStatus.Expired
+                user_pro_status = UserProStatus.Active if request_at <= user.expiry_at else UserProStatus.Expired
                 if backend.is_generation_revoked(tx.conn, user.current_generation_id, request_at):
                     user_pro_status = UserProStatus.Expired
 
