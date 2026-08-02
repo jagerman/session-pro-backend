@@ -106,17 +106,6 @@ class TestingContext:
             yield conn
 
 
-def _google_subscription_parse(monkeypatch):
-    # Shared setup for the two below: fetch succeeds (returns a non-None sentinel), reaching the parse step.
-    monkeypatch.setattr('providers.google_play.api.fetch_subscription_v2_details', lambda *a, **k: object())
-    return google_play.ParsedNotification(
-        payload_type=google_play.ParsedNotificationPayloadType.Subscription,
-        purchase_token='tok-xyz',
-        package_name='pkg',
-        event_time_ms=1,
-    )
-
-
 def _redeem_and_prove(conn, backend_key, master_key, rotating_key, request_at):
     """The reflow's client flow: generate_pro_proof reconciles any pending payments for the key (redeeming
     whatever the mule registered, bound by the master-key-derived account-id) and returns the proof.

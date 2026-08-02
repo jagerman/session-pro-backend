@@ -192,25 +192,48 @@ def handle_parsed_notification(tx: db.SQLTransaction, parse: ParsedNotification,
 
         case ParsedNotificationPayloadType.Subscription:
             try:
-                details: SubscriptionV2Data | None = api.fetch_subscription_v2_details(
-                    parse.package_name, parse.purchase_token, err
+                # Record that this token owes a look, and stop. No fetch, no dispatch on type: the
+                # notification's whole content is "something about this subscription changed", and the
+                # resource — which the drain fetches on its own schedule — is what says what it changed to.
+                #
+                # This is what decouples acking from handling. One small write is now the only step that has
+                # to succeed before the message can be acked, and it is the only step whose failure loses
+                # anything: a first sighting of a token cannot be recovered from anywhere else, while
+                # everything downstream is re-derivable from the resource for as long as the token is known.
+                # Dated from the store's event instant rather than our clock, because provider time stays
+                # coherent for a replay (already past, so still immediately due) and in the compressed
+                # testing environment, where a "day" is ten seconds.
+                #
+                # Clamped to now, though, because `eligible_at` is a FLOOR: a clock-skewed or malformed
+                # eventTimeMillis an hour ahead would defer this token for an hour with nothing reporting
+                # it, where the old path processed immediately. Past values pass through untouched.
+                event_at = base.datetime_from_unix_ms(parse.event_time_ms)
+                enqueue_now = base.utc_now()
+                backend.google_enqueue_reconcile(
+                    tx,
+                    payment_token=parse.purchase_token,
+                    eligible_at=event_at if event_at < enqueue_now else enqueue_now,
                 )
-                if err.has():
-                    err.msg_list.append('Failed to fetch subscription V2 details from Google')
-                    return result
 
-                assert details is not None
-                tx_payment = api.parse_subscription_purchase_tx(
-                    purchase_token=parse.purchase_token, details=details, err=err
-                )
-                tx_event = api.parse_subscription_plan_event_tx(details, parse.event_time_ms, parse.sub_type, err=err)
-                if err.has():
-                    err.msg_list.append('Parsing data from subscription V2 details failed')
-                    return result
-
-                handle_subscription_notification(tx_payment=tx_payment, tx_event=tx_event, tx=tx, err=err)
+                # The one fact the resource cannot express, so the one thing the type still decides. A
+                # revoked subscription reads EXPIRED with a back-dated term, which is indistinguishable from
+                # one that simply ran out — and that difference belongs in the payment record even though
+                # entitlement no longer depends on it (the drain's converge would end the entitlement either
+                # way). Safe without the state guard the old branch used: a revoked subscription is
+                # terminated permanently, so a replayed REVOKED can only ever be about this token's ending,
+                # and the `revoked_at IS NULL` guard makes re-stamping a no-op.
+                if parse.sub_type == SubscriptionNotificationType.REVOKED:
+                    backend.add_google_revocation(
+                        tx,
+                        google_payment_token=parse.purchase_token,
+                        revoke_at=base.datetime_from_unix_ms(parse.event_time_ms),
+                        err=err,
+                    )
             except Exception:
                 err.msg_list.append(f"Handling notification failed: {traceback.format_exc()}")
+
+            if err.has():
+                tx.cancel = True
         case ParsedNotificationPayloadType.Voided:
             try:
                 handle_voided_notification(parse.voided, err)
@@ -583,6 +606,20 @@ def thread_entry_point(
                             pass
                 except Exception:
                     log.error(f'Google notification handling failed. Error was {traceback.format_exc()}')
+
+                # Drain what this pull just enqueued, BEFORE the ack sweep, because the drain is what
+                # creates the payment rows the sweep then acknowledges. Triggered here rather than left to
+                # the periodic task purely for latency: the subscriber and the drain share this process, so
+                # the call is free, and it puts purchase-to-Pro back where the old inline handler had it —
+                # the fetch used to happen here, and now happens one call later. The maintenance task
+                # remains the backstop for crashes, backlogs and anything enqueued elsewhere.
+                #
+                # Best-effort, like the sweep below: a drain failure must not break the pull loop, and
+                # every token it could not finish is still queued.
+                try:
+                    drain_due_reconciles(at=base.utc_now())
+                except Exception:
+                    log.error(f'Reconcile drain failed from the pull loop. Error was {traceback.format_exc()}')
 
                 # Acknowledge any purchases still owing a Google ack, right before blocking on the next
                 # pull. Decoupled from handling (which only records the obligation): this is the sole

@@ -19,88 +19,77 @@ import base
 import server
 import db
 
-from tests.helpers import (
-    derived_status,
-    TestingContext,
-    _google_subscription_parse,
-    _redeem_and_prove,
-    _prove_at,
-    _grant_voucher,
-)
+from tests.helpers import derived_status, TestingContext, _redeem_and_prove, _prove_at, _grant_voucher
 
 
-def test_google_handle_parsed_notification_fetch_failure(monkeypatch, pg_database):
-    # CHARACTERIZATION (pre-ErrorSink-rewrite safety net). Pins the CURRENT control-flow contract of the
-    # Google subscription path so the exception rewrite can't silently change it:
-    #   a failed fetch_subscription_v2_details -> handle_parsed_notification returns handled=False (so the
-    #   pull loop does NOT ack -> Google redelivers), err is populated, and -- the subtle part -- the tx is
-    #   NOT cancelled on this early-return path (nothing was written yet, so it commits). Contrast a failure
-    #   inside handle_subscription_notification, which DOES set tx.cancel. If the rewrite changes either,
-    #   this test must fail loudly and the change be made deliberately.
+def test_google_subscription_notification_only_records_that_a_token_owes_a_look(monkeypatch, pg_database):
+    # This replaces three characterisations of a control flow that no longer exists. The subscription case
+    # used to fetch the resource and dispatch on notification type inside the handler, which gave it three
+    # distinct failure shapes -- a failed fetch and a failed parse both returned early WITHOUT cancelling the
+    # transaction, while a failure deeper in DID cancel -- and the asymmetry was worth pinning because it
+    # decided whether the message was acked.
+    #
+    # There is nothing left to fetch or parse here. The case is one write: record that this token owes a
+    # reconcile. So the contract collapses to something a test can state in one line, and the failures those
+    # tests guarded now happen in the drain, where tests/test_google_queue.py covers them.
     with TestingContext(pg_database) as ctx:
-
-        def boom_fetch(*args, **kwargs):
-            args[2].msg_list.append('injected fetch failure')  # (package_name, purchase_token, err)
-            return None
-
-        monkeypatch.setattr('providers.google_play.api.fetch_subscription_v2_details', boom_fetch)
-
+        monkeypatch.setattr('providers.google_play.api.package_name', 'network.loki.messenger')
         parse = google_play.ParsedNotification(
             payload_type=google_play.ParsedNotificationPayloadType.Subscription,
-            purchase_token='tok-xyz',
-            package_name='pkg',
-            event_time_ms=1,
+            purchase_token='tok-recorded',
+            package_name='network.loki.messenger',
+            event_time_ms=1767225600000,
+            sub_type=google_play.types.SubscriptionNotificationType.PURCHASED,
         )
         err = base.ErrorSink()
         with ctx.connection() as conn:
             with db.transaction(conn) as tx:
-                handled = google_play.handle_parsed_notification(tx, parse, err)
-                assert handled is False
-                assert err.has()
-                assert tx.cancel is False  # fetch-fail early-return does NOT cancel (current behavior)
+                assert google_play.handle_parsed_notification(tx, parse, err) is True
+                assert tx.cancel is False
+        assert not err.has(), err.msg_list
+
+        with ctx.connection() as conn:
+            queued = db.query(conn, 'SELECT payment_token, eligible_at FROM google_reconcile_queue').fetchall()
+        assert [row[0] for row in queued] == ['tok-recorded']
+        assert queued[0][1] == base.datetime_from_unix_ms(1767225600000), 'dated from the store event'
+
+        # Nothing was fetched, so nothing about the subscription is known yet -- that is the drain's job.
+        assert not _payment_rows(ctx)
 
 
-def test_google_handle_parsed_notification_parse_failure(monkeypatch, pg_database):
-    # CHARACTERIZATION: a failure while PARSING fetched subscription details is the same early-return
-    # asymmetry as the fetch failure -- handled=False, err populated, tx NOT cancelled.
+def test_google_a_failed_enqueue_is_not_acked_away(monkeypatch, pg_database):
+    # The other half of the contract above, and the one that matters most. Recording that a token owes a
+    # look is now the ONLY step that has to succeed before the message is acked, because it is the only
+    # thing that cannot be recovered from anywhere else: no Play endpoint enumerates subscribers and no
+    # client route submits a purchase token, so a first sighting acked away is a paying subscriber who
+    # never gets Pro, with nothing anywhere to say so.
+    #
+    # So a failing enqueue must cancel the transaction and report the message as unhandled, which is what
+    # keeps it unacked and redelivered.
     with TestingContext(pg_database) as ctx:
-        parse = _google_subscription_parse(monkeypatch)
-        monkeypatch.setattr(
-            'providers.google_play.api.parse_subscription_purchase_tx',
-            lambda *a, **k: (k['err'].msg_list.append('injected parse failure'), object())[1],
+        monkeypatch.setattr('providers.google_play.api.package_name', 'network.loki.messenger')
+
+        def _boom(*args, **kwargs):
+            raise RuntimeError('the queue write failed')
+
+        monkeypatch.setattr('backend.google_enqueue_reconcile', _boom)
+        parse = google_play.ParsedNotification(
+            payload_type=google_play.ParsedNotificationPayloadType.Subscription,
+            purchase_token='tok-lost-if-acked',
+            package_name='network.loki.messenger',
+            event_time_ms=1767225600000,
+            sub_type=google_play.types.SubscriptionNotificationType.PURCHASED,
         )
-        monkeypatch.setattr('providers.google_play.api.parse_subscription_plan_event_tx', lambda *a, **k: object())
         err = base.ErrorSink()
         with ctx.connection() as conn:
             with db.transaction(conn) as tx:
-                handled = google_play.handle_parsed_notification(tx, parse, err)
-                assert handled is False
-                assert err.has()
-                assert tx.cancel is False  # parse-fail early-return also does NOT cancel
+                assert google_play.handle_parsed_notification(tx, parse, err) is False, 'unhandled, so unacked'
+                assert tx.cancel is True, 'and rolled back rather than half-applied'
+        assert err.has(), 'and reported, rather than failing silently'
 
-
-def test_google_handle_parsed_notification_deep_failure_cancels(monkeypatch, pg_database):
-    # CHARACTERIZATION (the CONTRASTING side of the asymmetry): a failure INSIDE
-    # handle_subscription_notification reaches the function tail, which requires tx.cancel to have been set
-    # -> handled=False, err populated, and tx IS cancelled (so the transaction rolls back). This is the case
-    # the fetch/parse early-returns skip.
-    with TestingContext(pg_database) as ctx:
-        parse = _google_subscription_parse(monkeypatch)
-        monkeypatch.setattr('providers.google_play.api.parse_subscription_purchase_tx', lambda *a, **k: object())
-        monkeypatch.setattr('providers.google_play.api.parse_subscription_plan_event_tx', lambda *a, **k: object())
-
-        def deep_boom(**k):
-            k['err'].msg_list.append('injected deep failure')
-            k['tx'].cancel = True
-
-        monkeypatch.setattr('providers.google_play.notifications.handle_subscription_notification', deep_boom)
-        err = base.ErrorSink()
         with ctx.connection() as conn:
-            with db.transaction(conn) as tx:
-                handled = google_play.handle_parsed_notification(tx, parse, err)
-                assert handled is False
-                assert err.has()
-                assert tx.cancel is True  # deep failure DOES cancel (reaches the tail assert)
+            queued = db.query(conn, 'SELECT payment_token FROM google_reconcile_queue').fetchall()
+        assert not queued
 
 
 def test_google_process_notification_message(monkeypatch, pg_database):
@@ -338,15 +327,30 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
         event_ms: int
         expiry_at: int
 
+    def purchase_token_of(scenario: TestScenario) -> str:
+        block = scenario.rtdn_event.get("subscriptionNotification") or scenario.rtdn_event.get("voidedNotification")
+        assert isinstance(block, dict)
+        token = block["purchaseToken"]
+        assert isinstance(token, str)
+        return token
+
     def test_notification(scenario: TestScenario, ctx: TestingContext) -> TestTx:
         err_parse = base.ErrorSink()
         current_state = google_play.api.parse_get_subscription_v2_response(scenario.current_state, err_parse)
         assert not err_parse.has()
         assert current_state is not None
 
-        monkeypatch.setattr(
-            "providers.google_play.api.fetch_subscription_v2_details", lambda *args, **kwargs: current_state
-        )
+        # Token-keyed, like the standalone driver: the drain reconciles everything due, so a stub that
+        # ignored the token would answer for one subscription with another's resource.
+        _SNAPSHOTS[purchase_token_of(scenario)] = current_state
+
+        def _fetch(package_name, token, err):
+            known = _SNAPSHOTS.get(token)
+            if known is None:
+                err.msg_list.append(f'test fixture has no snapshot for {token}')
+            return known
+
+        monkeypatch.setattr("providers.google_play.api.fetch_subscription_v2_details", _fetch)
 
         event_time_ms_str = scenario.rtdn_event['eventTimeMillis']
         assert isinstance(event_time_ms_str, str)
@@ -369,6 +373,12 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             with db.transaction(conn) as tx:
                 handled = google_play.handle_parsed_notification(tx, parse, err_rtdn)
         assert not err_rtdn.has() and handled and len(parse.purchase_token) > 0
+
+        # The notification now only records that the token owes a look, so drive the drain too. This
+        # sequence asserts what each notification LEAVES BEHIND, which is still the right question; only the
+        # mechanism between arrival and outcome has changed. The fetch is stubbed to this scenario's
+        # snapshot, so the drain sees exactly what the old inline handler saw.
+        google_play.drain_due_reconciles(at=base.datetime_from_unix_ms(event_ms))
 
         order_id = current_state.line_items[0].latest_successful_order_id
         expiry_time_unix_ms = current_state.line_items[0].expiry_time.unix_milliseconds
@@ -1052,7 +1062,10 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
         """2. User fails to renew (enter grace period)"""
         tx_grace = test_notification(grace, ctx)
         assert_payment_details(
-            tx=tx_subscribe,
+            # tx_grace, not tx_subscribe: entering grace now converges the TERM as well as the grace period.
+            # The old IN_GRACE branch wrote only the grace duration and left expiry_at wherever the purchase
+            # had put it, so the resource's own view of the term never reached the payment row.
+            tx=tx_grace,
             pro_status=server.UserProStatus.Active,
             payment_status=base.PaymentStatus.Redeemed,
             auto_renew=True,
@@ -1067,7 +1080,9 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
 
         # Now that payments up to the expiry time has been expired, this user's status should be expired (we need to also time-travel the clock past the grace period they were allocated)
         assert_payment_details(
-            tx=tx_subscribe,
+            # tx_grace for the same reason as above: the grace notification converged the term, so the row
+            # this is asserting on carries the resource's expiry rather than the purchase's.
+            tx=tx_grace,
             pro_status=server.UserProStatus.Expired,
             payment_status=base.PaymentStatus.Expired,
             auto_renew=True,
@@ -1578,9 +1593,11 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
         )
 
         """7. User fails to renew (enter grace period)"""
+        # tx_grace, not tx_resubscribe: entering grace converges the TERM as well now, so the resource's
+        # own view of the expiry is what reached the payment row.
         tx_grace = test_notification(grace, ctx)
         assert_payment_details(
-            tx=tx_resubscribe,
+            tx=tx_grace,
             pro_status=server.UserProStatus.Active,
             payment_status=base.PaymentStatus.Redeemed,
             auto_renew=True,
@@ -1593,7 +1610,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
         # Now that payments up to the expiry time has been expired, this user's status should be expired
         run_prune_at_end_of_day(event_ms=tx_grace.event_ms)
         assert_payment_details(
-            tx=tx_resubscribe,
+            tx=tx_grace,
             pro_status=server.UserProStatus.Expired,
             payment_status=base.PaymentStatus.Expired,
             auto_renew=True,
@@ -1607,7 +1624,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
         """8. User fails to renew (enter account hold)"""
         test_notification(hold, ctx)
         assert_payment_details(
-            tx=tx_resubscribe,
+            tx=tx_grace,
             pro_status=server.UserProStatus.Expired,
             payment_status=base.PaymentStatus.Expired,
             auto_renew=True,
@@ -1620,9 +1637,12 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
 
         """9. User fails to renew, cancelling and expiring"""
         test_notification(fail_after_hold_a, ctx)
-        test_notification(fail_after_hold_b, ctx)
+        # The last resource to be converged is the account's term: each of these carries the subscription's
+        # current expiry, and convergence takes the store at its word rather than keeping the first value
+        # it ever saw.
+        tx_fail = test_notification(fail_after_hold_b, ctx)
         assert_payment_details(
-            tx=tx_resubscribe,
+            tx=tx_fail,
             pro_status=server.UserProStatus.Expired,
             payment_status=base.PaymentStatus.Expired,
             auto_renew=False,
@@ -1798,7 +1818,10 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
         """2. User fails to renew (enter grace period)"""
         tx_grace = test_notification(grace, ctx)
         assert_payment_details(
-            tx=tx_subscribe,
+            # tx_grace, not tx_subscribe: entering grace now converges the TERM as well as the grace period.
+            # The old IN_GRACE branch wrote only the grace duration and left expiry_at wherever the purchase
+            # had put it, so the resource's own view of the term never reached the payment row.
+            tx=tx_grace,
             pro_status=server.UserProStatus.Active,
             payment_status=base.PaymentStatus.Redeemed,
             auto_renew=True,
@@ -1810,7 +1833,9 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
         run_prune_at_end_of_day(event_ms=tx_grace.event_ms)
         # Now that payments up to the expiry time has been expired, this user's status should be expired
         assert_payment_details(
-            tx=tx_subscribe,
+            # tx_grace for the same reason as above: the grace notification converged the term, so the row
+            # this is asserting on carries the resource's expiry rather than the purchase's.
+            tx=tx_grace,
             pro_status=server.UserProStatus.Expired,
             payment_status=base.PaymentStatus.Expired,
             auto_renew=True,
@@ -1823,9 +1848,9 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
 
         """3. User cancels, exiting grace period"""
         test_notification(cancel_after_grace_a, ctx)
-        test_notification(cancel_after_grace_b, ctx)
+        tx_cancel = test_notification(cancel_after_grace_b, ctx)
         assert_payment_details(
-            tx=tx_subscribe,
+            tx=tx_cancel,
             pro_status=server.UserProStatus.Expired,
             payment_status=base.PaymentStatus.Expired,
             auto_renew=False,
@@ -2039,7 +2064,10 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
         """2. User fails to renew (enter grace period)"""
         tx_grace = test_notification(grace, ctx)
         assert_payment_details(
-            tx=tx_subscribe,
+            # tx_grace, not tx_subscribe: entering grace now converges the TERM as well as the grace period.
+            # The old IN_GRACE branch wrote only the grace duration and left expiry_at wherever the purchase
+            # had put it, so the resource's own view of the term never reached the payment row.
+            tx=tx_grace,
             pro_status=server.UserProStatus.Active,
             payment_status=base.PaymentStatus.Redeemed,
             auto_renew=True,
@@ -2052,7 +2080,9 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
         run_prune_at_end_of_day(event_ms=tx_grace.event_ms)
         # Now that payments up to the expiry time has been expired, this user's status should be expired
         assert_payment_details(
-            tx=tx_subscribe,
+            # tx_grace for the same reason as above: the grace notification converged the term, so the row
+            # this is asserting on carries the resource's expiry rather than the purchase's.
+            tx=tx_grace,
             pro_status=server.UserProStatus.Expired,
             payment_status=base.PaymentStatus.Expired,
             auto_renew=True,
@@ -2066,7 +2096,9 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
         """3. User fails to renew (enter account hold)"""
         test_notification(hold, ctx)
         assert_payment_details(
-            tx=tx_subscribe,
+            # tx_grace for the same reason as above: the grace notification converged the term, so the row
+            # this is asserting on carries the resource's expiry rather than the purchase's.
+            tx=tx_grace,
             pro_status=server.UserProStatus.Expired,
             payment_status=base.PaymentStatus.Expired,
             auto_renew=True,
@@ -2079,9 +2111,9 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
 
         """4. User cancels"""
         test_notification(cancel_after_hold_a, ctx)
-        test_notification(cancel_after_hold_b, ctx)
+        tx_cancel = test_notification(cancel_after_hold_b, ctx)
         assert_payment_details(
-            tx=tx_subscribe,
+            tx=tx_cancel,
             pro_status=server.UserProStatus.Expired,
             payment_status=base.PaymentStatus.Expired,
             auto_renew=False,
@@ -2258,7 +2290,10 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
         """2. User fails to renew (enter grace period)"""
         tx_grace = test_notification(grace, ctx)
         assert_payment_details(
-            tx=tx_subscribe,
+            # tx_grace, not tx_subscribe: entering grace now converges the TERM as well as the grace period.
+            # The old IN_GRACE branch wrote only the grace duration and left expiry_at wherever the purchase
+            # had put it, so the resource's own view of the term never reached the payment row.
+            tx=tx_grace,
             pro_status=server.UserProStatus.Active,
             payment_status=base.PaymentStatus.Redeemed,
             auto_renew=True,
@@ -2270,7 +2305,9 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
         run_prune_at_end_of_day(event_ms=tx_grace.event_ms)
         # Now that payments up to the expiry time has been expired, this user's status should be expired
         assert_payment_details(
-            tx=tx_subscribe,
+            # tx_grace for the same reason as above: the grace notification converged the term, so the row
+            # this is asserting on carries the resource's expiry rather than the purchase's.
+            tx=tx_grace,
             pro_status=server.UserProStatus.Expired,
             payment_status=base.PaymentStatus.Expired,
             auto_renew=True,
@@ -2284,7 +2321,9 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
         """3. User fails to renew (enter account hold)"""
         test_notification(hold, ctx)
         assert_payment_details(
-            tx=tx_subscribe,
+            # tx_grace for the same reason as above: the grace notification converged the term, so the row
+            # this is asserting on carries the resource's expiry rather than the purchase's.
+            tx=tx_grace,
             pro_status=server.UserProStatus.Expired,
             payment_status=base.PaymentStatus.Expired,
             auto_renew=True,
@@ -2724,7 +2763,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
         """3. User fails to renew (enter grace period)"""
         tx_grace = test_notification(grace, ctx)
         assert_payment_details(
-            tx=tx_change_plan,
+            tx=tx_grace,
             pro_status=server.UserProStatus.Active,
             payment_status=base.PaymentStatus.Redeemed,
             auto_renew=True,
@@ -2737,7 +2776,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
 
         # Now that payments up to the expiry time has been expired, this user's status should be expired
         assert_payment_details(
-            tx=tx_change_plan,
+            tx=tx_grace,
             pro_status=server.UserProStatus.Expired,
             payment_status=base.PaymentStatus.Expired,
             auto_renew=True,
@@ -3017,7 +3056,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
         """2. User fails to renew (enter grace period)"""
         tx_grace = test_notification(grace, ctx)
         assert_payment_details(
-            tx=tx_change_plan,
+            tx=tx_grace,
             pro_status=server.UserProStatus.Active,
             payment_status=base.PaymentStatus.Redeemed,
             auto_renew=True,
@@ -3029,7 +3068,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
         run_prune_at_end_of_day(event_ms=tx_grace.event_ms)
         # Now that payments up to the expiry time has been expired, this user's status should be expired
         assert_payment_details(
-            tx=tx_change_plan,
+            tx=tx_grace,
             pro_status=server.UserProStatus.Expired,
             payment_status=base.PaymentStatus.Expired,
             auto_renew=True,
@@ -3043,7 +3082,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
         """3. User fails to renew (enter account hold)"""
         test_notification(hold, ctx)
         assert_payment_details(
-            tx=tx_change_plan,
+            tx=tx_grace,
             pro_status=server.UserProStatus.Expired,
             payment_status=base.PaymentStatus.Expired,
             auto_renew=True,
@@ -3718,6 +3757,10 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
 
 _UPGRADE_ACCOUNT_SEED = bytes([0x42] * 32)
 
+# Token -> parsed resource, so the fetch stub can answer per token the way the real API does. Reset by
+# TestingContext's fixture scope in practice; harmless across tests since tokens are unique per fixture.
+_SNAPSHOTS: dict = {}
+
 
 def _google_snapshot(
     *,
@@ -3770,7 +3813,20 @@ def _drive_google_rtdn(
     err_parse = base.ErrorSink()
     details = google_play.api.parse_get_subscription_v2_response(snapshot, err_parse)
     assert not err_parse.has() and details is not None
-    monkeypatch.setattr('providers.google_play.api.fetch_subscription_v2_details', lambda *a, **k: details)
+
+    # Keyed by token, because the drain fetches per token and reconciles everything that is due -- including
+    # a linked token some earlier notification marked dirty. A stub that ignored the token would answer for
+    # one subscription with another's resource, which the real API cannot do and which quietly corrupts any
+    # fixture with more than one token in play.
+    _SNAPSHOTS[purchase_token] = details
+
+    def _fetch(package_name, token, err):
+        known = _SNAPSHOTS.get(token)
+        if known is None:
+            err.msg_list.append(f'test fixture has no snapshot for {token}')
+        return known
+
+    monkeypatch.setattr('providers.google_play.api.fetch_subscription_v2_details', _fetch)
     monkeypatch.setattr('providers.google_play.api.subscription_v1_acknowledge', lambda *a, **k: None)
 
     rtdn: base.JSONObject = {
@@ -3789,6 +3845,18 @@ def _drive_google_rtdn(
     with ctx.connection() as conn:
         with db.transaction(conn) as tx:
             handled = google_play.handle_parsed_notification(tx, parse, err)
+
+    # The notification now only records that the token owes a look, so drive the drain too: these tests are
+    # about what an arriving notification LEAVES BEHIND, and that is still the question worth asking. The
+    # fetch is already stubbed to the same snapshot, so the drain sees exactly what the old inline handler
+    # would have.
+    if handled:
+        # The drain owns its own sinks per token, so lift whatever it recorded onto ours: these tests ask
+        # "what did this notification end up doing", and after the switchover most of that happens here.
+        google_play.drain_due_reconciles(at=base.datetime_from_unix_ms(event_ms))
+        with ctx.connection() as conn:
+            for row in db.query(conn, 'SELECT last_error FROM google_reconcile_queue WHERE last_error IS NOT NULL'):
+                err.msg_list.append(row[0])
     return handled, err
 
 
@@ -3804,8 +3872,8 @@ def _payment_rows(ctx) -> list[tuple]:
         ).fetchall()
 
 
-def test_google_purchase_against_a_stale_state_is_silently_dropped(monkeypatch, pg_database):
-    # CHARACTERISATION of finding 3.1. The PURCHASED branch gates on the state of a FRESHLY FETCHED
+def test_google_purchase_against_a_stale_state_is_registered_anyway(monkeypatch, pg_database):
+    # REGRESSION for finding 3.1, the defect this whole branch started from. The PURCHASED branch gates on the state of a FRESHLY FETCHED
     # snapshot (notifications.py), while the notification type comes from the message. Process a PURCHASED
     # once the store already reads CANCELED -- the user bought, then turned auto-renew off, and our
     # subscriber was down in between -- and the guard fails, so the branch is skipped ENTIRELY.
@@ -3832,19 +3900,22 @@ def test_google_purchase_against_a_stale_state_is_silently_dropped(monkeypatch, 
         handled, err = _drive_google_rtdn(
             monkeypatch, ctx, notification_type=4, purchase_token=token, event_ms=1767225600000, snapshot=snapshot
         )
-        assert not _payment_rows(ctx), 'the purchase was dropped -- this is the defect being pinned'
-        assert handled is True, 'and reported as handled, so the pull loop acks it and it is gone for good'
-        assert not err.has(), 'silently: no error is raised for the operator to see'
+        assert handled is True and not err.has()
+        rows = _payment_rows(ctx)
+        assert len(rows) == 1, 'the purchase is recorded -- nothing asks whether the state still reads ACTIVE'
+        assert rows[0][0] == 'GPA.1111-2222-3333-44444'
 
-        # The cancellation for the same token now has nothing to update.
+        # And the cancellation that used to wedge forever, waiting on a row that could never appear, now
+        # finds one and simply converges it.
         handled, err = _drive_google_rtdn(
             monkeypatch, ctx, notification_type=3, purchase_token=token, event_ms=1767312000000, snapshot=snapshot
         )
-        assert handled is False and err.has(), 'so this one fails and is retried forever'
+        assert handled is True and not err.has()
+        assert len(_payment_rows(ctx)) == 1, 'still one cycle'
 
 
-def test_google_upgrade_revokes_every_consumed_cycle(monkeypatch, pg_database):
-    # CHARACTERISATION of findings 3.3 and 3.6. A monthly subscriber who switches plans gets a NEW purchase
+def test_google_upgrade_leaves_consumed_cycles_alone(monkeypatch, pg_database):
+    # REGRESSION for findings 3.3 and 3.6. A monthly subscriber who switches plans gets a NEW purchase
     # token, and the new subscription's snapshot names the old one in linkedPurchaseToken. The handler
     # responds by calling add_google_revocation on the old token -- whose SELECT carries no ORDER BY and no
     # LIMIT, so it revokes EVERY cycle ever recorded under that token, not the live one.
@@ -3900,17 +3971,17 @@ def test_google_upgrade_revokes_every_consumed_cycle(monkeypatch, pg_database):
         rows = _payment_rows(ctx)
         assert len(rows) == 4
         revoked = {order_id: revoked_at for order_id, _, revoked_at in rows}
-        assert revoked['GPA.8000-0000-0000-00002'] is None, 'the replacement itself survives'
-        # All three monthly cycles are revoked, including the two that had already run to completion.
-        assert all(revoked[order_id] is not None for order_id, _, _ in cycles)
-        consumed = revoked['GPA.9000-0000-0000-00001']
-        assert consumed is not None
-        expired_at = [expiry_at for order_id, expiry_at, _ in rows if order_id == 'GPA.9000-0000-0000-00001'][0]
-        assert consumed > expired_at, 'revoked at the upgrade instant, long after this cycle actually ended'
+        # Nothing is revoked. The old token is marked dirty instead, so its own resource decides what became
+        # of it -- and consumed cycles, which nobody refunded, keep saying so.
+        assert all(value is None for value in revoked.values()), revoked
+
+        with ctx.connection() as conn:
+            queued = db.query(conn, 'SELECT payment_token FROM google_reconcile_queue').fetchall()
+        assert 'tok-monthly' in [row[0] for row in queued], 'superseded, so it owes a look'
 
 
-def test_google_upgrade_broadcasts_a_revocation_for_an_account_that_never_lapsed(monkeypatch, pg_database):
-    # CHARACTERISATION of findings 3.4 and 3.5. Same upgrade as above, but with the subscription CLAIMED, so
+def test_google_upgrade_does_not_revoke_an_account_that_never_lapsed(monkeypatch, pg_database):
+    # REGRESSION for findings 3.4 and 3.5. Same upgrade as above, but with the subscription CLAIMED, so
     # the payments carry a user_id and the revocation path actually reaches its broadcast decision.
     #
     # That decision runs BEFORE the replacement payment is inserted (the linked-token revoke is the first
@@ -3976,24 +4047,12 @@ def test_google_upgrade_broadcasts_a_revocation_for_an_account_that_never_lapsed
         upgraded_at = base.datetime_from_unix_ms(1773532800000)
         with ctx.connection() as conn:
             user = backend.get_user(conn, master_key.verify_key)
-            revocations = backend.get_revocations_list(conn)
-            assert len(revocations) == 1, 'an entry every client downloads for the 31-day retention'
-            assert revocations[0].generation_id == generation_before, 'the generation the account was using'
+            assert not backend.get_revocations_list(conn), 'upgrading is not a reason to revoke anybody'
+            assert user.current_generation_id == generation_before, 'and the generation stands'
 
-            # No replacement generation is allocated, because at that instant the account has no usable
-            # payment: the old cycles were just revoked and the annual one has not been inserted yet. So the
-            # account is left POINTING AT a revoked generation, with every outstanding proof invalidated.
-            assert user.current_generation_id == generation_before
-
-            # And its expiry is left at the upgrade instant -- the account reads as lapsed. The replacement
-            # payment is inserted unredeemed, and _lookup_user_expiry filters on user_id, so the recompute
-            # inside the revoke path cannot see it; it sees only the coverage it just revoked.
-            assert user.expiry_at == upgraded_at
-
-        # It self-heals on the account's next request, which claims the replacement before recomputing.
-        with ctx.connection() as conn:
-            _redeem_and_prove(conn, ctx.backend_key, master_key, rotating_key, upgraded_at)
-            assert backend.get_user(conn, master_key.verify_key).expiry_at > upgraded_at
+            # Nor does the account read as lapsed. The replacement is registered by the same drain pass, so
+            # the recompute sees it rather than only the coverage it was replacing.
+            assert user.expiry_at is not None and user.expiry_at > upgraded_at
 
 
 def test_google_upgrade_revocation_does_not_depend_on_physical_row_order(monkeypatch, pg_database):
@@ -4080,15 +4139,16 @@ def test_google_upgrade_revocation_does_not_depend_on_physical_row_order(monkeyp
         assert handled and not err.has()
 
         with ctx.connection() as conn:
-            # Identical to the companion test, which runs the same upgrade without the extra write. That the
-            # broadcast still happens is finding 3.5, which the reconcile rewrite fixes by not judging an
-            # account before its replacement payment exists -- a separate defect from this one.
-            assert len(backend.get_revocations_list(conn)) == 1, 'the same outcome, whatever the row order'
-            assert backend.get_user(conn, master_key.verify_key).expiry_at == base.datetime_from_unix_ms(1773532800000)
+            # Identical to the companion test, which runs the same upgrade without the extra write. Both now
+            # revoke nothing: the decision reads the account rather than a payment row, so heap order has
+            # nothing to say about it, and the reconcile no longer judges an upgrade at all.
+            assert not backend.get_revocations_list(conn), 'the same outcome, whatever the row order'
+            user = backend.get_user(conn, master_key.verify_key)
+            assert user.expiry_at is not None and user.expiry_at > base.datetime_from_unix_ms(1773532800000)
 
 
-def test_google_expiry_is_never_revised_after_insert(monkeypatch, pg_database):
-    # CHARACTERISATION of finding 3.7. A store payment's expiry_at is written once, at insert, and no code
+def test_google_expiry_is_revised_when_the_store_changes_the_term(monkeypatch, pg_database):
+    # REGRESSION for finding 3.7. A store payment's expiry_at is written once, at insert, and no code
     # path ever revises it: every other UPDATE on payments touches revoked_at, redeemed_at, user_id,
     # auto_renewing or grace_period, and the only write to expiry_at is the credit drain's latch, which never
     # applies to a Google payment.
@@ -4137,12 +4197,12 @@ def test_google_expiry_is_never_revised_after_insert(monkeypatch, pg_database):
         assert handled and not err.has()
 
         rows = _payment_rows(ctx)
-        assert len(rows) == 1, 'same (token, order_id): deduped, no second row'
-        assert rows[0][1] == base.datetime_from_unix_ms(1769904000000), 'and the extension is discarded'
+        assert len(rows) == 1, 'same (token, order_id): one cycle, converged rather than duplicated'
+        assert rows[0][1] == base.datetime_from_unix_ms(1772323200000), 'and the new term is what stands'
 
 
-def test_google_deferred_notification_wedges_forever(monkeypatch, pg_database):
-    # CHARACTERISATION of finding 3.8. DEFERRED shares an explicitly-unsupported arm with PAUSED and
+def test_google_deferred_notification_is_harmless(monkeypatch, pg_database):
+    # REGRESSION for finding 3.8. DEFERRED shares an explicitly-unsupported arm with PAUSED and
     # PAUSE_SCHEDULE_CHANGED: it appends `unsupported!` and cancels the transaction, so the message is never
     # acked and is retried with backoff indefinitely, carrying a user_error on the token that surfaces in
     # that account's error_report.
@@ -4185,8 +4245,9 @@ def test_google_deferred_notification_wedges_forever(monkeypatch, pg_database):
                 obfuscated_account_id=account_id,
             ),
         )
-        assert handled is False, 'never acked -> Google redelivers -> retried with backoff forever'
-        assert err.has() and any('unsupported' in msg for msg in err.msg_list)
+        assert handled is True, 'acked and done: a deferral changes nothing yet, and the resource says so'
+        assert not err.has(), err.msg_list
+        assert len(_payment_rows(ctx)) == 1, 'the cycle is untouched, because nothing about it moved'
 
 
 def test_revoking_a_lapsed_payment_does_not_extend_the_account(monkeypatch, pg_database):
@@ -4536,13 +4597,22 @@ def test_an_unknown_base_plan_is_reported_not_asserted(monkeypatch, pg_database)
                 base_plan='session-pro-6-months',  # plausible, and not one we know
             ),
         )
-        assert handled is False, 'not acked, so Google redelivers once we understand the plan'
+        # The notification itself succeeds now -- it only records that the token owes a look, and nothing
+        # about an unknown plan is visible until the resource is fetched. The failure has moved to the
+        # drain, which the helper drives.
+        assert handled is True
         assert err.has() and any('session-pro-6-months' in msg for msg in err.msg_list), err.msg_list
         assert not _payment_rows(ctx), 'and nothing is written from a plan we cannot map'
         # The point of the change, and the only part the assertions above could not distinguish: the
         # failure is REPORTED. Previously the sink carried the message and an AssertionError traceback
         # behind it, having unwound through the blanket except on the way.
         assert not any('AssertionError' in msg for msg in err.msg_list), err.msg_list
+
+        # And the token is retained rather than lost, so deploying support for the plan drains the backlog.
+        with ctx.connection() as conn:
+            queued = db.query(conn, 'SELECT payment_token, attempts FROM google_reconcile_queue').fetchall()
+        assert [row[0] for row in queued] == ['tok-unknown-plan']
+        assert queued[0][1] == 1, 'one failed attempt recorded, backed off for the next'
 
 
 def test_one_token_is_one_subscription_whatever_its_order_ids_look_like(monkeypatch, pg_database):

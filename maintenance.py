@@ -56,6 +56,14 @@ APPLE_CATCHUP_INTERVAL_S = 300  # 5 min
 # gets charged — that is always the span since the account's own checkpoint.
 CREDIT_DRAIN_INTERVAL_S = 120  # 2 min
 
+# How often the Google reconcile queue is drained as a BACKSTOP. The pull loop triggers a drain itself after
+# every pull, so this is not the latency path — it covers what that cannot: a token enqueued while the
+# subscriber was down, a backlog left by a crash mid-pass, and the linked-token markers a reconcile writes
+# for a superseded subscription. It cannot be omitted, and not because of proof latency: `needs_ack` is
+# written only when the drain registers a payment, and Google auto-refunds a purchase left unacknowledged
+# for three days.
+GOOGLE_RECONCILE_INTERVAL_S = 60  # 1 min
+
 
 @dataclasses.dataclass
 class Task:
@@ -175,6 +183,24 @@ def run() -> None:
                 app_store.catchup_on_missed_notifications(core=core, sql_conn=conn)
 
         tasks.append(Task(name='apple-catchup', interval_s=APPLE_CATCHUP_INTERVAL_S, run=_apple_catchup))
+
+    if parsed.with_provider_google_play and not parsed.provider_dry_run:
+        # Same import-only-if-enabled shape as Apple above. Skipped under provider_dry_run for the reason
+        # start_subscriber is: the drain FETCHES from Google, and the dry-run stub answers with a synthetic
+        # active subscription that would be converged onto real rows.
+        from providers import google_play
+
+        google_play.notifications.log.handlers.clear()
+        google_play.notifications.log.addHandler(handler)
+
+        def _drain_google_reconciles() -> None:
+            drained = google_play.drain_due_reconciles(at=base.utc_now())
+            if drained:
+                log.info(f'Reconciled {drained} Google subscription(s)')
+
+        tasks.append(
+            Task(name='google-reconcile', interval_s=GOOGLE_RECONCILE_INTERVAL_S, run=_drain_google_reconciles)
+        )
 
     stop = threading.Event()
     atexit.register(stop.set)
