@@ -2809,9 +2809,14 @@ def google_add_notification_id(tx: db.SQLTransaction, message_id: str, expires_a
 
     db.query(
         tx.conn,
+        # ON CONFLICT because Pub/Sub is at-least-once: the same message can be delivered twice, and under
+        # the streaming subscriber those deliveries can be in flight together. A check-then-insert lets both
+        # pass the check, and the loser would raise on the primary key — turning a duplicate delivery, which
+        # is normal, into a nacked message and a redelivery. Recording it once is the whole requirement.
         ('''
             INSERT INTO google_notification_history (message_id, handled, payload, expires_at)
             VALUES      (%(message_id)s, FALSE, %(payload)s, %(expiry)s)
+            ON CONFLICT (message_id) DO NOTHING
     '''),
         message_id=message_id,
         payload=maybe_payload,

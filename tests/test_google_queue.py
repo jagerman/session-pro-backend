@@ -3,11 +3,16 @@ The Google reconcile queue: the durable record that a purchase token owes work, 
 notification be acked the moment it arrives.
 '''
 
+import dataclasses
+import json
+
 import pendulum
 
 import backend
 import base
 import db
+
+from providers import google_play
 
 from tests.helpers import TestingContext
 
@@ -330,3 +335,130 @@ def test_one_failing_token_does_not_cost_the_rest_of_the_batch(monkeypatch, pg_d
         with ctx.connection() as conn:
             rows = db.query(conn, 'SELECT payment_token FROM google_play_payment_details').fetchall()
         assert [row[0] for row in rows] == ['tok-ok']
+
+
+@dataclasses.dataclass
+class _FakeStreamedMessage:
+    """Duck-types the pubsub Message the subscriber callback receives.
+
+    The callback is the half of the streaming rewrite that can be tested here: it touches only `data`,
+    `message_id`, `publish_time`, `ack()` and `nack()`, none of which need a gRPC stream. What remains
+    untestable locally is the loop around it, which owns the client.
+    """
+
+    data: bytes
+    message_id: str
+    # The real `Message.publish_time` is a stdlib datetime; pendulum's DateTime subclasses it, so this
+    # satisfies the duck type the callback needs (`.timestamp()`) without a stdlib instant in the repo.
+    publish_time: pendulum.DateTime = dataclasses.field(default_factory=lambda: pendulum.datetime(2026, 1, 1))
+    acked: bool = False
+    nacked: bool = False
+
+    def ack(self) -> None:
+        self.acked = True
+
+    def nack(self) -> None:
+        self.nacked = True
+
+
+def _rtdn_bytes(token: str, event_ms: int = 1767225600000) -> bytes:
+    return json.dumps(
+        {
+            'version': '1.0',
+            'packageName': 'network.loki.messenger',
+            'eventTimeMillis': str(event_ms),
+            'subscriptionNotification': {
+                'version': '1.0',
+                'notificationType': 4,
+                'purchaseToken': token,
+                'subscriptionId': 'session_pro',
+            },
+        }
+    ).encode()
+
+
+def test_a_streamed_notification_is_recorded_queued_and_acked(monkeypatch, pg_database):
+    # The happy path of the subscriber callback, end to end against a real database: the message is
+    # recorded, its token is queued for a reconcile, and only then is it acked.
+    with TestingContext(pg_database) as ctx:
+        monkeypatch.setattr('providers.google_play.api.package_name', 'network.loki.messenger')
+        message = _FakeStreamedMessage(data=_rtdn_bytes('tok-streamed'), message_id='msg-1')
+
+        google_play.notifications._handle_streamed_message(message)
+
+        assert message.acked and not message.nacked
+        with ctx.connection() as conn:
+            assert [r[0] for r in db.query(conn, 'SELECT payment_token FROM google_reconcile_queue')] == [
+                'tok-streamed'
+            ]
+            handled = db.query_scalar(
+                conn, 'SELECT handled FROM google_notification_history WHERE message_id = %s', 'msg-1'
+            )
+        assert handled is True
+
+
+def test_an_undecodable_streamed_notification_is_nacked_not_acked(monkeypatch, pg_database):
+    # A payload we cannot read is left for redelivery rather than dropped: it is either a format we do not
+    # understand yet or a bug, and both are better answered after a deploy than by silence. Acking would
+    # make it unrecoverable -- Google never redelivers an acked message.
+    with TestingContext(pg_database) as ctx:
+        monkeypatch.setattr('providers.google_play.api.package_name', 'network.loki.messenger')
+        message = _FakeStreamedMessage(data=b'{not json at all', message_id='msg-bad')
+
+        google_play.notifications._handle_streamed_message(message)
+
+        assert message.nacked and not message.acked
+        with ctx.connection() as conn:
+            assert not db.query(conn, 'SELECT payment_token FROM google_reconcile_queue').fetchall()
+
+
+def test_a_redelivered_streamed_notification_is_acked_without_repeating_the_work(monkeypatch, pg_database):
+    # Pub/Sub is at-least-once, and the commit-then-ack window cannot be closed -- a callback abandoned
+    # between the two leaves a handled message unacked, which Google then redelivers. That must be a no-op
+    # ending in an ack, which is what makes the whole delivery model harmless.
+    with TestingContext(pg_database) as ctx:
+        monkeypatch.setattr('providers.google_play.api.package_name', 'network.loki.messenger')
+        first = _FakeStreamedMessage(data=_rtdn_bytes('tok-twice'), message_id='msg-dup')
+        google_play.notifications._handle_streamed_message(first)
+        assert first.acked
+
+        with ctx.connection() as conn:
+            revision_before = db.query_scalar(
+                conn, 'SELECT revision FROM google_reconcile_queue WHERE payment_token = %s', 'tok-twice'
+            )
+
+        second = _FakeStreamedMessage(data=_rtdn_bytes('tok-twice'), message_id='msg-dup')
+        google_play.notifications._handle_streamed_message(second)
+
+        assert second.acked and not second.nacked
+        with ctx.connection() as conn:
+            rows = db.query(conn, 'SELECT payment_token FROM google_reconcile_queue').fetchall()
+            revision_after = db.query_scalar(
+                conn, 'SELECT revision FROM google_reconcile_queue WHERE payment_token = %s', 'tok-twice'
+            )
+        assert len(rows) == 1, 'one token, one obligation'
+        assert revision_after == revision_before, 'and the redelivery did not re-enqueue it'
+
+
+def test_a_streamed_notification_that_fails_to_handle_is_nacked(monkeypatch, pg_database):
+    # The decode path has its own nack (tested above); this is the OTHER one -- a message that decodes fine
+    # and then fails to handle. Both have to nack, and it is worth stating separately because the first
+    # test's early return does not exercise this branch at all: an unconditional `ack()` here passes every
+    # other test in this file.
+    #
+    # An acked message is never redelivered, so getting this wrong loses the notification permanently.
+    with TestingContext(pg_database) as ctx:
+        monkeypatch.setattr('providers.google_play.api.package_name', 'network.loki.messenger')
+        monkeypatch.setattr(
+            'providers.google_play.notifications.handle_parsed_notification', lambda tx, parse, err: False
+        )
+        message = _FakeStreamedMessage(data=_rtdn_bytes('tok-unhandled'), message_id='msg-unhandled')
+
+        google_play.notifications._handle_streamed_message(message)
+
+        assert message.nacked and not message.acked
+        with ctx.connection() as conn:
+            handled = db.query_scalar(
+                conn, 'SELECT handled FROM google_notification_history WHERE message_id = %s', 'msg-unhandled'
+            )
+        assert handled is False, 'recorded, but not marked done -- so a redelivery retries it'

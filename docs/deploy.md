@@ -104,11 +104,44 @@ restart the service. It never clobbers your `[apple]`/`[google]` secrets in `con
    `/etc/session-pro-backend/config.ini`, set `WITH_PLATFORM_*=true` in `deploy.env`
    (re-run `deploy.sh`) or edit the toggles directly, then reload the vassal:
    `touch /etc/uwsgi-emperor/vassals/pro-backend.ini`.
-3. **Smoke test** an unauthenticated endpoint:
+3. **Google Pub/Sub subscription settings** (if enabling Google) — see below. These are not optional and
+   are not visible to any test.
+4. **Smoke test** an unauthenticated endpoint:
    ```bash
    curl -X POST https://<your-domain>/get_pro_revocations \
         -H 'Content-Type: application/json' -d '{"version":0,"ticket":0}'
    ```
+
+### Google Pub/Sub subscription settings
+
+The backend consumes RTDNs through the client library's streaming subscriber, which means **three
+behaviours that used to be application code are now subscription configuration.** They are invisible to the
+test suite — nothing here can observe them — so they have to be checked by hand, once, per environment.
+
+1. **Retry policy — set an exponential backoff.** This is the one that matters. The handler paces a failing
+   message by `nack()`ing it, and `nack()` has no backoff of its own: with no retry policy on the
+   subscription, Pub/Sub redelivers as fast as it can, and one persistently failing message becomes a hot
+   loop against the database. The code this replaced carried its own 1 s → 600 s backoff, and that
+   responsibility moved here rather than disappearing.
+   ```bash
+   gcloud pubsub subscriptions update <subscription> \
+       --min-retry-delay=10s --max-retry-delay=600s
+   ```
+2. **Exactly-once delivery — leave it OFF.** The backend already provides the guarantee itself, by
+   recording every message id before handling it and treating an already-handled id as a no-op, so enabling
+   it buys nothing. It also makes plain `ack()` unreliable: under exactly-once an ack can fail and must be
+   confirmed via `ack_with_response()`, which this code does not do. (If it is already enabled — the
+   `EXACTLY_ONCE_ACKID_FAILURE` handling in the code this replaced suggests it may be — either turn it off
+   or the ack path needs changing first.)
+3. **Ack deadline — the default (10 s) is fine.** The library extends the lease automatically for as long
+   as a callback runs, which the hand-rolled loop never did; a message parked in its retry queue past the
+   deadline was silently redelivered while still held. Nothing needs setting here, but do not raise it in
+   the belief that the handler needs the time.
+
+A **dead-letter topic** is worth configuring but is not required: a message that can never be handled is
+retained in `google_notification_history` and replayed at every subscriber start, so it is recoverable
+without one. Setting `max_delivery_attempts` moves that from "retried forever" to "parked somewhere an
+operator can see it".
 
 ## Operations
 

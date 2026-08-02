@@ -14,7 +14,6 @@ import dataclasses
 import typing
 import time
 import enum
-import collections.abc
 
 from google.oauth2 import service_account
 
@@ -48,6 +47,20 @@ from .types import (
 
 log = logging.Logger('GOOGLE')
 
+# How long the subscriber loop waits before doing its periodic work when nothing wakes it. A FLOOR, not a
+# schedule: a callback sets the event as soon as it commits, so an arriving notification is serviced in
+# milliseconds and this only paces the work no notification announces — the drain's own retry backoffs, and
+# tokens a reconcile enqueued rather than a message. An idle pass is two indexed queries.
+SUBSCRIBER_POLL_FLOOR_S: int = 15
+
+# Paces reconnection after the stream dies for good, so a subscribe() that fails instantly — bad
+# credentials, a deleted subscription — cannot spin the mule at the speed of the error.
+SUBSCRIBER_RECONNECT_DELAY_S: int = 5
+
+# How long a callback already running is given to finish once shutdown is signalled. Nothing is lost by
+# cutting it short: an abandoned callback's transaction rolls back, and the message was never acked.
+SUBSCRIBER_SHUTDOWN_GRACE_S: int = 2
+
 
 @dataclasses.dataclass
 class ThreadContext:
@@ -78,21 +91,18 @@ class ParsedNotification:
 
 @dataclasses.dataclass
 class SortedMessage:
-    event_unix_ts_ms: int = 0
-    next_retry_unix_ts_s: float = 0
-    curr_retry_delay_s: float = 0
-    message_id: str = ''
-    ack_id: str = ''
-    parse: ParsedNotification = dataclasses.field(default_factory=ParsedNotification)
-    raw: object | None = None  # a pubsub ReceivedMessage at runtime; only ever str()'d, so untyped here
+    """One RTDN on its way through `_process_notification_message`.
 
-    def increase_retry_delay(self, now_s: float):
-        MIN_RETRY_DELAY_S: float = 1
-        MAX_RETRY_DELAY_S: float = 600
-        self.curr_retry_delay_s = max(self.curr_retry_delay_s, MIN_RETRY_DELAY_S)
-        self.curr_retry_delay_s *= 2
-        self.curr_retry_delay_s = min(self.curr_retry_delay_s, MAX_RETRY_DELAY_S)
-        self.next_retry_unix_ts_s = now_s + self.curr_retry_delay_s
+    The name is a fossil of the sorted queue that no longer exists, kept because the tests that pin the
+    transaction composition are written against it. There is nothing left to sort: ordering stopped being a
+    requirement when handling became convergent, and the per-message backoff this once carried is now the
+    subscription's retry policy (see `docs/deploy.md`).
+    """
+
+    event_unix_ts_ms: int = 0
+    message_id: str = ''
+    parse: ParsedNotification = dataclasses.field(default_factory=ParsedNotification)
+    raw: object | None = None  # a pubsub message at runtime; only ever str()'d, so untyped here
 
 
 def init(
@@ -122,12 +132,12 @@ def init(
     api.package_name = package_name
     api.subscription_product_id = subscription_product_id
 
-    # NOTE: Setup thread for caller to use. daemon=True is load-bearing for uWSGI reloads: the pull loop
-    # blocks in client.pull() (a long-poll) and can't be interrupted mid-call, and CPython's interpreter
-    # shutdown JOINS every non-daemon thread BEFORE atexit runs — so a non-daemon subscriber wedges the
-    # whole mule until the pull's deadline and uWSGI NO-MERCY-kills it. As a daemon it's abandoned at
-    # exit instead (stop_subscriber still gives it a brief chance to drain); an abandoned in-flight pull
-    # just means those messages are never acked, so Google redelivers them — nothing is lost.
+    # NOTE: Setup thread for caller to use. daemon=True is load-bearing for uWSGI reloads: a callback
+    # already executing cannot be interrupted (no Python thread can), and CPython's interpreter shutdown
+    # JOINS every non-daemon thread BEFORE atexit runs — so a non-daemon subscriber wedges the whole mule
+    # and uWSGI NO-MERCY-kills it. As a daemon it's abandoned at exit instead (stop_subscriber still gives
+    # it a brief chance to finish); an abandoned callback's transaction rolls back and its message was
+    # never acked, so Google redelivers it — nothing is lost.
     result = ThreadContext()
     result.thread = threading.Thread(
         target=thread_entry_point,
@@ -170,11 +180,13 @@ def start_subscriber(
 
 def stop_subscriber(context: ThreadContext) -> None:
     '''
-    Signal the subscriber pull loop to stop and wait briefly for it to drain (idempotent; safe to
-    call on shutdown even if never started). The thread is a daemon (see init): if it's blocked in a
-    pull and can't drain within the window it's abandoned at interpreter exit rather than wedging the
-    mule — unacked messages redeliver, so nothing is lost. The short wait is only to let a mid-batch
-    cycle finish cleanly when it can.
+    Signal the subscriber to stop and wait briefly for it to finish (idempotent; safe to call on
+    shutdown even if never started). Setting `sleep_event` is what makes this immediate: the loop waits on
+    that event, so it wakes at once rather than serving out its poll floor.
+
+    The thread is a daemon (see init): a callback that cannot finish within the window is abandoned at
+    interpreter exit rather than wedging the mule — its transaction rolls back and its message was never
+    acked, so Google redelivers it.
     '''
     context.kill_thread = True
     context.sleep_event.set()
@@ -351,279 +363,213 @@ def thread_entry_point(
     # subscriber thread body and runs only post-fork, inside the mule. A module-level import pulls
     # grpcio's background C threads into the uWSGI master, and the forked mule then segfaults on the
     # dead inherited threads. DO NOT HOIST these to the top of the file.
+    import concurrent.futures
+
     from google.cloud import pubsub_v1  # type: ignore[attr-defined]
-    import google.pubsub_v1.types
-    import google.api_core.exceptions
 
-    sorted_msg_list: list[SortedMessage] = []
+    # Imported by its full path rather than reached through `pubsub_v1.subscriber.scheduler`: that package's
+    # __init__ exports only `Client`, so the attribute path works or not depending on what else happened to
+    # import the submodule first.
+    from google.cloud.pubsub_v1.subscriber.scheduler import ThreadScheduler
 
-    # NOTE Load unhandled messages from the DB and insert it in to the list of messages to start off.
-    #
-    # The whole drain is guarded because this thread is started once per mule and is a daemon: an exception
-    # escaping here kills it silently, and the mule then runs on with Google notification processing off
-    # until somebody reloads it. Loading less than everything is survivable in a way that not running is
-    # not — every message missed here is still unacked, so Google redelivers it.
+    _replay_unhandled_backlog()
+
+    # Set by a callback once its work is committed, so the drain runs promptly after a burst rather than on
+    # the next poll. `Event.set()` is idempotent, so a hundred messages wake the loop once and cost one
+    # drain pass — the trigger is coalesced, not per-message. `stop_subscriber` sets the same event, which
+    # is what makes shutdown immediate rather than waiting out a poll.
+    def _on_message(message: typing.Any) -> None:
+        _handle_streamed_message(message)
+        context.sleep_event.set()
+
+    while not context.kill_thread:
+        try:
+            with pubsub_v1.SubscriberClient.from_service_account_file(app_credentials_path) as client:
+                sub_path = client.subscription_path(project=cloud_project_id, subscription=cloud_subscription_name)
+
+                # ONE worker, deliberately, and not a throughput oversight. Every line of this pipeline was
+                # written and reviewed under a serial handler, and a callback no longer does network I/O —
+                # the fetch moved into the drain, so what runs here is a decode and a couple of small
+                # writes. Concurrency would buy nothing measurable at this volume and would cost the
+                # property that makes the handler easy to reason about. Revisit with volume evidence, not
+                # on principle. Flow control is explicit for the same reason the old loop capped
+                # `max_messages`: an unbounded lease is a memory leak wearing a queue's clothes.
+                scheduler = ThreadScheduler(executor=concurrent.futures.ThreadPoolExecutor(max_workers=1))
+                future = client.subscribe(
+                    subscription=sub_path,
+                    callback=_on_message,
+                    flow_control=pubsub_v1.types.FlowControl(max_messages=100),
+                    scheduler=scheduler,
+                    # Without this the default is False, and `result()` after `cancel()` returns while
+                    # callbacks are still running — which would make the shutdown grace below do nothing at
+                    # all. It does not close the commit-then-ack window (nothing can), but it stops us
+                    # abandoning work we could simply have waited a moment for.
+                    await_callbacks_on_shutdown=True,
+                )
+                log.info('Google subscriber streaming')
+                try:
+                    while not context.kill_thread:
+                        # Woken by a callback, by shutdown, or by the poll floor. The floor is what services
+                        # the drain's own backoffs and anything enqueued by a reconcile rather than by a
+                        # notification; the mule's periodic task is still the backstop for both.
+                        context.sleep_event.wait(timeout=SUBSCRIBER_POLL_FLOOR_S)
+                        context.sleep_event.clear()
+                        if context.kill_thread:
+                            break
+
+                        if future.done():
+                            # Transient stream errors are retried inside the library, so reaching here means
+                            # it gave up. Surface the reason rather than reconnecting blind.
+                            future.result()
+                            break
+
+                        # Best-effort: neither of these may break the loop, and everything they leave
+                        # undone is still queued or still flagged.
+                        try:
+                            drain_due_reconciles(at=base.utc_now())
+                        except Exception:
+                            log.error(f'Reconcile drain failed from the subscriber. Error was {traceback.format_exc()}')
+                        try:
+                            _sweep_pending_acks()
+                        except Exception:
+                            log.error(f'Ack sweep failed from the subscriber. Error was {traceback.format_exc()}')
+                finally:
+                    # Undispatched messages are dropped unacked and redelivered; a callback already running
+                    # is allowed to finish, because no Python thread can be killed. See
+                    # `_handle_streamed_message` for why being abandoned mid-flight is harmless.
+                    future.cancel()
+                    try:
+                        future.result(timeout=SUBSCRIBER_SHUTDOWN_GRACE_S)
+                    except Exception:
+                        # Including the CancelledError the line above is expected to raise.
+                        pass
+        except Exception:
+            log.error(f'Google subscriber stream failed. Error was {traceback.format_exc()}')
+
+        # Paced, so a subscribe() that fails immediately -- bad credentials, a deleted subscription -- does
+        # not spin the mule at the speed of the error.
+        if not context.kill_thread:
+            context.sleep_event.wait(timeout=SUBSCRIBER_RECONNECT_DELAY_S)
+            context.sleep_event.clear()
+
+
+def _handle_streamed_message(message: typing.Any) -> None:
+    """Record one streamed RTDN, process it, and ack or nack it.
+
+    Runs on the subscriber's callback thread. Every failure path here nacks, which returns the message for
+    redelivery; the pacing of that redelivery is the SUBSCRIPTION's retry policy, not ours. The old loop
+    carried its own 1 s -> 600 s backoff, and there is no code left holding that responsibility -- see
+    `docs/deploy.md` for the settings that have to exist before this ships.
+
+    Being abandoned between the commit and the ack is possible and harmless: the message is redelivered,
+    `_process_notification_message` finds its row already marked handled, and acks it. That is the same
+    mechanism that makes at-least-once delivery a non-event, and it is why the history row is written
+    BEFORE the message is processed rather than alongside it.
+    """
+
+    err = base.ErrorSink()
+    published = base.readable(base.datetime_from_unix_ms(message.publish_time.timestamp() * 1000))
+    label = f'{message.message_id} (published at {published})'
+
+    parse = decode_notification(message.data, label, err)
+    if parse is None or err.has():
+        # Left unacked deliberately, rather than dropped. A payload we cannot read is either a format we do
+        # not understand yet or a bug, and both are better answered by a redelivery after a deploy than by
+        # silence. Its history row, if one was written, keeps it replayable past Pub/Sub's retention.
+        log.warning(
+            f'Could not decode notification {label}: {err.build() if err.has() else "no payload type"}\n'
+            f'Message was:\n{base.maybe_obfuscate(str(message.data))}'
+        )
+        message.nack()
+        return
+
     try:
         with db.connection() as conn:
             with db.transaction(conn) as tx:
-                db_it: collections.abc.Iterator[backend.GoogleUnhandledNotificationIterator] = (
-                    backend.google_get_unhandled_notification_iterator(tx)
-                )
-                for row in db_it:
-                    message_id = row[0]
-                    payload: str | None = row[1]
-                    if not payload:
-                        continue
-
-                    # Per row as well as per drain, for the same reason the pull loop decodes per message:
-                    # one unreadable stored payload must not cost us the rest of the backlog.
-                    tmp_err = base.ErrorSink()
-                    try:
-                        raw_msg = typing.cast(
-                            google.pubsub_v1.types.ReceivedMessage,
-                            google.pubsub_v1.types.ReceivedMessage.from_json(payload),
-                        )
-                    except Exception:
-                        log.warning(
-                            f'Skipping stored notification {message_id}: its envelope no longer decodes.\n'
-                            f'Reason was:\n{traceback.format_exc()}'
-                        )
-                        continue
-
-                    parse = decode_notification(raw_msg.message.data, f'stored notification {message_id}', tmp_err)
-                    if parse is None or tmp_err.has():
-                        # Leave it unhandled in the DB rather than queueing it. A parse that failed carries
-                        # payload_type Nil, which handle_parsed_notification treats as nothing-to-do and so
-                        # reports as SUCCESS — the message would be acked and the row marked handled, which
-                        # is how a notification we never understood would have disappeared silently.
-                        log.warning(
-                            f'Skipping stored notification {message_id}, leaving it unhandled: '
-                            f'{tmp_err.build() if tmp_err.has() else "payload could not be decoded"}'
-                        )
-                        continue
-
-                    sorted_msg_list.append(
-                        SortedMessage(
-                            event_unix_ts_ms=parse.event_time_ms,
-                            message_id=message_id,
-                            parse=parse,
-                            ack_id=raw_msg.ack_id,
-                            raw=raw_msg,
-                        )
-                    )
-    except Exception:
-        log.error(
-            f'Failed to load the unhandled notification backlog; continuing with the '
-            f'{len(sorted_msg_list)} loaded so far. Reason was:\n{traceback.format_exc()}'
-        )
-
-    # NOTE: Then connect to Google and start pulling messages
-    log.info(f'Loaded {len(sorted_msg_list)} unhandled messages from the DB')
-    while not context.kill_thread:
-        with pubsub_v1.SubscriberClient.from_service_account_file(app_credentials_path) as client:
-            sub_path = client.subscription_path(project=cloud_project_id, subscription=cloud_subscription_name)
-            # NOTE: We have a little bit of a problem here in terms of ordering. Google
-            # notifications for payments can come out of order and if we miss them, they can also be
-            # replayed out of order. Unfortunately in our initial designs we intended events to be
-            # processed in order, this is a natural tendency that seems to be ill-suited for
-            # integrating with Google given these behaviours.
-            #
-            # In Google payment notifications do not set the ordering keys such that an order can be
-            # enforced for the same user's event I have witnessed notifications coming out of order
-            # in replays and out of order within the same batch of messages downloaded at a time. We
-            # are forced to then sort by event timestamp after the fact with some reasonable buffer
-            # which adds to latency but will produce the desired outcomes.
-            #
-            # What maybe the more natural way to approach this system was to build an idempotent
-            # notification handling system with the following pattern:
-            #
-            #  - Getting a notification
-            #  - Compare last event timestamp we processed for the purchase token, ignore if it's
-            #    too old
-            #  - Get subscription details for the notification
-            #  - Create the row if it doesn't exist in the state that google says it should be in,
-            #    or, if already exists- state transition it into the state that google says it
-            #    should be and ignore any violations of invariants (the final state it ends up in
-            #    should be valid though)
-            #  - Repeat
-            #
-            # Example payload:
-            #
-            #   received_messages [{
-            #     ack_id: "HxknBUxeR..."
-            #     message {
-            #       data: "{\"version\":\"1.0\",\"packageName\":\"network.loki.messenger\",\"eventTimeMillis\":\"1762752016420\",...}"  # noqa: E501
-            #       message_id: "17064522705211191"
-            #       publish_time {
-            #         seconds: 1762752016
-            #         nanos: 631000000
-            #       }
-            #     }
-            #   }, ...]
-            while not context.kill_thread:
-                try:
-                    # NOTE: Pull messages from Google
-                    result: google.pubsub_v1.types.PullResponse = client.pull(
-                        subscription=sub_path, return_immediately=False, max_messages=64
-                    )
-
-                    # NOTE: Parse the received_messages[].message.data into our queue of messages
-                    now: float = time.time()
-                    ack_ids: list[str] = []
-                    for index, it in enumerate(result.received_messages):
-                        err = base.ErrorSink()
-                        published = base.readable(base.datetime_from_unix_ms(it.message.publish_time.ToMilliseconds()))
-                        decoded = decode_notification(it.message.data, f'#{index} (published at {published})', err)
-                        if decoded is None:
-                            continue
-                        parse = decoded
-                        message_id = it.message.message_id  # Pub/Sub ids are opaque strings — never int()-cast
-                        if err.has():
-                            log.warning(
-                                f'Discarding message #{index}: could not parse it '
-                                f'(published at {published}).\n'
-                                f'Message was:\n{base.maybe_obfuscate(str(it))}\n'
-                                f'Reason was:\n{err.build()}'
-                            )
-                        else:
-                            is_new_message = True
-                            for sort_it in sorted_msg_list:
-                                if sort_it.message_id == message_id:
-                                    is_new_message = False
-                                    break
-
-                            # NOTE: Record it in the DB BEFORE queueing it. The dedup lookup in
-                            # _process_notification_message reads an absent row as "handled" (someone
-                            # removed it out-of-band) and acks the message, so a message that reaches
-                            # sorted_msg_list without its row is acked to Google unprocessed — and an
-                            # acked notification is never redelivered. On failure we skip the message
-                            # instead, leaving it unacked so Google delivers it again.
-                            def add_notification_id_to_db():
-                                with db.connection() as conn:
-                                    with db.transaction(conn) as tx:
-                                        if not backend.google_notification_message_id_is_in_db(tx, message_id).present:
-                                            # NOTE: Our message retention policy for this subscription is 7 days
-                                            # (default). We add a little buffer as we don't know exactly which
-                                            # timestamp Google uses.
-                                            #
-                                            # We always store the messages to mitigate network failures on
-                                            # acknowledgement. We store this in JSON because in the
-                                            # erroneous case there's highly likelihood we need human
-                                            # intervention and having human-readability there will be
-                                            # important.
-                                            backend.google_add_notification_id(
-                                                tx,
-                                                message_id=message_id,
-                                                expires_at=base.datetime_from_unix_ms(
-                                                    parse.event_time_ms + base.MILLISECONDS_IN_DAY * 8
-                                                ),
-                                                payload=google.pubsub_v1.types.ReceivedMessage.to_json(it),
-                                            )
-
-                            try:
-                                add_notification_id_to_db()
-                            except Exception:
-                                log.warning(
-                                    f'Discarding message #{index}: could not record it in the DB, leaving '
-                                    f'it unacknowledged for redelivery (published at {published}).\n'
-                                    f'Message was:\n{base.maybe_obfuscate(str(it))}\n'
-                                    f'Reason was:\n{traceback.format_exc()}'
-                                )
-                                continue
-
-                            if is_new_message:
-                                sorted_msg_list.append(
-                                    SortedMessage(
-                                        event_unix_ts_ms=parse.event_time_ms,
-                                        message_id=message_id,
-                                        parse=parse,
-                                        ack_id=it.ack_id,
-                                        raw=it,
-                                    )
-                                )
-
-                    # NOTE: Sort the messages we've added
-                    if len(result.received_messages):
-                        sorted_msg_list.sort(key=lambda it: it.event_unix_ts_ms)
-
-                    # NOTE: Attempt to process them in order
-                    index = 0
-                    while index < len(sorted_msg_list):
-                        err = base.ErrorSink()
-                        msg: SortedMessage = sorted_msg_list[index]
-                        attempt: bool = now > msg.next_retry_unix_ts_s
-                        handled: bool = False
-
-                        # NOTE: Attempt to process the message. Just before we execute it, we also check
-                        # that it hasn't been handled in the DB already. It's possible that someone
-                        # out-of-band executed the SET_GOOGLE_NOTIFICATION command via environment/.ini
-                        # file to mark a message as being done or handled so we check before proceeding.
-                        if attempt:
-                            try:
-                                with db.connection() as conn:
-                                    handled = _process_notification_message(conn, msg, err, now)
-                            except Exception:
-                                # NOTE: On any exception (e.g. the DB was momentarily unavailable) we just
-                                # mark the message not handled; this bumps its retry delay and reattempts.
-                                handled = False
-
-                        # NOTE: On success, we remove the message and add it to the acknowledge list
-                        # (to stop Google resending it), or otherwise configure an exponential back-off
-                        # on the retry and skip the message
-                        if handled:
-                            sorted_msg_list.pop(index)
-                            ack_ids.append(msg.ack_id)
-                        else:
-                            index += 1
-                            if attempt:
-                                # NOTE: Exponential backoff on retries. Hopefully, this gives us some time,
-                                # for the out-of-order messages that this message is dependent on to arrive,
-                                # get sorted into order and then executed successfully.
-                                msg.increase_retry_delay(now)
-                                emitted = base.readable(base.datetime_from_unix_ms(msg.event_unix_ts_ms))
-                                log.error(
-                                    f'Failed to handle message, retrying in {msg.curr_retry_delay_s}s '
-                                    f'(message was emitted at {emitted}). '
-                                    f'Reason was\n{err.build()}\n'
-                                    f'Message was\n{base.maybe_obfuscate(str(msg.raw))}'
-                                )
-
-                    # NOTE: Acknowledge the messages we handled successfully to stop Google from
-                    # resending it to us
-                    if len(ack_ids):
-                        try:
-                            client.acknowledge(subscription=sub_path, ack_ids=ack_ids)
-                        except google.api_core.exceptions.InvalidArgument:
-                            # NOTE: Ignore double-ack, especially if the notification we had was very
-                            # old and we only got around to completing it now rather than when it was
-                            # still ackable
-                            #
-                            #  InvalidArgument: 400 Some acknowledgement ids in the request were
-                            # invalid. This could be because the acknowledgement ids have expired or the
-                            # acknowledgement ids were malformed. [reason: "EXACTLY_ONCE_ACKID_FAILURE"
-                            pass
-                except Exception:
-                    log.error(f'Google notification handling failed. Error was {traceback.format_exc()}')
-
-                # Drain what this pull just enqueued, BEFORE the ack sweep, because the drain is what
-                # creates the payment rows the sweep then acknowledges. Triggered here rather than left to
-                # the periodic task purely for latency: the subscriber and the drain share this process, so
-                # the call is free, and it puts purchase-to-Pro back where the old inline handler had it —
-                # the fetch used to happen here, and now happens one call later. The maintenance task
-                # remains the backstop for crashes, backlogs and anything enqueued elsewhere.
+                # BEFORE handling, because `_process_notification_message` reads an absent row as "handled"
+                # (someone cleared it out-of-band) and acks. A message that reaches processing without its
+                # row would therefore be acked unprocessed, and an acked notification is never redelivered.
                 #
-                # Best-effort, like the sweep below: a drain failure must not break the pull loop, and
-                # every token it could not finish is still queued.
-                try:
-                    drain_due_reconciles(at=base.utc_now())
-                except Exception:
-                    log.error(f'Reconcile drain failed from the pull loop. Error was {traceback.format_exc()}')
+                # Stored as JSON because a message that needs this row needs a human to read it. Retention
+                # is our own 8 days against Pub/Sub's 7, so the row outlives the store's copy.
+                backend.google_add_notification_id(
+                    tx,
+                    message_id=message.message_id,
+                    expires_at=base.datetime_from_unix_ms(parse.event_time_ms + base.MILLISECONDS_IN_DAY * 8),
+                    payload=json.dumps({'data': message.data.decode('utf-8', errors='replace')}),
+                )
 
-                # Acknowledge any purchases still owing a Google ack, right before blocking on the next
-                # pull. Decoupled from handling (which only records the obligation): this is the sole
-                # acker, and running it every iteration covers fresh purchases, failed-ack retries, and
-                # startup/crash leftovers uniformly — no special startup path.
-                _sweep_pending_acks()
+            sorted_msg = SortedMessage(
+                event_unix_ts_ms=parse.event_time_ms, message_id=message.message_id, parse=parse, raw=message
+            )
+            handled = _process_notification_message(conn, sorted_msg, err, time.time())
+    except Exception:
+        log.error(f'Failed to handle notification {label}. Error was {traceback.format_exc()}')
+        message.nack()
+        return
+
+    if handled:
+        message.ack()
+    else:
+        log.error(f'Failed to handle notification {label}. Reason was:\n{err.build()}')
+        message.nack()
+
+
+def _replay_unhandled_backlog() -> None:
+    """Re-run notifications recorded but never handled, once, at subscriber startup.
+
+    Not redundant with Pub/Sub redelivery, which covers the same ground for seven days: past that the
+    history row is the only copy of the message anywhere, and this is the only thing that replays it. That
+    is what makes "ship the fix weeks later, restart, and the backlog applies itself" true -- which this
+    project has already relied on once, for notifications that wedged on an unrecognised base plan.
+
+    Guarded as a whole and per row, because this thread is a daemon started once per mule: an exception
+    escaping here kills it silently and Google processing is off until somebody reloads. Replaying less than
+    everything is survivable in a way that not running at all is not.
+    """
+    replayed = 0
+    try:
+        with db.connection() as conn:
+            with db.transaction(conn) as tx:
+                rows = list(backend.google_get_unhandled_notification_iterator(tx))
+
+            for row in rows:
+                message_id, payload = row[0], row[1]
+                if not payload:
+                    continue
+
+                err = base.ErrorSink()
+                try:
+                    stored = json.loads(payload)
+                    data = stored['data'].encode('utf-8') if isinstance(stored, dict) and 'data' in stored else None
+                except Exception:
+                    log.warning(f'Skipping stored notification {message_id}: its envelope no longer decodes.')
+                    continue
+                if data is None:
+                    log.warning(f'Skipping stored notification {message_id}: no payload recorded.')
+                    continue
+
+                parse = decode_notification(data, f'stored notification {message_id}', err)
+                if parse is None or err.has():
+                    # Left unhandled rather than marked done. A failed parse carries payload_type Nil, which
+                    # handle_parsed_notification treats as nothing-to-do and reports as SUCCESS -- so this
+                    # is how a notification we never understood would disappear silently.
+                    log.warning(
+                        f'Skipping stored notification {message_id}, leaving it unhandled: '
+                        f'{err.build() if err.has() else "payload could not be decoded"}'
+                    )
+                    continue
+
+                # No ack path: any stored ack_id is long dead, and a message still live at Pub/Sub is
+                # redelivered anyway and acked by the dedup once this marks it handled.
+                msg = SortedMessage(event_unix_ts_ms=parse.event_time_ms, message_id=message_id, parse=parse)
+                if _process_notification_message(conn, msg, err, time.time()):
+                    replayed += 1
+    except Exception:
+        log.error(f'Failed to replay the unhandled notification backlog. Reason was:\n{traceback.format_exc()}')
+
+    if replayed:
+        log.info(f'Replayed {replayed} unhandled notification(s) from the DB')
 
 
 def require_obfuscated_external_account_id(tx_event: SubscriptionPlanEventTransaction, err: base.ErrorSink) -> bytes:
