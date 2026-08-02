@@ -66,18 +66,23 @@ class Task:
 def _prune() -> None:
     now = base.utc_now()
     with db.connection() as conn:
-        result = backend.expire_payments_revocations_and_users(conn=conn, now=now)
-    if result.success:
-        log.info(
-            'Pruned expired rows (revocations/users/apple/google={}/{}/{}/{})'.format(
-                result.revocations,
-                result.users,
-                result.apple_notification_uuid_history,
-                result.google_notification_history,
-            )
-        )
-    else:
-        log.error('DB prune failed')
+        # The deletes are unrelated, so one failing (a lock timeout, a transient error) must not hold the
+        # others back until the next tick: attempt and report each separately. Safe to keep using `conn`
+        # after a failure because it is autocommit — a failed statement is its own rolled-back transaction,
+        # not an aborted block that poisons everything after it.
+        deletes: list[tuple[str, typing.Callable[[], int]]] = [
+            ('revocations', lambda: backend.delete_expired_revocations(conn, now)),
+            ('apple', lambda: backend.delete_expired_apple_notification_uuids(conn, now)),
+            ('google', lambda: backend.delete_expired_google_notifications(conn, now)),
+        ]
+        counts: list[str] = []
+        for name, delete in deletes:
+            try:
+                counts.append(f'{name}={delete()}')
+            except Exception:
+                log.error(f'Prune of {name} failed:\n{traceback.format_exc()}')
+                counts.append(f'{name}=FAILED')
+    log.info(f'Pruned expired rows ({", ".join(counts)})')
 
 
 def loop(tasks: list[Task], stop: threading.Event) -> None:

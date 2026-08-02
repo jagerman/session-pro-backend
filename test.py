@@ -1447,6 +1447,53 @@ def test_stale_revocation_is_not_served(pg_database):
     pool.close()
 
 
+def test_expired_revocations_are_pruned_once_unservable(pg_database):
+    # The prune is the exact complement of the served window: it removes a revoked generation once, and
+    # only once, get_pro_revocations can no longer return it — except for one a user is still sitting on,
+    # which the NOT NULL users.current_generation_id FK requires us to keep at any age.
+    pool = backend.bootstrap_db(database_url=pg_database())
+    assert pool
+
+    now = base.datetime_from_unix_seconds(1_700_000_000)
+    cutoff = now - base.REVOCATION_RETAIN_FOR
+    master_pkey = nacl.signing.SigningKey.generate().verify_key
+    with db.connection() as conn:
+        with db.transaction(conn) as tx:
+            user_id, gen_current, token_current, _created = backend.get_or_create_user_and_generation(
+                tx, master_pkey, now
+            )
+            gen_stale, token_stale = backend.mint_generation(tx, user_id, now)
+            gen_boundary, token_boundary = backend.mint_generation(tx, user_id, now)
+            gen_recent, token_recent = backend.mint_generation(tx, user_id, now)
+
+        revoked_at = {
+            gen_current: cutoff - pendulum.duration(seconds=1),  # aged out, but the user still points here
+            gen_stale: cutoff - pendulum.duration(seconds=1),
+            gen_boundary: cutoff,  # served filter is `revoked_at > cutoff`, so this one is already unserved
+            gen_recent: cutoff + pendulum.duration(seconds=1),
+        }
+        with db.transaction(conn) as tx:
+            for generation_id, at in revoked_at.items():
+                db.query(tx.conn, "UPDATE generations SET revoked_at = %s WHERE id = %s", at, generation_id)
+
+        assert backend.delete_expired_revocations(conn, now) == 2
+
+        remaining = {it.token for it in backend.get_revocations_list(conn)}
+        assert bytes(token_current) in remaining, 'the FK forbids deleting the generation a user is on'
+        assert bytes(token_recent) in remaining
+        assert bytes(token_stale) not in remaining
+        assert bytes(token_boundary) not in remaining
+
+        # Nothing the prune removed was still being served, and nothing it kept has stopped being served
+        # for a reason other than the user-is-on-it exemption.
+        served = {it.token for it in backend.get_revocations_list(conn, revoked_after=cutoff)}
+        assert served == {bytes(token_recent)}
+
+        # Idempotent: a second pass at the same instant has nothing left to do.
+        assert backend.delete_expired_revocations(conn, now) == 0
+    pool.close()
+
+
 def _redeem_and_prove(conn, backend_key, master_key, rotating_key, request_at):
     """The reflow's client flow: generate_pro_proof reconciles any pending payments for the key (redeeming
     whatever the mule registered, bound by the master-key-derived account-id) and returns the proof.
@@ -1672,12 +1719,8 @@ def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_d
     revocation_list: list[backend.RevocationRow] = backend.get_revocations_list(db_conn)
     assert not revocation_list
 
-    expire_result: backend.ExpireResult = backend.expire_payments_revocations_and_users(
-        db_conn, now=scenarios[0].expires_at
-    )
-    assert expire_result.success
-    assert expire_result.revocations == 0
-    assert expire_result.users == 0
+    backend.delete_expired_apple_notification_uuids(db_conn, now=scenarios[0].expires_at)
+    backend.delete_expired_google_notifications(db_conn, now=scenarios[0].expires_at)
 
     # NOTE: Update the latest payments grace period but set auto-renewing off
     payment_tx = base.PaymentProviderTransaction()
@@ -3669,9 +3712,9 @@ def test_platform_apple(pg_database):
 
         # NOTE: Run the housekeeping sweep at an instant past the payment's expiry
         with test.connection() as conn:
-            backend.expire_payments_revocations_and_users(
-                conn=conn, now=payment_list[0].expires_at + pendulum.duration(milliseconds=1)
-            )
+            past_expiry = payment_list[0].expires_at + pendulum.duration(milliseconds=1)
+            backend.delete_expired_apple_notification_uuids(conn, now=past_expiry)
+            backend.delete_expired_google_notifications(conn, now=past_expiry)
 
             # NOTE: The sweep leaves the payment untouched — expiry is derived on read, never marked.
             payment_list = backend.get_payments_list(conn)
@@ -5196,19 +5239,16 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             )
         return base.unix_ms_from_datetime(base.round_datetime_to_next_day(base.datetime_from_unix_ms(tx.event_ms)))
 
-    def backend_expire_payments_at_end_of_day(event_ms: int, assert_success: bool = False):
+    def run_prune_at_end_of_day(event_ms: int):
         boundary_ms = base.unix_ms_from_datetime(
             backend.round_datetime_to_next_day_with_provider_testing_support(
                 payment_provider=base.PaymentProvider.GooglePlayStore, at=base.datetime_from_unix_ms(event_ms)
             )
         )
-        end_of_day_ts_ms = event_ms + boundary_ms
+        end_of_day = base.datetime_from_unix_ms(event_ms + boundary_ms)
         with ctx.connection() as conn:
-            expire_result = backend.expire_payments_revocations_and_users(
-                conn=conn, now=base.datetime_from_unix_ms(end_of_day_ts_ms)
-            )
-        if assert_success:
-            assert expire_result.success
+            backend.delete_expired_apple_notification_uuids(conn, now=end_of_day)
+            backend.delete_expired_google_notifications(conn, now=end_of_day)
 
     """
     Testing Assert Utility Functions
@@ -5820,7 +5860,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
         )
 
         # Expire payments at the EOD of the resubscribe expiry_ts (note the extend expiry_ts from the grace period tx)
-        backend_expire_payments_at_end_of_day(event_ms=tx_grace.event_ms, assert_success=True)
+        run_prune_at_end_of_day(event_ms=tx_grace.event_ms)
 
         # Now that payments up to the expiry time has been expired, this user's status should be expired (we need to also time-travel the clock past the grace period they were allocated)
         assert_payment_details(
@@ -5872,7 +5912,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             ctx=ctx,
         )
 
-        backend_expire_payments_at_end_of_day(event_ms=tx_expire.event_ms, assert_success=True)
+        run_prune_at_end_of_day(event_ms=tx_expire.event_ms)
         # Now that payments up to the expiry time has been expired, this user's status should be expired
         assert_payment_details(
             tx=tx_renew,
@@ -6316,7 +6356,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
 
         # Expire payments
         # Now that payments up to the expiry time has been expired, this user's status should be expired
-        backend_expire_payments_at_end_of_day(event_ms=tx_expire.event_ms, assert_success=True)
+        run_prune_at_end_of_day(event_ms=tx_expire.event_ms)
         assert_payment_details(
             tx=tx_renew_2,
             pro_status=server.UserProStatus.Expired,
@@ -6348,7 +6388,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
         )
 
         # Now that payments up to the expiry time has been expired, this user's status should be expired
-        backend_expire_payments_at_end_of_day(event_ms=tx_grace.event_ms, assert_success=True)
+        run_prune_at_end_of_day(event_ms=tx_grace.event_ms)
         assert_payment_details(
             tx=tx_resubscribe,
             pro_status=server.UserProStatus.Expired,
@@ -6564,7 +6604,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             user_ctx=user_ctx,
             ctx=ctx,
         )
-        backend_expire_payments_at_end_of_day(event_ms=tx_grace.event_ms, assert_success=True)
+        run_prune_at_end_of_day(event_ms=tx_grace.event_ms)
         # Now that payments up to the expiry time has been expired, this user's status should be expired
         assert_payment_details(
             tx=tx_subscribe,
@@ -6806,7 +6846,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             ctx=ctx,
         )
         # Expire payments at the EOD of the resubscribe expiry_ts (not the extend expiry_ts from the grace period tx)
-        backend_expire_payments_at_end_of_day(event_ms=tx_grace.event_ms, assert_success=True)
+        run_prune_at_end_of_day(event_ms=tx_grace.event_ms)
         # Now that payments up to the expiry time has been expired, this user's status should be expired
         assert_payment_details(
             tx=tx_subscribe,
@@ -7024,7 +7064,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             user_ctx=user_ctx,
             ctx=ctx,
         )
-        backend_expire_payments_at_end_of_day(event_ms=tx_grace.event_ms, assert_success=True)
+        run_prune_at_end_of_day(event_ms=tx_grace.event_ms)
         # Now that payments up to the expiry time has been expired, this user's status should be expired
         assert_payment_details(
             tx=tx_subscribe,
@@ -7490,7 +7530,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             user_ctx=user_ctx,
             ctx=ctx,
         )
-        backend_expire_payments_at_end_of_day(event_ms=tx_grace.event_ms, assert_success=True)
+        run_prune_at_end_of_day(event_ms=tx_grace.event_ms)
 
         # Now that payments up to the expiry time has been expired, this user's status should be expired
         assert_payment_details(
@@ -7783,7 +7823,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             user_ctx=user_ctx,
             ctx=ctx,
         )
-        backend_expire_payments_at_end_of_day(event_ms=tx_grace.event_ms, assert_success=True)
+        run_prune_at_end_of_day(event_ms=tx_grace.event_ms)
         # Now that payments up to the expiry time has been expired, this user's status should be expired
         assert_payment_details(
             tx=tx_change_plan,
