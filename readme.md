@@ -642,10 +642,14 @@ token, then:
 
 **Subscription expiry**
 
-Every ten minutes the maintenance mule prunes the database of expired entries
-(`backend.expire_payments_revocations_and_users`). Payments are not pruned yet, so
-that clients can look up their payment history through `/get_payment_details`, but
-it could be done trivially by checking the expiry timestamp.
+Every ten minutes the maintenance mule prunes the database, running one delete per
+table and logging what each removed: `backend.delete_expired_revocations`,
+`delete_expired_apple_notification_uuids` and `delete_expired_google_notifications`.
+Each is attempted independently, so one failing does not hold back the rest.
+
+Payments and users are never deleted. Payments are the history
+`/get_payment_details` serves, and a user cannot be deleted while a payment
+references them. Both tables therefore grow without bound.
 
 **Using proofs on the Session protocol**
 

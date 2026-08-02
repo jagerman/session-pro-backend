@@ -121,7 +121,8 @@ CREATE TABLE IF NOT EXISTS generations (
     revoked_at TIMESTAMPTZ                                    -- NULL = live; set = revoked at this instant
 );
 CREATE INDEX IF NOT EXISTS generations_user_id_idx    ON generations (user_id);
--- The served revocation list scans only revoked rows; the daily sweep prunes long-past ones.
+-- Serves both readers of revoked rows: the served revocation list, and the sweep that deletes the ones
+-- that have aged out of it (backend.delete_expired_revocations).
 CREATE INDEX IF NOT EXISTS generations_revoked_at_idx ON generations (revoked_at) WHERE revoked_at IS NOT NULL;
 
 -- The circular back-reference: users.current_generation_id -> generations.id. DEFERRABLE INITIALLY

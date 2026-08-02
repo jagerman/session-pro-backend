@@ -133,15 +133,6 @@ class GoogleNotificationMessageIDInDB:
 
 
 @dataclasses.dataclass
-class ExpireResult:
-    success: bool = False
-    revocations: int = 0
-    users: int = 0
-    apple_notification_uuid_history: int = 0
-    google_notification_history: int = 0
-
-
-@dataclasses.dataclass
 class ProSubscriptionProof:
     version: int = 0
     revocation_tag: bytes = b''  # the generation's stored random 32-byte token
@@ -1826,7 +1817,11 @@ def get_or_create_user_and_generation(
 ) -> tuple[int, int, bytes, bool]:
     '''Ensure a user row AND its first generation exist for master_pkey. Race-free via ON CONFLICT on the
     master_pkey unique index. Returns (user_id, current_generation_id, token, was_created). Must run inside
-    a transaction (the circular users<->generations FK is deferred to COMMIT).'''
+    a transaction (the circular users<->generations FK is deferred to COMMIT).
+
+    The caller must link at least one payment to the returned user in that SAME transaction, so a user is
+    never committed without one. Nothing sweeps up a user that has no payments, so one committed without
+    would be permanent.'''
     master_pkey_bytes = bytes(master_pkey)
 
     # Common path: the user already exists — a plain read, no id/generation allocation burned.
@@ -2268,30 +2263,57 @@ def grant_rangeproof(
     return build_current_entitlement_proof(tx, master_pkey, rotating_pkey, request_at, signing_key)
 
 
-def expire_payments_revocations_and_users(conn: psycopg.Connection, now: pendulum.DateTime) -> ExpireResult:
-    # Pure idempotent housekeeping: prune rows whose expiry has passed (and orphaned users). Nothing
-    # here affects live results — payment expiry is derived on read, and every consuming query
-    # self-guards on expiry (e.g. is_generation_revoked) — so this can run on any schedule, any number
-    # of times, in any process, and only ever frees storage. Hence no `last_expire` checkpoint /
-    # windowing / cross-process "only one wins" guard: a redundant run simply deletes nothing.
-    result = ExpireResult()
-    with db.transaction(conn) as tx:
-        # A revocation is generations.revoked_at, and generations are entitlement history (FK'd from
-        # users.current_generation_id), so they aren't deleted here — the served revocation list filters
-        # by retain_for instead. (Safely pruning ancient, unreferenced revoked generations is a later item.)
-        users_result = db.query(
-            tx.conn, '''DELETE FROM users WHERE id NOT IN (SELECT user_id FROM payments WHERE user_id IS NOT NULL)'''
-        )
-        apple_result = db.query(tx.conn, '''DELETE FROM apple_notification_uuid_history WHERE %s >= expires_at''', now)
-        google_result = db.query(
-            tx.conn, '''DELETE FROM google_notification_history WHERE %s >= expires_at AND handled = TRUE''', now
-        )
-        result.revocations = 0
-        result.users = users_result.rowcount
-        result.apple_notification_uuid_history = apple_result.rowcount
-        result.google_notification_history = google_result.rowcount
-        result.success = True
-    return result
+# Housekeeping deletes, one table each. All are pure storage reclamation: nothing here affects a live
+# result, because every consuming query already self-guards (payment expiry is derived on read, the served
+# revocation list filters by its retention window, a notification id absent from the history is simply
+# unseen). So each can run on any schedule, any number of times, in any process, and a redundant run
+# deletes nothing — hence no checkpoint, no windowing, no cross-process "only one wins" guard. Each is a
+# single statement on an autocommit connection, so none of them needs a transaction, and they are separate
+# calls so that one failing does not roll back the others.
+#
+# Users and payments are never deleted. Payments are the history /get_payment_details serves, and
+# payments.user_id is a RESTRICT reference, so a user cannot be deleted for as long as one of their
+# payments exists — which is always (see get_or_create_user_and_generation).
+
+
+def delete_expired_revocations(conn: psycopg.Connection, now: pendulum.DateTime) -> int:
+    """Delete revoked generations that have aged out of the served revocation list, returning the number
+    removed.
+
+    The cutoff is exactly the complement of the window get_pro_revocations serves (`revoked_at > now -
+    REVOCATION_RETAIN_FOR`), so a row is only ever deleted once it can no longer appear in any response —
+    keep the two in step. Dropping it is then invisible: REVOCATION_RETAIN_FOR is at least the maximum
+    proof lifetime, so no proof still carrying this generation's token can be valid, and the token was
+    random, so a later generation cannot collide with it.
+
+    The `NOT EXISTS` is what makes this safe rather than merely tidy: a generation is a user's entitlement
+    epoch, and `users.current_generation_id` is a NOT NULL FK to it, so the row a user is sitting on must
+    survive however old its revocation is. In practice a live user is never that row (a revoked generation
+    is replaced by a fresh one on the next entitlement change), but a user whose entitlement has not been
+    touched since being revoked still points at it."""
+    return db.query(
+        conn,
+        '''
+        DELETE FROM generations g
+        WHERE  g.revoked_at IS NOT NULL AND g.revoked_at <= %(cutoff)s
+        AND    NOT EXISTS (SELECT 1 FROM users u WHERE u.current_generation_id = g.id)
+        ''',
+        cutoff=now - base.REVOCATION_RETAIN_FOR,
+    ).rowcount
+
+
+def delete_expired_apple_notification_uuids(conn: psycopg.Connection, now: pendulum.DateTime) -> int:
+    """Delete Apple notification-dedupe rows whose expiry has passed, returning the number removed."""
+    return db.query(conn, '''DELETE FROM apple_notification_uuid_history WHERE %s >= expires_at''', now).rowcount
+
+
+def delete_expired_google_notifications(conn: psycopg.Connection, now: pendulum.DateTime) -> int:
+    """Delete handled Google notification-history rows whose expiry has passed, returning the number
+    removed. An unhandled row is kept regardless of age: it is the record that the notification still
+    owes processing."""
+    return db.query(
+        conn, '''DELETE FROM google_notification_history WHERE %s >= expires_at AND handled = TRUE''', now
+    ).rowcount
 
 
 @db.transactional
