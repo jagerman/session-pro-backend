@@ -46,6 +46,22 @@ Keep this in sync with the code — it describes real branches, not intentions.
 
 \* known base plans: `session-pro-{1-month,3-months,12-months}`.
 
+**Store-config invariant — never set a base plan's grace period to 0 days.**
+
+Play does not honour a zero grace. It substitutes a 24-hour **silent grace period** during which the
+subscription still reads `SUBSCRIPTION_STATE_ACTIVE` and **no RTDN is sent at all**:
+
+> "You can set a grace period of 0 days, but Play will wait a minimum of 1 day to ensure sufficient time
+> for payment retries. This silent grace period offers a safety net for payment processing. During this
+> 24-hour period the subscription remains in the `ACTIVE` state."
+> — https://developer.android.com/google/play/billing/lifecycle/subscriptions
+
+Every other grace setting reaches us as an extended `expiryTime` on the subscription resource, which is
+where we read grace from. A zero setting is the one value that produces a documented silence instead, so a
+subscriber whose renewal fails would lapse a day early with nothing in any log to say why. This costs
+entitlement rather than latency, and it is one toggle away in the Play Console. All current plans are set
+to 1 day.
+
 **Handled / intentionally safe (no action needed):**
 - **Subscription full refund / revoke** — `voidedPurchaseNotification` `SUBSCRIPTION`+`FULL_REFUND` is an
   intentional **no-op** because subscription revocation is handled by the separate **`SUBSCRIPTION_REVOKED`**
