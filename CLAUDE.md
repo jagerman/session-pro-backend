@@ -77,6 +77,20 @@ coverage) + Σ remaining`, and anchoring on the checkpoint rather than on `now` 
 instant: each drain pass advances the checkpoint by exactly what it charged. Reaching for the wall clock
 there makes the expiry walk forward on every pass.
 
+**The schema defines the data, never what the code wants from the data.** A column holds exactly one
+domain fact; code adapts to the data, not the reverse. The grace-period column is this repo's
+cautionary tale: it held our notification-latency allowance most of the time and the store's dunning
+window during grace — two unrelated quantities sharing a column because both satisfied the consumer
+("a number to add to expiry"), with nothing marking which was present — and it bit months later,
+from a direction nobody predicted. The rules that fall out: our policy values (config, allowances)
+are applied **on read** and never stored beside store facts, because a stored constant fossilises;
+**NULL means the fact does not apply or was never stated** (a voucher has no grace concept; Google
+expresses grace by moving `expiryTime`) — never encode absence as `0` or a sentinel, and never
+introduce a NULL-vs-value distinction no domain input can produce; never store a marker derivable
+from other columns (it drifts, and nothing enforces it). "Show me code that reads the distinction"
+is not a valid argument for or against a schema shape in either direction — consumers legitimately
+inform indexes and migration risk, never meaning.
+
 ## Documentation map
 
 | File | What it is |
