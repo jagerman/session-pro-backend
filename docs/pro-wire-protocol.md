@@ -323,6 +323,30 @@ Each **payment item** carries: `status` (payment `code`), `plan`, `payment_provi
 `revoked_ts` (float), and the opaque `payment_id` — a backend-owned identifier the client stores and
 compares for equality but never parses.
 
+#### `expiry_ts` and `grace_period_duration` — two levels, two meanings
+
+`grace_period_duration` is **not** the same quantity on a payment item and on `get_pro_status`, and a client
+must not treat them interchangeably:
+
+- On a **payment item** it is what the *store declared* about that one transaction: a dunning window the
+  store granted without folding it into its own expiry. `0` where the store declared none.
+- On **`get_pro_status`** it is how much longer the *account* is served past `expiry_ts` — the store's grace
+  plus the backend's renewal-latency allowance, and `0` when the subscription is not auto-renewing (nothing
+  is in flight, so nothing is being waited for).
+
+The account-level pair is self-consistent: `expiry_ts + grace_period_duration` is exactly the instant the
+backend stops serving, and is the same instant `user_status` flips from `active` to `expired`. A client that
+wants "am I still Pro?" should read `user_status`; a client that wants "until when?" can add the two.
+
+**`expiry_ts` reports the end of the term the store currently states, which is not always the paid-through
+date.** Apple leaves its expiry alone and declares grace separately, so an Apple subscription in grace
+reports the paid term with the grace beside it. Google Play instead applies grace by *extending* its own
+expiry, and the backend does not know the configured amount to subtract — so a Google subscription in grace
+reports an `expiry_ts` that already includes the grace, with only the allowance beside it. The stop-serving
+arithmetic above holds in both cases; what differs is how the same window is split between the two fields.
+A client displaying a renewal date should expect it to move forward by the grace period when a Google
+renewal fails, which is not a renewal and not an error.
+
 ### 5.3 Pagination cursor (`get_payment_details`)
 
 `get_payment_details` uses **keyset** (seek) pagination, never numeric offsets. The client sends

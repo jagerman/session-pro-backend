@@ -315,7 +315,6 @@ def get_pro_status():
                 # TRUE expiry, straight from the store, so any sub-second part is floored (wire spec §1)
                 # — unlike the proof's expiry, which lands on a whole second by construction (§2.3).
                 expiry_ts = base.unix_seconds_from_datetime(user.expiry_at)
-                grace_period_duration = base.seconds_from_duration(user.grace_period)
 
                 # Status decided against the *request* clock (signed, anti-replay-bounded to ≈now) —
                 # the same clock the latest item's derived status uses, never a second time.time().
@@ -328,6 +327,15 @@ def get_pro_status():
                 # threshold.
                 coverage_end = backend.account_coverage_end(user)
                 user_pro_status = UserProStatus.Active if request_at <= coverage_end else UserProStatus.Expired
+
+                # Derived from the same instant the status is judged against, so `expiry_ts +
+                # grace_period_duration` is exactly when we stop serving and a client can reconcile the two
+                # rather than finding `active` next to numbers that say otherwise. This is how much longer
+                # we serve past the expiry shown — the account's state — and NOT the same quantity as the
+                # payment-level field of this name, which reports what a store declared about one
+                # transaction. `account_coverage_end` already returns the bare expiry when the subscription
+                # is not renewing, so the gate is in the arithmetic rather than bolted on after it.
+                grace_period_duration = base.seconds_from_duration(coverage_end - user.expiry_at)
                 if backend.is_generation_revoked(tx.conn, user.current_generation_id, request_at):
                     user_pro_status = UserProStatus.Expired
 
@@ -340,7 +348,7 @@ def get_pro_status():
             'user_status': user_pro_status.value,
             'auto_renewing': auto_renewing,
             'expiry_ts': expiry_ts,
-            'grace_period_duration': grace_period_duration if auto_renewing else 0,
+            'grace_period_duration': grace_period_duration,
             'error_report': error_report,
             'latest_payment': latest_payment,
         }

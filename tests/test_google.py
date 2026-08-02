@@ -561,10 +561,15 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             # expiry precedes the refund by a fifth of a "day".
             assert res_expiry_ts == to_s(min(tx.expiry_at, revoke_unix_ts_ms))
         else:
-            expiry_at = res_expiry_ts
-            if res_auto_renewing:
-                expiry_at -= res_grace_period_duration
-            assert expiry_at == to_s(tx.expiry_at), json.dumps(result, indent=1)
+            # The account's expiry is reported as the store states it, with nothing added: no subtraction
+            # to undo. What the account is SERVED past that instant is the separate duration below.
+            assert res_expiry_ts == to_s(tx.expiry_at), json.dumps(result, indent=1)
+            # And the pair reconciles: expiry + duration is when serving stops, which is the same instant
+            # `user_status` flips. Google declares no separate grace, so this is our allowance alone.
+            expected_served_past = base.seconds_from_duration(base.RENEWAL_LATENCY_ALLOWANCE)
+            assert res_grace_period_duration == (expected_served_past if res_auto_renewing else 0), json.dumps(
+                result, indent=1
+            )
         assert res_pro_status == pro_status
         item = res_latest
         assert isinstance(item, dict)
