@@ -420,7 +420,7 @@ def handle_notification_tx(
                     log.debug(
                         f'{notif_type} for {payment_tx_id_label(payment_tx)}: '
                         f'New payment (expiry/unredeemed/refund expiry) ts = {expiry}/{unredeemed}/{refund}, '
-                        f'grace period = {base.DEFAULT_APPLE_GRACE_PERIOD}, auto-renewing = {auto_renewing}'
+                        f'grace period = {base.RENEWAL_LATENCY_ALLOWANCE}, auto-renewing = {auto_renewing}'
                     )
 
                 # NOTE: Process notification
@@ -445,7 +445,7 @@ def handle_notification_tx(
                     backend.update_payment_renewal_info(
                         sql_tx,
                         payment_tx=payment_tx,
-                        grace_period=base.DEFAULT_APPLE_GRACE_PERIOD,
+                        grace_period=base.RENEWAL_LATENCY_ALLOWANCE,
                         auto_renewing=auto_renewing,
                         err=err,
                     )
@@ -534,13 +534,13 @@ def handle_notification_tx(
                         # info that we need to set auto-renewal back on for
                         log.debug(
                             f'{notif_type}+DOWNGRADE for {payment_tx_id_label(payment_tx)}: '
-                            f'Grace period = {base.DEFAULT_APPLE_GRACE_PERIOD}, auto-renewing = true'
+                            f'Grace period = {base.RENEWAL_LATENCY_ALLOWANCE}, auto-renewing = true'
                         )
                         sql_tx.cancel = True
                         backend.update_payment_renewal_info(
                             sql_tx,
                             payment_tx=payment_tx,
-                            grace_period=base.DEFAULT_APPLE_GRACE_PERIOD,
+                            grace_period=base.RENEWAL_LATENCY_ALLOWANCE,
                             auto_renewing=True,
                             err=err,
                         )
@@ -572,7 +572,7 @@ def handle_notification_tx(
                                 f'{notif_type}+UPGRADE for {payment_tx_id_label(payment_tx)}: '
                                 f'Revoke (orig. TX ID) date = {revoke}, '
                                 f'new payment (expiry/unredeemed/refund expiry) ts = {expiry}/{unredeemed}/{refund}, '
-                                f'grace period = {base.DEFAULT_APPLE_GRACE_PERIOD}, auto-renewing = {auto_renewing}'
+                                f'grace period = {base.RENEWAL_LATENCY_ALLOWANCE}, auto-renewing = {auto_renewing}'
                             )
 
                         sql_tx.cancel = True
@@ -611,7 +611,7 @@ def handle_notification_tx(
                             backend.update_payment_renewal_info(
                                 sql_tx,
                                 payment_tx=payment_tx,
-                                grace_period=base.DEFAULT_APPLE_GRACE_PERIOD,
+                                grace_period=base.RENEWAL_LATENCY_ALLOWANCE,
                                 auto_renewing=None,
                                 err=err,
                             )
@@ -740,7 +740,7 @@ def handle_notification_tx(
                             f'{notif_type}+UPGRADE for {payment_tx_id_label(payment_tx)}: '
                             f'Revoking (orig TX id) at = {revoke}, '
                             f'new payment (expiry/unredeemed/refund ts) = {expiry}/{unredeemed}/{refund}, '
-                            f'grace = {base.DEFAULT_APPLE_GRACE_PERIOD}, auto-renewing = {auto_renewing}'
+                            f'grace = {base.RENEWAL_LATENCY_ALLOWANCE}, auto-renewing = {auto_renewing}'
                         )
 
                     revoked = backend.add_apple_revocation(
@@ -770,7 +770,7 @@ def handle_notification_tx(
                         backend.update_payment_renewal_info(
                             sql_tx,
                             payment_tx=payment_tx,
-                            grace_period=base.DEFAULT_APPLE_GRACE_PERIOD,
+                            grace_period=base.RENEWAL_LATENCY_ALLOWANCE,
                             auto_renewing=auto_renewing,
                             err=err,
                         )
@@ -913,7 +913,7 @@ def handle_notification_tx(
                 auto_renewing = decoded_notification.body.subtype == AppleSubtype.AUTO_RENEW_ENABLED
                 log.debug(
                     f'{notif_type} for {payment_tx_id_label(payment_tx)}: '
-                    f'Auto-renewing = {auto_renewing}, grace period = {base.DEFAULT_APPLE_GRACE_PERIOD}'
+                    f'Auto-renewing = {auto_renewing}, grace period = {base.RENEWAL_LATENCY_ALLOWANCE}'
                 )
                 backend.update_payment_renewal_info(
                     sql_tx, payment_tx=payment_tx, grace_period=None, auto_renewing=auto_renewing, err=err

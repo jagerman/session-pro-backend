@@ -181,6 +181,37 @@ def test_voucher_processing_window_config(tmp_path, monkeypatch):
     assert any('voucher_processing_window' in m for m in excinfo.value.errors)
 
 
+def test_renewal_latency_allowance_config(tmp_path, monkeypatch):
+    # Our allowance for learning that a renewal happened -- not any store's grace period. Defaults to an
+    # hour, read from the .INI, and bounded at BOTH ends, unlike the voucher window: this value extends
+    # every renewing subscriber's entitlement, so a units slip (milliseconds pasted into a seconds field)
+    # would silently grant everyone decades of Pro. A week is well past any plausible outage.
+    #
+    # Zero is allowed: it means "honour exactly the paid-through instant", which is a coherent thing to ask
+    # for even if nobody sensible wants it in production.
+    for k in list(os.environ):
+        if k.startswith('SESH_PRO_BACKEND_'):
+            monkeypatch.delenv(k, raising=False)
+
+    assert config.parse_args().renewal_latency_allowance == base.RENEWAL_LATENCY_ALLOWANCE
+
+    def parse_with(value: str) -> config.ParsedArgs:
+        ini = tmp_path / f'a{value.strip("-")}.ini'
+        body = f'db_url = postgresql:///x\nbackend_key_path = /k\nrenewal_latency_allowance = {value}\n'
+        ini.write_text(f'[base]\n{body}')
+        monkeypatch.setenv('SESH_PRO_BACKEND_INI_PATH', str(ini))
+        return config.parse_args()
+
+    assert parse_with('7200').renewal_latency_allowance == base.duration_from_seconds(7200)
+    assert parse_with('0').renewal_latency_allowance == pendulum.duration()
+    assert parse_with(str(7 * base.SECONDS_IN_DAY)).renewal_latency_allowance == 7 * base.DAY
+
+    for bad in ('-1', str(7 * base.SECONDS_IN_DAY + 1), '3600000'):
+        with pytest.raises(config.ConfigError) as excinfo:
+            parse_with(bad)
+        assert any('renewal_latency_allowance' in m for m in excinfo.value.errors), excinfo.value.errors
+
+
 def test_migrations_bootstrap_and_idempotency(pg_database):
     # bootstrap_db runs the schema/ migrations; every migration file should be recorded, the globals
     # rows seeded exactly once, and a second pass must be a clean no-op (nothing re-run or duplicated).

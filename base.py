@@ -155,19 +155,26 @@ def unix_seconds_float_from_datetime(value: pendulum.DateTime) -> float:
     return (value - EPOCH) / pendulum.duration(seconds=1)
 
 
-# Grace periods added to a subscription's paid-through instant, because no billing cycle charges exactly
-# on the dot: without one, a renewal that lands minutes late reads as a lapse and the user loses Pro.
-# Per-provider policy — the providers behave differently, so each has its own value.
-
-# Apple configures no grace period at all, so this is entirely ours: it absorbs the variance in when the
-# end-of-cycle billing actually executes, so a late charge doesn't cost the user their Pro status.
-DEFAULT_APPLE_GRACE_PERIOD: pendulum.Duration = 1 * HOUR
-
-# Google has a real grace period but doesn't report it until the subscriber enters the renewing state;
-# this stands in until that notification arrives. Without it, a user watching their Pro state across the
-# expiry boundary sees it flicker Pro → not-Pro → Pro as the renewal lands. A provider testing environment
-# overrides this at runtime with Google's much shorter test value (providers/google_play/mule.py).
-DEFAULT_GOOGLE_GRACE_PERIOD: pendulum.Duration = 1 * HOUR
+# How long we keep honouring a RENEWING subscription past its paid-through instant while we wait to learn
+# whether it renewed. Without it a user watching their status across that boundary sees it flicker
+# Pro → not-Pro → Pro as the renewal lands.
+#
+# This is OURS, and it is not a store grace period. A store grace period is the window a store keeps
+# entitling a user while it retries a declined card — a different quantity, with a different cause, an order
+# of magnitude larger (Google: 1 day, configured in the Play Console). Apple states its own separately and
+# leaves its expiry untouched, so that has to be stored per payment; Google folds its own into the expiry it
+# reports, so there is nothing to store. Neither is this.
+#
+# The distinction is load-bearing. `payments.grace_period` used to hold whichever of the two wrote last —
+# this value on the purchase path, Google's dunning window on the in-grace path, differing by 24x with
+# nothing marking which was present — and converging the store's already-extended expiry on top of it
+# counted a subscriber's grace twice.
+#
+# One value across providers, because it describes OUR pipeline's latency, and our pipeline is not slower
+# for Apple. Settable as `renewal_latency_allowance` in the [base] config so it can be raised ahead of
+# planned maintenance; a provider testing environment overrides it at runtime, since an hour would swamp a
+# subscription whose "day" is ten seconds.
+RENEWAL_LATENCY_ALLOWANCE: pendulum.Duration = 1 * HOUR
 
 # NOTE: Global variables
 UNSAFE_LOGGING = False

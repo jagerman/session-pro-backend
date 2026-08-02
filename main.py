@@ -38,6 +38,7 @@ def entry_point() -> flask.Flask:
     base.UNSAFE_LOGGING = parsed_args.unsafe_logging
     db.set_dsn(parsed_args.db_url)
     base.PROVIDER_TESTING_ENV = parsed_args.provider_testing_env
+    base.RENEWAL_LATENCY_ALLOWANCE = parsed_args.renewal_latency_allowance
     base.PROVIDER_DRY_RUN = parsed_args.provider_dry_run
 
     # NOTE: log_path is deliberately ignored here. Under uWSGI the vassal's `logto` already captures

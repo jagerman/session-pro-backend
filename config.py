@@ -57,6 +57,10 @@ class ParsedArgs:
     # only how promptly a spent voucher stops entitling the account, and how the write load is spread.
     voucher_processing_window: pendulum.Duration = 1 * base.DAY
 
+    # How long a renewing subscription is honoured past its paid-through instant while we wait to learn
+    # whether it renewed. Ours, not a store's — see base.RENEWAL_LATENCY_ALLOWANCE.
+    renewal_latency_allowance: pendulum.Duration = base.RENEWAL_LATENCY_ALLOWANCE
+
     session_webhooks: list[SessionWebhook] = dataclasses.field(default_factory=list)
 
     apple_key_id: str = ''
@@ -107,6 +111,24 @@ def parse_args() -> ParsedArgs:
         result.provider_dry_run = base_section.getboolean(option='provider_dry_run', fallback=False)
 
         result.dev_endpoints = base_section.getboolean(option='dev_endpoints', fallback=False)
+
+        allowance_s = base_section.getint(option='renewal_latency_allowance', fallback=None)
+        if allowance_s is not None:
+            if allowance_s < 0:
+                errors.append(f'renewal_latency_allowance must not be negative, got {allowance_s}')
+            else:
+                # Bounded above as well as below, unlike the voucher window: this value EXTENDS entitlement,
+                # so a units slip (milliseconds pasted into a seconds field) silently grants everyone years
+                # of Pro. A week is well past any plausible outage and still orders of magnitude below a
+                # typo.
+                max_allowance_s = 7 * base.SECONDS_IN_DAY
+                if allowance_s > max_allowance_s:
+                    errors.append(
+                        f'renewal_latency_allowance must not exceed {max_allowance_s}s (7 days), '
+                        f'got {allowance_s} — it extends every renewing subscriber\'s entitlement'
+                    )
+                else:
+                    result.renewal_latency_allowance = base.duration_from_seconds(allowance_s)
 
         window_s = base_section.getint(option='voucher_processing_window', fallback=None)
         if window_s is not None:

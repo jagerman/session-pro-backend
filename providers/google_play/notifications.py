@@ -776,7 +776,7 @@ def reconcile_google_subscription(
     # The grace period is a property of the base plan, and only worth an extra API call when the store says
     # the subscription is actually in it. Everywhere else the configured default is what the old
     # per-notification branches used.
-    grace_period = base.DEFAULT_GOOGLE_GRACE_PERIOD
+    grace_period = base.RENEWAL_LATENCY_ALLOWANCE
     if tx_event.subscription_state == SubscriptionsV2State.IN_GRACE_PERIOD:
         plan_details = api.fetch_subscription_details_for_base_plan_id(base_plan_id=tx_event.base_plan_id, err=err)
         if err.has() or plan_details is None:
@@ -917,7 +917,7 @@ def handle_subscription_notification(
 
                     if not err.has():
                         set_purchase_grace_period_duration(
-                            tx_payment=tx_payment, tx=tx, grace_period=base.DEFAULT_GOOGLE_GRACE_PERIOD, err=err
+                            tx_payment=tx_payment, tx=tx, grace_period=base.RENEWAL_LATENCY_ALLOWANCE, err=err
                         )
 
         case SubscriptionNotificationType.IN_GRACE_PERIOD:
@@ -976,7 +976,7 @@ def handle_subscription_notification(
 
                     if not err.has():
                         set_purchase_grace_period_duration(
-                            tx_payment=tx_payment, tx=tx, grace_period=base.DEFAULT_GOOGLE_GRACE_PERIOD, err=err
+                            tx_payment=tx_payment, tx=tx, grace_period=base.RENEWAL_LATENCY_ALLOWANCE, err=err
                         )
 
         case SubscriptionNotificationType.CANCELED:

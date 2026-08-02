@@ -62,7 +62,7 @@ class TestingContext:
     flask_client: werkzeug.Client
     provider_testing_env: bool = False
     db_url_factory: typing.Callable[[], str] | None = None
-    saved_google_grace_period: pendulum.Duration = base.DEFAULT_GOOGLE_GRACE_PERIOD
+    saved_renewal_allowance: pendulum.Duration = base.RENEWAL_LATENCY_ALLOWANCE
 
     def __init__(self, db_url_factory: typing.Callable[[], str], provider_testing_env: bool = False):
         self.db_url_factory = db_url_factory
@@ -70,9 +70,9 @@ class TestingContext:
 
     def __enter__(self):
         base.PROVIDER_TESTING_ENV = self.provider_testing_env
-        self.saved_google_grace_period = base.DEFAULT_GOOGLE_GRACE_PERIOD
+        self.saved_renewal_allowance = base.RENEWAL_LATENCY_ALLOWANCE
         if base.PROVIDER_TESTING_ENV:
-            base.DEFAULT_GOOGLE_GRACE_PERIOD = base.duration_from_ms(google_play.api.testing_grace_period_duration_ms)
+            base.RENEWAL_LATENCY_ALLOWANCE = base.duration_from_ms(google_play.api.testing_renewal_latency_allowance_ms)
 
         # Mint a fresh database on the ephemeral PostgreSQL cluster
         assert self.db_url_factory is not None
@@ -97,7 +97,7 @@ class TestingContext:
     ):
         self.db_engine.close()
         base.PROVIDER_TESTING_ENV = False
-        base.DEFAULT_GOOGLE_GRACE_PERIOD = self.saved_google_grace_period
+        base.RENEWAL_LATENCY_ALLOWANCE = self.saved_renewal_allowance
         return False
 
     @contextlib.contextmanager
