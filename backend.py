@@ -1065,12 +1065,29 @@ def refresh_entitlement_and_revoke_overreaching_proofs(
     if surviving_now is not None and surviving_now >= prior_expiry:
         return False
 
-    # An account that was expiring within the day anyway is not worth an entry in the revocation list every
-    # client fetches. A proof built against it can reach the renewal lead plus a whole grid period (≤ ~25 h)
-    # past that boundary, so one can outlive this early-out by that much: accepted, because the entitlement
-    # was ending regardless and the outcome is bounded. Testing environments compress a "day" (Google: 10 s),
-    # hence the provider-aware rounding.
-    if prior_expiry <= round_datetime_to_next_day_with_provider_testing_support(base.PaymentProvider.Nil, at):
+    # An account that was ending within a grid period anyway is not worth an entry in the revocation list
+    # every client fetches. A proof built against it can outlive this by the renewal lead plus two grid
+    # periods: accepted, because the entitlement was ending regardless and the overreach is bounded.
+    #
+    # Denominated in the PROOF GRID, not in calendar days. It used to ask whether `prior_expiry` fell before
+    # the next UTC midnight, which is a boundary that no longer governs anything this decision cares about —
+    # proof expiries land on the account's own random grid, and nothing in the revocation machinery is
+    # day-aligned (retention is denominated in proof lifetime, `effective_ts` is a stamp plus a delay, and
+    # the served list is window-filtered rather than day-bucketed).
+    #
+    # That framing also made an ORDINARY LAPSE broadcast. A lapse drops coverage by exactly the allowance —
+    # the renewal flag goes false, so `expiry + allowance` becomes `expiry` — which slips past the delta
+    # gate above; this check then compared two instants within an allowance of each other, so it really
+    # asked "did a midnight fall between them". For a term ending in the last hour before midnight it did,
+    # and a subscription that quietly ended landed in a retained list. That rate is the allowance as a
+    # fraction of a day: one lapse in twenty-four at the default hour, one in four if the setting is raised
+    # to six hours ahead of maintenance — worst exactly when the knob is being used.
+    #
+    # The bound is not a loosening: the old rule already admitted a `prior_expiry` up to a full day past
+    # `at` whenever `at` fell just after midnight. This accepts the same worst case uniformly instead of
+    # letting the wall clock decide which accounts get it. Testing environments compress the grid, so the
+    # comparison follows them without needing a provider-aware special case.
+    if prior_expiry <= at + base.proof_expiry_shape().grid:
         return False
 
     # The furthest any outstanding proof can reach: a proof reaches at most `max_proof_lifetime` past its

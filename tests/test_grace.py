@@ -10,7 +10,6 @@ pins the total, not the parts, because the parts were individually defensible ea
 
 import nacl.signing
 import pendulum
-import pytest
 
 import backend
 import base
@@ -174,10 +173,9 @@ def test_an_ordinary_lapse_publishes_no_revocation(pg_database):
     pool.close()
 
 
-@pytest.mark.xfail(strict=True, reason='known defect: coverage crossing midnight defeats the day-boundary early-out')
 def test_a_lapse_near_midnight_publishes_no_revocation(pg_database):
-    # The same ordinary lapse, with the term ending inside the last hour of a UTC day. It publishes a
-    # revocation, and it should not.
+    # The same ordinary lapse, with the term ending inside the last hour of a UTC day -- the case that used
+    # to publish a revocation.
     #
     # `refresh_entitlement_and_revoke_overreaching_proofs` skips the broadcast when the entitlement was
     # ending within the day anyway, asking `prior_coverage <= round_to_next_day(at)`. On a lapse those two
@@ -204,4 +202,31 @@ def test_a_lapse_near_midnight_publishes_no_revocation(pg_database):
         before = len(backend.get_revocations_list(conn))
         _converge(conn, sub, expiry_at=lapses_at, auto_renewing=False, at=lapses_at)
         assert len(backend.get_revocations_list(conn)) == before, 'a lapse is not a revocation'
+    pool.close()
+
+
+def test_a_mid_term_refund_still_publishes_a_revocation(pg_database):
+    # The companion to the two lapse tests, and the reason they are not simply "never broadcast". Quieting
+    # the lapse case must not quieten a genuine fall: a refund partway through a paid term cuts coverage by
+    # far more than the bounded window the early-out accepts, so the proofs already signed overstate the
+    # account and every client has to be told.
+    pool = backend.bootstrap_db(database_url=pg_database())
+    assert pool
+    backend_key = nacl.signing.SigningKey.generate()
+    rotating_key = nacl.signing.SigningKey.generate()
+
+    with db.connection() as conn:
+        T = base.round_datetime_to_next_day(base.utc_now())
+        f = _CreditFixture(conn, T)
+        sub = f.subscribe(expiry_at=T + 365 * base.DAY)
+        _redeem_and_prove(conn, backend_key, f.master_key, rotating_key, T)
+
+        before = len(backend.get_revocations_list(conn))
+        err = base.ErrorSink()
+        with db.transaction(conn) as tx:
+            assert backend.add_google_revocation(
+                tx, google_payment_token=sub.google_payment_token, revoke_at=T + 30 * base.DAY, err=err
+            )
+        assert not err.msg_list, err.msg_list
+        assert len(backend.get_revocations_list(conn)) > before, 'a refund mid-term is not a lapse'
     pool.close()
