@@ -192,6 +192,50 @@ is what the loud-guard is for.
 
 Deliberate trade-offs, not bugs or dormant handlers. Recorded so they aren't rediscovered as surprises.
 
+### Changing Session identity loses a store subscription — KNOWN GAP, NOT ACCEPTED (raised 2026-08-03)
+
+The one entry here that is **not** a trade-off. It is a real user-visible defect with no code remedy today,
+recorded so it is a known TODO rather than a support mystery.
+
+A user who deletes and recreates their Session account keeps paying their store subscription and silently
+loses Pro. There is no way for them to recover it, and no way for us to move it.
+
+Why it is structural rather than a bug in one path:
+
+- Both stores bind a subscription to an account identifier at PURCHASE time and never revise it. Google's
+  `obfuscatedAccountId` is set by `setObfuscatedAccountId` when the billing flow is launched — Play
+  documents the field as present because it "was specified using `setObfuscatedAccountId` when the purchase
+  was made" — and Apple's `appAccountToken` is `uuid_from_master_pk(pubkey)`. A renewal does not re-run the
+  purchase flow, so the resource reports the ORIGINAL key for the life of the subscription.
+- Claiming is key equality with no override: `reconcile_pending_payments` treats holding the master key as
+  the claim itself, because the store attests the identifier as a function of that key. A new identity
+  presents a key that matches nothing.
+- Nothing rewrites the stored account id. `google_converge_payment` refuses deliberately — it "adjusts the
+  terms of a payment, never who holds it" — which is the right rule for convergence and the reason this
+  cannot be fixed by accident.
+
+So every renewal registers a payment attributed to a key the user no longer controls, and their new account
+sees nothing.
+
+**What support can do today:** `cli.py voucher` grants a *parallel* complimentary payment to the new master
+pkey. It restores the user's Pro but does not move the store payment or stop the charging, so the account is
+covered twice while the old subscription runs on. The alternative is cancel-and-repurchase, forfeiting the
+remainder of the paid term.
+
+**Candidate fixes, in increasing cost:**
+
+1. An admin re-attribution command: point an existing payment's account id at a new master pkey and re-run
+   the claim. Small, support-operable, no wire or client change — it makes the existing manual remedy exact
+   instead of approximate.
+2. A client-driven re-association route. The client on the new identity can enumerate its own store
+   purchases and submit the purchase token; the backend verifies it against the store and re-attributes.
+   This is the real fix. Possession is reasonable evidence — only a device signed into that store account
+   can enumerate it — but it is a new authenticated route plus client work on both platforms, and it needs
+   designing so a token cannot be used to capture someone else's subscription.
+
+Note the narrower form of this already exists inside the resubscription fallback above: a user who rotated
+identities between subscriptions is attributed to the keys they no longer hold. Same root cause.
+
 ### Proof expiry-value metadata channel (privacy; accepted 2026-07-20, narrowed 2026-07-30)
 
 Proofs ride on the user's messages, so a conversation partner or group member — who already knows the
