@@ -85,14 +85,18 @@ USERS_COLUMNS = ", ".join(
         "u.current_generation_id",
         "g.token",
         "u.expiry_at",
-        "u.grace_period",
+        # Coalesced at the read, not in the column. NULL there says "no store grace applies to this
+        # account", which is the honest fact; no consumer of the user row distinguishes it from zero — the
+        # wire reports 0 either way and the coverage arithmetic adds 0 either way — so the query hands
+        # callers the form they want rather than making each of them handle the absence.
+        "COALESCE(u.grace_period, '0'::interval) AS grace_period",
         "u.auto_renewing",
         "u.proof_expiry_offset",
     )
 )
 USERS_FROM = "users u JOIN generations g ON g.id = u.current_generation_id"
 
-# payments.payment_provider / .plan and user_errors.payment_provider store the string `code` directly
+# payments.payment_provider / .plan store the string `code` directly
 # (the lookup tables payment_providers/pro_plans use the code as their PRIMARY KEY, FK'd for validity).
 # So there's no id indirection: the enum's `.value` IS the stored value, and reads map it straight back
 # via base.PaymentProvider(...)/base.ProPlan(...).
@@ -142,11 +146,11 @@ class ProSubscriptionProof:
     # --- Advisory account-entitlement value: NOT signed and NOT part of the proof message (the signed
     # message is revocation_tag ‖ rotating_pkey ‖ expiry_at). Populated by
     # build_current_entitlement_proof from the SAME DB snapshot that produced the proof, so a proof
-    # fetch also hands the client its current subscription horizon in one response. This is the TRUE
-    # entitlement end (grace-inclusive, matching what get_pro_status reports), except in the closing
-    # window where the proof's over-provision runs past it and it reads back the proof's own expiry so
-    # that `expiry_at <= account_expiry_at` always holds. Deliberately distinct from `expiry_at`
-    # above, which is the rolling, clamped (~30 d) proof validity — never conflate the two.
+    # fetch also hands the client its current subscription horizon in one response. This is the TRUE end
+    # of the paid term, matching what get_pro_status reports and carrying NEITHER the store's grace nor
+    # our renewal-latency allowance — those are how long we keep SERVING, not how long was paid for.
+    # Deliberately distinct from `expiry_at` above, which is the rolling, clamped (~30 d) proof validity,
+    # and which may therefore run PAST this value — never conflate the two.
     # Display state only; the signed proof + revocation list remain authoritative.
     # Left at the default on any proof built without a user context (none today). ---
     account_expiry_at: pendulum.DateTime = base.EPOCH
@@ -177,13 +181,14 @@ class ProSubscriptionProof:
 
 @dataclasses.dataclass
 class LookupUserExpiry:
-    # `None` expiry = "no such payment found yet". Durations default to zero.
+    # `None` expiry = "no such payment found yet". `None` grace = the winning payment declares no store
+    # grace, carried through rather than flattened because this is what gets written back to `users`.
     expiry_from_redeemed: pendulum.DateTime | None = None
-    grace_from_redeemed: pendulum.Duration = pendulum.duration()
+    grace_from_redeemed: pendulum.Duration | None = None
     auto_renewing_from_redeemed: bool = False
 
     best_expiry: pendulum.DateTime | None = None
-    best_grace: pendulum.Duration = pendulum.duration()
+    best_grace: pendulum.Duration | None = None
     best_auto_renewing: bool = False
 
 
@@ -194,13 +199,6 @@ AddRevocationIterator: typing.TypeAlias = tuple[
 GoogleUnhandledNotificationIterator: typing.TypeAlias = tuple[
     str, str | None, pendulum.DateTime  # message_id (opaque string)  # payload
 ]  # expiry_at
-
-
-@dataclasses.dataclass
-class UserError:
-    provider: base.PaymentProvider = base.PaymentProvider.Nil
-    apple_original_tx_id: str = ''
-    google_payment_token: str = ''
 
 
 @dataclasses.dataclass
@@ -258,6 +256,9 @@ class PaymentRow:
     # None while a live credit's length has not run out: nothing has determined where its coverage ends yet.
     # Set for every store subscription, and latched by the drain when a credit is spent.
     expiry_at: pendulum.DateTime | None = None
+    # A store grace currently in effect that the store declared SEPARATELY from its own expiry — Apple does,
+    # Play instead extends `expiryTime`. None everywhere else, including a payment grace cannot apply to at
+    # all (a credit, a one-shot), which is why this is not derivable from `payment_provider`.
     grace_period: pendulum.Duration | None = None
     platform_refund_expiry_at: pendulum.DateTime = base.EPOCH
     revoked_at: pendulum.DateTime | None = None
@@ -291,7 +292,8 @@ class UserRow:
     grace_period: pendulum.Duration = pendulum.duration()
     auto_renewing: bool = False
     # This account's private proof-expiry grid: expiries land on `UTC midnight + this + k * one day`.
-    # Re-drawn whenever `expiry_at` moves. See new_proof_expiry_offset / _build_proof_clamped_expiry_time.
+    # Re-drawn when `expiry_at` EXTENDS, and whenever a generation is minted; a shrink keeps it. See
+    # _offset_redrawn_if_expiry_extends for why, and _build_proof_clamped_expiry_time for what it buys.
     proof_expiry_offset: int = 0
 
 
@@ -315,7 +317,7 @@ class RevocationRow:
 class AllocatedGenID:
     found: bool = False
     expiry_at: pendulum.DateTime | None = None
-    grace_period: pendulum.Duration = pendulum.duration()
+    grace_period: pendulum.Duration | None = None
     generation_id: int = 0
     token: bytes = b''
 
@@ -477,7 +479,7 @@ def payment_row_from_dict(row: dict[str, typing.Any]) -> PaymentRow:
     result.purchased_at = row['purchased_at']
     result.redeemed_at = row['redeemed_at']  # NULL until redeemed
     result.expiry_at = row['expiry_at']
-    result.grace_period = row['grace_period']  # nullable
+    result.grace_period = row['grace_period']
     result.platform_refund_expiry_at = row['platform_refund_expiry_at']
     result.revoked_at = row['revoked_at']  # NULL unless revoked
     result.apple.original_tx_id = str(row['apple_original_tx_id']) if row['apple_original_tx_id'] else ''
@@ -511,20 +513,45 @@ def derive_payment_status(payment: PaymentRow, now: pendulum.DateTime) -> base.P
 
 
 def subscription_coverage_end(
-    expiry_at: pendulum.DateTime, grace_period: pendulum.Duration | None, auto_renewing: bool
+    expiry_at: pendulum.DateTime, store_grace: pendulum.Duration | None, auto_renewing: bool
 ) -> pendulum.DateTime:
-    """The instant a subscription payment stops covering the account: its paid-through expiry, plus the
-    grace period only when a renewal is going to be attempted.
+    """The instant a subscription payment stops covering the account: its paid-through expiry, plus any
+    window we are still honouring on top — but only while a renewal is going to be attempted.
 
-    Grace is the window after a renewal payment FAILS, so it exists only for an auto-renewing payment. A
-    cancelled subscription still carries the grace value in its column while `auto_renewing` has gone
-    false and `expiry_at` is untouched — it covers the account to the end of the paid term and not a
-    moment longer.
+    Two spans, both applied HERE and neither stored:
+
+    * `store_grace` — a dunning window the store granted and stated separately (Apple). NULL where the
+      store folds it into its own expiry instead (Play extends `expiryTime`), and where grace is not a
+      concept for the payment at all (a credit, a one-shot).
+    * `base.RENEWAL_LATENCY_ALLOWANCE` — ours, config, covering the gap between a term ending and us
+      learning whether it renewed. Read at call time rather than captured, so raising the setting ahead of
+      maintenance moves accounts that already have payments; a stored copy would fossilise and protect
+      nobody who mattered.
+
+    BOTH are gated on `auto_renewing`, which is the whole reason no mechanism is needed to clear store
+    grace when it ends. Grace is the window after a renewal payment FAILS, so it exists only while one is
+    still being attempted: a subscriber who cancels mid-billing-retry keeps a 16-day value in the column
+    and is covered to the end of the paid term and not a moment longer. Gating only the allowance would
+    over-entitle that account by the remainder of the store's window.
 
     Shared by the entitlement fold and the credit drain deliberately: if the two disagreed about when
     coverage ends, an account could be entitled while its credits drain, or hold protected credits while
     reading as expired."""
-    return expiry_at + grace_period if (auto_renewing and grace_period is not None) else expiry_at
+    if not auto_renewing:
+        return expiry_at
+    grace = store_grace if store_grace is not None else pendulum.duration()
+    return expiry_at + grace + base.RENEWAL_LATENCY_ALLOWANCE
+
+
+def account_coverage_end(user: UserRow) -> pendulum.DateTime:
+    """`subscription_coverage_end` asked of the account snapshot rather than of one payment row.
+
+    Same shape at a different level: `users` carries the winning payment's raw expiry, its store grace and
+    its renewal flag, so the arithmetic is identical and deliberately not duplicated. Every consumer asking
+    "is this account still covered" goes through one of these two, because a consumer that reads
+    `users.expiry_at` directly is reading the TRUE end of the paid term — which is the honest thing to show
+    a user, and the wrong thing to make a serving decision on."""
+    return subscription_coverage_end(user.expiry_at, user.grace_period, user.auto_renewing)
 
 
 @dataclasses.dataclass
@@ -873,7 +900,8 @@ def new_proof_expiry_offset() -> int:
 
     Two properties are load-bearing, both for the same reason — an observer reads the offset off any proof
     and is trying to work backwards from it (see `_build_proof_clamped_expiry_time` for what the offset
-    buys, and `schema/003_proof_expiry_offset.sql` for why it is stored and re-drawn per cycle):
+    buys, `_offset_redrawn_if_expiry_extends` for when it is re-drawn, and
+    `schema/003_proof_expiry_offset.sql` for why it is stored rather than derived):
     UNPREDICTABLE, so it must come from the CSPRNG and never from the clock or the account key; and
     UNIFORM over the full period, since a skew re-clusters the expiry times the offset exists to scatter.
     '''
@@ -882,17 +910,39 @@ def new_proof_expiry_offset() -> int:
     return int.from_bytes(nacl.utils.random(8), 'big') % base.proof_expiry_shape().offset_range
 
 
-# Re-draw `users.proof_expiry_offset` exactly when the account's true expiry MOVES. Both users of this
-# clause set expiry_at from the payment list, so "moved" is the honest trigger for a new subscription
-# cycle: it covers a redeem, a renewal, a stacked purchase and a revocation, and skips a no-op refresh (a
-# flag-only touch, a re-reconcile that claims nothing). That precision matters in both directions — never
-# re-drawing against a fixed anniversary instant would leave a stable per-account fingerprint, while
-# re-drawing on every touch would hand an observer repeated samples of the same true expiry, whose minimum
-# converges straight back onto it.
-_REDRAW_OFFSET_IF_EXPIRY_MOVED = (
-    "proof_expiry_offset = CASE WHEN expiry_at IS DISTINCT FROM %(expiry)s"
-    " THEN %(proof_random_offset)s ELSE proof_expiry_offset END"
-)
+def _offset_redrawn_if_expiry_extends(expiry: pendulum.DateTime | None) -> str:
+    '''The SQL value for `users.proof_expiry_offset`: a fresh draw when the account's true expiry EXTENDS,
+    the stored one otherwise. Both callers set expiry_at from the payment list, so an extension is the
+    honest trigger for a new subscription cycle — a redeem, a renewal, a stacked purchase.
+
+    Precision matters in three directions. Never re-drawing would leave a stable per-account fingerprint
+    against a fixed anniversary instant. Re-drawing on a no-op refresh (a flag-only touch, a re-reconcile
+    that claims nothing) would hand an observer repeated samples of one true expiry, whose minimum converges
+    straight back onto it. And re-drawing on a SHRINK would let a reduction in entitlement hand out MORE
+    coverage: the served expiry is the true one rounded up onto `EPOCH + offset + k*grid`, so an independent
+    new offset lands anywhere in the following period and can overshoot what the longer expiry served. Keep
+    the offset and the grid is unchanged, so rounding up a smaller value can only give a smaller result.
+
+    Keeping it on a shrink costs no privacy: the offset is not secret — the served expiry IS a grid point,
+    so its time-of-day is the offset (test_proof_expiry_lands_on_the_account_grid asserts exactly that). What
+    the offset hides is the true expiry within one period, and that only degrades under repeated independent
+    draws against a MATERIALLY UNCHANGED expiry, which is the case this still excludes. (Strictly, an
+    extension smaller than one period — a grace-duration edit moving `expiry + grace` by minutes — also
+    re-draws against a near-identical value, but that happens a handful of times in a subscription's life,
+    nowhere near enough for the minimum to converge.)
+
+    ONE EXCEPTION, applied by the caller rather than here: minting a generation forces a re-draw regardless.
+    A broadcast revocation is a shrink, and it is also the moment the revocation_tag rolls — the one point at
+    which the design unlinks an account's proofs — so an offset carried across it would be a ~16-bit
+    fingerprint defeating exactly that (docs/limitations.md).
+    '''
+    # A shrink to "no expiry at all" is still a shrink, so the degenerate case is just: keep it.
+    if expiry is None:
+        return 'proof_expiry_offset'
+    return (
+        'CASE WHEN expiry_at IS NULL OR %(expiry)s > expiry_at'
+        ' THEN %(proof_random_offset)s ELSE proof_expiry_offset END'
+    )
 
 
 @db.transactional
@@ -910,7 +960,7 @@ def _update_user_expiry_grace_and_renew_flag_from_payment_list(
         UPDATE users
         SET    expiry_at = %(expiry)s, grace_period = %(grace)s,
                auto_renewing = %(renewing)s,
-               {_REDRAW_OFFSET_IF_EXPIRY_MOVED}
+               proof_expiry_offset = {_offset_redrawn_if_expiry_extends(lookup.best_expiry)}
         WHERE  master_pkey = %(pkey)s
     ''',
         expiry=lookup.best_expiry,
@@ -949,64 +999,101 @@ def revoke_payments_by_id_internal(tx: db.SQLTransaction, rows: typing.Any, revo
             id=id,
         )
 
-    revoke_at_next_day = round_datetime_to_next_day_with_provider_testing_support(base.PaymentProvider.Nil, revoke_at)
-
-    # The furthest into the future any outstanding proof can certify: a proof reaches at most
-    # `max_proof_lifetime` past its request instant (_build_proof_clamped_expiry_time) and a request_at is
-    # only accepted within DEFAULT_TIMESTAMP_TOLERANCE of the server clock, so no proof issued up to the
-    # revoke instant reaches beyond this. Anchoring to `revoke_at` assumes we process the refund promptly: a
-    # notification that reaches us late — a backlog drained after an outage — leaves any proof issued in the
-    # interim outside this bound.
-    max_outstanding_proof_expiry = (
-        revoke_at + base.DEFAULT_TIMESTAMP_TOLERANCE + base.proof_expiry_shape().max_proof_lifetime
-    )
-
+    # Every revoke UPDATE above has landed, so each affected account can now be recomputed and judged from
+    # what it actually holds. Deliberately not per-payment: a refund is only one of several ways an
+    # entitlement can fall, and they all reduce to the same question about outstanding proofs.
     for it in master_pkey_dict:
-        master_pkey = nacl.signing.VerifyKey(it)
-
-        # Bind any payment the mule has registered for this key that the owner has not claimed yet, BEFORE
-        # judging below whether this refund needs broadcasting. `_lookup_user_expiry` is user-scoped and a
-        # user_id is set only at redemption, so an unclaimed-but-live survivor is invisible to that judgement:
-        # we would broadcast a revocation, and revoke every outstanding proof, for an account whose paid
-        # coverage never actually lapsed. Claim-all and idempotent — the same bind the owner's next request
-        # performs, just early. Deliberately AFTER the revoke UPDATE above, since reconcile only claims rows
-        # with `revoked_at IS NULL` and so can never claim the payment being revoked. Stamped with OUR clock,
-        # never `revoke_at`: the store's refund date can be days old (same reasoning as
-        # revoke_master_pkey_proofs_and_allocate_new_gen_id below).
-        reconcile_pending_payments(tx, master_pkey, redeemed_at=to_redeemed_at(base.utc_now()))
-
-        # NOTE: For each user we revoked a payment for, we have modified their 'auto_renewing' value
-        # on the payment, we need to go and update their user row to track the, new, next best
-        # expiry time so that the backend knows the new time-frame in which the user is allowed to
-        # generate a Session Pro proof (now that one or more of their payments get revoked)
-        _update_user_expiry_grace_and_renew_flag_from_payment_list(tx, master_pkey)
-
-        # NOTE: A payment at or past the end of the current day is on its way out anyway, so revoking it is
-        # not worth an entry in the (network-costly, every-client-fetches-it) revocation list. A proof built
-        # against such a payment can reach the renewal lead plus a whole grid period (≤ ~25 h) past that
-        # boundary, so an outstanding proof for a nearly-expired, then-refunded payment can outlive this
-        # early-out by that much. Accepted: it takes a refund of the account's *longest* payment inside that
-        # payment's final day, and the outcome is bounded extra Pro on an entitlement that was ending anyway.
-        #
-        # For different platforms in their testing environments, they have different timespans
-        # for a day, for example in Google 1 day is 10s. We handle that explicitly here.
-        expiry_at = master_pkey_dict[it]
-        if expiry_at is not None and expiry_at <= revoke_at_next_day:
-            continue
-
-        # Even when the revoked payment's own proof would outlive the day boundary, a broadcast revocation
-        # + generation roll is only needed if the refund drops the user's *remaining* entitlement below
-        # something an outstanding proof already certifies. If enough paid time survives the refund
-        # (aggregate expiry at or beyond the furthest a live proof can reach) every outstanding proof stays
-        # honest, so we skip the revocation entirely. The revocation list is fetched by every client, so
-        # keeping it minimal is the point.
-        post_refund_expiry = _lookup_user_expiry(tx, master_pkey).best_expiry
-        if post_refund_expiry is not None and post_refund_expiry >= max_outstanding_proof_expiry:
-            continue
-
-        revoke_master_pkey_proofs_and_allocate_new_gen_id(tx, master_pkey, created_at=revoke_at)
+        refresh_entitlement_and_revoke_overreaching_proofs(tx, nacl.signing.VerifyKey(it), at=revoke_at)
 
     return result
+
+
+@db.transactional
+def refresh_entitlement_and_revoke_overreaching_proofs(
+    tx: db.SQLTransaction, master_pkey: nacl.signing.VerifyKey, at: pendulum.DateTime
+) -> bool:
+    """Recompute what an account is entitled to, and revoke its outstanding proofs if they now claim more
+    than it has. Returns whether a revocation was broadcast.
+
+    WHY the entitlement fell is deliberately not an input. A refund, a store-side revoke that back-dates the
+    term, a downgrade, a supersession by an upgraded subscription, a shortened term — they differ only in
+    what moved the payment rows, and by the time this runs the rows already say what they say. The single
+    question left is whether anything we have already signed now overstates the account, and that has one
+    answer regardless of cause.
+
+    Ordering is the point: every write lands first, then the account is recomputed, then the decision is
+    taken from the recomputed state. Judging mid-write is what made the old inline version depend on rows
+    that had not been inserted yet, and on which row an unordered SELECT happened to return last.
+    """
+    # Before anything moves. `users.expiry_at` is only written by the recompute below, so this is still the
+    # pre-change value even though the payment rows have already been updated.
+    #
+    # COVERAGE, not the stored expiry. Every question below is "did what we are willing to serve fall", and
+    # the stored value is the paid term with neither the store's grace nor our allowance on it. Comparing
+    # raw values understates both sides: an Apple subscriber refunded during a 16-day grace has a raw prior
+    # expiry of today-ish, which clears the day-boundary early-out below and returns without broadcasting —
+    # while the proofs already signed certify the full grace-inclusive horizon.
+    prior_expiry = account_coverage_end(get_user(tx.conn, master_pkey))
+
+    # Bind any payment the mule registered that the owner has not claimed yet, BEFORE judging.
+    # `_lookup_user_expiry` is user-scoped and `user_id` is set only at redemption, so an unclaimed-but-live
+    # payment is invisible to that judgement: we would revoke every outstanding proof for an account whose
+    # coverage never actually lapsed. Claim-all and idempotent — the same bind the owner's next request
+    # performs, just early. Stamped with OUR clock, never `at`: a store's instant can be days old.
+    reconcile_pending_payments(tx, master_pkey, redeemed_at=to_redeemed_at(base.utc_now()))
+    _update_user_expiry_grace_and_renew_flag_from_payment_list(tx, master_pkey)
+
+    # The honest question is the DELTA, so ask it first and exactly: if the account ends up covering at
+    # least what it covered before, nothing already signed can overstate it, whatever moved underneath.
+    # Both gates below test absolutes, which is nearly always the same thing and occasionally is not —
+    # refunding a payment that was NOT the account's entitlement driver leaves `surviving` unchanged and far
+    # out, clears the day boundary, and yet falls short of the 30-day cap, so without this it would revoke
+    # every proof of an account whose entitlement never moved.
+    surviving = _lookup_user_expiry(tx, master_pkey)
+    surviving_now = (
+        subscription_coverage_end(surviving.best_expiry, surviving.best_grace, surviving.best_auto_renewing)
+        if surviving.best_expiry is not None
+        else None
+    )
+    if surviving_now is not None and surviving_now >= prior_expiry:
+        return False
+
+    # An account that was ending within a grid period anyway is not worth an entry in the revocation list
+    # every client fetches. A proof built against it can outlive this by the renewal lead plus two grid
+    # periods: accepted, because the entitlement was ending regardless and the overreach is bounded.
+    #
+    # Denominated in the PROOF GRID, not in calendar days. It used to ask whether `prior_expiry` fell before
+    # the next UTC midnight, which is a boundary that no longer governs anything this decision cares about —
+    # proof expiries land on the account's own random grid, and nothing in the revocation machinery is
+    # day-aligned (retention is denominated in proof lifetime, `effective_ts` is a stamp plus a delay, and
+    # the served list is window-filtered rather than day-bucketed).
+    #
+    # That framing also made an ORDINARY LAPSE broadcast. A lapse drops coverage by exactly the allowance —
+    # the renewal flag goes false, so `expiry + allowance` becomes `expiry` — which slips past the delta
+    # gate above; this check then compared two instants within an allowance of each other, so it really
+    # asked "did a midnight fall between them". For a term ending in the last hour before midnight it did,
+    # and a subscription that quietly ended landed in a retained list. That rate is the allowance as a
+    # fraction of a day: one lapse in twenty-four at the default hour, one in four if the setting is raised
+    # to six hours ahead of maintenance — worst exactly when the knob is being used.
+    #
+    # The bound is not a loosening: the old rule already admitted a `prior_expiry` up to a full day past
+    # `at` whenever `at` fell just after midnight. This accepts the same worst case uniformly instead of
+    # letting the wall clock decide which accounts get it. Testing environments compress the grid, so the
+    # comparison follows them without needing a provider-aware special case.
+    if prior_expiry <= at + base.proof_expiry_shape().grid:
+        return False
+
+    # The furthest any outstanding proof can reach: a proof reaches at most `max_proof_lifetime` past its
+    # request instant, and a request is only accepted within the clock tolerance, so nothing issued up to
+    # now goes beyond this. If what survives covers that, every proof we have signed is still honest and
+    # there is nothing to announce.
+    if surviving_now is not None and surviving_now >= at + base.DEFAULT_TIMESTAMP_TOLERANCE + (
+        base.proof_expiry_shape().max_proof_lifetime
+    ):
+        return False
+
+    revoke_master_pkey_proofs_and_allocate_new_gen_id(tx, master_pkey, created_at=at)
+    return True
 
 
 @db.transactional
@@ -1123,7 +1210,14 @@ def reinstate_apple_payment(
     for master_pkey_bytes in master_pkeys:
         master_pkey = nacl.signing.VerifyKey(master_pkey_bytes)
         lookup = _lookup_user_expiry(tx, master_pkey)
-        if lookup.expiry_from_redeemed is not None and lookup.expiry_from_redeemed > reinstated_at:
+        restored_coverage_end = (
+            subscription_coverage_end(
+                lookup.expiry_from_redeemed, lookup.grace_from_redeemed, lookup.auto_renewing_from_redeemed
+            )
+            if lookup.expiry_from_redeemed is not None
+            else None
+        )
+        if restored_coverage_end is not None and restored_coverage_end > reinstated_at:
             # Live restored window: ensure the user is on a usable (non-revoked) generation — mints a fresh
             # one iff the refund had revoked the current one — and refresh their entitlement snapshot.
             _ensure_active_generation(tx, master_pkey, issued_at=reinstated_at)
@@ -1355,7 +1449,7 @@ def _lookup_user_expiry(tx: db.SQLTransaction, master_pkey: nacl.signing.VerifyK
         tx.conn,
         '''
         SELECT    p.expiry_at, p.grace_period, p.auto_renewing, p.redeemed_at,
-                  p.payment_provider, ad.original_tx_id, gd.order_id, rd.order_id, p.revoked_at,
+                  p.payment_provider, ad.original_tx_id, gd.payment_token, rd.order_id, p.revoked_at,
                   p.credit_remaining, u.credits_checkpoint_at
         FROM      payments p
                   JOIN users u ON u.id = p.user_id
@@ -1382,9 +1476,15 @@ def _lookup_user_expiry(tx: db.SQLTransaction, master_pkey: nacl.signing.VerifyK
     # nothing else covers the account, which is exactly when it is the truthful answer.
     credit_total = pendulum.duration()
 
-    used_google_order_ids: list[str] = []
+    used_google_tokens: set[str] = set()
     used_apple_orig_tx_ids: set[int] = set()
     used_stf_order_ids: set[str] = set()
+
+    # The coverage the winners so far reach. Kept local rather than on the result: it is the comparison key,
+    # not an answer — what the caller gets is the winner's raw expiry, and re-deriving coverage from that is
+    # the two helpers' job.
+    best_coverage: pendulum.DateTime | None = None
+    best_coverage_from_redeemed: pendulum.DateTime | None = None
 
     # NOTE: Determine the user's latest expiry by enumerating all the payments and calculating
     # the expiry time (inclusive of the grace period if applicable)
@@ -1399,14 +1499,12 @@ def _lookup_user_expiry(tx: db.SQLTransaction, master_pkey: nacl.signing.VerifyK
             redeemed_at,
             payment_provider,
             apple_original_tx_id,
-            google_order_id,
+            google_payment_token,
             stf_order_id,
             revoked_at,
             credit_remaining,
             credits_checkpoint_at,
         ) = row
-        # grace_period is nullable; treat "absent" as zero for the entitlement arithmetic below.
-        grace = grace_period if grace_period is not None else pendulum.duration()
 
         # A live credit contributes its remaining length to the total and nothing to the max. A revoked
         # one contributes neither: the revoke path zeroes it, and until it does, a clawed-back credit must
@@ -1416,35 +1514,23 @@ def _lookup_user_expiry(tx: db.SQLTransaction, master_pkey: nacl.signing.VerifyK
                 credit_total += credit_remaining
             continue
 
-        # NOTE: Consecutive subscription payments are added to the DB under _roughly_ the same
-        # transaction ID (this differs between platforms). We only want to consider that latest
-        # subscription payment as the user's "best" payment that we should show as their entitlement
+        # One row per billing cycle, but a subscription's cycles must not each contribute to the max — only
+        # its most recent one is the entitlement. So collapse by whatever identifies the SUBSCRIPTION on
+        # each provider: Google's `payment_token`, Apple's `original_transaction_id`, and for a directly
+        # granted payment the order id, which has no cycles. Rows arrive newest-first (the SELECT orders by
+        # id DESC), so the first of each group seen is the one that counts.
         #
-        # For google they do an <order_id> but then append a suffix to disambiguate such as
-        # <order_id>, <order_id>..0, <order_id>..1 and so forth
-        #
-        # For apple they have a <original_transaction_id> that is shared across all transactions for
-        # a given subscription.
-        #
-        # Our SQL query sorts the user's payments by insertion order and looks for the _latest_
-        # instance of the transactions associated with the user and selects those.
+        # Google's per-cycle order ids happen to encode the subscription in a prefix (`GPA.x`, `GPA.x..0`,
+        # `GPA.x..1`), and this once grouped by parsing that. The token says the same thing without
+        # depending on the format, is already joined here, and is not confused by a subscription whose
+        # order-id base changes mid-life — which the prefix match would have split into two competing
+        # subscriptions.
         seen_before = False
         if payment_provider == base.PaymentProvider.GooglePlayStore.value:
-            order_split: list[str] = google_order_id.split('..')
-            if len(order_split) <= 0:
-                log.warning(
-                    f"Failed to split order google order ID by '..' for {base.maybe_obfuscate_bytes(master_pkey)}: "
-                    f"{base.maybe_obfuscate(google_order_id)}"
-                )
-                continue
-
-            for used_it in used_google_order_ids:
-                if used_it.startswith(order_split[0]):
-                    seen_before = True
-                    break
-
-            if not seen_before:
-                used_google_order_ids.append(google_order_id)
+            if google_payment_token in used_google_tokens:
+                seen_before = True
+            else:
+                used_google_tokens.add(google_payment_token)
         elif payment_provider == base.PaymentProvider.iOSAppStore.value:
             if apple_original_tx_id in used_apple_orig_tx_ids:
                 seen_before = True
@@ -1465,41 +1551,42 @@ def _lookup_user_expiry(tx: db.SQLTransaction, master_pkey: nacl.signing.VerifyK
         if seen_before:
             continue
 
-        # NOTE: Track the current best expiry (newest payment that entitles them to Pro). `best_*` is
-        # None until the first qualifying payment. Auto-renewing payments fold the grace period into
-        # their stored expiry, so strip it back off for a like-for-like comparison.
-        best_wo_grace_from_redeemed = result.expiry_from_redeemed
-        if best_wo_grace_from_redeemed is not None and result.auto_renewing_from_redeemed:
-            best_wo_grace_from_redeemed -= result.grace_from_redeemed
-
-        best_wo_grace = result.best_expiry
-        if best_wo_grace is not None and result.best_auto_renewing:
-            best_wo_grace -= result.best_grace
-
         # NOTE: If we're revoked, clamp the expiry to the revoke time (entitlement stops effective
         # there). `status` is derived, not stored — we work from the orthogonal facts (revoked ⟺
         # revoked_at set), never a flattened status. Whether a payment has *expired* is a separate,
         # now-relative concern handled downstream (get_pro_status / proof-expiry clamping) — it must
         # not gate what expiry the user is *entitled* to, so no wall-clock enters here.
+        #
+        # A clamp, never an assignment: a revocation stops entitlement, so it can only ever pull the end
+        # EARLIER. A payment refunded after it had already lapsed keeps its own expiry — assigning would
+        # instead hand the account coverage from its lapse up to the refund, and this value becomes
+        # users.expiry_at, i.e. the wire's expiry_ts and the ceiling a proof is clamped against. Apple
+        # reaches that case whenever it processes a refund for a subscription that has already ended.
         assert expiry_at is not None, 'a row reaching the max has an expiry: live credits are summed above'
         if revoked_at is not None:
             assert not auto_renewing
-            payment_expiry_at = revoked_at
-            expiry_at = revoked_at
-        else:
-            payment_expiry_at = expiry_at + grace if auto_renewing else expiry_at
+            expiry_at = min(expiry_at, revoked_at)
+
+        # Compared on COVERAGE, stored RAW. The two differ, and each is right for its job: with a mix of
+        # renewing and cancelled payments the one that covers the account furthest is not necessarily the
+        # one with the latest paid-through date, so the winner has to be picked grace-inclusive — while what
+        # gets stored is the true end of the paid term, because that is what a user is shown and what every
+        # consumer re-derives coverage from through the two helpers.
+        coverage_end = subscription_coverage_end(expiry_at, grace_period, bool(auto_renewing))
 
         # NOTE: A payment contributes to the "redeemed" entitlement iff it has been redeemed and not
         # revoked. (Expiry is deliberately excluded — see above.)
         is_redeemed = redeemed_at is not None and revoked_at is None
-        if is_redeemed and (best_wo_grace_from_redeemed is None or expiry_at > best_wo_grace_from_redeemed):
-            result.expiry_from_redeemed = payment_expiry_at
-            result.grace_from_redeemed = grace
+        if is_redeemed and (best_coverage_from_redeemed is None or coverage_end > best_coverage_from_redeemed):
+            best_coverage_from_redeemed = coverage_end
+            result.expiry_from_redeemed = expiry_at
+            result.grace_from_redeemed = grace_period
             result.auto_renewing_from_redeemed = bool(auto_renewing)
 
-        if best_wo_grace is None or expiry_at > best_wo_grace:
-            result.best_expiry = payment_expiry_at
-            result.best_grace = grace
+        if best_coverage is None or coverage_end > best_coverage:
+            best_coverage = coverage_end
+            result.best_expiry = expiry_at
+            result.best_grace = grace_period
             result.best_auto_renewing = bool(auto_renewing)
 
     # Credits extend whatever the subscriptions above cover, from the later of that coverage and the drain
@@ -1877,9 +1964,17 @@ def add_unredeemed_payment(
                     #   > improve recovery performance
                     #
                     # Source: https://support.google.com/googleplay/android-developer/answer/16631229
+                    # Corroborated on the lifecycle page, which states the same calculation:
+                    # https://developer.android.com/google/play/billing/lifecycle/subscriptions
+                    # A flat 60 days, and it is EXACT rather than generous: the grace cancels out. The
+                    # window in which a recovery can still arrive is the paid term plus grace plus hold, and
+                    # Play sets hold to `60 days - grace`, so the sum is 60 days whatever the grace is set
+                    # to. Subtracting grace here — as this once did — took it off a window it was never
+                    # part of, and did so from a column that then held our own latency allowance rather
+                    # than any store's grace, so the number removed was not even the one the formula names.
                     auto_redeem_deadline_at = user.expiry_at
                     if user.auto_renewing:
-                        auto_redeem_deadline_at += 60 * base.DAY - user.grace_period
+                        auto_redeem_deadline_at += 60 * base.DAY
                 else:
                     assert payment_tx.provider == base.PaymentProvider.iOSAppStore
                     # NOTE: We don't currently configure a grace period/account hold period for Apple
@@ -2037,10 +2132,18 @@ def _ensure_active_generation(
     user = get_user(tx.conn, master_pkey)
     assert user.found, "user must exist before allocating a generation"
 
-    if is_generation_revoked(tx.conn, user.current_generation_id, issued_at):
+    minted = is_generation_revoked(tx.conn, user.current_generation_id, issued_at)
+    if minted:
         result.generation_id, result.token = mint_generation(tx, user.id, issued_at)
     else:
         result.generation_id, result.token = user.current_generation_id, user.token
+
+    # A minted generation ALWAYS re-draws the offset, whatever the expiry did. The revocation that rolls the
+    # tag is a shrink, so the extension-only rule alone would carry the offset across the one moment the
+    # design deliberately unlinks an account's proofs — and the offset is ~16 bits, readable off every proof
+    # (docs/limitations.md, "adds no cross-roll linkage"). Nothing is lost: monotonicity across a roll would
+    # be protecting proofs that were just revoked, so there is no served expiry left to undercut.
+    offset_value = '%(proof_random_offset)s' if minted else _offset_redrawn_if_expiry_extends(lookup.best_expiry)
 
     db.query(
         tx.conn,
@@ -2050,7 +2153,7 @@ def _ensure_active_generation(
                expiry_at                   = %(expiry)s,
                grace_period                 = %(grace)s,
                auto_renewing                = %(auto_renewing)s,
-               {_REDRAW_OFFSET_IF_EXPIRY_MOVED}
+               proof_expiry_offset          = {offset_value}
         WHERE  id = %(user_id)s
     ''',
         gen_id=result.generation_id,
@@ -2239,8 +2342,9 @@ def _build_proof_clamped_expiry_time(
       matching change here, or its attempts start landing before the renewal can have resolved.
 
     The cost is over-provisioning: an account is honoured for up to one period past `true + renewal_lead`.
-    That is deliberate (it also buffers a late store notification), and the per-cycle re-draw keeps the luck
-    from settling on the same accounts. `shape.max_proof_lifetime` bounds the resulting proof lifetime.
+    That is deliberate (it also buffers a late store notification), and re-drawing the offset on every
+    extension keeps the luck from settling on the same accounts. `shape.max_proof_lifetime` bounds the
+    resulting proof lifetime.
     '''
     shape = base.proof_expiry_shape()
     # The stored column's own range (a day — the schema CHECK), NOT the current shape's: a database written
@@ -2360,19 +2464,6 @@ def revoke_master_pkey_proofs_and_allocate_new_gen_id(
     return result
 
 
-def round_datetime_to_next_day_with_provider_testing_support(
-    payment_provider: base.PaymentProvider, at: pendulum.DateTime
-) -> pendulum.DateTime:
-    """Round `at` up to the next day boundary. In some platforms' testing environments a "day" is
-    compressed (Google: 10 seconds); only that case differs from the normal UTC-day rounding."""
-    if base.PROVIDER_TESTING_ENV and payment_provider == base.PaymentProvider.GooglePlayStore:
-        google_day = pendulum.duration(seconds=10)  # in Google's test env, 1 day == 10s
-        elapsed = at - base.EPOCH
-        units = -((-elapsed) // google_day)  # ceil-divide the duration
-        return base.EPOCH + units * google_day
-    return base.round_datetime_to_next_day(at)
-
-
 @db.transactional
 def build_current_entitlement_proof(
     tx: db.SQLTransaction,
@@ -2395,9 +2486,13 @@ def build_current_entitlement_proof(
     if is_generation_revoked(tx.conn, get_user.user.current_generation_id, request_at):
         raise base.FailError(f'User {bytes(master_pkey).hex()} payment has been revoked', code=base.ErrorCode.revoked)
 
+    # Coverage, not the stored expiry: what we are willing to certify runs to the end of the window we are
+    # willing to serve. Clamping against the raw term would stop a renewing subscriber's proofs at their
+    # paid-through date, which is precisely the interval the allowance exists to cover — and it would break
+    # the locked pair `_build_proof_clamped_expiry_time` documents, where our lead matches the client's.
     proof_expiry_at = _build_proof_clamped_expiry_time(
         request_at=request_at,
-        proposed_expiry_at=get_user.user.expiry_at,
+        proposed_expiry_at=account_coverage_end(get_user.user),
         proof_expiry_offset=get_user.user.proof_expiry_offset,
     )
     # The expiry we are willing to certify is the honest cut-off, so a lapsed account keeps getting proofs
@@ -2406,14 +2501,11 @@ def build_current_entitlement_proof(
     # over-provision every live account gets, granted no further, and it keeps us consistent with the
     # `account_expiry_ts` we already handed the client.
     if request_at > proof_expiry_at:
-        payment_expiry_at = (
-            get_user.user.expiry_at - get_user.user.grace_period
-            if get_user.user.auto_renewing
-            else get_user.user.expiry_at
-        )
         raise base.FailError(
-            f'User {bytes(master_pkey).hex()} entitlement expired at {base.readable(get_user.user.expiry_at)} '
-            f'({base.readable(payment_expiry_at)} + {get_user.user.grace_period})',
+            f'User {bytes(master_pkey).hex()} entitlement expired at '
+            f'{base.readable(account_coverage_end(get_user.user))} '
+            f'({base.readable(get_user.user.expiry_at)} + {get_user.user.grace_period} store grace '
+            f'+ {base.RENEWAL_LATENCY_ALLOWANCE} allowance)',
             code=base.ErrorCode.subscription_expired,
             # Advisory, same as the success path: carry the (now-past) account entitlement end so the
             # client can refresh its cached horizon without a separate get_pro_status. Only on this slug —
@@ -2430,13 +2522,13 @@ def build_current_entitlement_proof(
     # Advisory (unsigned) account entitlement end, from this same snapshot — the client's true
     # subscription horizon, distinct from the clamped proof expiry above.
     #
-    # `max` so `expiry_ts <= account_expiry_ts` holds by construction rather than by luck. Everywhere the
-    # proof is still clamped (all of a long plan's life) this is exactly the true expiry, which is what the
-    # owner should see. It only reads back the proof's own expiry in the closing window where the
-    # over-provision pushes the proof past the true end — and there the two agree, to within the ≤25 h we
-    # are honouring anyway, so the client is never told its subscription ended before a proof we signed
-    # stops verifying.
-    proof.account_expiry_at = max(get_user.user.expiry_at, proof.expiry_at)
+    # The TRUE end of the paid term, and deliberately NOT `max(…, proof.expiry_at)`. That max existed to
+    # keep `expiry_at <= account_expiry_at` self-consistent, and buying it meant handing the owner a date
+    # carrying the proof's random grid offset — up to a day out from the one they would put in a UI. The two
+    # answer different questions: the proof's expiry is how long peers honour the credential, deliberately
+    # over-provisioned; this is when the subscription actually ends. Confirmed with both client teams before
+    # breaking it — libsession schedules renewal one hour before PROOF expiry, so nothing keys on this.
+    proof.account_expiry_at = get_user.user.expiry_at
     return proof
 
 
@@ -2525,88 +2617,6 @@ def delete_expired_google_notifications(conn: psycopg.Connection, now: pendulum.
     return db.query(
         conn, '''DELETE FROM google_notification_history WHERE %s >= expires_at AND handled = TRUE''', now
     ).rowcount
-
-
-@db.transactional
-def add_user_error(tx: db.SQLTransaction, error: UserError, at: pendulum.DateTime):
-    match error.provider:
-        case base.PaymentProvider.SessionFoundation:
-            pass
-        case base.PaymentProvider.Nil:
-            pass
-        case base.PaymentProvider.GooglePlayStore:
-            assert len(error.google_payment_token) > 0
-            db.query(
-                tx.conn,
-                '''
-                INSERT INTO user_errors (payment_provider, payment_id, errored_at)
-                VALUES (%(provider)s, %(payment_id)s, %(ts)s)
-                ON CONFLICT DO NOTHING
-                ''',
-                provider=error.provider.value,
-                payment_id=error.google_payment_token,
-                ts=at,
-            )
-        case base.PaymentProvider.iOSAppStore:
-            assert len(error.apple_original_tx_id) > 0
-            db.query(
-                tx.conn,
-                '''
-                INSERT INTO user_errors (payment_provider, payment_id, errored_at)
-                VALUES (%(provider)s, %(payment_id)s, %(ts)s)
-                ON CONFLICT DO NOTHING
-                ''',
-                provider=error.provider.value,
-                payment_id=error.apple_original_tx_id,
-                ts=at,
-            )
-
-
-@db.transactional
-def has_user_error_from_master_pkey(tx: db.SQLTransaction, master_pkey: nacl.signing.VerifyKey) -> bool:
-    # NOTE: A directly granted payment has no provider notifications, so no user error can exist for it
-    return bool(
-        db.query_scalar(
-            tx.conn,
-            (f'''
-SELECT EXISTS (
-    SELECT 1
-    FROM payments p
-    LEFT JOIN app_store_payment_details  ad ON ad.payment_id = p.id
-    LEFT JOIN google_play_payment_details gd ON gd.payment_id = p.id
-    LEFT JOIN user_errors ue
-        ON (p.payment_provider = '{base.PaymentProvider.iOSAppStore.value}'     AND ad.original_tx_id = ue.payment_id)
-        OR (p.payment_provider = '{base.PaymentProvider.GooglePlayStore.value}' AND gd.payment_token  = ue.payment_id)
-    WHERE p.user_id = (SELECT id FROM users WHERE master_pkey = %s)
-    AND ue.payment_id IS NOT NULL
-) AS has_error;
-'''),
-            bytes(master_pkey),
-        )
-    )
-
-
-def has_user_error(conn: psycopg.Connection, payment_provider: base.PaymentProvider, payment_id: str) -> bool:
-    # Single SELECT on the given connection (mid-tx callers pass tx.conn). payment_provider is a string
-    # code (the lookup tables key on the code itself) — compared directly, never int()-cast.
-    row = db.query_one(
-        conn,
-        'SELECT 1 FROM user_errors WHERE payment_id = %s AND payment_provider = %s',
-        payment_id,
-        payment_provider.value,
-    )
-    return row is not None
-
-
-def delete_user_errors(conn: psycopg.Connection, payment_provider: base.PaymentProvider, payment_id: str) -> bool:
-    # Single statement on the given connection (mid-tx callers pass tx.conn); the pool is autocommit.
-    row = db.query(
-        conn,
-        'DELETE FROM user_errors WHERE payment_provider = %s AND payment_id = %s',
-        payment_provider.value,
-        payment_id,
-    )
-    return row.rowcount > 0
 
 
 @db.transactional
@@ -2711,9 +2721,14 @@ def google_add_notification_id(tx: db.SQLTransaction, message_id: str, expires_a
 
     db.query(
         tx.conn,
+        # ON CONFLICT because Pub/Sub is at-least-once: the same message can be delivered twice, and under
+        # the streaming subscriber those deliveries can be in flight together. A check-then-insert lets both
+        # pass the check, and the loser would raise on the primary key — turning a duplicate delivery, which
+        # is normal, into a nacked message and a redelivery. Recording it once is the whole requirement.
         ('''
             INSERT INTO google_notification_history (message_id, handled, payload, expires_at)
             VALUES      (%(message_id)s, FALSE, %(payload)s, %(expiry)s)
+            ON CONFLICT (message_id) DO NOTHING
     '''),
         message_id=message_id,
         payload=maybe_payload,
@@ -2756,11 +2771,23 @@ def google_notification_message_id_is_in_db(tx: db.SQLTransaction, message_id: s
     return result
 
 
-def google_payment_tokens_needing_ack(conn: psycopg.Connection) -> list[str]:
-    """Distinct Google purchase-tokens with an outstanding acknowledgement (needs_ack). The mule's
-    sweep acks each against Google and clears the flag via google_clear_needs_ack."""
-    rows = db.query(conn, '''SELECT DISTINCT payment_token FROM google_play_payment_details WHERE needs_ack''')
-    return [row[0] for row in rows]
+def google_payment_tokens_needing_ack(conn: psycopg.Connection) -> list[tuple[str, pendulum.DateTime]]:
+    """Google purchase-tokens with an outstanding acknowledgement, each with its EARLIEST purchase instant.
+
+    The mule's sweep acks each against Google and clears the flag via google_clear_needs_ack. It gets
+    `purchased_at` because that is the clock Google's three-day auto-refund runs on, so it is what tells the
+    sweep whether a failing ack is a blip or an emergency. The earliest cycle of the token is the
+    conservative choice: a token acknowledged as a whole is at risk from its oldest unacknowledged purchase.
+    """
+    rows = db.query(
+        conn,
+        '''SELECT   gd.payment_token, MIN(p.purchased_at)
+           FROM     google_play_payment_details gd
+                    JOIN payments p ON p.id = gd.payment_id
+           WHERE    gd.needs_ack
+           GROUP BY gd.payment_token''',
+    )
+    return [(row[0], row[1]) for row in rows]
 
 
 @db.transactional
@@ -2770,6 +2797,318 @@ def google_clear_needs_ack(tx: db.SQLTransaction, payment_token: str) -> None:
     db.query(
         tx.conn, '''UPDATE google_play_payment_details SET needs_ack = FALSE WHERE payment_token = %s''', payment_token
     )
+
+
+@db.transactional
+def google_converge_payment(
+    tx: db.SQLTransaction,
+    payment_tx: base.PaymentProviderTransaction,
+    expiry_at: pendulum.DateTime,
+    auto_renewing: bool,
+    needs_ack: bool,
+    at: pendulum.DateTime,
+    err: base.ErrorSink,
+) -> bool:
+    """Bring an existing payment row into line with what Google's subscription resource now says, and report
+    whether a row was there to converge.
+
+    This is the write half of "the notification is a hint, the resource is the truth". The store owns these
+    values, so they are taken as stated rather than merged: a term Google has shortened, extended or deferred
+    is simply what it now says. That is only possible because `expiry_at` is revisable — it used to be
+    written once at insert, so the only way a new expiry could reach the database was a new order id, and a
+    change that moved an expiry without starting a billing cycle was invisible.
+
+    Two things the snapshot does NOT get to overrule:
+
+    * A REVOKED row is terminal and is left entirely alone. Google reports a refunded subscription as
+      expired, but it does not report *that money came back* — that is the void feed's job — so converging a
+      revoked row on the resource would quietly undo a refund we already recorded, and could extend its
+      expiry past the instant entitlement actually stopped.
+    * A CLAIMED row's ownership. Convergence adjusts the terms of a payment, never who holds it.
+
+    `grace_period` is written as a constant NULL rather than taken from the caller. The column records a
+    store grace declared SEPARATELY from the store's own expiry, and Play instead applies grace by EXTENDING
+    `expiryTime` — so on a Google row the grace is already inside the `expiry_at` above, and a second copy
+    beside it would be counted twice. Writing rather than leaving the column alone is deliberate: a row the
+    retired `IN_GRACE_PERIOD` branch stamped with the base plan's real grace would otherwise keep that day
+    forever, since nothing else would ever write the column again — and it is exactly those rows, the ones
+    in grace when this shipped, that convergence would then double-count.
+
+    Idempotency is the load-bearing property, not an optimisation: re-running this against an unchanged
+    snapshot must leave `users.expiry_at` untouched, because a move there re-draws the account's
+    proof-expiry offset, and a convergence pass that "changed" nothing on every run would hand an observer
+    repeated samples against one true expiry — the exact attack the offset exists to prevent. Writing the
+    same values is genuinely a no-op here, so the recompute below sees no movement.
+    """
+    verify_payment_provider_tx(payment_tx, err)
+    if err.has():
+        return False
+
+    assert payment_tx.provider == base.PaymentProvider.GooglePlayStore, 'Google-only: keyed on (token, order id)'
+
+    rows = db.query(
+        tx.conn,
+        '''
+        UPDATE payments p
+        SET    expiry_at     = %(expiry_at)s,
+               auto_renewing = %(auto_renewing)s,
+               grace_period  = NULL
+        FROM   google_play_payment_details gd
+        WHERE  gd.payment_id = p.id
+          AND  gd.payment_token = %(token)s AND gd.order_id = %(order_id)s
+          AND  p.revoked_at IS NULL
+        RETURNING (SELECT master_pkey FROM users WHERE users.id = p.user_id)
+    ''',
+        token=payment_tx.google_payment_token,
+        order_id=payment_tx.google_order_id,
+        expiry_at=expiry_at,
+        auto_renewing=auto_renewing,
+    )
+
+    # RETURNING breaks rowcount (see update_payment_renewal_info), so the fetch is what tells us whether a
+    # row matched. Absent means either no such payment or a revoked one; both are "nothing to converge".
+    row = typing.cast(tuple[bytes | None] | None, rows.fetchone())
+    if row is None:
+        return False
+
+    db.query(
+        tx.conn,
+        '''
+        UPDATE google_play_payment_details SET needs_ack = %(needs_ack)s
+        WHERE  payment_token = %(token)s AND order_id = %(order_id)s
+    ''',
+        token=payment_tx.google_payment_token,
+        order_id=payment_tx.google_order_id,
+        needs_ack=needs_ack,
+    )
+
+    # Only a claimed payment has an account whose entitlement could have moved; an unclaimed one is folded
+    # in when its owner's next request reconciles it.
+    #
+    # Through the SAME rule the revoke path uses, not a bare recompute. Converging is one of the ways an
+    # entitlement FALLS — a term the store shortened, or a revoke we never received a notification for,
+    # whose resource now reads back-dated — and a fall that nobody judges leaves every outstanding proof
+    # certifying a horizon the account no longer has. Safe on the paths where nothing fell: the rule claims
+    # pending payments before deciding, so an upgrade's replacement is bound first, the delta gate sees no
+    # fall, and it returns without announcing anything.
+    if row[0] is not None:
+        refresh_entitlement_and_revoke_overreaching_proofs(tx, nacl.signing.VerifyKey(bytes(row[0])), at=at)
+    return True
+
+
+@dataclasses.dataclass
+class GoogleReconcileClaim:
+    '''A purchase token leased for reconciliation.
+
+    `revision` is the obligation this worker picked up. It must be handed back to `google_reconcile_done` or
+    `google_reconcile_failed`, which use it to tell whether a notification arrived while the fetch was in
+    flight — one that describes a state the fetch cannot have seen, and so must not be cleared by it.
+    '''
+
+    payment_token: str = ''
+    attempts: int = 0
+    revision: int = 0
+
+
+@db.transactional
+def google_owner_of_purchase_token(tx: db.SQLTransaction, payment_token: str) -> bytes | None:
+    """The master pkey that owns any payment on `payment_token`, or None if none is claimed.
+
+    For attributing a resubscription whose new purchase carries no identifiers of its own and whose EXPIRED
+    subscription never carried one either — so `expiredExternalAccountIdentifiers` is absent and only
+    `expiredPurchaseToken` is left. Redemption bound the old row to its owner whatever the store knew, so our
+    own record answers a question the store cannot.
+
+    Any row will do: every cycle on one token belongs to one subscription and therefore one account, so this
+    takes the newest rather than asserting there is exactly one.
+    """
+    # query_one, not query_scalar: an unknown or unclaimed token legitimately returns nothing, and
+    # query_scalar asserts a row is present.
+    row = db.query_one(
+        tx.conn,
+        '''
+        SELECT   u.master_pkey
+        FROM     google_play_payment_details gd
+                 JOIN payments p ON p.id = gd.payment_id
+                 JOIN users u    ON u.id = p.user_id
+        WHERE    gd.payment_token = %s
+        ORDER BY p.id DESC
+        LIMIT    1
+    ''',
+        payment_token,
+    )
+    return bytes(row[0]) if row is not None and row[0] is not None else None
+
+
+def google_enqueue_reconcile(tx: db.SQLTransaction, payment_token: str, eligible_at: pendulum.DateTime) -> None:
+    """Record that `payment_token` owes a reconcile against Google's current subscription resource.
+
+    Idempotent by construction: the token is the primary key, so a burst of notifications for one
+    subscription collapses into one piece of work. That is the whole point of keying on the token — the
+    resource is fetched at reconcile time, so whatever the tenth notification would have told us is already
+    in the snapshot the first fetch returns.
+
+    A repeat enqueue pulls the work EARLIER (`LEAST`) and never later, so a fresh notification for a token
+    already waiting out a backoff is acted on promptly rather than inheriting the wait. `attempts` is
+    deliberately left alone: a new notification arriving says nothing about whether the reason the last
+    attempt failed has gone away, and resetting it would let a permanently stuck token retry at full speed
+    forever.
+    """
+    db.query(
+        tx.conn,
+        '''
+        INSERT INTO google_reconcile_queue (payment_token, eligible_at)
+        VALUES      (%(token)s, %(eligible_at)s)
+        ON CONFLICT (payment_token) DO UPDATE
+        SET         eligible_at   = LEAST(google_reconcile_queue.eligible_at, EXCLUDED.eligible_at),
+                    revision = google_reconcile_queue.revision + 1
+    ''',
+        token=payment_token,
+        eligible_at=eligible_at,
+    )
+
+
+@db.transactional
+def google_claim_due_reconciles(
+    tx: db.SQLTransaction, now: pendulum.DateTime, lease_until: pendulum.DateTime, limit: int
+) -> list[GoogleReconcileClaim]:
+    """Lease up to `limit` tokens that are due, and return them.
+
+    A lease rather than the claim-and-process-in-one-transaction shape the credit drain uses, because
+    reconciling makes a NETWORK CALL to Google: holding row locks across that would pin a transaction open
+    for the length of an external request. So the claim pushes `eligible_at` out to `lease_until` and commits,
+    and the work happens outside any transaction. A worker that dies mid-fetch simply lets the lease lapse
+    and the token comes due again — no in-progress state to clean up, and no way to lose the work.
+
+    `lease_until` therefore has to exceed the longest a reconcile can take (the API call carries its own
+    socket timeout), or a slow fetch would be re-leased while it is still running. SKIP LOCKED keeps two
+    runners from contending on the same rows.
+    """
+    rows = db.query(
+        tx.conn,
+        '''
+        UPDATE google_reconcile_queue
+        SET    leased_until = %(lease_until)s
+        WHERE  payment_token IN (
+                   SELECT   payment_token
+                   FROM     google_reconcile_queue
+                   WHERE    eligible_at <= %(now)s
+                     AND    parked_at IS NULL
+                     AND    (leased_until IS NULL OR leased_until <= %(now)s)
+                   ORDER BY eligible_at
+                   FOR UPDATE SKIP LOCKED
+                   LIMIT    %(limit)s
+               )
+        RETURNING payment_token, attempts, revision
+    ''',
+        now=now,
+        lease_until=lease_until,
+        limit=limit,
+    )
+    return [GoogleReconcileClaim(payment_token=row[0], attempts=row[1], revision=row[2]) for row in rows.fetchall()]
+
+
+@db.transactional
+def google_reconcile_done(tx: db.SQLTransaction, claim: GoogleReconcileClaim) -> bool:
+    """Drop a token from the queue if the obligation just discharged is still the current one, and report
+    whether it went.
+
+    Deleting rather than marking done is right because the row is an OBLIGATION, not a record: the
+    notification history keeps what arrived, and this table only ever answers "what still owes work".
+
+    Conditional on `revision` because a notification arriving mid-fetch describes a state the fetch cannot
+    have seen. Deleting unconditionally would discard that newer obligation on the strength of an older
+    snapshot, and the change would sit unapplied until some later event happened to touch the token. Note
+    that comparing `eligible_at` would NOT catch this: enqueue only ever lowers it, and a token being worked on
+    is already due, so the new notification would leave the value untouched.
+    """
+    rows = db.query(
+        tx.conn,
+        '''
+        DELETE FROM google_reconcile_queue
+        WHERE  payment_token = %(token)s AND revision = %(revision)s
+        RETURNING payment_token
+    ''',
+        token=claim.payment_token,
+        revision=claim.revision,
+    )
+    if rows.fetchone() is not None:
+        return True
+
+    # A newer obligation stands, so the row survives — but this worker is done with it, and leaving the
+    # lease standing would make the fresh notification wait out however much of it remains for nothing.
+    db.query(
+        tx.conn,
+        '''UPDATE google_reconcile_queue SET leased_until = NULL WHERE payment_token = %s''',
+        claim.payment_token,
+    )
+    return False
+
+
+@db.transactional
+def google_reconcile_failed(
+    tx: db.SQLTransaction, claim: GoogleReconcileClaim, retry_at: pendulum.DateTime, error: str, park: bool = False
+) -> None:
+    """Record a failed attempt, release the lease, and back the token off to `retry_at`.
+
+    The failure itself is always recorded — it happened, whatever else has changed. The BACK-OFF is not:
+    if a notification arrived while the fetch was in flight, its obligation is newer than this failure and
+    keeps the due time it asked for. Otherwise a token whose reconcile is failing would have every fresh
+    notification's urgency stomped by the backoff from an attempt that predates it, which contradicts
+    enqueue's rule that new information only ever pulls work earlier.
+
+    `park` stops the automatic retries for good (see `parked_at`, added by migration
+    008_google_convergence). It is subject to the same
+    newer-obligation rule as the backoff: a notification that arrived during this fetch describes a state
+    this attempt cannot have seen, so it gets its chance rather than being parked on the strength of a
+    failure that predates it.
+    """
+    db.query(
+        tx.conn,
+        '''
+        UPDATE google_reconcile_queue
+        SET    attempts     = attempts + 1,
+               last_error   = %(error)s,
+               leased_until = NULL,
+               eligible_at  = CASE WHEN revision = %(revision)s THEN %(retry_at)s ELSE eligible_at END,
+               parked_at    = CASE WHEN %(park)s AND revision = %(revision)s THEN %(retry_at)s ELSE parked_at END
+        WHERE  payment_token = %(token)s
+    ''',
+        token=claim.payment_token,
+        revision=claim.revision,
+        retry_at=retry_at,
+        error=error,
+        park=park,
+    )
+
+
+def google_parked_reconciles(conn: psycopg.Connection) -> list[tuple[str, int, str | None, pendulum.DateTime]]:
+    """Every token the drain has given up on, for an operator or a report. Never called by the drain."""
+    return [
+        (row[0], row[1], row[2], row[3])
+        for row in db.query(
+            conn,
+            '''SELECT payment_token, attempts, last_error, parked_at FROM google_reconcile_queue
+               WHERE parked_at IS NOT NULL ORDER BY parked_at''',
+        )
+    ]
+
+
+def google_unpark_reconcile(tx: db.SQLTransaction, payment_token: str, eligible_at: pendulum.DateTime) -> bool:
+    """Put a parked token back in the queue, due at `eligible_at`. Returns whether one was parked.
+
+    `attempts` is deliberately NOT reset: the count is the history of how much trouble this token has been,
+    and an operator un-parking it has not made the previous failures un-happen. It does mean the first retry
+    after un-parking uses the ceiling backoff, which is the right pace for something already known to fail.
+    """
+    rows = db.query(
+        tx.conn,
+        '''UPDATE google_reconcile_queue SET parked_at = NULL, eligible_at = %(eligible_at)s
+           WHERE payment_token = %(token)s AND parked_at IS NOT NULL''',
+        token=payment_token,
+        eligible_at=eligible_at,
+    )
+    return rows.rowcount > 0
 
 
 def _get_date_group_expr_sql(column: str, period: ReportPeriod) -> str:

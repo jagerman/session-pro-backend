@@ -3,6 +3,7 @@ Functionality to query the Google APIs and parse it
 '''
 
 import dataclasses
+import logging
 import typing
 import base
 from base import (
@@ -28,11 +29,9 @@ import googleapiclient.discovery
 
 from .types import (
     GoogleTimestamp,
-    Monetizationv3SubscriptionData,
     ProductType,
     RefundType,
     SubscriptionNotificationType,
-    SubscriptionProductDetails,
     SubscriptionV2Data,
     SubscriptionV2DataAutoRenewingPlan,
     SubscriptionV2DataLineItem,
@@ -51,10 +50,11 @@ from .types import (
     SubscriptionsV2PausedState,
     SubscriptionsV2State,
     json_dict_optional_google_empty_object_bool,
-    json_dict_require_google_duration,
     json_dict_require_google_money,
     json_dict_require_google_timestamp,
 )
+
+log = logging.Logger('GOOGLE')
 
 # NOTE: Globals specifically for interacting with the Google APIs
 credentials: service_account.Credentials | None = None
@@ -63,14 +63,20 @@ package_name: str = ''
 subscription_product_id: str = ''
 refund_deadline_duration_ms: int = base.MILLISECONDS_IN_DAY * 2
 
-# NOTE: In the testing environment on Google, 1 day gets shortened to 10s. This means the default
-# grace period which at this time is set to 1hr is going to largely overrun the subscription's
-# testing duration, this causes weird/difficult to explain things to happen that we can avoid by
-# patching the grace period here.
+# Every Play API call is bounded by this (see notifications.init, which builds the transport). Named because
+# the reconcile lease has to be derived from it: a lease shorter than a batch's worst-case runtime expires
+# under the worker still holding it.
+SOCKET_TIMEOUT_S: int = 15
+
+# Google's testing environment compresses a "day" to 10s, so OUR renewal-latency allowance — an hour in
+# production — would swamp an entire test subscription and make its lifecycle impossible to reason about.
+# This replaces it under PROVIDER_TESTING_ENV (see base.RENEWAL_LATENCY_ALLOWANCE, which the mule and the
+# test context assign it to).
 #
-# This value gets assigned to base.DEFAULT_GOOGLE_PERIOD_DURATION_MS when in said testing
-# environment
-testing_grace_period_duration_ms: int = 10 * 1000
+# It compresses our own value to match a compressed timeline. It is NOT Google's grace period: that is
+# configured per base plan in the Play Console, and Google applies it by extending the `expiryTime` it
+# reports rather than by telling us a number.
+testing_renewal_latency_allowance_ms: int = 10 * 1000
 
 
 def get_publisher_service() -> googleapiclient.discovery.Resource:
@@ -390,6 +396,24 @@ def parse_get_subscription_v2_response(response: typing.Any, err: ErrorSink) -> 
                 external_account_identifiers, "obfuscatedExternalAccountId", err
             )
 
+        # Optional throughout, and read with `optional` rather than `require` at every level: this whole
+        # object appears only on an unacknowledged resubscription, its identifiers block only if the expired
+        # subscription had one configured, and neither absence is an error. `expiredPurchaseToken` is
+        # deliberately not parsed — the account id is the identifier our attribution already keys on, so
+        # taking the token too would mean a second resolution path to keep correct for no extra reach.
+        expired_obfuscated_external_account_id: str | None = None
+        expired_purchase_token: str | None = None
+        out_of_app_context = json_dict_optional_obj(response, "outOfAppPurchaseContext", err)
+        if out_of_app_context is not None:
+            expired_identifiers = json_dict_optional_obj(out_of_app_context, "expiredExternalAccountIdentifiers", err)
+            if expired_identifiers is not None:
+                # Named `obfuscatedAccountId` here, NOT `obfuscatedExternalAccountId` as on the purchase
+                # itself. Same value, two spellings, one of which is easy to copy wrongly.
+                expired_obfuscated_external_account_id = base.json_dict_optional_str(
+                    expired_identifiers, "obfuscatedAccountId"
+                )
+            expired_purchase_token = base.json_dict_optional_str(out_of_app_context, "expiredPurchaseToken")
+
         if not err.has() and acknowledgement_state is not None:
             result = SubscriptionV2Data(
                 kind=kind,
@@ -402,6 +426,8 @@ def parse_get_subscription_v2_response(response: typing.Any, err: ErrorSink) -> 
                 test_purchase=is_test_purchase,
                 acknowledgement_state=acknowledgement_state,
                 obfuscated_external_account_id=obfuscated_external_account_id,
+                expired_obfuscated_external_account_id=expired_obfuscated_external_account_id,
+                expired_purchase_token=expired_purchase_token,
             )
     else:
         err.msg_list.append('Failed to get subscription details, result not a dict')
@@ -454,97 +480,48 @@ def subscription_v1_acknowledge(purchase_token: str, err: ErrorSink):
         )
 
 
-def fetch_monetizationv3_subscriptions_for_product_id(
-    package_name: str, product_id: str, err: ErrorSink
-) -> Monetizationv3SubscriptionData | None:
-    """
-    Call the Google monetizationv3.subscriptions.get endpoint:
-    https://developers.google.com/android-publisher/api-ref/rest/v3/monetization.subscriptions/get
-    """
-    if base.PROVIDER_DRY_RUN:
-        # Dry-run: no call to Google. This is only reached via the notification subscriber, which does not
-        # start under dry-run (see notifications.start_subscriber), so this is belt-and-suspenders.
-        return Monetizationv3SubscriptionData(base_plans=[])
+def parse_line_item(details: SubscriptionV2Data, err: ErrorSink) -> SubscriptionV2DataLineItem | None:
+    '''The line item the user actually OWNS, or None with the reason recorded.
 
-    service = get_publisher_service()
-    result = None
-    response = service.monetization().subscriptions().get(packageName=package_name, productId=product_id).execute()
+    Chosen rather than assumed. This used to take `line_items[0]`, which is only correct while a
+    subscription has exactly one item. Google sends a second during a deferred change — for the product
+    being replaced *to* — and documents that item as having no `latestSuccessfulOrderId`, precisely because
+    the user does not own it yet. Taking position 0 therefore reads whichever the response happened to list
+    first, and picking the incoming one yields an item with no order id: the identity every payment row is
+    keyed by.
 
-    if isinstance(response, dict):
-        base_plans = json_dict_require_array(response, "basePlans", err)
-        if not err.has():
-            result = Monetizationv3SubscriptionData(base_plans=base_plans)
-    else:
+    Ownership is the honest filter, and it is the same one Google's own field semantics imply. Among owned
+    items — a multi-item subscription is legal, though nothing we sell produces one — the furthest expiry is
+    the one that decides entitlement, so that is the tie-break.
+    '''
+    owned = [item for item in details.line_items if item.latest_successful_order_id is not None]
+    if not owned:
+        # Distinguished from "several": no owned item at all means the resource describes a subscription
+        # the user has not been charged for yet (a pending signup), which is not something to key a payment
+        # on and not an error in the response.
         err.msg_list.append(
-            f'Subscription info response is not a valid dict: {safe_dump_arbitrary_value_or_type(response)}'
+            f'Subscription resource has no owned line item ({len(details.line_items)} present); '
+            f'nothing to attribute a payment to'
         )
+        return None
 
-    assert result is None if err.has() else isinstance(result, Monetizationv3SubscriptionData)
-    return result
-
-
-def fetch_subscription_details_for_base_plan_id(base_plan_id: str, err: ErrorSink) -> SubscriptionProductDetails | None:
-    """
-    Internally calls the Google monetization v3 api
-    """
-    result = None
-
-    subscriptions = fetch_monetizationv3_subscriptions_for_product_id(
-        package_name=package_name, product_id=subscription_product_id, err=err
-    )
-
-    if err.has():
-        err.msg_list.append(f'Failed to get subscription details for {package_name} and {subscription_product_id}')
-        return result
-
-    assert subscriptions is not None
-
-    result = None
-    for plan in subscriptions.base_plans:
-        assert plan is not None
-
-        if not isinstance(plan, dict):
-            err.msg_list.append(f'Plan is not a dict: {type(plan)}')
-            continue
-
-        result_base_plan_id = json_dict_require_str(plan, "basePlanId", err)
-
-        if result_base_plan_id != base_plan_id:
-            continue
-
-        auto_renewing_base_plan_type = json_dict_require_obj(plan, "autoRenewingBasePlanType", err)
-        grace_period = json_dict_require_google_duration(auto_renewing_base_plan_type, "gracePeriodDuration", err)
-        billing_period = json_dict_require_google_duration(auto_renewing_base_plan_type, "billingPeriodDuration", err)
-
-        if err.has():
-            continue
-
-        result = SubscriptionProductDetails(billing_period=billing_period, grace_period=grace_period)
-        break
-
-    if result is None:
-        err.msg_list.append(
-            f'Unable to find plan details for plan_id "{base_plan_id}", plan_details was {subscriptions.base_plans}'
+    if len(owned) > 1:
+        log.warning(
+            f'Subscription resource has {len(owned)} owned line items; taking the furthest expiry. '
+            f'Nothing we sell produces this, so it is worth understanding.'
         )
-
-    assert result is None if err.has() else isinstance(result, SubscriptionProductDetails)
-
-    return result
-
-
-def parse_line_item(details: SubscriptionV2Data) -> SubscriptionV2DataLineItem:
-    assert len(details.line_items) > 0
-    return details.line_items[0]
+    return max(owned, key=lambda item: item.expiry_time.unix_milliseconds)
 
 
 def parse_valid_order_id(details: SubscriptionV2Data, err: ErrorSink) -> str:
-    result = ""
-    line_item = parse_line_item(details)
-    if line_item.latest_successful_order_id is None:
-        err.msg_list.append("Order id is None is subscription but was required!")
-    else:
-        result = line_item.latest_successful_order_id
-    return result
+    # Owning an item and having an order id are the same fact, so parse_line_item's filter already
+    # guarantees this; the check remains because the type does not.
+    line_item = parse_line_item(details, err)
+    if line_item is None or line_item.latest_successful_order_id is None:
+        if not err.has():
+            err.msg_list.append("Order id is None is subscription but was required!")
+        return ""
+    return line_item.latest_successful_order_id
 
 
 @dataclasses.dataclass
@@ -558,6 +535,11 @@ class SubscriptionPlanEventTransaction:
     subscription_state: SubscriptionsV2State
     purchase_acknowledged: SubscriptionsV2AcknowledgementState
     obfuscated_external_account_id: str | None
+    # The expired subscription's account id, when this is an unacknowledged resubscribe. See
+    # `SubscriptionV2Data.expired_obfuscated_external_account_id` for why it is the only attribution
+    # available in that case.
+    expired_obfuscated_external_account_id: str | None
+    expired_purchase_token: str | None
 
 
 def parse_subscription_purchase_tx(purchase_token: str, details: SubscriptionV2Data, err: ErrorSink):
@@ -577,16 +559,55 @@ def pro_plan_from_base_plan_id(base_plan_id: str, err: ErrorSink) -> ProPlan:
         case "session-pro-12-months":
             result = ProPlan.TwelveMonth
         case _:
+            # Reported, never asserted: a base plan added in Play Console is EXTERNAL INPUT, not a broken
+            # invariant, so it must reach the caller as an error it can act on. Asserting sent an
+            # AssertionError through the handler's blanket except instead, losing the message text into a
+            # traceback. (Under `python -O` the assert vanished, leaving exactly the behaviour written here
+            # — the caller has always guarded on the sink, so `Nil` never reached a write either way.)
+            #
+            # The caller declines to write, which is the right answer: we cannot invent an entitlement for a
+            # plan we do not know. Recovery is open-ended rather than racing a deadline, but NOT via the
+            # notification — that was acked the moment its token was queued. The durable record is the
+            # token's `google_reconcile_queue` row, which the drain retries with a backoff and which has no
+            # retention limit at all, so deploying support for the plan registers the purchase on the next
+            # pass whenever that happens.
+            #
+            # It is still an emergency: the subscriber has paid and has no Pro until that deploy, and
+            # Google auto-refunds a purchase left unacknowledged for three days — which this one will be,
+            # since `needs_ack` is only written when the drain manages to register the payment.
             err.msg_list.append(f'Invalid google base_plan_id, unable to determine plan variant: {base_plan_id}')
 
-    assert result != ProPlan.Nil
     return result
 
 
 def parse_subscription_plan_event_tx(
     details: SubscriptionV2Data, event_ts_ms: int, notification: SubscriptionNotificationType, err: ErrorSink
 ) -> SubscriptionPlanEventTransaction:
-    line_item: SubscriptionV2DataLineItem = parse_line_item(details)
+    line_item = parse_line_item(details, err)
+    if line_item is None:
+        # The sink carries the reason; hand back a zero-valued tx so the caller's `err.has()` guard is what
+        # stops it, matching how every other parse failure here behaves.
+        return SubscriptionPlanEventTransaction(
+            base_plan_id='',
+            # Never read: the populated sink is what stops the caller. Borrowed rather than fabricated,
+            # because GoogleTimestamp parses RFC3339. A parsed resource always has at least one item
+            # (parse_get_subscription_v2_response rejects an empty lineItems), but the PROVIDER_DRY_RUN
+            # synthetic is built by hand with none, so the guard is not decorative.
+            expiry_time=(
+                details.line_items[0].expiry_time
+                if details.line_items
+                else GoogleTimestamp('1970-01-01T00:00:00Z', ErrorSink())
+            ),
+            pro_plan=ProPlan.Nil,
+            event_ts_ms=event_ts_ms,
+            notification=notification,
+            subscription_state=details.subscription_state,
+            linked_purchase_token=details.linked_purchase_token,
+            purchase_acknowledged=details.acknowledgement_state,
+            obfuscated_external_account_id=details.obfuscated_external_account_id,
+            expired_obfuscated_external_account_id=details.expired_obfuscated_external_account_id,
+            expired_purchase_token=details.expired_purchase_token,
+        )
     result = SubscriptionPlanEventTransaction(
         base_plan_id=line_item.offer_details.base_plan_id,
         expiry_time=line_item.expiry_time,
@@ -597,6 +618,8 @@ def parse_subscription_plan_event_tx(
         linked_purchase_token=details.linked_purchase_token,
         purchase_acknowledged=details.acknowledgement_state,
         obfuscated_external_account_id=details.obfuscated_external_account_id,
+        expired_obfuscated_external_account_id=details.expired_obfuscated_external_account_id,
+        expired_purchase_token=details.expired_purchase_token,
     )
     return result
 

@@ -40,6 +40,15 @@ provider_testing_env   = true
 ; exercise vouchers in a test deployment.
 ; voucher_processing_window = 86400
 
+; renewal_latency_allowance: how long a RENEWING subscription keeps being honoured past its paid-through
+; instant, in SECONDS, while we wait to learn whether it renewed. Defaults to 3600 (1h). This is OURS, not
+; a store's grace period -- it absorbs the delay between a renewal landing at the store and the store's
+; notification reaching us, so a subscriber does not see Pro flicker off and on across the boundary. Raise
+; it ahead of planned maintenance so a backlog of notifications costs latency rather than entitlement; it
+; applies immediately on reload, including to subscriptions bought before the change. Capped at 604800 (7
+; days), because it extends every renewing subscriber's entitlement and a units slip would be expensive.
+; renewal_latency_allowance = 3600
+
 ; log_path: file for the app's own logging, used ONLY for non-uWSGI/CLI invocations. Under uWSGI
 ; (the normal deployment) it is IGNORED — the vassal's `logto` captures stdout/stderr to the log
 ; file and rotates it, which also avoids two processes writing/rotating the same file unsafely.

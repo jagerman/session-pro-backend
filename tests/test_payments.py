@@ -191,7 +191,7 @@ def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_d
         proof: backend.ProSubscriptionProof = dataclasses.field(default_factory=backend.ProSubscriptionProof)
         payment_provider: base.PaymentProvider = base.PaymentProvider.Nil
         expiry_at: pendulum.DateTime = base.EPOCH
-        grace_period: pendulum.Duration = pendulum.duration()
+        grace_period: pendulum.Duration | None = None
 
     scenarios: list[Scenario] = [
         Scenario(
@@ -199,7 +199,7 @@ def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_d
             google_order_id='DEV.' + os.urandom(backend.BLAKE2B_DIGEST_SIZE).hex(),
             plan=base.ProPlan.OneMonth,
             expiry_at=redeemed_at + 30 * base.DAY,
-            grace_period=pendulum.duration(),
+            grace_period=None,
             payment_provider=base.PaymentProvider.GooglePlayStore,
         ),
         Scenario(
@@ -207,7 +207,7 @@ def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_d
             google_order_id='DEV.' + os.urandom(backend.BLAKE2B_DIGEST_SIZE).hex(),
             plan=base.ProPlan.TwelveMonth,
             expiry_at=redeemed_at + 31 * base.DAY,
-            grace_period=pendulum.duration(),
+            grace_period=None,
             payment_provider=base.PaymentProvider.GooglePlayStore,
         ),
     ]
@@ -395,7 +395,7 @@ def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_d
             google_order_id='DEV.' + os.urandom(backend.BLAKE2B_DIGEST_SIZE).hex(),
             plan=base.ProPlan.OneMonth,
             expiry_at=redeemed_at + 30 * base.DAY,
-            grace_period=pendulum.duration(),
+            grace_period=None,
             payment_provider=base.PaymentProvider.GooglePlayStore,
         ),
         Scenario(
@@ -403,7 +403,7 @@ def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_d
             google_order_id='DEV.' + os.urandom(backend.BLAKE2B_DIGEST_SIZE).hex(),
             plan=base.ProPlan.TwelveMonth,
             expiry_at=redeemed_at + 31 * base.DAY,
-            grace_period=pendulum.duration(),
+            grace_period=None,
             payment_provider=base.PaymentProvider.GooglePlayStore,
         ),
     ]

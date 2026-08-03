@@ -62,7 +62,7 @@ class TestingContext:
     flask_client: werkzeug.Client
     provider_testing_env: bool = False
     db_url_factory: typing.Callable[[], str] | None = None
-    saved_google_grace_period: pendulum.Duration = base.DEFAULT_GOOGLE_GRACE_PERIOD
+    saved_renewal_allowance: pendulum.Duration = base.RENEWAL_LATENCY_ALLOWANCE
 
     def __init__(self, db_url_factory: typing.Callable[[], str], provider_testing_env: bool = False):
         self.db_url_factory = db_url_factory
@@ -70,9 +70,9 @@ class TestingContext:
 
     def __enter__(self):
         base.PROVIDER_TESTING_ENV = self.provider_testing_env
-        self.saved_google_grace_period = base.DEFAULT_GOOGLE_GRACE_PERIOD
+        self.saved_renewal_allowance = base.RENEWAL_LATENCY_ALLOWANCE
         if base.PROVIDER_TESTING_ENV:
-            base.DEFAULT_GOOGLE_GRACE_PERIOD = base.duration_from_ms(google_play.api.testing_grace_period_duration_ms)
+            base.RENEWAL_LATENCY_ALLOWANCE = base.duration_from_ms(google_play.api.testing_renewal_latency_allowance_ms)
 
         # Mint a fresh database on the ephemeral PostgreSQL cluster
         assert self.db_url_factory is not None
@@ -97,7 +97,7 @@ class TestingContext:
     ):
         self.db_engine.close()
         base.PROVIDER_TESTING_ENV = False
-        base.DEFAULT_GOOGLE_GRACE_PERIOD = self.saved_google_grace_period
+        base.RENEWAL_LATENCY_ALLOWANCE = self.saved_renewal_allowance
         return False
 
     @contextlib.contextmanager
@@ -106,15 +106,21 @@ class TestingContext:
             yield conn
 
 
-def _google_subscription_parse(monkeypatch):
-    # Shared setup for the two below: fetch succeeds (returns a non-None sentinel), reaching the parse step.
-    monkeypatch.setattr('providers.google_play.api.fetch_subscription_v2_details', lambda *a, **k: object())
-    return google_play.ParsedNotification(
-        payload_type=google_play.ParsedNotificationPayloadType.Subscription,
-        purchase_token='tok-xyz',
-        package_name='pkg',
-        event_time_ms=1,
-    )
+def round_datetime_to_next_day_with_provider_testing_support(
+    payment_provider: base.PaymentProvider, at: pendulum.DateTime
+) -> pendulum.DateTime:
+    """Round `at` up to the next day boundary, honouring a store's compressed testing "day" (Google: 10 s).
+
+    Test scaffolding: it lives here because nothing in production rounds to a day boundary any more. The
+    revocation early-out used to, and now measures in proof-grid periods; the legacy Google dispatch used to,
+    and is gone. Only the recorded RTDN sequences still need it, to place their assertions on the same
+    boundaries the fixtures were captured against."""
+    if base.PROVIDER_TESTING_ENV and payment_provider == base.PaymentProvider.GooglePlayStore:
+        google_day = pendulum.duration(seconds=10)  # in Google's test env, 1 day == 10s
+        elapsed = at - base.EPOCH
+        units = -((-elapsed) // google_day)  # ceil-divide the duration
+        return base.EPOCH + units * google_day
+    return base.round_datetime_to_next_day(at)
 
 
 def _redeem_and_prove(conn, backend_key, master_key, rotating_key, request_at):

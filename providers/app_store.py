@@ -15,7 +15,6 @@ import psycopg
 import dataclasses
 import pprint
 import logging
-import time
 import traceback
 import uuid
 
@@ -156,8 +155,10 @@ def pro_plan_from_product_id(product_id: str, err: base.ErrorSink) -> base.ProPl
         case 'com.getsession.org.pro_sub_12_months':
             result = base.ProPlan.TwelveMonth
         case _:
+            # Reported, never asserted — see pro_plan_from_base_plan_id in the Google provider for the
+            # reasoning; a product added in App Store Connect is external input, not a broken invariant.
+            # Every caller here already guards on the sink before using the result.
             err.msg_list.append(f'Invalid apple plan_id, unable to determine plan variant: {product_id}')
-            assert False, f'Invalid apple plan_id: {product_id}'
 
     return result
 
@@ -418,7 +419,7 @@ def handle_notification_tx(
                     log.debug(
                         f'{notif_type} for {payment_tx_id_label(payment_tx)}: '
                         f'New payment (expiry/unredeemed/refund expiry) ts = {expiry}/{unredeemed}/{refund}, '
-                        f'grace period = {base.DEFAULT_APPLE_GRACE_PERIOD}, auto-renewing = {auto_renewing}'
+                        f'auto-renewing = {auto_renewing}'
                     )
 
                 # NOTE: Process notification
@@ -441,11 +442,7 @@ def handle_notification_tx(
 
                 if not err.has():
                     backend.update_payment_renewal_info(
-                        sql_tx,
-                        payment_tx=payment_tx,
-                        grace_period=base.DEFAULT_APPLE_GRACE_PERIOD,
-                        auto_renewing=auto_renewing,
-                        err=err,
+                        sql_tx, payment_tx=payment_tx, grace_period=None, auto_renewing=auto_renewing, err=err
                     )
                 sql_tx.cancel = err.has()
 
@@ -531,16 +528,11 @@ def handle_notification_tx(
                         # subscription before the downgrade is to take effect, e.g. it has the TX
                         # info that we need to set auto-renewal back on for
                         log.debug(
-                            f'{notif_type}+DOWNGRADE for {payment_tx_id_label(payment_tx)}: '
-                            f'Grace period = {base.DEFAULT_APPLE_GRACE_PERIOD}, auto-renewing = true'
+                            f'{notif_type}+DOWNGRADE for {payment_tx_id_label(payment_tx)}: ' f'auto-renewing = true'
                         )
                         sql_tx.cancel = True
                         backend.update_payment_renewal_info(
-                            sql_tx,
-                            payment_tx=payment_tx,
-                            grace_period=base.DEFAULT_APPLE_GRACE_PERIOD,
-                            auto_renewing=True,
-                            err=err,
+                            sql_tx, payment_tx=payment_tx, grace_period=None, auto_renewing=True, err=err
                         )
                         sql_tx.cancel = err.has()
 
@@ -570,7 +562,7 @@ def handle_notification_tx(
                                 f'{notif_type}+UPGRADE for {payment_tx_id_label(payment_tx)}: '
                                 f'Revoke (orig. TX ID) date = {revoke}, '
                                 f'new payment (expiry/unredeemed/refund expiry) ts = {expiry}/{unredeemed}/{refund}, '
-                                f'grace period = {base.DEFAULT_APPLE_GRACE_PERIOD}, auto-renewing = {auto_renewing}'
+                                f'auto-renewing = {auto_renewing}'
                             )
 
                         sql_tx.cancel = True
@@ -599,20 +591,9 @@ def handle_notification_tx(
                                 err=err,
                             )
 
-                        # NOTE: Update grace period, note we do not update the auto-renewing flag
-                        # because it is set on by default for new subscription payments (by
-                        # definition, paying for a subscription means the user is enrolling into
-                        # auto-renewing payments at the subsequent billing cycle so that's the
-                        # default behaviour of the backend which is to set that flag on the payment
-                        # immediately)
-                        if not err.has():
-                            backend.update_payment_renewal_info(
-                                sql_tx,
-                                payment_tx=payment_tx,
-                                grace_period=base.DEFAULT_APPLE_GRACE_PERIOD,
-                                auto_renewing=None,
-                                err=err,
-                            )
+                        # Nothing follows the insert: `auto_renewing` is already true on a newly inserted
+                        # subscription payment (paying for one enrols the next cycle by definition), and the
+                        # grace column is store data Apple has not sent for this transaction.
                         sql_tx.cancel = err.has()
 
     elif decoded_notification.body.notificationType == AppleNotificationV2.OFFER_REDEEMED:
@@ -738,7 +719,7 @@ def handle_notification_tx(
                             f'{notif_type}+UPGRADE for {payment_tx_id_label(payment_tx)}: '
                             f'Revoking (orig TX id) at = {revoke}, '
                             f'new payment (expiry/unredeemed/refund ts) = {expiry}/{unredeemed}/{refund}, '
-                            f'grace = {base.DEFAULT_APPLE_GRACE_PERIOD}, auto-renewing = {auto_renewing}'
+                            f'auto-renewing = {auto_renewing}'
                         )
 
                     revoked = backend.add_apple_revocation(
@@ -766,11 +747,7 @@ def handle_notification_tx(
 
                     if not err.has():
                         backend.update_payment_renewal_info(
-                            sql_tx,
-                            payment_tx=payment_tx,
-                            grace_period=base.DEFAULT_APPLE_GRACE_PERIOD,
-                            auto_renewing=auto_renewing,
-                            err=err,
+                            sql_tx, payment_tx=payment_tx, grace_period=None, auto_renewing=auto_renewing, err=err
                         )
 
                     sql_tx.cancel = err.has()
@@ -909,10 +886,7 @@ def handle_notification_tx(
             payment_tx = payment_tx_from_apple_jws_transaction(tx, err)
             if not err.has():
                 auto_renewing = decoded_notification.body.subtype == AppleSubtype.AUTO_RENEW_ENABLED
-                log.debug(
-                    f'{notif_type} for {payment_tx_id_label(payment_tx)}: '
-                    f'Auto-renewing = {auto_renewing}, grace period = {base.DEFAULT_APPLE_GRACE_PERIOD}'
-                )
+                log.debug(f'{notif_type} for {payment_tx_id_label(payment_tx)}: ' f'Auto-renewing = {auto_renewing}')
                 backend.update_payment_renewal_info(
                     sql_tx, payment_tx=payment_tx, grace_period=None, auto_renewing=auto_renewing, err=err
                 )
@@ -1176,16 +1150,6 @@ def notifications_apple_app_connect_sandbox() -> flask.Response:
 
     # NOTE: Handle errors
     if err.has():
-        # NOTE: Record the error under the payment token if possible to propagate to clients
-        if decoded_notification.tx_info and decoded_notification.tx_info.originalTransactionId:
-            user_error = backend.UserError(
-                provider=base.PaymentProvider.iOSAppStore,
-                apple_original_tx_id=decoded_notification.tx_info.originalTransactionId,
-            )
-
-            with db.connection() as conn:
-                backend.add_user_error(conn, error=user_error, at=base.datetime_from_unix_ms(int(time.time() * 1000)))
-
         # NOTE: Log and abort request
         log.error(
             f'Failed to parse notification ({resp.signedDate}) signed payload was:\n'

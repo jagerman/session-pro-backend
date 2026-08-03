@@ -338,8 +338,6 @@ python cli.py --config config.ini voucher --master-pkey 0xabcd... --plan 12M
 python cli.py --config config.ini voucher --master-pkey 0xabcd... --plan 1M --provider google_play
 
 # User error management (requires --config)
-python cli.py --config config.ini user-error set "google_play:token123=true"
-python cli.py --config config.ini user-error delete "google_play:token123"
 
 # Google notification management (requires --config)
 python cli.py --config config.ini google-notification handle "12345"

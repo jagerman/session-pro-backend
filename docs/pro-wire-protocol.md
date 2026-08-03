@@ -149,7 +149,10 @@ compute, just an opaque stored random value.
 
 ### 2.2 `account_expiry_ts` (advisory, unsigned)
 The account's **true entitlement end** in integer seconds — the same value `get_pro_status` reports as
-`expiry_ts` (grace-inclusive). It is **not** part of the signed message `M` and carries no signature of
+`expiry_ts`. This is the end of the term that was *paid for*: it carries neither the store's grace period
+nor the backend's renewal-latency allowance, both of which describe how long service continues past that
+point rather than what the subscription ran to. It is **not** part of the signed message `M` and carries no
+signature of
 its own: a verifier reconstructs `M` from `version`/`revocation_tag`/`rotating_pkey`/`expiry_ts` only and
 MUST NOT feed `account_expiry_ts` into that check. It is **distinct from the proof's `expiry_ts`**, which
 is the clamped, rolling (~30 d) proof-validity window; `account_expiry_ts` is the subscription horizon
@@ -157,10 +160,13 @@ and may be far later. It rides on the proof response so a proof fetch also refre
 expiry; treat it as display state, not an entitlement authority (the signed proof + revocation list are
 authoritative).
 
-`expiry_ts ≤ account_expiry_ts` always holds. In the final stretch of a subscription the proof's expiry
-overtakes the true entitlement end (§2.3), and there `account_expiry_ts` reports the proof's expiry rather
-than the true end — so it is exact everywhere except that closing window, where it reads up to ~25 h
-generous. The `subscription_expired` failure (§5.1) carries the true, now-past end instead.
+**`expiry_ts ≤ account_expiry_ts` does NOT hold**, and a client must not assume it. The two answer
+different questions and are allowed to cross: in the final stretch of a subscription the proof's expiry
+overtakes the account's true end (§2.3), and a proof issued during a store grace period or the backend's
+renewal-latency allowance runs past it by construction. `account_expiry_ts` is exact in every case — it is
+the one value here with no over-provision and no random offset on it, which is what makes it the right
+thing to show a user and the wrong thing to make a serving decision on. The `subscription_expired`
+failure (§5.1) carries the same value, then in the past.
 
 ### 2.3 `expiry_ts` (proof validity)
 The proof's own validity window, and **nothing else**. It is the earlier of the subscription end and a
@@ -306,7 +312,7 @@ two fields; `user_status: never` is the state behind an `error_code: not_subscri
 
 The two read endpoints return these `result` shapes:
 - **`get_pro_status`** (cheap, hot path) — `{ user_status, auto_renewing, expiry_ts,
-  grace_period_duration, error_report, latest_payment }`. `latest_payment` is a single payment item (shape
+  grace_period_duration, latest_payment }`. `latest_payment` is a single payment item (shape
   below) or `null` when the account has no payments. No list, no pagination.
 - **`get_payment_details`** (paginated history) — `{ payments_total, items, next_cursor }`. `items` is one
   keyset page of payment items, newest-first, and carries **no** `user_status`; `payments_total` is the
@@ -316,6 +322,30 @@ Each **payment item** carries: `status` (payment `code`), `plan`, `payment_provi
 `purchased_ts` (float), `expiry_ts`, `grace_period_duration`, `platform_refund_expiry_ts`,
 `revoked_ts` (float), and the opaque `payment_id` — a backend-owned identifier the client stores and
 compares for equality but never parses.
+
+#### `expiry_ts` and `grace_period_duration` — two levels, two meanings
+
+`grace_period_duration` is **not** the same quantity on a payment item and on `get_pro_status`, and a client
+must not treat them interchangeably:
+
+- On a **payment item** it is what the *store declared* about that one transaction: a dunning window the
+  store granted without folding it into its own expiry. `0` where the store declared none.
+- On **`get_pro_status`** it is how much longer the *account* is served past `expiry_ts` — the store's grace
+  plus the backend's renewal-latency allowance, and `0` when the subscription is not auto-renewing (nothing
+  is in flight, so nothing is being waited for).
+
+The account-level pair is self-consistent: `expiry_ts + grace_period_duration` is exactly the instant the
+backend stops serving, and is the same instant `user_status` flips from `active` to `expired`. A client that
+wants "am I still Pro?" should read `user_status`; a client that wants "until when?" can add the two.
+
+**`expiry_ts` reports the end of the term the store currently states, which is not always the paid-through
+date.** Apple leaves its expiry alone and declares grace separately, so an Apple subscription in grace
+reports the paid term with the grace beside it. Google Play instead applies grace by *extending* its own
+expiry, and the backend does not know the configured amount to subtract — so a Google subscription in grace
+reports an `expiry_ts` that already includes the grace, with only the allowance beside it. The stop-serving
+arithmetic above holds in both cases; what differs is how the same window is split between the two fields.
+A client displaying a renewal date should expect it to move forward by the grace period when a Google
+renewal fails, which is not a renewal and not an error.
 
 ### 5.3 Pagination cursor (`get_payment_details`)
 

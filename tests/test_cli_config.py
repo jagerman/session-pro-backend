@@ -58,23 +58,6 @@ def test_cli_parse_helpers():
     # The CLI arg parsers raise ValueError on malformed input (no ErrorSink); command handlers catch it,
     # print "Failed to parse arguments", and exit 1. Here we pin the parse contract directly.
 
-    # parse_set_user_error_arg: "<provider>:<payment_id>=[true|false]", comma-separated.
-    assert cli.parse_set_user_error_arg('') == []
-    assert cli.parse_set_user_error_arg('google_play:tok1=true, app_store:otx2=false') == [
-        (base.PaymentProvider.GooglePlayStore, 'tok1', True),
-        (base.PaymentProvider.iOSAppStore, 'otx2', False),
-    ]
-    with pytest.raises(ValueError):
-        cli.parse_set_user_error_arg('google_play-tok1-true')  # no ':' / '='
-    with pytest.raises(ValueError):
-        cli.parse_set_user_error_arg('notaprovider:tok=true')  # bad provider (was swallowed into the sink)
-    with pytest.raises(ValueError):
-        cli.parse_set_user_error_arg('google_play:tok=maybe')  # bad flag
-    with pytest.raises(ValueError):
-        cli.parse_set_user_error_arg('nil:tok=true')  # Nil provider rejected
-    with pytest.raises(ValueError):
-        cli.parse_set_user_error_arg('stf:tok=true')  # a directly granted payment cannot error
-
     # parse_payment_id_list: "<provider>:<payment_id>", comma-separated.
     assert cli.parse_payment_id_list('') == []
     assert cli.parse_payment_id_list('google_play:tok1, stf:ord2') == [
@@ -179,6 +162,37 @@ def test_voucher_processing_window_config(tmp_path, monkeypatch):
     with pytest.raises(config.ConfigError) as excinfo:
         parse_with('-1')
     assert any('voucher_processing_window' in m for m in excinfo.value.errors)
+
+
+def test_renewal_latency_allowance_config(tmp_path, monkeypatch):
+    # Our allowance for learning that a renewal happened -- not any store's grace period. Defaults to an
+    # hour, read from the .INI, and bounded at BOTH ends, unlike the voucher window: this value extends
+    # every renewing subscriber's entitlement, so a units slip (milliseconds pasted into a seconds field)
+    # would silently grant everyone decades of Pro. A week is well past any plausible outage.
+    #
+    # Zero is allowed: it means "honour exactly the paid-through instant", which is a coherent thing to ask
+    # for even if nobody sensible wants it in production.
+    for k in list(os.environ):
+        if k.startswith('SESH_PRO_BACKEND_'):
+            monkeypatch.delenv(k, raising=False)
+
+    assert config.parse_args().renewal_latency_allowance == base.RENEWAL_LATENCY_ALLOWANCE
+
+    def parse_with(value: str) -> config.ParsedArgs:
+        ini = tmp_path / f'a{value.strip("-")}.ini'
+        body = f'db_url = postgresql:///x\nbackend_key_path = /k\nrenewal_latency_allowance = {value}\n'
+        ini.write_text(f'[base]\n{body}')
+        monkeypatch.setenv('SESH_PRO_BACKEND_INI_PATH', str(ini))
+        return config.parse_args()
+
+    assert parse_with('7200').renewal_latency_allowance == base.duration_from_seconds(7200)
+    assert parse_with('0').renewal_latency_allowance == pendulum.duration()
+    assert parse_with(str(7 * base.SECONDS_IN_DAY)).renewal_latency_allowance == 7 * base.DAY
+
+    for bad in ('-1', str(7 * base.SECONDS_IN_DAY + 1), '3600000'):
+        with pytest.raises(config.ConfigError) as excinfo:
+            parse_with(bad)
+        assert any('renewal_latency_allowance' in m for m in excinfo.value.errors), excinfo.value.errors
 
 
 def test_migrations_bootstrap_and_idempotency(pg_database):

@@ -299,7 +299,6 @@ def get_pro_status():
     auto_renewing = False
     expiry_ts = 0
     grace_period_duration = 0
-    error_report = 0
     latest_payment: dict[str, str | int | float | bool] | None = None
 
     with db.connection() as conn:
@@ -307,7 +306,6 @@ def get_pro_status():
             # Bind any payment the mule has registered for this key but that isn't yet redeemed, so a
             # status check right after purchase reflects it. No-op when there's nothing new.
             backend.reconcile_pending_payments(tx, master_pkey_nacl, redeemed_at=backend.to_redeemed_at(request_at))
-            error_report = int(backend.has_user_error_from_master_pkey(tx, master_pkey_nacl))
             user = backend.get_user(tx.conn, master_pkey_nacl)
             if user.found:
                 auto_renewing = user.auto_renewing
@@ -315,11 +313,27 @@ def get_pro_status():
                 # TRUE expiry, straight from the store, so any sub-second part is floored (wire spec §1)
                 # — unlike the proof's expiry, which lands on a whole second by construction (§2.3).
                 expiry_ts = base.unix_seconds_from_datetime(user.expiry_at)
-                grace_period_duration = base.seconds_from_duration(user.grace_period)
 
                 # Status decided against the *request* clock (signed, anti-replay-bounded to ≈now) —
                 # the same clock the latest item's derived status uses, never a second time.time().
-                user_pro_status = UserProStatus.Active if request_at <= user.expiry_at else UserProStatus.Expired
+                #
+                # Against COVERAGE rather than the expiry reported above, so the answer agrees with what
+                # the proof path will actually do: an account inside the store's grace or our allowance is
+                # still being served, and reporting it Expired while proofs mint for it is a contradiction
+                # a client would have to reconcile. This also preserves the behaviour from when the stored
+                # expiry was itself grace-inclusive — it is the reported VALUE that changes here, not the
+                # threshold.
+                coverage_end = backend.account_coverage_end(user)
+                user_pro_status = UserProStatus.Active if request_at <= coverage_end else UserProStatus.Expired
+
+                # Derived from the same instant the status is judged against, so `expiry_ts +
+                # grace_period_duration` is exactly when we stop serving and a client can reconcile the two
+                # rather than finding `active` next to numbers that say otherwise. This is how much longer
+                # we serve past the expiry shown — the account's state — and NOT the same quantity as the
+                # payment-level field of this name, which reports what a store declared about one
+                # transaction. `account_coverage_end` already returns the bare expiry when the subscription
+                # is not renewing, so the gate is in the arithmetic rather than bolted on after it.
+                grace_period_duration = base.seconds_from_duration(coverage_end - user.expiry_at)
                 if backend.is_generation_revoked(tx.conn, user.current_generation_id, request_at):
                     user_pro_status = UserProStatus.Expired
 
@@ -332,8 +346,7 @@ def get_pro_status():
             'user_status': user_pro_status.value,
             'auto_renewing': auto_renewing,
             'expiry_ts': expiry_ts,
-            'grace_period_duration': grace_period_duration if auto_renewing else 0,
-            'error_report': error_report,
+            'grace_period_duration': grace_period_duration,
             'latest_payment': latest_payment,
         }
     )

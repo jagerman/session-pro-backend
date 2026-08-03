@@ -180,12 +180,16 @@ def test_proof_is_identical_for_requests_in_the_same_grid_period(pg_database):
     pool.close()
 
 
-def test_proof_expiry_offset_redraws_only_when_true_expiry_moves(monkeypatch, pg_database):
+def test_proof_expiry_offset_redraws_only_when_true_expiry_extends(monkeypatch, pg_database):
     # The offset tracks the subscription CYCLE, not every touch of the user row. Both directions matter:
     # re-drawing on a refresh that changes nothing would hand an observer repeated samples against one true
     # expiry, and the minimum of those samples converges straight back onto it; never re-drawing would leave
     # a fixed expiry time-of-day (a stable fingerprint) and let the same accounts perpetually collect the
-    # offset's bonus Pro. So: re-draw exactly when `users.expiry_at` moves.
+    # offset's bonus Pro. So: re-draw when `users.expiry_at` EXTENDS.
+    #
+    # The two other arms of that rule live in tests/test_google.py, since they need a store payment with a
+    # real expiry to shrink: a shrink KEEPS the offset (so that reducing an entitlement cannot serve a later
+    # expiry than before), except that minting a generation always re-draws.
     draws = itertools.count(1)
     monkeypatch.setattr(backend, 'new_proof_expiry_offset', lambda: next(draws))
 
@@ -292,10 +296,11 @@ def test_lapsed_account_keeps_proofs_through_the_over_provision(pg_database):
         # Past the true expiry but inside the over-provision: still served, and the expiry has not budged.
         lapsed = _prove_at(conn, backend_key, master_key, rotating_key, true_expiry + pendulum.duration(minutes=30))
         assert lapsed.expiry_at == expiry
-        # account_expiry_ts reads back the proof's expiry here (it is the later of the two), so the client is
-        # never told its subscription ended while a proof we signed still verifies.
-        assert lapsed.account_expiry_at == expiry
-        assert lapsed.expiry_at <= lapsed.account_expiry_at
+        # account_expiry_ts is the TRUE end of the paid term and does NOT read back the proof's expiry: the
+        # two answer different questions, and the old `max` bought self-consistency by handing the owner a
+        # date carrying the proof's random grid offset. So the proof deliberately outlives it here.
+        assert lapsed.account_expiry_at == true_expiry
+        assert lapsed.expiry_at > lapsed.account_expiry_at
 
         # Spent: now it lapses, reporting the TRUE expiry and never the over-provisioned one.
         with pytest.raises(base.FailError) as excinfo:

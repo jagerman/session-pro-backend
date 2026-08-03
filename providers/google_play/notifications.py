@@ -14,7 +14,6 @@ import dataclasses
 import typing
 import time
 import enum
-import collections.abc
 
 from google.oauth2 import service_account
 
@@ -27,7 +26,6 @@ import base
 import db
 
 from base import (
-    ProPlan,
     JSONObject,
     json_dict_require_str,
     json_dict_require_str_coerce_to_int,
@@ -44,11 +42,24 @@ from .types import (
     SubscriptionsV2AcknowledgementState,
     RefundType,
     ProductType,
-    SubscriptionsV2State,
     SubscriptionV2Data,
 )
 
 log = logging.Logger('GOOGLE')
+
+# How long the subscriber loop waits before doing its periodic work when nothing wakes it. A FLOOR, not a
+# schedule: a callback sets the event as soon as it commits, so an arriving notification is serviced in
+# milliseconds and this only paces the work no notification announces — the drain's own retry backoffs, and
+# tokens a reconcile enqueued rather than a message. An idle pass is two indexed queries.
+SUBSCRIBER_POLL_FLOOR_S: int = 15
+
+# Paces reconnection after the stream dies for good, so a subscribe() that fails instantly — bad
+# credentials, a deleted subscription — cannot spin the mule at the speed of the error.
+SUBSCRIBER_RECONNECT_DELAY_S: int = 5
+
+# How long a callback already running is given to finish once shutdown is signalled. Nothing is lost by
+# cutting it short: an abandoned callback's transaction rolls back, and the message was never acked.
+SUBSCRIBER_SHUTDOWN_GRACE_S: int = 2
 
 
 @dataclasses.dataclass
@@ -80,21 +91,18 @@ class ParsedNotification:
 
 @dataclasses.dataclass
 class SortedMessage:
-    event_unix_ts_ms: int = 0
-    next_retry_unix_ts_s: float = 0
-    curr_retry_delay_s: float = 0
-    message_id: str = ''
-    ack_id: str = ''
-    parse: ParsedNotification = dataclasses.field(default_factory=ParsedNotification)
-    raw: object | None = None  # a pubsub ReceivedMessage at runtime; only ever str()'d, so untyped here
+    """One RTDN on its way through `_process_notification_message`.
 
-    def increase_retry_delay(self, now_s: float):
-        MIN_RETRY_DELAY_S: float = 1
-        MAX_RETRY_DELAY_S: float = 600
-        self.curr_retry_delay_s = max(self.curr_retry_delay_s, MIN_RETRY_DELAY_S)
-        self.curr_retry_delay_s *= 2
-        self.curr_retry_delay_s = min(self.curr_retry_delay_s, MAX_RETRY_DELAY_S)
-        self.next_retry_unix_ts_s = now_s + self.curr_retry_delay_s
+    The name is a fossil of the sorted queue that no longer exists, kept because the tests that pin the
+    transaction composition are written against it. There is nothing left to sort: ordering stopped being a
+    requirement when handling became convergent, and the per-message backoff this once carried is now the
+    subscription's retry policy (see `docs/deploy.md`).
+    """
+
+    event_unix_ts_ms: int = 0
+    message_id: str = ''
+    parse: ParsedNotification = dataclasses.field(default_factory=ParsedNotification)
+    raw: object | None = None  # a pubsub message at runtime; only ever str()'d, so untyped here
 
 
 def init(
@@ -115,7 +123,7 @@ def init(
             app_credentials_path, scopes=['https://www.googleapis.com/auth/androidpublisher']
         )
         # Bound every Play API call with a socket timeout. googleapiclient's default httplib2 transport
-        # has NO timeout, so a hung Google request would block the mule's single-threaded pull loop
+        # has NO timeout, so a hung Google request would block the subscriber's single worker
         # indefinitely (there's no harakiri leash on the mule like there is on the request workers). 15s
         # is plenty; a timeout just fails the call, and the mule retries — nothing it does is time-critical.
         authed_http = google_auth_httplib2.AuthorizedHttp(api.credentials, http=httplib2.Http(timeout=15))
@@ -124,12 +132,12 @@ def init(
     api.package_name = package_name
     api.subscription_product_id = subscription_product_id
 
-    # NOTE: Setup thread for caller to use. daemon=True is load-bearing for uWSGI reloads: the pull loop
-    # blocks in client.pull() (a long-poll) and can't be interrupted mid-call, and CPython's interpreter
-    # shutdown JOINS every non-daemon thread BEFORE atexit runs — so a non-daemon subscriber wedges the
-    # whole mule until the pull's deadline and uWSGI NO-MERCY-kills it. As a daemon it's abandoned at
-    # exit instead (stop_subscriber still gives it a brief chance to drain); an abandoned in-flight pull
-    # just means those messages are never acked, so Google redelivers them — nothing is lost.
+    # NOTE: Setup thread for caller to use. daemon=True is load-bearing for uWSGI reloads: a callback
+    # already executing cannot be interrupted (no Python thread can), and CPython's interpreter shutdown
+    # JOINS every non-daemon thread BEFORE atexit runs — so a non-daemon subscriber wedges the whole mule
+    # and uWSGI NO-MERCY-kills it. As a daemon it's abandoned at exit instead (stop_subscriber still gives
+    # it a brief chance to finish); an abandoned callback's transaction rolls back and its message was
+    # never acked, so Google redelivers it — nothing is lost.
     result = ThreadContext()
     result.thread = threading.Thread(
         target=thread_entry_point,
@@ -147,7 +155,8 @@ def start_subscriber(
     app_credentials_path: str | None,
 ) -> ThreadContext:
     '''
-    Initialise + start the Google Pub/Sub notification subscriber. Runs a background pull loop. All
+    Initialise + start the Google Pub/Sub notification subscriber. Runs a background streaming
+    subscriber. All
     Google/gRPC state is constructed here, so the caller (the maintenance mule) invokes this
     post-fork.
     '''
@@ -172,16 +181,21 @@ def start_subscriber(
 
 def stop_subscriber(context: ThreadContext) -> None:
     '''
-    Signal the subscriber pull loop to stop and wait briefly for it to drain (idempotent; safe to
-    call on shutdown even if never started). The thread is a daemon (see init): if it's blocked in a
-    pull and can't drain within the window it's abandoned at interpreter exit rather than wedging the
-    mule — unacked messages redeliver, so nothing is lost. The short wait is only to let a mid-batch
-    cycle finish cleanly when it can.
+    Signal the subscriber to stop and wait briefly for it to finish (idempotent; safe to call on
+    shutdown even if never started). Setting `sleep_event` is what makes this immediate: the loop waits on
+    that event, so it wakes at once rather than serving out its poll floor.
+
+    The thread is a daemon (see init): a callback that cannot finish within the window is abandoned at
+    interpreter exit rather than wedging the mule — its transaction rolls back and its message was never
+    acked, so Google redelivers it.
     '''
     context.kill_thread = True
     context.sleep_event.set()
     if context.thread and context.thread.is_alive():
-        context.thread.join(timeout=1)
+        # Outlasts SUBSCRIBER_SHUTDOWN_GRACE_S deliberately: the loop spends that long waiting for an
+        # executing callback, so joining for less would return before the grace it configures could
+        # elapse, making the grace period decorative.
+        context.thread.join(timeout=SUBSCRIBER_SHUTDOWN_GRACE_S + 1)
 
 
 def handle_parsed_notification(tx: db.SQLTransaction, parse: ParsedNotification, err: base.ErrorSink) -> bool:
@@ -192,33 +206,63 @@ def handle_parsed_notification(tx: db.SQLTransaction, parse: ParsedNotification,
 
         case ParsedNotificationPayloadType.Subscription:
             try:
-                details: SubscriptionV2Data | None = api.fetch_subscription_v2_details(
-                    parse.package_name, parse.purchase_token, err
+                # Record that this token owes a look, and stop. No fetch, no dispatch on type: the
+                # notification's whole content is "something about this subscription changed", and the
+                # resource — which the drain fetches on its own schedule — is what says what it changed to.
+                #
+                # This is what decouples acking from handling. One small write is now the only step that has
+                # to succeed before the message can be acked, and it is the only step whose failure loses
+                # anything: a first sighting of a token cannot be recovered from anywhere else, while
+                # everything downstream is re-derivable from the resource for as long as the token is known.
+                # Dated from the store's event instant rather than our clock, because provider time stays
+                # coherent for a replay (already past, so still immediately due) and in the compressed
+                # testing environment, where a "day" is ten seconds.
+                #
+                # Clamped to now, though, because `eligible_at` is a FLOOR: a clock-skewed or malformed
+                # eventTimeMillis an hour ahead would defer this token for an hour with nothing reporting
+                # it, where the old path processed immediately. Past values pass through untouched.
+                event_at = base.datetime_from_unix_ms(parse.event_time_ms)
+                enqueue_now = base.utc_now()
+                backend.google_enqueue_reconcile(
+                    tx,
+                    payment_token=parse.purchase_token,
+                    eligible_at=event_at if event_at < enqueue_now else enqueue_now,
                 )
-                if err.has():
-                    err.msg_list.append('Failed to fetch subscription V2 details from Google')
-                    return result
 
-                assert details is not None
-                tx_payment = api.parse_subscription_purchase_tx(
-                    purchase_token=parse.purchase_token, details=details, err=err
-                )
-                tx_event = api.parse_subscription_plan_event_tx(details, parse.event_time_ms, parse.sub_type, err=err)
-                if err.has():
-                    err.msg_list.append('Parsing data from subscription V2 details failed')
-                    return result
-
-                handle_subscription_notification(tx_payment=tx_payment, tx_event=tx_event, tx=tx, err=err)
+                # The one fact the resource cannot express, so the one thing the type still decides. A
+                # revoked subscription reads EXPIRED with a back-dated term, which is indistinguishable from
+                # one that simply ran out — and that difference belongs in the payment record even though
+                # entitlement no longer depends on it (the drain's converge would end the entitlement either
+                # way). Safe without the state guard the old branch used: a revoked subscription is
+                # terminated permanently, so a replayed REVOKED can only ever be about this token's ending,
+                # and the `revoked_at IS NULL` guard makes re-stamping a no-op.
+                if parse.sub_type == SubscriptionNotificationType.REVOKED:
+                    backend.add_google_revocation(
+                        tx,
+                        google_payment_token=parse.purchase_token,
+                        revoke_at=base.datetime_from_unix_ms(parse.event_time_ms),
+                        err=err,
+                    )
             except Exception:
                 err.msg_list.append(f"Handling notification failed: {traceback.format_exc()}")
+
+            if err.has():
+                tx.cancel = True
         case ParsedNotificationPayloadType.Voided:
             try:
                 handle_voided_notification(parse.voided, err)
             except Exception:
-                err.msg_list.append("Handling notification failed: {traceback.format_exc()}")
+                err.msg_list.append(f"Handling notification failed: {traceback.format_exc()}")
+            # The subscription path cancels from inside its own handler; this one has to do it here, and
+            # the tail below asserts that it happened. Missing while the branch was unreachable dead code
+            # (see the payload_type typo it was hiding behind), it would have turned the first unsupported
+            # void into an AssertionError instead of the reported skip it is meant to be.
+            if err.has():
+                tx.cancel = True
 
         case ParsedNotificationPayloadType.OneTimeProduct:
             err.msg_list.append('One time product is not supported!')
+            tx.cancel = True
 
         case ParsedNotificationPayloadType.Test:
             pass
@@ -234,54 +278,42 @@ def _process_notification_message(
 ) -> bool:
     """
     Process one queued RTDN message inside a single DB transaction and report whether it was handled
-    (True → ack + drop from the queue; False → leave for retry). Marking the message handled, and
-    recording or clearing the purchase token's user_error, all happen in the SAME transaction as
-    handle_parsed_notification — so a handling failure that sets tx.cancel rolls back that
-    bookkeeping too.  Extracted from the Pub/Sub pull loop so this transaction-composition is
-    unit-testable (the loop itself, which owns the gRPC client, is not).
+    (True → ack; False → nack for redelivery). Marking the message handled happens in the SAME transaction
+    as handle_parsed_notification, so a handling failure that sets tx.cancel rolls back that bookkeeping
+    too. Extracted from the subscriber callback so this transaction-composition is unit-testable (the loop
+    itself, which owns the gRPC client, is not).
+
+    Where a failure becomes visible: the token's `google_reconcile_queue` row, which the drain stamps with
+    `attempts` and `last_error`. This used to also write a `user_error` row, surfaced to the account as the
+    wire's `error_report` — one undocumented bit with no reason and no remedy, which a handling failure then
+    rolled back anyway. Deleted rather than repointed; a stuck purchase is operator information.
     """
 
     handled = False
     with db.transaction(conn) as tx:
-        # NOTE: By definition to be in the sorted list, the message must have also been submitted into the
-        # DB. So if for some reason the notification doesn't exist anymore (maybe someone deleted it
+        # NOTE: The caller records the message in the DB before reaching here. So if for some reason the
+        # notification doesn't exist anymore (maybe someone deleted it
         # out-of-band, e.g. via the SET_GOOGLE_NOTIFICATION command) then we skip the notification.
         lookup = backend.google_notification_message_id_is_in_db(tx, msg.message_id)
-        user_is_in_error_state = backend.has_user_error(
-            conn=tx.conn, payment_provider=base.PaymentProvider.GooglePlayStore, payment_id=msg.parse.purchase_token
-        )
         if not lookup.present or lookup.present and lookup.handled:
             handled = True
         else:
             handled = handle_parsed_notification(tx, msg.parse, err)
 
-        # NOTE: Clear user error if success, or add one if we failed
-        if lookup.present:
-            if handled:
-                backend.google_set_notification_handled(tx, message_id=msg.message_id, delete=False)
-                if user_is_in_error_state:
-                    backend.delete_user_errors(
-                        tx.conn,
-                        payment_provider=base.PaymentProvider.GooglePlayStore,
-                        payment_id=msg.parse.purchase_token,
-                    )
-            elif not user_is_in_error_state:
-                user_error = backend.UserError()
-                user_error.provider = base.PaymentProvider.GooglePlayStore
-                user_error.google_payment_token = msg.parse.purchase_token
-                backend.add_user_error(tx, error=user_error, at=base.datetime_from_unix_ms(int(now_s * 1000)))
+        if lookup.present and handled:
+            backend.google_set_notification_handled(tx, message_id=msg.message_id, delete=False)
     return handled
 
 
 def _sweep_pending_acks() -> None:
     """Acknowledge to Google every Google purchase still flagged needs_ack, then clear the flag. This is
-    the SOLE acker: notification handling only records needs_ack, and the pull loop calls this once per
+    the SOLE acker: notification handling only records needs_ack, and the subscriber loop calls this once per
     iteration (right before blocking on the next pull), so a fresh purchase is acked the next cycle and a
     crash between committing a payment and acking it is picked up by the next sweep — startup included, no
     special case. Google 400s an already-acknowledged purchase with no cleanly-identifiable error, so on
     ANY ack failure we consult the authoritative acknowledgement_state and clear the flag iff Google
     already considers it acked (the "acked, then crashed before clearing" case); otherwise leave it set to
-    retry. Best-effort — never raises, so it can't break the pull loop."""
+    retry. Best-effort — never raises, so it can't break the subscriber loop."""
     try:
         with db.connection() as conn:
             tokens = backend.google_payment_tokens_needing_ack(conn)
@@ -289,7 +321,7 @@ def _sweep_pending_acks() -> None:
         log.error(f'needs_ack sweep: failed to load pending acks. Error was {traceback.format_exc()}')
         return
 
-    for token in tokens:
+    for token, purchased_at in tokens:
         ack_err = base.ErrorSink()
         api.subscription_v1_acknowledge(purchase_token=token, err=ack_err)
         acked = not ack_err.has()
@@ -313,7 +345,25 @@ def _sweep_pending_acks() -> None:
                     f'Error was {traceback.format_exc()}'
                 )
         else:
-            log.warning(f'needs_ack sweep: ack still failing for {base.maybe_obfuscate(token)}; will retry next sweep')
+            # Escalated against Google's own clock, not ours: an unacknowledged purchase is automatically
+            # refunded and its entitlement revoked three days after purchase, so a failing ack is a blip on
+            # the first sweep and an emergency on the third day. Anchored on the purchase instant because
+            # that is when the store starts counting, and on the token's EARLIEST cycle because a token is
+            # acknowledged as a whole.
+            age = base.utc_now() - purchased_at
+            token_label = base.maybe_obfuscate(token)
+            if age >= ACK_DEADLINE_ALERT_AFTER:
+                log.critical(
+                    f'needs_ack sweep: ack has been failing for {token_label} since '
+                    f'{base.readable(purchased_at)} ({age.in_hours():.0f}h). Google auto-refunds an '
+                    f'unacknowledged purchase at {ACK_DEADLINE.in_hours():.0f}h and revokes the '
+                    f'entitlement with it — this needs intervention now'
+                )
+            else:
+                log.warning(
+                    f'needs_ack sweep: ack still failing for {token_label} '
+                    f'({age.in_hours():.0f}h since purchase); will retry next sweep'
+                )
 
 
 def thread_entry_point(
@@ -323,582 +373,559 @@ def thread_entry_point(
     # subscriber thread body and runs only post-fork, inside the mule. A module-level import pulls
     # grpcio's background C threads into the uWSGI master, and the forked mule then segfaults on the
     # dead inherited threads. DO NOT HOIST these to the top of the file.
+    import concurrent.futures
+
     from google.cloud import pubsub_v1  # type: ignore[attr-defined]
-    import google.pubsub_v1.types
-    import google.api_core.exceptions
 
-    sorted_msg_list: list[SortedMessage] = []
+    # Imported by its full path rather than reached through `pubsub_v1.subscriber.scheduler`: that package's
+    # __init__ exports only `Client`, so the attribute path works or not depending on what else happened to
+    # import the submodule first.
+    from google.cloud.pubsub_v1.subscriber.scheduler import ThreadScheduler
 
-    # NOTE Load unhandled messages from the DB and insert it in to the list of messages to start off
-    with db.connection() as conn:
-        with db.transaction(conn) as tx:
-            db_it: collections.abc.Iterator[backend.GoogleUnhandledNotificationIterator] = (
-                backend.google_get_unhandled_notification_iterator(tx)
+    _replay_unhandled_backlog()
+
+    # Set by a callback once its work is committed, so the drain runs promptly after a burst rather than on
+    # the next poll. `Event.set()` is idempotent, so a hundred messages wake the loop once and cost one
+    # drain pass — the trigger is coalesced, not per-message. `stop_subscriber` sets the same event, which
+    # is what makes shutdown immediate rather than waiting out a poll.
+    def _on_message(message: typing.Any) -> None:
+        _handle_streamed_message(message)
+        context.sleep_event.set()
+
+    while not context.kill_thread:
+        try:
+            with pubsub_v1.SubscriberClient.from_service_account_file(app_credentials_path) as client:
+                sub_path = client.subscription_path(project=cloud_project_id, subscription=cloud_subscription_name)
+
+                # ONE worker, deliberately, and not a throughput oversight. Every line of this pipeline was
+                # written and reviewed under a serial handler, and a callback no longer does network I/O —
+                # the fetch moved into the drain, so what runs here is a decode and a couple of small
+                # writes. Concurrency would buy nothing measurable at this volume and would cost the
+                # property that makes the handler easy to reason about. Revisit with volume evidence, not
+                # on principle. Flow control is explicit for the same reason the old loop capped
+                # `max_messages`: an unbounded lease is a memory leak wearing a queue's clothes.
+                scheduler = ThreadScheduler(executor=concurrent.futures.ThreadPoolExecutor(max_workers=1))
+                future = client.subscribe(
+                    subscription=sub_path,
+                    callback=_on_message,
+                    flow_control=pubsub_v1.types.FlowControl(max_messages=100),
+                    scheduler=scheduler,
+                    # Without this the default is False, and `result()` after `cancel()` returns while
+                    # callbacks are still running — which would make the shutdown grace below do nothing at
+                    # all. It does not close the commit-then-ack window (nothing can), but it stops us
+                    # abandoning work we could simply have waited a moment for.
+                    await_callbacks_on_shutdown=True,
+                )
+                log.info('Google subscriber streaming')
+                try:
+                    while not context.kill_thread:
+                        # Woken by a callback, by shutdown, or by the poll floor. The floor is what services
+                        # the drain's own backoffs and anything enqueued by a reconcile rather than by a
+                        # notification; the mule's periodic task is still the backstop for both.
+                        context.sleep_event.wait(timeout=SUBSCRIBER_POLL_FLOOR_S)
+                        context.sleep_event.clear()
+                        if context.kill_thread:
+                            break
+
+                        if future.done():
+                            # Transient stream errors are retried inside the library, so reaching here means
+                            # it gave up. Surface the reason rather than reconnecting blind.
+                            future.result()
+                            break
+
+                        # Best-effort: neither of these may break the loop, and everything they leave
+                        # undone is still queued or still flagged.
+                        try:
+                            drain_due_reconciles(at=base.utc_now())
+                        except Exception:
+                            log.error(f'Reconcile drain failed from the subscriber. Error was {traceback.format_exc()}')
+                        try:
+                            _sweep_pending_acks()
+                        except Exception:
+                            log.error(f'Ack sweep failed from the subscriber. Error was {traceback.format_exc()}')
+                finally:
+                    # Undispatched messages are dropped unacked and redelivered; a callback already running
+                    # is allowed to finish, because no Python thread can be killed. See
+                    # `_handle_streamed_message` for why being abandoned mid-flight is harmless.
+                    future.cancel()
+                    try:
+                        future.result(timeout=SUBSCRIBER_SHUTDOWN_GRACE_S)
+                    except Exception:
+                        # Including the CancelledError the line above is expected to raise.
+                        pass
+        except Exception:
+            log.error(f'Google subscriber stream failed. Error was {traceback.format_exc()}')
+
+        # Paced, so a subscribe() that fails immediately -- bad credentials, a deleted subscription -- does
+        # not spin the mule at the speed of the error.
+        if not context.kill_thread:
+            context.sleep_event.wait(timeout=SUBSCRIBER_RECONNECT_DELAY_S)
+            context.sleep_event.clear()
+
+    # Reaching here without being asked to stop means the loop gave up. The mule blocks on this thread and
+    # uWSGI respawns it, so the supervision is already right -- but a respawn loop is indistinguishable from
+    # health in the logs unless the exit says so. Everything inside is wrapped, so this needs a BaseException
+    # to happen at all, which is exactly why it should be loud rather than assumed impossible.
+    if not context.kill_thread:
+        log.critical('Google subscriber loop exited without being asked to stop; the mule will restart it')
+
+
+def _handle_streamed_message(message: typing.Any) -> None:
+    """Record one streamed RTDN, process it, and ack or nack it.
+
+    Runs on the subscriber's callback thread. Every failure path here nacks, which returns the message for
+    redelivery; the pacing of that redelivery is the SUBSCRIPTION's retry policy, not ours. The old loop
+    carried its own 1 s -> 600 s backoff, and there is no code left holding that responsibility -- see
+    `docs/deploy.md` for the settings that have to exist before this ships.
+
+    Being abandoned between the commit and the ack is possible and harmless: the message is redelivered,
+    `_process_notification_message` finds its row already marked handled, and acks it. That is the same
+    mechanism that makes at-least-once delivery a non-event, and it is why the history row is written
+    BEFORE the message is processed rather than alongside it.
+    """
+
+    err = base.ErrorSink()
+    published = base.readable(base.datetime_from_unix_ms(message.publish_time.timestamp() * 1000))
+    label = f'{message.message_id} (published at {published})'
+
+    parse = decode_notification(message.data, label, err)
+    if parse is None or err.has():
+        # Left unacked deliberately, rather than dropped. A payload we cannot read is either a format we do
+        # not understand yet or a bug, and both are better answered by a redelivery after a deploy than by
+        # silence. Its history row, if one was written, keeps it replayable past Pub/Sub's retention.
+        log.warning(
+            f'Could not decode notification {label}: {err.build() if err.has() else "no payload type"}\n'
+            f'Message was:\n{base.maybe_obfuscate(str(message.data))}'
+        )
+        message.nack()
+        return
+
+    try:
+        with db.connection() as conn:
+            with db.transaction(conn) as tx:
+                # BEFORE handling, because `_process_notification_message` reads an absent row as "handled"
+                # (someone cleared it out-of-band) and acks. A message that reaches processing without its
+                # row would therefore be acked unprocessed, and an acked notification is never redelivered.
+                #
+                # Stored as JSON because a message that needs this row needs a human to read it. Retention
+                # is our own 8 days against Pub/Sub's 7, so the row outlives the store's copy.
+                backend.google_add_notification_id(
+                    tx,
+                    message_id=message.message_id,
+                    expires_at=base.datetime_from_unix_ms(parse.event_time_ms + base.MILLISECONDS_IN_DAY * 8),
+                    payload=json.dumps({'data': message.data.decode('utf-8', errors='replace')}),
+                )
+
+            sorted_msg = SortedMessage(
+                event_unix_ts_ms=parse.event_time_ms, message_id=message.message_id, parse=parse, raw=message
             )
-            for row in db_it:
-                message_id = row[0]
-                payload: str | None = row[1]
+            handled = _process_notification_message(conn, sorted_msg, err, time.time())
+    except Exception:
+        log.error(f'Failed to handle notification {label}. Error was {traceback.format_exc()}')
+        message.nack()
+        return
+
+    if handled:
+        message.ack()
+    else:
+        log.error(f'Failed to handle notification {label}. Reason was:\n{err.build()}')
+        message.nack()
+
+
+def _replay_unhandled_backlog() -> None:
+    """Re-run notifications recorded but never handled, once, at subscriber startup.
+
+    Not redundant with Pub/Sub redelivery, which covers the same ground for seven days: past that the
+    history row is the only copy of the message anywhere, and this is the only thing that replays it. That
+    is what makes "ship the fix weeks later, restart, and the backlog applies itself" true -- which this
+    project has already relied on once, for notifications that wedged on an unrecognised base plan.
+
+    Guarded as a whole and per row, because this thread is a daemon started once per mule: an exception
+    escaping here kills it silently and Google processing is off until somebody reloads. Replaying less than
+    everything is survivable in a way that not running at all is not.
+    """
+    replayed = 0
+    try:
+        with db.connection() as conn:
+            with db.transaction(conn) as tx:
+                rows = list(backend.google_get_unhandled_notification_iterator(tx))
+
+            for row in rows:
+                message_id, payload = row[0], row[1]
                 if not payload:
                     continue
 
-                raw_msg = typing.cast(
-                    google.pubsub_v1.types.ReceivedMessage, google.pubsub_v1.types.ReceivedMessage.from_json(payload)
-                )
-                message_data = json.loads(raw_msg.message.data)
-                tmp_err = base.ErrorSink()
-                parse = parse_notification(message_data, tmp_err)
-
-                sorted_msg_list.append(
-                    SortedMessage(
-                        event_unix_ts_ms=parse.event_time_ms,
-                        message_id=message_id,
-                        parse=parse,
-                        ack_id=raw_msg.ack_id,
-                        raw=raw_msg,
-                    )
-                )
-
-    # NOTE: Then connect to Google and start pulling messages
-    log.info(f'Loaded {len(sorted_msg_list)} unhandled messages from the DB')
-    while not context.kill_thread:
-        with pubsub_v1.SubscriberClient.from_service_account_file(app_credentials_path) as client:
-            sub_path = client.subscription_path(project=cloud_project_id, subscription=cloud_subscription_name)
-            # NOTE: We have a little bit of a problem here in terms of ordering. Google
-            # notifications for payments can come out of order and if we miss them, they can also be
-            # replayed out of order. Unfortunately in our initial designs we intended events to be
-            # processed in order, this is a natural tendency that seems to be ill-suited for
-            # integrating with Google given these behaviours.
-            #
-            # In Google payment notifications do not set the ordering keys such that an order can be
-            # enforced for the same user's event I have witnessed notifications coming out of order
-            # in replays and out of order within the same batch of messages downloaded at a time. We
-            # are forced to then sort by event timestamp after the fact with some reasonable buffer
-            # which adds to latency but will produce the desired outcomes.
-            #
-            # What maybe the more natural way to approach this system was to build an idempotent
-            # notification handling system with the following pattern:
-            #
-            #  - Getting a notification
-            #  - Compare last event timestamp we processed for the purchase token, ignore if it's
-            #    too old
-            #  - Get subscription details for the notification
-            #  - Create the row if it doesn't exist in the state that google says it should be in,
-            #    or, if already exists- state transition it into the state that google says it
-            #    should be and ignore any violations of invariants (the final state it ends up in
-            #    should be valid though)
-            #  - Repeat
-            #
-            # Example payload:
-            #
-            #   received_messages [{
-            #     ack_id: "HxknBUxeR..."
-            #     message {
-            #       data: "{\"version\":\"1.0\",\"packageName\":\"network.loki.messenger\",\"eventTimeMillis\":\"1762752016420\",...}"  # noqa: E501
-            #       message_id: "17064522705211191"
-            #       publish_time {
-            #         seconds: 1762752016
-            #         nanos: 631000000
-            #       }
-            #     }
-            #   }, ...]
-            while not context.kill_thread:
+                err = base.ErrorSink()
                 try:
-                    # NOTE: Pull messages from Google
-                    result: google.pubsub_v1.types.PullResponse = client.pull(
-                        subscription=sub_path, return_immediately=False, max_messages=64
-                    )
-
-                    # NOTE: Parse the received_messages[].message.data into our queue of messages
-                    now: float = time.time()
-                    ack_ids: list[str] = []
-                    for index, it in enumerate(result.received_messages):
-                        err = base.ErrorSink()
-                        message_data = json.loads(it.message.data)
-                        published = base.readable(base.datetime_from_unix_ms(it.message.publish_time.ToMilliseconds()))
-                        parse = parse_notification(message_data, err)
-                        message_id = it.message.message_id  # Pub/Sub ids are opaque strings — never int()-cast
-                        if err.has():
-                            log.warning(
-                                f'Discarding message #{index}: could not parse it '
-                                f'(published at {published}).\n'
-                                f'Message was:\n{base.maybe_obfuscate(str(it))}\n'
-                                f'Reason was:\n{err.build()}'
-                            )
-                        else:
-                            is_new_message = True
-                            for sort_it in sorted_msg_list:
-                                if sort_it.message_id == message_id:
-                                    is_new_message = False
-                                    break
-
-                            # NOTE: Record it in the DB BEFORE queueing it. The dedup lookup in
-                            # _process_notification_message reads an absent row as "handled" (someone
-                            # removed it out-of-band) and acks the message, so a message that reaches
-                            # sorted_msg_list without its row is acked to Google unprocessed — and an
-                            # acked notification is never redelivered. On failure we skip the message
-                            # instead, leaving it unacked so Google delivers it again.
-                            def add_notification_id_to_db():
-                                with db.connection() as conn:
-                                    with db.transaction(conn) as tx:
-                                        if not backend.google_notification_message_id_is_in_db(tx, message_id).present:
-                                            # NOTE: Our message retention policy for this subscription is 7 days
-                                            # (default). We add a little buffer as we don't know exactly which
-                                            # timestamp Google uses.
-                                            #
-                                            # We always store the messages to mitigate network failures on
-                                            # acknowledgement. We store this in JSON because in the
-                                            # erroneous case there's highly likelihood we need human
-                                            # intervention and having human-readability there will be
-                                            # important.
-                                            backend.google_add_notification_id(
-                                                tx,
-                                                message_id=message_id,
-                                                expires_at=base.datetime_from_unix_ms(
-                                                    parse.event_time_ms + base.MILLISECONDS_IN_DAY * 8
-                                                ),
-                                                payload=google.pubsub_v1.types.ReceivedMessage.to_json(it),
-                                            )
-
-                            try:
-                                add_notification_id_to_db()
-                            except Exception:
-                                log.warning(
-                                    f'Discarding message #{index}: could not record it in the DB, leaving '
-                                    f'it unacknowledged for redelivery (published at {published}).\n'
-                                    f'Message was:\n{base.maybe_obfuscate(str(it))}\n'
-                                    f'Reason was:\n{traceback.format_exc()}'
-                                )
-                                continue
-
-                            if is_new_message:
-                                sorted_msg_list.append(
-                                    SortedMessage(
-                                        event_unix_ts_ms=parse.event_time_ms,
-                                        message_id=message_id,
-                                        parse=parse,
-                                        ack_id=it.ack_id,
-                                        raw=it,
-                                    )
-                                )
-
-                    # NOTE: Sort the messages we've added
-                    if len(result.received_messages):
-                        sorted_msg_list.sort(key=lambda it: it.event_unix_ts_ms)
-
-                    # NOTE: Attempt to process them in order
-                    index = 0
-                    while index < len(sorted_msg_list):
-                        err = base.ErrorSink()
-                        msg: SortedMessage = sorted_msg_list[index]
-                        attempt: bool = now > msg.next_retry_unix_ts_s
-                        handled: bool = False
-
-                        # NOTE: Attempt to process the message. Just before we execute it, we also check
-                        # that it hasn't been handled in the DB already. It's possible that someone
-                        # out-of-band executed the SET_GOOGLE_NOTIFICATION command via environment/.ini
-                        # file to mark a message as being done or handled so we check before proceeding.
-                        if attempt:
-                            try:
-                                with db.connection() as conn:
-                                    handled = _process_notification_message(conn, msg, err, now)
-                            except Exception:
-                                # NOTE: On any exception (e.g. the DB was momentarily unavailable) we just
-                                # mark the message not handled; this bumps its retry delay and reattempts.
-                                handled = False
-
-                        # NOTE: On success, we remove the message and add it to the acknowledge list
-                        # (to stop Google resending it), or otherwise configure an exponential back-off
-                        # on the retry and skip the message
-                        if handled:
-                            sorted_msg_list.pop(index)
-                            ack_ids.append(msg.ack_id)
-                        else:
-                            index += 1
-                            if attempt:
-                                # NOTE: Exponential backoff on retries. Hopefully, this gives us some time,
-                                # for the out-of-order messages that this message is dependent on to arrive,
-                                # get sorted into order and then executed successfully.
-                                msg.increase_retry_delay(now)
-                                emitted = base.readable(base.datetime_from_unix_ms(msg.event_unix_ts_ms))
-                                log.error(
-                                    f'Failed to handle message, retrying in {msg.curr_retry_delay_s}s '
-                                    f'(message was emitted at {emitted}). '
-                                    f'Reason was\n{err.build()}\n'
-                                    f'Message was\n{base.maybe_obfuscate(str(msg.raw))}'
-                                )
-
-                    # NOTE: Acknowledge the messages we handled successfully to stop Google from
-                    # resending it to us
-                    if len(ack_ids):
-                        try:
-                            client.acknowledge(subscription=sub_path, ack_ids=ack_ids)
-                        except google.api_core.exceptions.InvalidArgument:
-                            # NOTE: Ignore double-ack, especially if the notification we had was very
-                            # old and we only got around to completing it now rather than when it was
-                            # still ackable
-                            #
-                            #  InvalidArgument: 400 Some acknowledgement ids in the request were
-                            # invalid. This could be because the acknowledgement ids have expired or the
-                            # acknowledgement ids were malformed. [reason: "EXACTLY_ONCE_ACKID_FAILURE"
-                            pass
+                    stored = json.loads(payload)
+                    data = stored['data'].encode('utf-8') if isinstance(stored, dict) and 'data' in stored else None
                 except Exception:
-                    log.error(f'Google notification handling failed. Error was {traceback.format_exc()}')
+                    log.warning(f'Skipping stored notification {message_id}: its envelope no longer decodes.')
+                    continue
+                if data is None:
+                    log.warning(f'Skipping stored notification {message_id}: no payload recorded.')
+                    continue
 
-                # Acknowledge any purchases still owing a Google ack, right before blocking on the next
-                # pull. Decoupled from handling (which only records the obligation): this is the sole
-                # acker, and running it every iteration covers fresh purchases, failed-ack retries, and
-                # startup/crash leftovers uniformly — no special startup path.
-                _sweep_pending_acks()
+                parse = decode_notification(data, f'stored notification {message_id}', err)
+                if parse is None or err.has():
+                    # Left unhandled rather than marked done. A failed parse carries payload_type Nil, which
+                    # handle_parsed_notification treats as nothing-to-do and reports as SUCCESS -- so this
+                    # is how a notification we never understood would disappear silently.
+                    log.warning(
+                        f'Skipping stored notification {message_id}, leaving it unhandled: '
+                        f'{err.build() if err.has() else "payload could not be decoded"}'
+                    )
+                    continue
 
+                # No ack path: any stored ack_id is long dead, and a message still live at Pub/Sub is
+                # redelivered anyway and acked by the dedup once this marks it handled.
+                msg = SortedMessage(event_unix_ts_ms=parse.event_time_ms, message_id=message_id, parse=parse)
+                if _process_notification_message(conn, msg, err, time.time()):
+                    replayed += 1
+    except Exception:
+        log.error(f'Failed to replay the unhandled notification backlog. Reason was:\n{traceback.format_exc()}')
 
-def _update_payment_renewal_info(
-    tx_payment: base.PaymentProviderTransaction,
-    auto_renewing: bool | None,
-    grace_period: pendulum.Duration | None,
-    tx: db.SQLTransaction,
-    err: base.ErrorSink,
-) -> bool:
-    assert len(tx_payment.google_payment_token) > 0 and len(tx_payment.google_order_id) > 0 and not err.has()
-    return backend.update_payment_renewal_info(
-        tx, payment_tx=tx_payment, grace_period=grace_period, auto_renewing=auto_renewing, err=err
-    )
-
-
-def set_payment_auto_renew(
-    tx_payment: base.PaymentProviderTransaction, auto_renewing: bool, tx: db.SQLTransaction, err: base.ErrorSink
-):
-    success = _update_payment_renewal_info(tx_payment, auto_renewing, None, tx, err)
-    if not success:
-        err.msg_list.append(
-            f'Failed to update auto_renew flag for '
-            f'purchase_token: {base.maybe_obfuscate(tx_payment.google_payment_token)} '
-            f'and order_id: {base.maybe_obfuscate(tx_payment.google_order_id)}'
-        )
+    if replayed:
+        log.info(f'Replayed {replayed} unhandled notification(s) from the DB')
 
 
-def set_purchase_grace_period_duration(
-    tx_payment: base.PaymentProviderTransaction,
-    grace_period: pendulum.Duration,
-    tx: db.SQLTransaction,
-    err: base.ErrorSink,
-):
-    success = _update_payment_renewal_info(tx_payment, None, grace_period, tx, err)
-    if not success:
-        err.msg_list.append(
-            f'Failed to update grace period duration for '
-            f'purchase_token: {base.maybe_obfuscate(tx_payment.google_payment_token)} '
-            f'and order_id: {base.maybe_obfuscate(tx_payment.google_order_id)}'
-        )
+def require_obfuscated_external_account_id(
+    tx_event: SubscriptionPlanEventTransaction, tx: db.SQLTransaction, err: base.ErrorSink
+) -> bytes:
+    """The account this purchase belongs to, as the 32-byte master-pkey hash our attribution keys on.
 
+    Normally the purchase carries it, because our billing flow calls setObfuscatedAccountId. One documented
+    case does not: a resubscribe after the previous subscription expired COMPLETELY is a brand new purchase
+    with no `linkedPurchaseToken` -- Play states that explicitly -- and if it was not made through our app
+    there was no opportunity to set an account id on it. Play's answer is `outOfAppPurchaseContext`, which
+    carries the identifiers from the EXPIRED subscription, "present exclusively for unacknowledged
+    resubscription purchases".
 
-def require_obfuscated_external_account_id(tx_event: SubscriptionPlanEventTransaction, err: base.ErrorSink) -> bytes:
-    # NOTE: Parse the obfuscated_external_account_id into bytes
+    So that value is the fallback rather than a nicety. Without it the chain is: no id -> this reports ->
+    the caller returns before registering the payment -> `needs_ack` is never written -> the ack sweep never
+    acknowledges it -> Google auto-refunds at three days. The user pays, gets nothing, and is refunded
+    without either side being told why.
+
+    Preferring the purchase's own id keeps the fallback from ever overriding a current fact with a
+    historical one -- it is only consulted when the present is silent.
+
+    One case this attributes WRONGLY, accepted: a user who lost their Session identity between subscriptions
+    resubscribes, and the expired subscription names the master pkey they no longer hold, so the payment
+    waits for keys that may not exist. It is the narrow intersection of two uncommon events, it is what Play
+    prescribes, and a support-minted voucher covers it -- but it is why this is documented in
+    `docs/limitations.md` rather than left for someone to discover as a mystery.
+
+    The identifiers are also TRANSIENT: `outOfAppPurchaseContext` is present only while the purchase is
+    unacknowledged. Attribution must therefore happen before the acknowledgement, which is the order the
+    caller uses -- register (flagging needs_ack), then let the sweep acknowledge. Anything that acknowledged
+    first would destroy the only evidence of ownership permanently.
+    """
+    account_id_hex = tx_event.obfuscated_external_account_id
+    source = 'the purchase'
+    if account_id_hex is None:
+        account_id_hex = tx_event.expired_obfuscated_external_account_id
+        source = 'the expired subscription it resubscribes (outOfAppPurchaseContext)'
+        if account_id_hex is not None:
+            log.info(f'Attributing a resubscription from {source}: the purchase itself carries no account id')
+
+    # Deeper still: the expired subscription may never have carried an account id either, in which case the
+    # token is all that is left. Our own record answers what the store cannot, because redemption bound that
+    # old row to its owner regardless of what Google knew about it.
+    if account_id_hex is None and tx_event.expired_purchase_token is not None:
+        owner = backend.google_owner_of_purchase_token(tx, tx_event.expired_purchase_token)
+        if owner is not None:
+            log.info(
+                'Attributing a resubscription through the expired purchase token: neither the purchase nor '
+                'the expired subscription carries an account id'
+            )
+            return owner
+
     result: bytes = b''
-    if tx_event.obfuscated_external_account_id is None:
+    if account_id_hex is None:
+        # Left unattributed on purpose. Google auto-refunds a purchase left unacknowledged for three days,
+        # and since nothing here registers a row, nothing ever flags it for acknowledgement — so an
+        # unattributable purchase ends in the store making the user whole. That is a better outcome than
+        # acknowledging it and stranding paid money in a row no account can ever claim.
         err.msg_list.append(
-            'Google user submitted a payment and did not set a setObfuscatedAccountId, '
-            'payment will not be attributed to the user'
+            'Google user submitted a payment and did not set a setObfuscatedAccountId, and neither the '
+            'expired subscription it resubscribes nor our record of it identifies an owner; payment will '
+            'not be attributed to the user'
         )
     else:
-        obfuscated_external_account_id_hex = tx_event.obfuscated_external_account_id
-        if obfuscated_external_account_id_hex.startswith('0x'):
-            obfuscated_external_account_id_hex = obfuscated_external_account_id_hex[2:]
+        if account_id_hex.startswith('0x'):
+            account_id_hex = account_id_hex[2:]
 
-        if len(obfuscated_external_account_id_hex) != 64:
+        if len(account_id_hex) != 64:
             err.msg_list.append(
-                f'Google user submitted a payment that was not a 32 byte hash, received: {len(result)/2}b'
+                f'Google account id from {source} is not a 32 byte hash, received: {len(account_id_hex)/2}b'
             )
 
         try:
-            result = bytes.fromhex(obfuscated_external_account_id_hex)
+            result = bytes.fromhex(account_id_hex)
         except Exception:
-            err.msg_list.append(
-                'Google user submitted a payment with a obfuscated ID that could not be parsed from hex into bytes'
-            )
+            err.msg_list.append(f'Google account id from {source} could not be parsed from hex into bytes')
     return result
 
 
-def handle_subscription_notification(
-    tx_payment: base.PaymentProviderTransaction,
-    tx_event: SubscriptionPlanEventTransaction,
-    tx: db.SQLTransaction,
-    err: base.ErrorSink,
-):
-    match tx_event.notification:
-        case SubscriptionNotificationType.PURCHASED:
-            """
-            These are the steps documented by Google:
-            When a user purchases a subscription, a SubscriptionNotification message with type
-            SUBSCRIPTION_PURCHASED is sent to your RTDN client. Whether you receive this
-            notification or you register a new purchase in-app through PurchasesUpdatedListener or
-            manually fetching purchases in your app's onResume() method, you should process the new
-            purchase in your secure backend. To do this, follow these steps:
+# How many tokens one drain pass claims. Bounds the DB read and, more importantly, the number of Google API
+# calls a single pass can make; the rest simply wait for the next one.
+RECONCILE_BATCH_LIMIT = 32
 
-            1. Query the purchases.subscriptionsv2.get endpoint to get a subscription resource that
-               contains the latest subscription state.
-            2. Make sure that the value of the subscriptionState field is SUBSCRIPTION_STATE_ACTIVE.
-            3. Verify the purchase.
-            4. Give the user access to the content. The user account associated with the purchase
-               can be identified with the ExternalAccountIdentifiers object from the subscription
-               resource if identifiers were set at purchase time using setObfuscatedAccountId and
-               setObfuscatedProfileId.
-            """
-            if tx_event.subscription_state == SubscriptionsV2State.ACTIVE:
-                assert (
-                    tx_event.pro_plan != ProPlan.Nil
-                ), "Plan was parsed into a valid enum when extracting notification data, but is now Nil"
-                assert len(tx_payment.google_order_id) > 0 and len(tx_payment.google_payment_token) > 0
+# How long a claimed token is held. DERIVED, not chosen: the pass is serial, so its worst case is every
+# token in the batch taking a full socket timeout, and a lease shorter than that expires under the worker
+# still holding it -- handing live tokens to the next pass, which is the exact race the lease exists to
+# prevent. Doubled for the DB work between fetches and for a slow host. Change either input and this
+# follows; pick them independently and they drift apart silently, which is how the first version of this
+# ended up with a 5 minute lease over an 8 minute worst case.
+RECONCILE_LEASE = pendulum.duration(seconds=2 * RECONCILE_BATCH_LIMIT * api.SOCKET_TIMEOUT_S)
 
-                obfuscated_external_account_id: bytes = require_obfuscated_external_account_id(tx_event, err)
-                if not err.has():
-                    expiry: str = base.readable(base.datetime_from_unix_ms(tx_event.expiry_time.unix_milliseconds))
-                    unredeemed: str = base.readable(base.datetime_from_unix_ms(tx_event.event_ts_ms))
-                    payment_label: str = backend.payment_provider_tx_log_label_safe(tx_payment)
-                    log.info(
-                        f'{tx_event.notification.name}+{tx_event.subscription_state.name}; '
-                        f'(linked_token={base.maybe_obfuscate(tx_event.linked_purchase_token)}, '
-                        f'plan={tx_event.pro_plan.name}, payment={payment_label}, '
-                        f'unredeemed={unredeemed}, expiry={expiry}, acked={tx_event.purchase_acknowledged.name})'
-                    )
+# Backoff after a failed reconcile, doubling per consecutive failure to a ceiling. The ceiling matters more
+# than the curve: a token that is permanently unreconcilable must not consume a claim slot on every pass,
+# because the claim is ordered by eligible_at and a limited batch would otherwise let stuck tokens crowd out
+# newly-arrived work indefinitely.
+RECONCILE_RETRY_MIN = pendulum.duration(minutes=1)
+RECONCILE_RETRY_MAX = pendulum.duration(hours=6)
 
-                    # NOTE: If a linked token is in the payload, it means that the old token
-                    # needs to be voided first before continuing as the link token is the new
-                    # token allocated to the user.
+# Attempts before the drain stops retrying a token and parks it for manual review (see `parked_at`, added
+# by migration 008_google_convergence).
+#
+# 36 is about a week of wall clock: the doubling reaches the six-hour ceiling by the tenth attempt, having
+# spent ~14 h getting there, and the remaining 26 attempts are six hours each. A week is chosen against two
+# other clocks rather than picked round — it outlives Pub/Sub's 7-day message retention, so a token still
+# failing has outlived the notification that created it, and it is well past the three days after which
+# Google auto-refunds an unacknowledged purchase, so the subscriber has already been made whole. Retrying
+# past that point cannot help them; it only spends quota and crowds the queue.
+RECONCILE_MAX_ATTEMPTS = 36
 
-                    # NOTE: Revoke the old token
-                    if tx_event.linked_purchase_token is not None:
-                        # NOTE: For google, the only information we have about the previous order
-                        # is the purchase token. So we have to go and find the latest payment
-                        # valid for a purchase token and void that.
-                        backend.add_google_revocation(
-                            tx,
-                            google_payment_token=tx_event.linked_purchase_token,
-                            revoke_at=base.datetime_from_unix_ms(tx_event.event_ts_ms),
-                            err=err,
+# Attempts before a token is reported as stuck rather than merely retrying. Two failures are a blip — a
+# hung fetch, a momentary DB error — and the backoff absorbs them silently. By the fifth, roughly half an
+# hour in, something is wrong that will not fix itself, and the operator should hear about it long before
+# the token is parked a week later.
+RECONCILE_STUCK_ATTEMPTS = 5
+
+# Google auto-refunds a purchase left unacknowledged for this long and revokes the entitlement with it:
+# "must be done within three days so that the purchase isn't automatically refunded and entitlement revoked"
+# -- https://developer.android.com/google/play/billing/integrate
+ACK_DEADLINE = 3 * base.DAY
+
+# When a failing acknowledgement stops being a blip and becomes an emergency. Two thirds of the way to the
+# deadline leaves a full day to act, and the sweep runs on every subscriber wake, so the alert repeats.
+ACK_DEADLINE_ALERT_AFTER = 2 * base.DAY
+
+
+def reconcile_retry_delay(attempts: int) -> pendulum.Duration:
+    """Exponential backoff, bounded. `attempts` counts failures BEFORE this one."""
+    doubled = RECONCILE_RETRY_MIN * (2 ** min(attempts, 16))
+    return doubled if doubled < RECONCILE_RETRY_MAX else RECONCILE_RETRY_MAX
+
+
+def drain_due_reconciles(at: pendulum.DateTime) -> int:
+    """Reconcile every token whose turn has come, and report how many were attempted.
+
+    The claim and the work are deliberately in SEPARATE transactions. Reconciling makes a Play API call, and
+    holding row locks across an external request would pin a transaction open for its duration; the lease
+    taken at claim time is what protects the token instead. A pass that dies mid-fetch therefore leaves the
+    lease to lapse and the token comes due again on its own.
+
+    Each token then gets its own transaction, so one failure is logged and skipped rather than costing the
+    batch — the same rule the notification handlers follow, and for the same reason: these are unrelated
+    subscriptions that happen to be due at the same moment.
+    """
+    with db.connection() as conn:
+        with db.transaction(conn) as tx:
+            claims = backend.google_claim_due_reconciles(
+                tx, now=at, lease_until=at + RECONCILE_LEASE, limit=RECONCILE_BATCH_LIMIT
+            )
+
+    for claim in claims:
+        err = base.ErrorSink()
+        try:
+            # Outside any transaction, on purpose. See above.
+            details = api.fetch_subscription_v2_details(api.package_name, claim.payment_token, err)
+            if err.has() or details is None:
+                err.msg_list.append('Failed to fetch subscription V2 details from Google')
+            else:
+                with db.connection() as conn:
+                    with db.transaction(conn) as tx:
+                        reconcile_google_subscription(
+                            tx, purchase_token=claim.payment_token, details=details, at=at, err=err
                         )
-                    # NOTE: Register the payment. Idempotent on (token, order_id), so a Pub/Sub
-                    # redelivery of an already-handled purchase re-registers harmlessly instead of
-                    # erroring. needs_ack flags a fresh, not-yet-acknowledged purchase for the mule's
-                    # separate ack sweep (the "confirm within 3 days or it's auto-refunded" step) — kept
-                    # off this transaction so we never tell Google a payment is provisioned before our DB
-                    # durably records it.
-                    backend.add_unredeemed_payment(
-                        tx,
-                        payment_tx=tx_payment,
-                        plan=tx_event.pro_plan,
-                        expiry_at=base.datetime_from_unix_ms(tx_event.expiry_time.unix_milliseconds),
-                        purchased_at=base.datetime_from_unix_ms(tx_event.event_ts_ms),
-                        platform_refund_expiry_at=base.datetime_from_unix_ms(
-                            tx_event.event_ts_ms + api.refund_deadline_duration_ms
-                        ),
-                        platform_obfuscated_account_id=obfuscated_external_account_id,
-                        err=err,
-                        needs_ack=tx_event.purchase_acknowledged != SubscriptionsV2AcknowledgementState.ACKNOWLEDGED,
-                    )
+                        if err.has():
+                            tx.cancel = True
+        except Exception:
+            err.msg_list.append(f'Reconcile raised: {traceback.format_exc()}')
 
-                    if not err.has():
-                        set_purchase_grace_period_duration(
-                            tx_payment=tx_payment, tx=tx, grace_period=base.DEFAULT_GOOGLE_GRACE_PERIOD, err=err
+        with db.connection() as conn:
+            with db.transaction(conn) as tx:
+                if err.has():
+                    retry_at = at + reconcile_retry_delay(claim.attempts)
+                    attempt = claim.attempts + 1
+                    park = attempt >= RECONCILE_MAX_ATTEMPTS
+                    token_label = base.maybe_obfuscate(claim.payment_token)
+                    if park:
+                        # The loudest thing this module says, because it is the end of the line: a purchase
+                        # that will now never register unless a human intervenes. The token is retained, so
+                        # clearing `parked_at` re-queues it once whatever broke is fixed.
+                        log.critical(
+                            f'Reconcile PARKED for {token_label} after {attempt} attempts — this purchase '
+                            f'will not register without intervention. Last error: {err.build()}'
                         )
-
-        case SubscriptionNotificationType.IN_GRACE_PERIOD:
-            if tx_event.subscription_state == SubscriptionsV2State.IN_GRACE_PERIOD:
-                plan_details = api.fetch_subscription_details_for_base_plan_id(
-                    base_plan_id=tx_event.base_plan_id, err=err
-                )
-                payment_label = backend.payment_provider_tx_log_label_safe(tx_payment)
-                grace_ms: int = plan_details.grace_period.milliseconds if plan_details else 0
-                log.info(
-                    f'{tx_event.notification.name}+{tx_event.subscription_state.name}; '
-                    f'(payment={payment_label}, grace period ms={grace_ms})'
-                )
-
-                if not err.has():
-                    assert plan_details is not None
-                    set_purchase_grace_period_duration(
-                        tx_payment=tx_payment,
-                        grace_period=base.duration_from_ms(plan_details.grace_period.milliseconds),
-                        tx=tx,
-                        err=err,
-                    )
-
-        case SubscriptionNotificationType.RECOVERED | SubscriptionNotificationType.RENEWED:
-            if tx_event.subscription_state == SubscriptionsV2State.ACTIVE:
-                expiry = base.readable(base.datetime_from_unix_ms(tx_event.expiry_time.unix_milliseconds))
-                unredeemed = base.readable(base.datetime_from_unix_ms(tx_event.event_ts_ms))
-                payment_label = backend.payment_provider_tx_log_label_safe(tx_payment)
-                log.info(
-                    f'{tx_event.notification.name}+{tx_event.subscription_state.name}; '
-                    f'(payment={payment_label}, plan={tx_event.pro_plan.name}, '
-                    f'unredeemed={unredeemed}, expiry={expiry})'
-                )
-
-                obfuscated_external_account_id = require_obfuscated_external_account_id(tx_event, err)
-                if not err.has():
-                    assert (
-                        tx_event.pro_plan != ProPlan.Nil
-                    ), "Plan was parsed into a valid enum when extracting notification data, but is now Nil"
-                    assert len(tx_payment.google_order_id) > 0 and len(tx_payment.google_payment_token) > 0
-                    backend.add_unredeemed_payment(
-                        tx,
-                        payment_tx=tx_payment,
-                        plan=tx_event.pro_plan,
-                        expiry_at=base.datetime_from_unix_ms(tx_event.expiry_time.unix_milliseconds),
-                        purchased_at=base.datetime_from_unix_ms(tx_event.event_ts_ms),
-                        platform_refund_expiry_at=base.datetime_from_unix_ms(
-                            tx_event.event_ts_ms + api.refund_deadline_duration_ms
-                        ),
-                        platform_obfuscated_account_id=obfuscated_external_account_id,
-                        err=err,
-                        # Renewals normally arrive already acknowledged; flag for the sweep on the off
-                        # chance Google reports one that isn't.
-                        needs_ack=tx_event.purchase_acknowledged != SubscriptionsV2AcknowledgementState.ACKNOWLEDGED,
-                    )
-
-                    if not err.has():
-                        set_purchase_grace_period_duration(
-                            tx_payment=tx_payment, tx=tx, grace_period=base.DEFAULT_GOOGLE_GRACE_PERIOD, err=err
+                    elif attempt >= RECONCILE_STUCK_ATTEMPTS:
+                        log.error(
+                            f'Reconcile STUCK for {token_label} (attempt {attempt} of '
+                            f'{RECONCILE_MAX_ATTEMPTS}, retrying at {base.readable(retry_at)}): {err.build()}'
                         )
-
-        case SubscriptionNotificationType.CANCELED:
-            """
-            Google mentions a case where if a user is on account hold and the canceled event happens
-            they should have entitlement revoked, but entitlement is already expired so this does
-            not need to be handled.
-            """
-            if (
-                tx_event.subscription_state == SubscriptionsV2State.CANCELED
-                or tx_event.subscription_state == SubscriptionsV2State.EXPIRED
-            ):
-                payment_label = backend.payment_provider_tx_log_label_safe(tx_payment)
-                log.info(
-                    f'{tx_event.notification.name}+{tx_event.subscription_state.name}; '
-                    f'(payment={payment_label}, auto_renew=false)'
-                )
-                set_payment_auto_renew(tx_payment=tx_payment, auto_renewing=False, tx=tx, err=err)
-
-        case SubscriptionNotificationType.RESTARTED:
-            # Only happens when going from CANCELLED to ACTIVE, this is called resubscribing, or re-enabling auto-renew
-            if tx_event.subscription_state == SubscriptionsV2State.ACTIVE:
-                payment_label = backend.payment_provider_tx_log_label_safe(tx_payment)
-                log.info(
-                    f'{tx_event.notification.name}+{tx_event.subscription_state.name}; '
-                    f'(payment={payment_label}, auto_renew=true)'
-                )
-                set_payment_auto_renew(tx_payment=tx_payment, auto_renewing=True, tx=tx, err=err)
-
-        case SubscriptionNotificationType.REVOKED:
-            if tx_event.subscription_state == SubscriptionsV2State.EXPIRED:
-                payment_label = backend.payment_provider_tx_log_label_safe(tx_payment)
-                log.info(
-                    f'{tx_event.notification.name}+{tx_event.subscription_state.name}; '
-                    f'(payment={payment_label}, auto_renew=false)'
-                )
-                backend.add_google_revocation(
-                    tx,
-                    google_payment_token=tx_payment.google_payment_token,
-                    revoke_at=base.datetime_from_unix_ms(tx_event.event_ts_ms),
-                    err=err,
-                )
-
-        case SubscriptionNotificationType.EXPIRED | SubscriptionNotificationType.ON_HOLD:
-            """
-            The revocation function only actually revokes proofs that are not going to self-expire
-            at the end of the UTC day, so for the vast majority of users this function wont make any
-            changes to user entitlement. An example of when a proof will actually be revoked if the
-            user enters account hold and for some reason their pro proof expires some time in the
-            future (later than the end of the UTC day). A user enters account hold if their billing
-            method is still failing after their grace period ends.
-            """
-            if (
-                tx_event.subscription_state == SubscriptionsV2State.EXPIRED
-                or tx_event.subscription_state == SubscriptionsV2State.ON_HOLD
-            ):
-                payment_label = backend.payment_provider_tx_log_label_safe(tx_payment)
-                log.info(
-                    f'{tx_event.notification.name}+{tx_event.subscription_state.name}; '
-                    f'(payment={payment_label}, '
-                    f'revoke={base.readable(base.datetime_from_unix_ms(tx_event.event_ts_ms))})'
-                )
-
-                # TODO: If this function ever finds rounded(expiry_ts) > rounded(event_ts) the devs
-                # need to be notified somehow.
-                """
-                If everything works as intended, this function should always find that
-                `rounded(expiry_ts) == rounded(event_ts)` and not issue a revocation. If a payment
-                is ever in a state where it should self-expire but isn't, we need to revoke it. In
-                this case something has gone wrong and the user was over-entitled.
-                """
-                payment: backend.PaymentRow | None = backend.get_payment(tx, payment_tx=tx_payment, err=err)
-                if payment is None or err.has():
-                    err.msg_list.append("Failed to get payment details for potential revocation!")
-
-                if not err.has():
-                    assert payment is not None
-                    # A store subscription always states its expiry; only a live credit leaves it open, and
-                    # Google never issues one.
-                    assert payment.expiry_at is not None
-                    rounded_expiry_at = backend.round_datetime_to_next_day_with_provider_testing_support(
-                        payment_provider=tx_payment.provider, at=payment.expiry_at
-                    )
-                    rounded_event_at = backend.round_datetime_to_next_day_with_provider_testing_support(
-                        payment_provider=tx_payment.provider, at=base.datetime_from_unix_ms(tx_event.event_ts_ms)
-                    )
-
-                    # NOTE: A payment at or past the end of the current day is expiring anyway, so it isn't
-                    # worth an entry in the revocation list every client fetches. Mirrors the day-boundary
-                    # early-out in backend.revoke_payments_by_id_internal — see the note there for the
-                    # bounded window an outstanding proof can outlive it by.
-                    if rounded_expiry_at > rounded_event_at:
-                        backend.add_google_revocation(
-                            tx,
-                            google_payment_token=tx_payment.google_payment_token,
-                            revoke_at=base.datetime_from_unix_ms(tx_event.event_ts_ms),
-                            err=err,
+                    else:
+                        log.warning(
+                            f'Reconcile failed for {token_label} '
+                            f'(attempt {attempt}, retrying at {base.readable(retry_at)}): {err.build()}'
                         )
+                    backend.google_reconcile_failed(tx, claim, retry_at=retry_at, error=err.build(), park=park)
+                else:
+                    backend.google_reconcile_done(tx, claim)
 
-        # NOTE: Explicitly unsupported cases
-        case (
-            SubscriptionNotificationType.DEFERRED
-            | SubscriptionNotificationType.PAUSED
-            | SubscriptionNotificationType.PAUSE_SCHEDULE_CHANGED
-        ):
-            err.msg_list.append(f'Subscription notificationType {reflect_enum(tx_event.notification)} is unsupported!')
+    return len(claims)
 
-        # NOTE: No-op cases
-        case (
-            SubscriptionNotificationType.PRICE_CHANGE_CONFIRMED
-            | SubscriptionNotificationType.PRICE_CHANGE_UPDATED
-            | SubscriptionNotificationType.PENDING_PURCHASE_CANCELED
-            | SubscriptionNotificationType.PRICE_STEP_UP_CONSENT_UPDATED
-        ):
-            pass
 
+def reconcile_google_subscription(
+    tx: db.SQLTransaction, purchase_token: str, details: SubscriptionV2Data, at: pendulum.DateTime, err: base.ErrorSink
+) -> None:
+    """Bring our record of one purchase token into line with the subscription resource Google just gave us.
+
+    The whole of the type dispatch collapses into this. A notification says only "something about this
+    subscription changed"; the resource says what it now IS, and every field the old per-type branches wrote
+    is in it — the term, whether it renews, whether it still owes an acknowledgement, which plan it is on.
+    So there is nothing for a PURCHASED branch to do that a RENEWED branch would not, and nothing for either
+    to do that is not simply "write down what the store says".
+
+    Consequences worth stating, because they are what the old shape got wrong:
+
+    * A notification arriving for a state that has since moved on is harmless. It triggers a fetch, the fetch
+      returns the CURRENT resource, and we converge on that. Order stops mattering, because nothing here
+      applies a delta.
+    * A purchase is never dropped for arriving late. The old PURCHASED branch required the snapshot to still
+      read ACTIVE and silently did nothing otherwise, so a purchase followed quickly by a cancellation
+      registered nothing at all.
+    * A revoked row stays revoked: `google_converge_payment` will not touch one, so a resource that still
+      describes the subscription cannot resurrect it.
+
+    `linked_purchase_token` is handled by marking the OLD token dirty rather than acting on it here. Its
+    resource is the authority on what became of it, exactly as this one is, and we are not holding it.
+    """
+    line_item = api.parse_line_item(details, err)
+    payment_tx = api.parse_subscription_purchase_tx(purchase_token=purchase_token, details=details, err=err)
+    tx_event = api.parse_subscription_plan_event_tx(
+        details, base.unix_ms_from_datetime(at), SubscriptionNotificationType.UNKNOWN, err=err
+    )
+    if err.has() or line_item is None:
+        err.msg_list.append('Failed to read the subscription resource well enough to reconcile it')
+        return
+
+    # Straight from the resource rather than inferred from why we were woken: a plan that does not renew
+    # says so here, and a plan that is not auto-renewing at all (prepaid) has no such block.
+    auto_renewing = line_item.auto_renewing_plan is not None and line_item.auto_renewing_plan.auto_renew_enabled
+
+    # Nothing here reads the base plan's grace period. Play applies grace by EXTENDING `expiryTime`, so a
+    # subscription in grace already states its grace-inclusive end above and converging that captures it —
+    # whether or not the notification that woke us was the IN_GRACE_PERIOD one. Fetching the plan to store
+    # the number separately used to make the same span arrive twice, once inside the expiry and once beside
+    # it, with nothing marking which of the two the column held.
+    needs_ack = tx_event.purchase_acknowledged != SubscriptionsV2AcknowledgementState.ACKNOWLEDGED
+    expiry_at = base.datetime_from_unix_ms(tx_event.expiry_time.unix_milliseconds)
+
+    converged = backend.google_converge_payment(
+        tx, payment_tx=payment_tx, expiry_at=expiry_at, auto_renewing=auto_renewing, needs_ack=needs_ack, at=at, err=err
+    )
     if err.has():
-        # Purchase token logging is included in the wrapper function
-        err.msg_list.append(
-            f'Failed to handle {reflect_enum(tx_event.notification)} for order_id '
-            f'{base.maybe_obfuscate(tx_payment.google_order_id) if len(tx_payment.google_order_id) > 0 else "N/A"}'
+        return
+
+    if not converged:
+        # No row for this (token, order id): either a cycle we have never seen, or one whose row is revoked
+        # and therefore terminal. add_unredeemed_payment dedups on the same pair, so the revoked case is a
+        # no-op rather than a resurrection.
+        obfuscated_external_account_id = require_obfuscated_external_account_id(tx_event, tx, err)
+        if err.has():
+            return
+        backend.add_unredeemed_payment(
+            tx,
+            payment_tx=payment_tx,
+            plan=tx_event.pro_plan,
+            expiry_at=expiry_at,
+            # `at` stands in for the instant the cycle was bought. A snapshot does not carry a per-cycle
+            # purchase time — only the subscription's own start_time — so reconciling a cycle whose
+            # notification we never saw dates it from when we noticed. It feeds the refund deadline and the
+            # payment's displayed purchase date, never entitlement, which comes from expiry_at.
+            purchased_at=at,
+            platform_refund_expiry_at=base.datetime_from_unix_ms(
+                base.unix_ms_from_datetime(at) + api.refund_deadline_duration_ms
+            ),
+            platform_obfuscated_account_id=obfuscated_external_account_id,
+            err=err,
+            needs_ack=needs_ack,
+            auto_renewing=auto_renewing,
         )
-        tx.cancel = True
+        if err.has():
+            return
+
+    if tx_event.linked_purchase_token is not None:
+        # Superseded, not refunded. The old token's own resource is the authority on what became of it, and
+        # it is the only place that says so — Google sends no further notification for a token it has
+        # replaced, so this marker is our sole chance to learn the subscription needs revisiting. Enqueued
+        # rather than acted on inline, because judging an account mid-write is what made the old path revoke
+        # a subscriber for upgrading.
+        backend.google_enqueue_reconcile(tx, payment_token=tx_event.linked_purchase_token, eligible_at=at)
 
 
 def handle_voided_notification(tx: VoidedPurchaseTxFields, err: base.ErrorSink):
-    assert tx.product_type != ProductType.NIL
+    # Reported, never asserted, and with a default arm on each match — the same treatment the plan mappers
+    # and the subscription match received. It matters more here than it looks: NIL is 0 and IS an enum
+    # member, so `productType: 0` coerces cleanly at parse and arrives intact, which made the asserts this
+    # replaced reachable from the wire rather than being the impossible-state guards they were written as.
+    # They were harmless only while the whole function was unreachable dead code.
     match tx.product_type:
         case ProductType.SUBSCRIPTION:
-            assert tx.refund_type != RefundType.NIL
             match tx.refund_type:
                 case RefundType.FULL_REFUND:
-                    # TODO: investigate if we need to implement anything here
+                    # A deliberate no-op: subscription revocation arrives separately, as SUBSCRIPTION_REVOKED.
                     pass
                 case RefundType.QUANTITY_BASED_PARTIAL_REFUND:
                     err.msg_list.append(f'voided purchase refundType {reflect_enum(tx.refund_type)} is unsupported!')
+                case _:
+                    err.msg_list.append(
+                        f'voided purchase of a subscription has refundType {reflect_enum(tx.refund_type)}, '
+                        f'which is not handled!'
+                    )
         case ProductType.ONE_TIME:
             err.msg_list.append(f'voided purchase productType {reflect_enum(tx.product_type)} is unsupported!')
+        case _:
+            err.msg_list.append(f'voided purchase productType {reflect_enum(tx.product_type)} is not handled!')
 
     if err.has():
-        err.msg_list.append(f'Failed to handle {reflect_enum(tx.refund_type)}')
+        # Labelled by the pair, not by the refund type alone: a ONE_TIME failure is a product-type problem
+        # and used to be reported under whatever refund type happened to accompany it.
+        err.msg_list.append(
+            f'Failed to handle voided purchase ' f'({reflect_enum(tx.product_type)}, {reflect_enum(tx.refund_type)})'
+        )
+
+
+def decode_notification(data: str | bytes, label: str, err: base.ErrorSink) -> ParsedNotification | None:
+    '''JSON-decode and parse one RTDN payload, or None if it could not be decoded at all.
+
+    The decode gets its OWN guard because both halves raise on bad input: `json.loads` on a malformed
+    payload, and `parse_notification` on a voided block missing the fields its asserts require. Under the
+    batched pull loop this replaced, an unguarded raise unwound to the batch handler and took the parsing,
+    processing and acking of every other message in that pull with it; per-message callbacks make that
+    blast radius one message, so this now buys a clean skip rather than protecting the neighbours.
+
+    Returning None is distinct from returning a parse with `err` set: the latter decoded fine and simply is
+    not a notification we accept. Neither is acked, so Google redelivers and a transient cause gets another
+    chance, while a permanently undecodable message keeps failing here in isolation.
+    '''
+    try:
+        return parse_notification(json.loads(data), err)
+    except Exception:
+        log.warning(f'Discarding message {label}: could not decode it.\nReason was:\n{traceback.format_exc()}')
+        return None
 
 
 def parse_notification(body: JSONObject, err: base.ErrorSink) -> ParsedNotification:
@@ -934,10 +961,23 @@ def parse_notification(body: JSONObject, err: base.ErrorSink) -> ParsedNotificat
     if subscription is not None:
         result.purchase_token = json_dict_require_str(subscription, "purchaseToken", err)
         result.payload_version = json_dict_require_str(subscription, "version", err)
-        result.sub_type = typing.cast(
-            SubscriptionNotificationType,
-            json_dict_require_int_coerce_to_enum(subscription, "notificationType", SubscriptionNotificationType, err),
+        # Coerced by hand rather than through json_dict_require_int_coerce_to_enum, which ERRS on a value
+        # it does not recognise. Erring here would reject a notificationType Google adds later before the
+        # message is written down, so it would redeliver until retention lapsed and then be lost.
+        #
+        # Mapping to UNKNOWN instead means a type we have never heard of is handled correctly rather than
+        # merely survived: handling does not consult the type at all any more, so the token is enqueued and
+        # its resource converged exactly as for a type we do know. The value is retained only so an operator
+        # reading the stored message can see what arrived.
+        raw_sub_type = base.json_dict_require_int(subscription, "notificationType", err)
+        result.sub_type = SubscriptionNotificationType._value2member_map_.get(  # type: ignore[assignment]
+            raw_sub_type, SubscriptionNotificationType.UNKNOWN
         )
+        if result.sub_type == SubscriptionNotificationType.UNKNOWN:
+            log.warning(
+                f'Google sent subscription notificationType {raw_sub_type}, which this backend does not '
+                f'know. Handled anyway -- the type is not consulted -- and recorded here so it can be seen.'
+            )
         result.payload_type = ParsedNotificationPayloadType.Subscription
 
     elif voided_purchase is not None:
@@ -961,7 +1001,7 @@ def parse_notification(body: JSONObject, err: base.ErrorSink) -> ParsedNotificat
             product_type=product_type,
             refund_type=refund_type,
         )
-        result.payload_type = ParsedNotificationPayloadType.Test
+        result.payload_type = ParsedNotificationPayloadType.Voided
 
     elif one_time_product is not None:
         result.payload_type = ParsedNotificationPayloadType.Nil

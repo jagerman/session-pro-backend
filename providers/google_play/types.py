@@ -149,6 +149,13 @@ class SubscriptionNotificationType(IntEnum):
     # step-up is required.
     PRICE_STEP_UP_CONSENT_UPDATED = 22
 
+    # Any notificationType Google introduces that this table does not list yet. Parsing maps an
+    # unrecognised value here rather than rejecting the message, which is what lets it be STORED and
+    # retried: rejecting at parse discards it before it is written down, so it redelivers until Pub/Sub's
+    # retention lapses and is then gone. Retaining it means a deploy that adds the type can still apply it.
+    # -1 cannot collide with a real value, which Google draws from the non-negative ints.
+    UNKNOWN = -1
+
 
 class ProductType(IntEnum):  # Product types for voided purchases
     NIL = 0  # Sentinel value, never used except for zero-initialised objects
@@ -457,20 +464,21 @@ class SubscriptionV2Data:
 
     obfuscated_external_account_id: str | None = None
 
+    # The account id configured on the PREVIOUS, expired subscription, carried in
+    # `outOfAppPurchaseContext` and present exclusively on an unacknowledged resubscription purchase.
+    #
+    # A resubscribe after full expiry is a brand new purchase with no `linked_purchase_token` — Play says so
+    # explicitly, "because the original subscription expired completely" — and when it happens outside our
+    # app there is no billing flow of ours to call setObfuscatedAccountId, so the new purchase carries no
+    # account id of its own. This is the only thing that says whose it is. Google returning the old
+    # subscription's id is itself the evidence that the new one has none: there would be nothing to return
+    # it for otherwise.
+    expired_obfuscated_external_account_id: str | None = None
 
-@dataclasses.dataclass
-class Monetizationv3SubscriptionData:
-    """
-    NOTE: only the fields we use are here, the api returns loads of other info we dont need.
-    """
-
-    base_plans: base.JSONArray
-
-
-@dataclasses.dataclass
-class SubscriptionProductDetails:
-    billing_period: GoogleDuration  # Subscription duration
-    grace_period: GoogleDuration  # Duration of entitlement an auto-renewing subscription has after it expires
+    # The expired subscription's purchase token, also from `outOfAppPurchaseContext`. Kept because it
+    # attributes a resubscribe even when the expired subscription never carried an account id either:
+    # redemption bound that old row to its owner in OUR records whatever the store knew.
+    expired_purchase_token: str | None = None
 
 
 def json_dict_require_google_money(d: dict[str, base.JSONValue], key: str, err: base.ErrorSink):
@@ -490,11 +498,6 @@ def json_dict_require_google_money(d: dict[str, base.JSONValue], key: str, err: 
 def json_dict_require_google_timestamp(d: dict[str, base.JSONValue], key: str, err: base.ErrorSink):
     timestamp_str = base.json_dict_require_str(d, key, err)
     return GoogleTimestamp(timestamp_str, err)
-
-
-def json_dict_require_google_duration(d: dict[str, base.JSONValue], key: str, err: base.ErrorSink):
-    duration_str = base.json_dict_require_str(d, key, err)
-    return GoogleDuration(duration_str, err)
 
 
 def json_dict_optional_google_empty_object_bool(d: dict[str, base.JSONValue], key: str, err: base.ErrorSink) -> bool:

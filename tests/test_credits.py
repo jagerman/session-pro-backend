@@ -461,8 +461,12 @@ def test_credit_does_not_make_a_subscriber_look_non_renewing(pg_database):
         user = backend.get_user(conn, f.pkey)
         assert user.auto_renewing is True
         assert user.grace_period == 2 * base.DAY
-        # Coverage runs to the paid term plus grace, and only then does the credit's year begin.
-        assert user.expiry_at == T + 32 * base.DAY + 365 * base.DAY
+        # The stored expiry is the paid term plus the credit's length, with neither the store's grace nor
+        # our allowance in it -- both are applied once, on read, by account_coverage_end. The credit's year
+        # still begins where coverage ends rather than where the term does: the drain protects it through
+        # the grace and allowance window, so adding those once at the end lands on the same instant.
+        assert user.expiry_at == T + 30 * base.DAY + 365 * base.DAY
+        assert backend.account_coverage_end(user) == T + 32 * base.DAY + 365 * base.DAY + base.RENEWAL_LATENCY_ALLOWANCE
     pool.close()
 
 
@@ -545,4 +549,52 @@ def test_grant_voucher(pg_database):
         proof_hash = backend.build_proof_message(proof.revocation_tag, proof.rotating_pkey, proof.expiry_at)
         backend_key.verify_key.verify(smessage=proof_hash, signature=proof.sig)
         assert backend.get_user(conn, master_key.verify_key).found
+    pool.close()
+
+
+def test_refund_during_store_grace_is_announced(pg_database):
+    # REGRESSION: a refund landing while a subscription sits in the store's grace period used to skip the
+    # revocation broadcast entirely, leaving every outstanding proof certifying the whole grace window.
+    #
+    # `refresh_entitlement_and_revoke_overreaching_proofs` asks three questions -- did coverage fall, was
+    # the account expiring within the day anyway, does what survives still cover the proofs we signed --
+    # and each was asked of `users.expiry_at`. Once that column became the TRUE end of the paid term,
+    # rather than the grace-inclusive value it used to hold, the day-boundary early-out saw a payment
+    # expiring today, concluded it was ending regardless, and returned without announcing anything -- while
+    # the proofs actually issued reached to the end of the store's grace plus our allowance, up to 16 days
+    # out on Apple's longest window.
+    #
+    # So the three comparisons go through the coverage helpers. Driven through the Google fixture because
+    # it is cheap to build; the live path is Apple's, which is the only store that declares grace separately
+    # rather than folding it into the expiry it reports.
+    pool = backend.bootstrap_db(database_url=pg_database())
+    assert pool
+    backend_key = nacl.signing.SigningKey.generate()
+    rotating_key = nacl.signing.SigningKey.generate()
+
+    with db.connection() as conn:
+        T = base.round_datetime_to_next_day(base.utc_now())
+        err = base.ErrorSink()
+
+        # A subscription whose paid term ends today, in a 16-day store grace: the account is covered well
+        # past the day boundary even though its expiry_at sits on it.
+        f = _CreditFixture(conn, T)
+        sub = f.subscribe(expiry_at=T, grace=16 * base.DAY)
+        user = backend.get_user(conn, f.pkey)
+        assert user.expiry_at == T
+        assert backend.account_coverage_end(user) == T + 16 * base.DAY + base.RENEWAL_LATENCY_ALLOWANCE
+
+        proof = _redeem_and_prove(conn, backend_key, f.master_key, rotating_key, T)
+        assert proof.expiry_at > T, 'the proof reaches into the grace window, which is the whole point'
+
+        before = len(backend.get_revocations_list(conn))
+        with db.transaction(conn) as tx:
+            assert backend.add_google_revocation(
+                tx, google_payment_token=sub.google_payment_token, revoke_at=T, err=err
+            )
+        assert not err.msg_list, err.msg_list
+
+        # The refund cut coverage from T+16d back to T, so the proofs already signed overstate the account
+        # and the fall has to be announced.
+        assert len(backend.get_revocations_list(conn)) > before
     pool.close()

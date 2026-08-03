@@ -26,7 +26,8 @@ Keep this in sync with the code — it describes real branches, not intentions.
 ### Legend
 - **Consequence** — what happens to a real customer if the branch is hit in production.
 - **Fails** — *silent* (no human notified: RTDN retry-loop / swallowed / no-op) vs *loud-ish* (HTTP 500 +
-  provider retries) vs *crash* (raises). None currently alerts ops; that's what the Phase-4 loud-guard adds.
+  provider retries) vs *crash* (raises). **None of them alerts anyone today** — the loud-guard described at
+  the top of this file is the planned remedy and is not built.
 
 ---
 
@@ -36,29 +37,105 @@ Keep this in sync with the code — it describes real branches, not intentions.
 
 | Feature / notification | Enabled in Play Console by… | Current behaviour if hit | Consequence | Fails |
 |---|---|---|---|---|
-| **One-time (managed) product** — `voidedPurchaseNotification` `productType=ONE_TIME` | offering any one-time / managed product SKU | `handle_voided_notification` appends `unsupported!` (and today is unreachable — see the `.Test` bug below — so it's a silent no-op) | refunded one-time purchase keeps full Pro (over-entitlement) | silent |
+| **One-time (managed) product** — `voidedPurchaseNotification` `productType=ONE_TIME` | offering any one-time / managed product SKU | `handle_voided_notification` appends `unsupported!` → `tx.cancel` → RTDN retry-loop | refunded one-time purchase keeps full Pro (over-entitlement) | loud-ish |
 | **One-time product purchase** — `OneTimeProduct` notification | offering any one-time / managed product SKU | mapped to `Nil` → silent no-op (the explicit `OneTimeProduct` error branch is dead code) | one-time purchase grants no Pro (paid-but-no-Pro) | silent |
-| **Prepaid base plan** — `prepaidPlan` line item (`platform_google_api.py`) | adding a prepaid (non-auto-renewing) base plan to a subscription | `handle_not_implemented('prepaidPlan')` → error propagates → RTDN retry-loop + purchase-token error state | prepaid subscriber's purchase never registers (paid-but-no-Pro); notification loops forever | silent |
-| **Subscription pause** — `PAUSED` / `PAUSE_SCHEDULE_CHANGED` notifications | enabling **pause** on any base plan | appends `unsupported!` → `tx.cancel` → RTDN retry-loop + token error state | paused user may stay entitled; notification stuck | silent |
-| **Deferred billing / recurrence change** — `DEFERRED` notification | issuing a deferred upgrade/downgrade or recurrence-date extension | same as pause (retry-loop + token error) | deferred renewal mis-timed; notification stuck | silent |
-| **Partial / quantity-based refund** — `voidedPurchaseNotification` `refundType=QUANTITY_BASED_PARTIAL_REFUND` | issuing a partial refund (only possible on multi-quantity purchases) | `handle_voided_notification` appends `unsupported!` (unreachable today via the `.Test` bug → silent no-op) | partial refund not reflected in entitlement | silent |
+| **Prepaid base plan** — `prepaidPlan` line item (`providers/google_play/api.py`) | adding a prepaid (non-auto-renewing) base plan to a subscription | `handle_not_implemented('prepaidPlan')` fires in the drain's resource parse → the token stays in `google_reconcile_queue` and retries with a backoff | prepaid subscriber's purchase never registers (paid-but-no-Pro); the token retries indefinitely, with the reason in its `last_error` | silent |
+| **Partial / quantity-based refund** — `voidedPurchaseNotification` `refundType=QUANTITY_BASED_PARTIAL_REFUND` | issuing a partial refund (only possible on multi-quantity purchases) | `handle_voided_notification` appends `unsupported!` → `tx.cancel` → RTDN retry-loop | partial refund not reflected in entitlement | loud-ish |
+| **New / changed base plan** — `pro_plan_from_base_plan_id` | adding any base plan beyond the three known ones* | reported to the ErrorSink; the caller declines to write and the notification is retried | any purchase of the new plan registers no Pro until the plan is supported — recoverable, since the payload is retained and a later deploy applies it | loud-ish |
+
+\* known base plans: `session-pro-{1-month,3-months,12-months}`.
+
+**No longer dormant — `PAUSED`, `PAUSE_SCHEDULE_CHANGED` and `DEFERRED`.** These were rows in the table
+above, on the grounds that the notification dispatch had no arm for them and so appended `unsupported!`,
+cancelled the transaction and left the RTDN redelivering forever. That dispatch no longer exists: handling
+does not consult the notification type at all, so each of these records the purchase token, fetches the
+subscription resource and writes what it says.
+
+Play documents a pause as taking effect *only after the current billing period ends* — so a scheduled pause
+takes nothing away, the term the user paid for runs out normally, and resume (`SUBSCRIPTION_RECOVERED`,
+which is also the account-hold recovery type) renews into a fresh cycle. A deferral states a later expiry on
+the cycle it names, which convergence takes. Covered by
+`test_google_paused_and_deferred_notifications_converge_instead_of_wedging`, which follows that documented
+sequence.
+
+One thing Play does NOT document is what `expiryTime` holds while a subscription is paused; it says only
+that `PausedStateContext` carries the expected resume time. Nothing here depends on knowing: coverage is
+whatever the resource states, so the handling is right either way. It does mean an operator debugging a
+paused subscriber should read the resource rather than trust a rule of thumb about it.
+
+Enabling pause or issuing deferrals is therefore no longer gated on a code change. The remaining rows
+above are still dormant and still worth keeping off.
+
+**Resubscription from the Play subscriptions center attributes through the EXPIRED subscription.**
+
+A lapsed subscriber pressing "Resubscribe" in Play makes a purchase our app never sees, so nothing calls
+`setObfuscatedAccountId` and the new purchase carries no account id of its own — Play documents the field as
+present only "if account linking happened as part of the subscription purchase flow" or if it "was specified
+using `setObfuscatedAccountId` when the purchase was made". Play's substitute is `outOfAppPurchaseContext`,
+which carries the *expired* subscription's identifiers and is "present exclusively for unacknowledged
+resubscription purchases". The backend reads it, preferring in order: the purchase's own account id, the
+expired subscription's, then our own record of who owned the expired purchase token.
+
+Two consequences worth knowing:
+
+- **Attribution must precede acknowledgement**, because the context vanishes once the purchase is acked.
+  The order is register (flagging `needs_ack`) and then let the ack sweep run. Anything that acknowledged
+  first would destroy the only evidence of ownership permanently.
+- **A user who lost their Session identity between subscriptions is attributed to the keys they no longer
+  hold.** The payment then waits, unredeemed, for a master pkey that may not exist. This is the narrow
+  intersection of two uncommon events and it is what Play prescribes, so it is accepted rather than worked
+  around; a support-minted voucher is the remedy. Worth recognising rather than debugging from scratch.
+
+If attribution fails entirely the purchase is deliberately left unregistered, which means it is never
+acknowledged, which means Google auto-refunds it after three days. That is the better failure: the user is
+made whole automatically, where acknowledging an unattributable purchase would strand paid money in a row no
+account could ever claim.
+
+**Store-config invariant — never set a base plan's grace period to 0 days.**
+
+Play does not honour a zero grace. It substitutes a 24-hour **silent grace period** during which the
+subscription still reads `SUBSCRIPTION_STATE_ACTIVE` and **no RTDN is sent at all**:
+
+> "You can set a grace period of 0 days, but Play will wait a minimum of 1 day to ensure sufficient time
+> for payment retries. This silent grace period offers a safety net for payment processing. During this
+> 24-hour period the subscription remains in the `ACTIVE` state."
+> — https://developer.android.com/google/play/billing/lifecycle/subscriptions
+
+Every other grace setting reaches us as an extended `expiryTime` on the subscription resource, which is
+where we read grace from. A zero setting is the one value that produces a documented silence instead, so a
+subscriber whose renewal fails would lapse a day early with nothing in any log to say why. This costs
+entitlement rather than latency, and it is one toggle away in the Play Console. All current plans are set
+to 1 day.
 
 **Handled / intentionally safe (no action needed):**
 - **Subscription full refund / revoke** — `voidedPurchaseNotification` `SUBSCRIPTION`+`FULL_REFUND` is an
   intentional **no-op** because subscription revocation is handled by the separate **`SUBSCRIPTION_REVOKED`**
-  RTDN. (This is *why* the `.Test` dispatch bug below has no live subscription impact today.)
+  RTDN. (This is *why* the dispatch typo noted below had no live subscription impact.)
 - **Price-change / pending-purchase notifications** — `PRICE_CHANGE_CONFIRMED`/`PRICE_CHANGE_UPDATED`/
   `PENDING_PURCHASE_CANCELED`/`PRICE_STEP_UP_CONSENT_UPDATED` are benign no-ops (no entitlement action).
 
-**Bug (not merely dormant), coupled to the above:**
-- **Voided RTDNs are mis-dispatched.** `parse_notification` tags every `voidedPurchaseNotification` as
-  `payload_type = Test` instead of `Voided` (a one-word typo), so `handle_voided_notification` is
-  **unreachable dead code**. Live impact today is nil (subscription refunds go via `SUBSCRIPTION_REVOKED`;
-  one-time/partial are dormant per above), but it must be fixed **together** with wiring the `ONE_TIME`/
-  partial handlers — otherwise any handler/loud-guard placed there never runs. Tracked in the bug ledger +
-  Phase 4.
-- **No `case _:` default** in `handle_subscription_notification`'s `match` — a *future* Google
-  `SubscriptionNotificationType` would fall through as a silent no-op. Add a default that hits the loud-guard.
+**Dispatch reaches these branches now, which changes what "dormant" costs:**
+- Voided RTDNs were mis-dispatched as `payload_type = Test` rather than `Voided` (a one-word typo), so
+  `handle_voided_notification` was unreachable dead code and every void was quietly acked. It is now
+  reachable, which means the `ONE_TIME` and partial-refund rows above **fail loudly rather than silently**
+  the moment either feature is enabled — the notification is retried and retained instead of acked away.
+  That is the intended trade: a wedged notification is recoverable once a handler exists, whereas the
+  silent ack it replaced let a refunded purchase keep Pro with nobody told.
+- A `SubscriptionNotificationType` Google adds later is reported rather than falling through as a silent
+  no-op, and — because parsing maps an unrecognised value to `UNKNOWN` instead of rejecting it — the
+  message is *stored* first, so a deploy that adds the type applies the backlog. If a new *benign* type
+  starts arriving in volume, add it to the no-op list above; do not soften the default.
+
+**A note on what "retry-loop" now means.** Nothing above retries an RTDN any more: the notification is
+acked as soon as its token is queued, and the failure happens later in the drain, which retries the TOKEN
+with a backoff and records `attempts` and `last_error` on its `google_reconcile_queue` row. That row is the
+durable record of a stuck purchase, it has no retention limit, and it is where an operator should look.
+
+There used to be a second signal here: a `user_errors` row, surfaced to the account as the wire's
+`error_report`. Both are deleted (migration `008_google_convergence`). It was one undocumented bit with no reason, no detail
+and no remedy — an internal handler failure shown to a user who could do nothing with it — and it had
+stopped meaning the same thing on each provider, since a Google handling failure rolled the row back in the
+same transaction while Apple wrote its own on a separate connection.
 
 ---
 
@@ -71,7 +148,7 @@ Keep this in sync with the code — it describes real branches, not intentions.
 | **Promotional offers / offer codes / win-back offers** — `OFFER_REDEEMED` | configuring any offer for the subscription group | `assert isinstance(expiresDate, str)` — but `expiresDate` is an int → **AssertionError** | offer redemption crashes the handler → paid-but-no-Pro | crash (500) |
 | **External purchases / alternative marketplaces** — `EXTERNAL_PURCHASE_TOKEN` | enabling the External Purchase entitlement | appends `we do not support 3rd party stores` → 500; Apple retries, then catch-up logs+skips it each pass | 3rd-party-store purchase never handled | loud-ish |
 | **Renewal-date extensions** — `RENEWAL_EXTENSION` / `RENEWAL_EXTENDED` | requesting a subscription renewal-date extension (e.g. outage compensation) | appends `we don't handle … extension` → 500; Apple retries, then catch-up logs+skips it each pass | extension never applied | loud-ish |
-| **New / changed subscription SKU** — `pro_plan_from_product_id` | adding any product id beyond the three known SKUs* | `assert False, 'Invalid apple plan_id'` → crash | any purchase of the new SKU crashes the handler (paid-but-no-Pro) | crash (500) |
+| **New / changed subscription SKU** — `pro_plan_from_product_id` | adding any product id beyond the three known SKUs* | reported to the ErrorSink; the caller declines to write | any purchase of the new SKU registers no Pro until the SKU is supported | loud-ish |
 
 \* known SKUs: `com.getsession.org.pro_sub_{1_month,3_months,12_months}`.
 
@@ -103,21 +180,82 @@ is what the loud-guard is for.
 ---
 
 ## Observability gaps (not branches — silent conditions worth alerting on)
-- **Google `EXPIRED`/`ON_HOLD` over-entitlement detector** revokes when a proof would outlive expiry but
-  raises **no alert** on that anomalous condition (`# TODO … devs need to be notified somehow`).
-- **`appAccountToken` missing** (Apple) falls back to an empty `platform_obfuscated_account_id` rather than
-  flagging it — a payment can be registered unattributed to a user.
+- **`appAccountToken` missing (Apple)** falls back to an empty `platform_obfuscated_account_id` rather than
+  flagging it — a payment can be registered unattributed to a user. Google's equivalent gap was closed (see
+  the resubscription entry above); Apple's remains.
+
+**What now logs loudly, and at what level.** These were silent until this branch; the remaining gap is that
+nothing routes CRITICAL anywhere but the log.
+
+| condition | level | why that level |
+|---|---|---|
+| A reconcile token fails 5 times (`RECONCILE_STUCK_ATTEMPTS`) | ERROR | ~30 minutes in; past a blip, will not fix itself |
+| A reconcile token is parked at 36 attempts (`RECONCILE_MAX_ATTEMPTS`) | CRITICAL | end of the line — that purchase will not register without a human |
+| An unsupported store feature is reached (`handle_not_implemented`) | CRITICAL | a real customer bought or was refunded something we cannot process |
+| An acknowledgement has been failing 2 days (`ACK_DEADLINE_ALERT_AFTER`) | CRITICAL | Google auto-refunds and revokes at 3 days; one day left to act |
+| The subscriber loop exits unasked | CRITICAL | the mule restarts it, but a respawn loop otherwise looks like health |
+
+A parked token is retained, never deleted: clearing `parked_at` (`backend.google_unpark_reconcile`) re-queues
+it, which is what makes "deploy the fix, then re-run it" possible. `backend.google_parked_reconciles` lists
+them.
 
 ---
 
-*Source: audit of `platform_google.py`, `platform_google_api.py`, `platform_apple.py` at branch
-`phase2-foundation` (2026-07-19). If you add a handler or change a branch, update the corresponding row.*
+*Source: audit of the provider paths at branch `phase2-foundation` (2026-07-19), revised on branch
+`simplify-google-processing` (2026-08-03) after the Google notification path became convergent — the files
+audited then (`platform_google.py`, `platform_google_api.py`, `platform_apple.py`) are now
+`providers/google_play/` and `providers/app_store.py`. If you add a handler or change a branch, update the
+corresponding row.*
 
 ---
 
 ## Part 2 — Accepted design limitations
 
 Deliberate trade-offs, not bugs or dormant handlers. Recorded so they aren't rediscovered as surprises.
+
+### Changing Session identity loses a store subscription — KNOWN GAP, NOT ACCEPTED (raised 2026-08-03)
+
+The one entry here that is **not** a trade-off. It is a real user-visible defect with no code remedy today,
+recorded so it is a known TODO rather than a support mystery.
+
+A user who deletes and recreates their Session account keeps paying their store subscription and silently
+loses Pro. There is no way for them to recover it, and no way for us to move it.
+
+Why it is structural rather than a bug in one path:
+
+- Both stores bind a subscription to an account identifier at PURCHASE time and never revise it. Google's
+  `obfuscatedAccountId` is set by `setObfuscatedAccountId` when the billing flow is launched — Play
+  documents the field as present because it "was specified using `setObfuscatedAccountId` when the purchase
+  was made" — and Apple's `appAccountToken` is `uuid_from_master_pk(pubkey)`. A renewal does not re-run the
+  purchase flow, so the resource reports the ORIGINAL key for the life of the subscription.
+- Claiming is key equality with no override: `reconcile_pending_payments` treats holding the master key as
+  the claim itself, because the store attests the identifier as a function of that key. A new identity
+  presents a key that matches nothing.
+- Nothing rewrites the stored account id. `google_converge_payment` refuses deliberately — it "adjusts the
+  terms of a payment, never who holds it" — which is the right rule for convergence and the reason this
+  cannot be fixed by accident.
+
+So every renewal registers a payment attributed to a key the user no longer controls, and their new account
+sees nothing.
+
+**What support can do today:** `cli.py voucher` grants a *parallel* complimentary payment to the new master
+pkey. It restores the user's Pro but does not move the store payment or stop the charging, so the account is
+covered twice while the old subscription runs on. The alternative is cancel-and-repurchase, forfeiting the
+remainder of the paid term.
+
+**Candidate fixes, in increasing cost:**
+
+1. An admin re-attribution command: point an existing payment's account id at a new master pkey and re-run
+   the claim. Small, support-operable, no wire or client change — it makes the existing manual remedy exact
+   instead of approximate.
+2. A client-driven re-association route. The client on the new identity can enumerate its own store
+   purchases and submit the purchase token; the backend verifies it against the store and re-attributes.
+   This is the real fix. Possession is reasonable evidence — only a device signed into that store account
+   can enumerate it — but it is a new authenticated route plus client work on both platforms, and it needs
+   designing so a token cannot be used to capture someone else's subscription.
+
+Note the narrower form of this already exists inside the resubscription fallback above: a user who rotated
+identities between subscriptions is attributed to the keys they no longer hold. Same root cause.
 
 ### Proof expiry-value metadata channel (privacy; accepted 2026-07-20, narrowed 2026-07-30)
 
@@ -146,8 +284,17 @@ end, and can bound the true expiry to within ~25 h. Don't oversell the fix as mo
   resilience. Judged not worth it.
 - **The grid offset itself is readable** (`expiry_ts` modulo 24 h) and that's fine: it is a uniform random
   per-cycle value that leaves the true expiry bounded to the same ~24 h window either way, and it is less
-  identifying than the per-generation `revocation_tag` already in the proof. Because a revocation moves the
-  true expiry, the offset re-draws in the same moment the tag rolls, so it adds no cross-roll linkage.
+  identifying than the per-generation `revocation_tag` already in the proof. **Minting a generation always
+  re-draws the offset**, so it adds no cross-roll linkage — this is load-bearing rather than incidental, and
+  it is forced at the mint site precisely because the re-draw is otherwise extension-only (a revocation is a
+  *shrink*, which keeps the offset so that reducing an entitlement cannot serve a later expiry than before).
+  Where the generation persists, the unchanged tag already links those proofs, so a held offset adds nothing.
+- **A served-expiry step-down is an unambiguous shrink signal.** With the offset held across a shrink, the
+  grid is fixed, so a conversation partner who sees `expiry_ts` move earlier learns the entitlement was
+  reduced, where a re-draw would have blurred the direction. The same fixed grid also means a shrink landing
+  inside one grid cell is invisible where a re-draw would have signalled *something* changed. Both are
+  accepted: shrinks are rare (refunds, early-out revocations), and the alternative reintroduces the
+  monotonicity break above.
 - **Decision: accept the residual slide-vs-pin shape as a known limitation.**
 
 Note the *distinct* subscription-**cadence** leak (an observer watching how often the `revocation_tag`
@@ -157,22 +304,23 @@ changes on a revocation) is likewise intrinsic and accepted.
 
 *(Ref: wire spec §2.3.)*
 
-### Google RTDN ordering (accepted; the safety property is load-bearing)
+### Google RTDN ordering (not a limitation any more; kept because the reasoning matters)
 
 Google does not set Pub/Sub ordering keys on RTDNs, so notifications for one purchase token arrive out of
-order, both within a single pull and on a replay. The subscriber sorts a batch by `eventTimeMillis`, which
-orders only *within* that batch; across batches, ordering is handled by the handler failing and the message
-being retried with a back-off until whatever it depended on has landed. There is no reorder buffer.
+order, both within a single delivery and on a replay. **Nothing depends on their order**, because handling
+never reads the notification type: a notification records that its token owes a look, and a later drain
+fetches the resource and writes what it currently says. Two notifications collapse to one fetch, and a
+replay converges onto the same values.
 
-**What makes that safe is an invariant, not the sort:** every mutating branch in
-`handle_subscription_notification` gates on the `subscription_state` from a *freshly fetched* subscription
-resource, so a notification whose type no longer matches the store's current state does nothing rather than
-applying a stale change. The notification is a hint; the resource is the truth (as `google.md` says).
+This entry used to describe the opposite arrangement — a per-batch sort by `eventTimeMillis`, a per-message
+retry backoff, and a state-guard in every mutating branch of a type dispatch — and it warned that wiring any
+dormant branch without that guard would break ordering safety. None of that exists. The sort ordered only
+within one batch and so bought nothing across batches; the guard was needed only because the dispatch read
+the notification type in the first place.
 
-**Wiring any dormant branch above without that guard breaks it.** A handler that acts on the notification
-type alone will apply stale changes out of order. The same applies to a handler that needs a payment row to
-already exist: it will fail and retry until the row appears, which is correct but costs a `user_error` and
-error-level logs in the meantime.
+**The reason it is kept:** the failure it warned about is still available to anyone who reintroduces
+per-type handling. `docs/google.md` §2 states the rule and `CLAUDE.md` repeats it. `REVOKED` is the sole
+branch that reads a type, because a refund is the one fact the resource cannot express.
 
 ### Credits are not clawed back on refund (accepted)
 
