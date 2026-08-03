@@ -2988,6 +2988,35 @@ class GoogleReconcileClaim:
 
 
 @db.transactional
+def google_owner_of_purchase_token(tx: db.SQLTransaction, payment_token: str) -> bytes | None:
+    """The master pkey that owns any payment on `payment_token`, or None if none is claimed.
+
+    For attributing a resubscription whose new purchase carries no identifiers of its own and whose EXPIRED
+    subscription never carried one either — so `expiredExternalAccountIdentifiers` is absent and only
+    `expiredPurchaseToken` is left. Redemption bound the old row to its owner whatever the store knew, so our
+    own record answers a question the store cannot.
+
+    Any row will do: every cycle on one token belongs to one subscription and therefore one account, so this
+    takes the newest rather than asserting there is exactly one.
+    """
+    # query_one, not query_scalar: an unknown or unclaimed token legitimately returns nothing, and
+    # query_scalar asserts a row is present.
+    row = db.query_one(
+        tx.conn,
+        '''
+        SELECT   u.master_pkey
+        FROM     google_play_payment_details gd
+                 JOIN payments p ON p.id = gd.payment_id
+                 JOIN users u    ON u.id = p.user_id
+        WHERE    gd.payment_token = %s
+        ORDER BY p.id DESC
+        LIMIT    1
+    ''',
+        payment_token,
+    )
+    return bytes(row[0]) if row is not None and row[0] is not None else None
+
+
 def google_enqueue_reconcile(tx: db.SQLTransaction, payment_token: str, eligible_at: pendulum.DateTime) -> None:
     """Record that `payment_token` owes a reconcile against Google's current subscription resource.
 

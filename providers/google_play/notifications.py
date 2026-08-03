@@ -572,30 +572,81 @@ def _replay_unhandled_backlog() -> None:
         log.info(f'Replayed {replayed} unhandled notification(s) from the DB')
 
 
-def require_obfuscated_external_account_id(tx_event: SubscriptionPlanEventTransaction, err: base.ErrorSink) -> bytes:
-    # NOTE: Parse the obfuscated_external_account_id into bytes
+def require_obfuscated_external_account_id(
+    tx_event: SubscriptionPlanEventTransaction, tx: db.SQLTransaction, err: base.ErrorSink
+) -> bytes:
+    """The account this purchase belongs to, as the 32-byte master-pkey hash our attribution keys on.
+
+    Normally the purchase carries it, because our billing flow calls setObfuscatedAccountId. One documented
+    case does not: a resubscribe after the previous subscription expired COMPLETELY is a brand new purchase
+    with no `linkedPurchaseToken` -- Play states that explicitly -- and if it was not made through our app
+    there was no opportunity to set an account id on it. Play's answer is `outOfAppPurchaseContext`, which
+    carries the identifiers from the EXPIRED subscription, "present exclusively for unacknowledged
+    resubscription purchases".
+
+    So that value is the fallback rather than a nicety. Without it the chain is: no id -> this reports ->
+    the caller returns before registering the payment -> `needs_ack` is never written -> the ack sweep never
+    acknowledges it -> Google auto-refunds at three days. The user pays, gets nothing, and is refunded
+    without either side being told why.
+
+    Preferring the purchase's own id keeps the fallback from ever overriding a current fact with a
+    historical one -- it is only consulted when the present is silent.
+
+    One case this attributes WRONGLY, accepted: a user who lost their Session identity between subscriptions
+    resubscribes, and the expired subscription names the master pkey they no longer hold, so the payment
+    waits for keys that may not exist. It is the narrow intersection of two uncommon events, it is what Play
+    prescribes, and a support-minted voucher covers it -- but it is why this is documented in
+    `docs/limitations.md` rather than left for someone to discover as a mystery.
+
+    The identifiers are also TRANSIENT: `outOfAppPurchaseContext` is present only while the purchase is
+    unacknowledged. Attribution must therefore happen before the acknowledgement, which is the order the
+    caller uses -- register (flagging needs_ack), then let the sweep acknowledge. Anything that acknowledged
+    first would destroy the only evidence of ownership permanently.
+    """
+    account_id_hex = tx_event.obfuscated_external_account_id
+    source = 'the purchase'
+    if account_id_hex is None:
+        account_id_hex = tx_event.expired_obfuscated_external_account_id
+        source = 'the expired subscription it resubscribes (outOfAppPurchaseContext)'
+        if account_id_hex is not None:
+            log.info(f'Attributing a resubscription from {source}: the purchase itself carries no account id')
+
+    # Deeper still: the expired subscription may never have carried an account id either, in which case the
+    # token is all that is left. Our own record answers what the store cannot, because redemption bound that
+    # old row to its owner regardless of what Google knew about it.
+    if account_id_hex is None and tx_event.expired_purchase_token is not None:
+        owner = backend.google_owner_of_purchase_token(tx, tx_event.expired_purchase_token)
+        if owner is not None:
+            log.info(
+                'Attributing a resubscription through the expired purchase token: neither the purchase nor '
+                'the expired subscription carries an account id'
+            )
+            return owner
+
     result: bytes = b''
-    if tx_event.obfuscated_external_account_id is None:
+    if account_id_hex is None:
+        # Left unattributed on purpose. Google auto-refunds a purchase left unacknowledged for three days,
+        # and since nothing here registers a row, nothing ever flags it for acknowledgement — so an
+        # unattributable purchase ends in the store making the user whole. That is a better outcome than
+        # acknowledging it and stranding paid money in a row no account can ever claim.
         err.msg_list.append(
-            'Google user submitted a payment and did not set a setObfuscatedAccountId, '
-            'payment will not be attributed to the user'
+            'Google user submitted a payment and did not set a setObfuscatedAccountId, and neither the '
+            'expired subscription it resubscribes nor our record of it identifies an owner; payment will '
+            'not be attributed to the user'
         )
     else:
-        obfuscated_external_account_id_hex = tx_event.obfuscated_external_account_id
-        if obfuscated_external_account_id_hex.startswith('0x'):
-            obfuscated_external_account_id_hex = obfuscated_external_account_id_hex[2:]
+        if account_id_hex.startswith('0x'):
+            account_id_hex = account_id_hex[2:]
 
-        if len(obfuscated_external_account_id_hex) != 64:
+        if len(account_id_hex) != 64:
             err.msg_list.append(
-                f'Google user submitted a payment that was not a 32 byte hash, received: {len(result)/2}b'
+                f'Google account id from {source} is not a 32 byte hash, received: {len(account_id_hex)/2}b'
             )
 
         try:
-            result = bytes.fromhex(obfuscated_external_account_id_hex)
+            result = bytes.fromhex(account_id_hex)
         except Exception:
-            err.msg_list.append(
-                'Google user submitted a payment with a obfuscated ID that could not be parsed from hex into bytes'
-            )
+            err.msg_list.append(f'Google account id from {source} could not be parsed from hex into bytes')
     return result
 
 
@@ -732,7 +783,7 @@ def reconcile_google_subscription(
         # No row for this (token, order id): either a cycle we have never seen, or one whose row is revoked
         # and therefore terminal. add_unredeemed_payment dedups on the same pair, so the revoked case is a
         # no-op rather than a resurrection.
-        obfuscated_external_account_id = require_obfuscated_external_account_id(tx_event, err)
+        obfuscated_external_account_id = require_obfuscated_external_account_id(tx_event, tx, err)
         if err.has():
             return
         backend.add_unredeemed_payment(

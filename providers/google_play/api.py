@@ -396,6 +396,24 @@ def parse_get_subscription_v2_response(response: typing.Any, err: ErrorSink) -> 
                 external_account_identifiers, "obfuscatedExternalAccountId", err
             )
 
+        # Optional throughout, and read with `optional` rather than `require` at every level: this whole
+        # object appears only on an unacknowledged resubscription, its identifiers block only if the expired
+        # subscription had one configured, and neither absence is an error. `expiredPurchaseToken` is
+        # deliberately not parsed — the account id is the identifier our attribution already keys on, so
+        # taking the token too would mean a second resolution path to keep correct for no extra reach.
+        expired_obfuscated_external_account_id: str | None = None
+        expired_purchase_token: str | None = None
+        out_of_app_context = json_dict_optional_obj(response, "outOfAppPurchaseContext", err)
+        if out_of_app_context is not None:
+            expired_identifiers = json_dict_optional_obj(out_of_app_context, "expiredExternalAccountIdentifiers", err)
+            if expired_identifiers is not None:
+                # Named `obfuscatedAccountId` here, NOT `obfuscatedExternalAccountId` as on the purchase
+                # itself. Same value, two spellings, one of which is easy to copy wrongly.
+                expired_obfuscated_external_account_id = base.json_dict_optional_str(
+                    expired_identifiers, "obfuscatedAccountId"
+                )
+            expired_purchase_token = base.json_dict_optional_str(out_of_app_context, "expiredPurchaseToken")
+
         if not err.has() and acknowledgement_state is not None:
             result = SubscriptionV2Data(
                 kind=kind,
@@ -408,6 +426,8 @@ def parse_get_subscription_v2_response(response: typing.Any, err: ErrorSink) -> 
                 test_purchase=is_test_purchase,
                 acknowledgement_state=acknowledgement_state,
                 obfuscated_external_account_id=obfuscated_external_account_id,
+                expired_obfuscated_external_account_id=expired_obfuscated_external_account_id,
+                expired_purchase_token=expired_purchase_token,
             )
     else:
         err.msg_list.append('Failed to get subscription details, result not a dict')
@@ -515,6 +535,11 @@ class SubscriptionPlanEventTransaction:
     subscription_state: SubscriptionsV2State
     purchase_acknowledged: SubscriptionsV2AcknowledgementState
     obfuscated_external_account_id: str | None
+    # The expired subscription's account id, when this is an unacknowledged resubscribe. See
+    # `SubscriptionV2Data.expired_obfuscated_external_account_id` for why it is the only attribution
+    # available in that case.
+    expired_obfuscated_external_account_id: str | None
+    expired_purchase_token: str | None
 
 
 def parse_subscription_purchase_tx(purchase_token: str, details: SubscriptionV2Data, err: ErrorSink):
@@ -577,6 +602,8 @@ def parse_subscription_plan_event_tx(
             linked_purchase_token=details.linked_purchase_token,
             purchase_acknowledged=details.acknowledgement_state,
             obfuscated_external_account_id=details.obfuscated_external_account_id,
+            expired_obfuscated_external_account_id=details.expired_obfuscated_external_account_id,
+            expired_purchase_token=details.expired_purchase_token,
         )
     result = SubscriptionPlanEventTransaction(
         base_plan_id=line_item.offer_details.base_plan_id,
@@ -588,6 +615,8 @@ def parse_subscription_plan_event_tx(
         linked_purchase_token=details.linked_purchase_token,
         purchase_acknowledged=details.acknowledgement_state,
         obfuscated_external_account_id=details.obfuscated_external_account_id,
+        expired_obfuscated_external_account_id=details.expired_obfuscated_external_account_id,
+        expired_purchase_token=details.expired_purchase_token,
     )
     return result
 

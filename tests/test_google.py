@@ -5430,3 +5430,186 @@ def test_google_paused_and_deferred_notifications_converge_instead_of_wedging(mo
         assert len(_payment_rows(ctx)) == 2, 'no new cycle: a deferral revises the term it is given'
         assert stored_expiry('GPA.7777-0000-0000-00002') == pendulum.datetime(2026, 5, 15), 'from the resource'
         assert stored_expiry(order_id) == pendulum.datetime(2026, 2, 1), 'and the earlier cycle is untouched'
+
+
+def test_google_resubscription_is_attributed_from_the_expired_subscription(monkeypatch, pg_database):
+    # A resubscribe after the previous subscription expired COMPLETELY is a brand new purchase with no
+    # `linkedPurchaseToken` -- Play says so, "because the original subscription expired completely" -- and
+    # when it is not made through our app nothing called setObfuscatedAccountId, so it carries no account id
+    # of its own. Play's answer is `outOfAppPurchaseContext`, holding the identifiers from the expired
+    # subscription, "present exclusively for unacknowledged resubscription purchases".
+    #
+    # Without reading it the purchase cannot be attributed, which is not merely paid-but-no-Pro: the
+    # reconcile returns before registering the row, so `needs_ack` is never written, the ack sweep never
+    # acknowledges it, and Google auto-refunds at three days. The user pays, gets nothing, and is refunded.
+    with TestingContext(pg_database) as ctx:
+        account_id = bytes(nacl.signing.SigningKey.generate().verify_key)
+        snapshot = _google_snapshot(
+            state='SUBSCRIPTION_STATE_ACTIVE',
+            expiry='2026-03-01T00:00:00.000Z',
+            order_id='GPA.4444-0000-0000-00001',
+            obfuscated_account_id=account_id,
+        )
+        # The new purchase carries NO identifiers of its own; only the expired one's are available. And it
+        # is PENDING acknowledgement, because Play states outOfAppPurchaseContext is present exclusively on
+        # unacknowledged resubscriptions -- an acknowledged one could not carry the field at all.
+        del snapshot['externalAccountIdentifiers']
+        snapshot['acknowledgementState'] = 'ACKNOWLEDGEMENT_STATE_PENDING'
+        snapshot['outOfAppPurchaseContext'] = {
+            'expiredExternalAccountIdentifiers': {'obfuscatedAccountId': account_id.hex()},
+            'expiredPurchaseToken': 'tok-the-expired-one',
+        }
+
+        handled, err = _drive_google_rtdn(
+            monkeypatch,
+            ctx,
+            notification_type=google_play.types.SubscriptionNotificationType.PURCHASED.value,
+            purchase_token='tok-resubscribed',
+            event_ms=1767225600000,
+            snapshot=snapshot,
+        )
+        assert handled is True and not err.has(), err.msg_list
+
+        with ctx.connection() as conn:
+            attributed = db.query_scalar(
+                conn,
+                '''SELECT gd.obfuscated_account_id FROM google_play_payment_details gd
+                   WHERE gd.payment_token = %s''',
+                'tok-resubscribed',
+            )
+            needs_ack = db.query_scalar(
+                conn, 'SELECT needs_ack FROM google_play_payment_details WHERE payment_token = %s', 'tok-resubscribed'
+            )
+        assert attributed is not None and bytes(attributed) == account_id, 'attributed to the resubscribing user'
+        assert needs_ack is True, 'and flagged for acknowledgement, which is what averts the auto-refund'
+
+
+def test_google_a_purchase_prefers_its_own_account_id_over_an_expired_one(monkeypatch, pg_database):
+    # The fallback must never override a current fact with a historical one. If the purchase carries its own
+    # account id, that is the answer even when an expired subscription's identifiers are also present --
+    # otherwise a resubscribe by a DIFFERENT account than the one that let the old subscription lapse would
+    # be handed to the wrong user, which is the one failure this fallback could introduce.
+    with TestingContext(pg_database) as ctx:
+        current = bytes(nacl.signing.SigningKey.generate().verify_key)
+        previous = bytes(nacl.signing.SigningKey.generate().verify_key)
+        assert current != previous
+        snapshot = _google_snapshot(
+            state='SUBSCRIPTION_STATE_ACTIVE',
+            expiry='2026-03-01T00:00:00.000Z',
+            order_id='GPA.4444-0000-0000-00002',
+            obfuscated_account_id=current,
+        )
+        snapshot['outOfAppPurchaseContext'] = {
+            'expiredExternalAccountIdentifiers': {'obfuscatedAccountId': previous.hex()},
+            'expiredPurchaseToken': 'tok-someone-elses',
+        }
+
+        handled, err = _drive_google_rtdn(
+            monkeypatch,
+            ctx,
+            notification_type=google_play.types.SubscriptionNotificationType.PURCHASED.value,
+            purchase_token='tok-has-its-own',
+            event_ms=1767225600000,
+            snapshot=snapshot,
+        )
+        assert handled is True and not err.has(), err.msg_list
+
+        with ctx.connection() as conn:
+            attributed = db.query_scalar(
+                conn,
+                'SELECT obfuscated_account_id FROM google_play_payment_details WHERE payment_token = %s',
+                'tok-has-its-own',
+            )
+        assert bytes(attributed) == current, "the purchase's own id wins"
+
+
+def test_google_a_purchase_with_no_identifiers_at_all_is_still_reported(monkeypatch, pg_database):
+    # The fallback narrows the unattributable case; it does not remove it. A purchase with neither its own
+    # identifiers nor an expired subscription's must still fail loudly rather than be registered against
+    # nobody, because an unattributed row is a payment no user can ever claim.
+    with TestingContext(pg_database) as ctx:
+        snapshot = _google_snapshot(
+            state='SUBSCRIPTION_STATE_ACTIVE',
+            expiry='2026-03-01T00:00:00.000Z',
+            order_id='GPA.4444-0000-0000-00003',
+            obfuscated_account_id=bytes(nacl.signing.SigningKey.generate().verify_key),
+        )
+        del snapshot['externalAccountIdentifiers']
+
+        handled, err = _drive_google_rtdn(
+            monkeypatch,
+            ctx,
+            notification_type=google_play.types.SubscriptionNotificationType.PURCHASED.value,
+            purchase_token='tok-anonymous',
+            event_ms=1767225600000,
+            snapshot=snapshot,
+        )
+        # `handled` is the NOTIFICATION's outcome, and recording the token succeeded -- the attribution
+        # failure happens in the drain, which is the point of decoupling them.
+        assert handled is True
+        assert err.has() and any('not be attributed' in m for m in err.msg_list), err.msg_list
+        assert not _payment_rows(ctx), 'nothing was registered against nobody'
+        with ctx.connection() as conn:
+            still_queued = db.query(conn, 'SELECT payment_token FROM google_reconcile_queue').fetchall()
+        assert [r[0] for r in still_queued] == ['tok-anonymous'], 'the obligation is RETAINED, not discarded'
+
+
+def test_google_resubscription_is_attributed_through_the_expired_token(monkeypatch, pg_database):
+    # The deepest fallback: neither the new purchase nor the EXPIRED subscription carries an account id, so
+    # only `expiredPurchaseToken` is left. Our own record answers it -- redemption bound the old row to its
+    # owner whatever the store knew -- which is reach the store-side identifiers alone do not have.
+    with TestingContext(pg_database) as ctx:
+        account_id = bytes(nacl.signing.SigningKey.generate().verify_key)
+
+        # An earlier subscription, claimed by this account, that has since fully expired.
+        old = _google_snapshot(
+            state='SUBSCRIPTION_STATE_ACTIVE',
+            expiry='2026-01-15T00:00:00.000Z',
+            order_id='GPA.5555-0000-0000-00001',
+            obfuscated_account_id=account_id,
+        )
+        handled, err = _drive_google_rtdn(
+            monkeypatch,
+            ctx,
+            notification_type=google_play.types.SubscriptionNotificationType.PURCHASED.value,
+            purchase_token='tok-old-expired',
+            event_ms=1767225600000,
+            snapshot=old,
+        )
+        assert handled is True and not err.has(), err.msg_list
+        with ctx.connection() as conn:
+            assert (
+                backend.reconcile_pending_payments(
+                    conn, nacl.signing.VerifyKey(account_id), redeemed_at=pendulum.datetime(2026, 1, 1)
+                )
+                >= 1
+            )
+
+        # The resubscribe: no identifiers anywhere, only the expired token.
+        new = _google_snapshot(
+            state='SUBSCRIPTION_STATE_ACTIVE',
+            expiry='2026-04-01T00:00:00.000Z',
+            order_id='GPA.5555-0000-0000-00002',
+            obfuscated_account_id=account_id,
+        )
+        del new['externalAccountIdentifiers']
+        new['acknowledgementState'] = 'ACKNOWLEDGEMENT_STATE_PENDING'
+        new['outOfAppPurchaseContext'] = {'expiredPurchaseToken': 'tok-old-expired'}
+
+        handled, err = _drive_google_rtdn(
+            monkeypatch,
+            ctx,
+            notification_type=google_play.types.SubscriptionNotificationType.PURCHASED.value,
+            purchase_token='tok-resub-by-token',
+            event_ms=1772323200000,
+            snapshot=new,
+        )
+        assert handled is True and not err.has(), err.msg_list
+
+        with ctx.connection() as conn:
+            attributed = db.query_scalar(
+                conn,
+                'SELECT obfuscated_account_id FROM google_play_payment_details WHERE payment_token = %s',
+                'tok-resub-by-token',
+            )
+        assert bytes(attributed) == account_id, 'attributed through our own record of the expired token'

@@ -65,6 +65,31 @@ paused subscriber should read the resource rather than trust a rule of thumb abo
 Enabling pause or issuing deferrals is therefore no longer gated on a code change. The remaining rows
 above are still dormant and still worth keeping off.
 
+**Resubscription from the Play subscriptions center attributes through the EXPIRED subscription.**
+
+A lapsed subscriber pressing "Resubscribe" in Play makes a purchase our app never sees, so nothing calls
+`setObfuscatedAccountId` and the new purchase carries no account id of its own — Play documents the field as
+present only "if account linking happened as part of the subscription purchase flow" or if it "was specified
+using `setObfuscatedAccountId` when the purchase was made". Play's substitute is `outOfAppPurchaseContext`,
+which carries the *expired* subscription's identifiers and is "present exclusively for unacknowledged
+resubscription purchases". The backend reads it, preferring in order: the purchase's own account id, the
+expired subscription's, then our own record of who owned the expired purchase token.
+
+Two consequences worth knowing:
+
+- **Attribution must precede acknowledgement**, because the context vanishes once the purchase is acked.
+  The order is register (flagging `needs_ack`) and then let the ack sweep run. Anything that acknowledged
+  first would destroy the only evidence of ownership permanently.
+- **A user who lost their Session identity between subscriptions is attributed to the keys they no longer
+  hold.** The payment then waits, unredeemed, for a master pkey that may not exist. This is the narrow
+  intersection of two uncommon events and it is what Play prescribes, so it is accepted rather than worked
+  around; a support-minted voucher is the remedy. Worth recognising rather than debugging from scratch.
+
+If attribution fails entirely the purchase is deliberately left unregistered, which means it is never
+acknowledged, which means Google auto-refunds it after three days. That is the better failure: the user is
+made whole automatically, where acknowledging an unattributable purchase would strand paid money in a row no
+account could ever claim.
+
 **Store-config invariant — never set a base plan's grace period to 0 days.**
 
 Play does not honour a zero grace. It substitutes a 24-hour **silent grace period** during which the

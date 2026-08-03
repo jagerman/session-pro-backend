@@ -464,6 +464,22 @@ class SubscriptionV2Data:
 
     obfuscated_external_account_id: str | None = None
 
+    # The account id configured on the PREVIOUS, expired subscription, carried in
+    # `outOfAppPurchaseContext` and present exclusively on an unacknowledged resubscription purchase.
+    #
+    # A resubscribe after full expiry is a brand new purchase with no `linked_purchase_token` — Play says so
+    # explicitly, "because the original subscription expired completely" — and when it happens outside our
+    # app there is no billing flow of ours to call setObfuscatedAccountId, so the new purchase carries no
+    # account id of its own. This is the only thing that says whose it is. Google returning the old
+    # subscription's id is itself the evidence that the new one has none: there would be nothing to return
+    # it for otherwise.
+    expired_obfuscated_external_account_id: str | None = None
+
+    # The expired subscription's purchase token, also from `outOfAppPurchaseContext`. Kept because it
+    # attributes a resubscribe even when the expired subscription never carried an account id either:
+    # redemption bound that old row to its owner in OUR records whatever the store knew.
+    expired_purchase_token: str | None = None
+
 
 def json_dict_require_google_money(d: dict[str, base.JSONValue], key: str, err: base.ErrorSink):
     price_obj = base.json_dict_require_obj(d, key, err)
