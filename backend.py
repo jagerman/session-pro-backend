@@ -3057,7 +3057,8 @@ def google_reconcile_failed(
     notification's urgency stomped by the backoff from an attempt that predates it, which contradicts
     enqueue's rule that new information only ever pulls work earlier.
 
-    `park` stops the automatic retries for good (see migration 012). It is subject to the same
+    `park` stops the automatic retries for good (see `parked_at`, added by migration
+    008_google_convergence). It is subject to the same
     newer-obligation rule as the backoff: a notification that arrived during this fetch describes a state
     this attempt cannot have seen, so it gets its chance rather than being parked on the strength of a
     failure that predates it.

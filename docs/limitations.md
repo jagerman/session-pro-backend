@@ -132,7 +132,7 @@ with a backoff and records `attempts` and `last_error` on its `google_reconcile_
 durable record of a stuck purchase, it has no retention limit, and it is where an operator should look.
 
 There used to be a second signal here: a `user_errors` row, surfaced to the account as the wire's
-`error_report`. Both are deleted (migration `011`). It was one undocumented bit with no reason, no detail
+`error_report`. Both are deleted (migration `008_google_convergence`). It was one undocumented bit with no reason, no detail
 and no remedy — an internal handler failure shown to a user who could do nothing with it — and it had
 stopped meaning the same thing on each provider, since a Google handling failure rolled the row back in the
 same transaction while Apple wrote its own on a separate connection.

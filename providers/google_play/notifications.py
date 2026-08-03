@@ -686,7 +686,8 @@ RECONCILE_LEASE = pendulum.duration(seconds=2 * RECONCILE_BATCH_LIMIT * api.SOCK
 RECONCILE_RETRY_MIN = pendulum.duration(minutes=1)
 RECONCILE_RETRY_MAX = pendulum.duration(hours=6)
 
-# Attempts before the drain stops retrying a token and parks it for manual review (see migration 012).
+# Attempts before the drain stops retrying a token and parks it for manual review (see `parked_at`, added
+# by migration 008_google_convergence).
 #
 # 36 is about a week of wall clock: the doubling reaches the six-hour ceiling by the tenth attempt, having
 # spent ~14 h getting there, and the remaining 26 attempts are six hours each. A week is chosen against two
