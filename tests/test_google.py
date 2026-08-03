@@ -9,6 +9,7 @@ import nacl.bindings
 import nacl.public
 import os
 import pendulum
+import pytest
 import time
 import typing
 import dataclasses
@@ -100,42 +101,38 @@ def test_google_a_failed_enqueue_is_not_acked_away(monkeypatch, pg_database):
 
 
 def test_google_process_notification_message(monkeypatch, pg_database):
-    # CHARACTERIZATION of _process_notification_message (the per-message tx block extracted from the pull
-    # loop in 91ad5fe). Pins the control flow the ErrorSink rewrite must preserve, INCLUDING the
-    # present+unhandled+no-prior-error FAILURE branch that records a poison user_error -- add_user_error was
-    # fixed here (string-code provider + at= datetime; it was int()/unix_ts_ms= broken, refactor-introduced).
-    # Seeds prior user_errors via direct SQL to stay independent of the writer under test.
+    # The per-message transaction block: what it does with a message that is absent, already handled, or
+    # unhandled-and-failing. Pins the control flow the callback depends on -- handled=True means ack, and a
+    # failure must leave the history row unhandled so a redelivery retries it.
+    #
+    # It used to also pin a `user_error` row per outcome, surfaced to the account as the wire's
+    # `error_report`. Both are deleted: the bit was not actionable by a user, and a handling failure rolled
+    # it back anyway. A stuck purchase is now visible as `attempts`/`last_error` on its reconcile-queue row.
     now_s = 1_600_000_000.0
     expiry = base.datetime_from_unix_ms(int(now_s * 1000) + base.MILLISECONDS_IN_DAY)
-    seeded_at = base.datetime_from_unix_ms(int(now_s * 1000))
 
-    def make_msg(message_id, token):
-        return google_play.SortedMessage(
+    def make_msg(message_id: str, token: str):
+        return google_play.notifications.SortedMessage(
+            event_unix_ts_ms=int(now_s * 1000),
             message_id=message_id,
             parse=google_play.ParsedNotification(
                 payload_type=google_play.ParsedNotificationPayloadType.Subscription,
                 purchase_token=token,
-                package_name='pkg',
+                package_name='network.loki.messenger',
                 event_time_ms=int(now_s * 1000),
             ),
         )
 
-    def seed_user_error(conn, token):
-        with db.transaction(conn) as tx:
-            db.query(
-                tx.conn,
-                'INSERT INTO user_errors (payment_provider, payment_id, errored_at) VALUES (%s, %s, %s)',
-                base.PaymentProvider.GooglePlayStore.value,
-                token,
-                seeded_at,
-            )
-
-    def is_handled(conn, message_id):
-        # Read-only lookup: wrap conn in a bare SQLTransaction (no BEGIN needed on the autocommit pool).
-        return backend.google_notification_message_id_is_in_db(db.SQLTransaction(conn=conn), message_id).handled
+    def is_handled(conn, message_id: str):
+        return db.query_scalar(
+            conn, 'SELECT handled FROM google_notification_history WHERE message_id = %s', message_id
+        )
 
     with TestingContext(pg_database) as ctx:
-        # (A) message not in the DB -> handled=True (skip; someone may have deleted it out-of-band).
+        monkeypatch.setattr('providers.google_play.api.package_name', 'network.loki.messenger')
+
+        # (A) No history row at all -> treated as handled, so the message is acked rather than retried
+        #     forever. Someone cleared it out-of-band and that is taken as authoritative.
         with ctx.connection() as conn:
             assert (
                 google_play.notifications._process_notification_message(
@@ -144,27 +141,31 @@ def test_google_process_notification_message(monkeypatch, pg_database):
                 is True
             )
 
-        # (B) message present + already handled -> handled=True (no reprocessing).
+        # (B) Present and ALREADY handled -> handled again without re-running the handler. This is the path a
+        #     redelivery of a committed-but-unacked message takes, and it is what makes at-least-once
+        #     delivery a non-event.
+        monkeypatch.setattr(
+            'providers.google_play.notifications.handle_parsed_notification',
+            lambda tx, parse, err: pytest.fail('handler must not run for an already-handled message'),
+        )
         with ctx.connection() as conn:
             with db.transaction(conn) as tx:
-                backend.google_add_notification_id(tx, 'm-handled', expiry, '')
-                backend.google_set_notification_handled(tx, message_id='m-handled', delete=False)
+                backend.google_add_notification_id(tx, 'm-done', expiry, '')
+                backend.google_set_notification_handled(tx, message_id='m-done', delete=False)
             assert (
                 google_play.notifications._process_notification_message(
-                    conn, make_msg('m-handled', 'tok-b'), base.ErrorSink(), now_s
+                    conn, make_msg('m-done', 'tok-b'), base.ErrorSink(), now_s
                 )
                 is True
             )
 
-        # (C) present + unhandled + SUCCESS -> handled=True, the notification is marked handled, and a prior
-        #     user_error for the token is cleared -- all committed in the one transaction.
+        # (C) Present, unhandled, handler SUCCEEDS -> marked handled in the same transaction.
         monkeypatch.setattr(
             'providers.google_play.notifications.handle_parsed_notification', lambda tx, parse, err: True
         )
         with ctx.connection() as conn:
             with db.transaction(conn) as tx:
                 backend.google_add_notification_id(tx, 'm-ok', expiry, '')
-            seed_user_error(conn, 'tok-c')
             assert (
                 google_play.notifications._process_notification_message(
                     conn, make_msg('m-ok', 'tok-c'), base.ErrorSink(), now_s
@@ -172,18 +173,15 @@ def test_google_process_notification_message(monkeypatch, pg_database):
                 is True
             )
             assert is_handled(conn, 'm-ok') is True
-            assert backend.has_user_error(conn, base.PaymentProvider.GooglePlayStore, 'tok-c') is False
 
-        # (D) present + unhandled + FAILURE (no tx.cancel) WITH a prior user_error -> handled=False, the
-        #     notification stays unhandled, and the prior error is left intact (the failure branch neither
-        #     clears nor re-adds while already in error state -- so it never reaches the broken add path).
+        # (D) Present, unhandled, handler FAILS -> reported unhandled and the row stays unhandled, which is
+        #     what makes the callback nack it and Google redeliver.
         monkeypatch.setattr(
             'providers.google_play.notifications.handle_parsed_notification', lambda tx, parse, err: False
         )
         with ctx.connection() as conn:
             with db.transaction(conn) as tx:
                 backend.google_add_notification_id(tx, 'm-fail', expiry, '')
-            seed_user_error(conn, 'tok-d')
             assert (
                 google_play.notifications._process_notification_message(
                     conn, make_msg('m-fail', 'tok-d'), base.ErrorSink(), now_s
@@ -191,27 +189,6 @@ def test_google_process_notification_message(monkeypatch, pg_database):
                 is False
             )
             assert is_handled(conn, 'm-fail') is False
-            assert backend.has_user_error(conn, base.PaymentProvider.GooglePlayStore, 'tok-d') is True
-
-        # (E) present + unhandled + FAILURE (no tx.cancel) + NO prior error -> RECORDS a poison user_error
-        #     (add_user_error, now fixed: string-code provider + at= datetime). Returns False, notification
-        #     stays unhandled, the token is now flagged. The poison ride the same tx, and this failure did
-        #     not cancel, so it commits. (This branch used to raise TypeError before the add_user_error fix.)
-        monkeypatch.setattr(
-            'providers.google_play.notifications.handle_parsed_notification', lambda tx, parse, err: False
-        )  # self-contained (not relying on (D))
-        with ctx.connection() as conn:
-            with db.transaction(conn) as tx:
-                backend.google_add_notification_id(tx, 'm-poison', expiry, '')
-            assert backend.has_user_error(conn, base.PaymentProvider.GooglePlayStore, 'tok-e') is False
-            assert (
-                google_play.notifications._process_notification_message(
-                    conn, make_msg('m-poison', 'tok-e'), base.ErrorSink(), now_s
-                )
-                is False
-            )
-            assert is_handled(conn, 'm-poison') is False
-            assert backend.has_user_error(conn, base.PaymentProvider.GooglePlayStore, 'tok-e') is True
 
 
 def test_google_ack_sweep(monkeypatch, pg_database):

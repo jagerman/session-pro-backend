@@ -25,8 +25,6 @@ BRIEF_EPILOG = """
 QUICK START EXAMPLES (all commands require --config):
   voucher                     --master-pkey <hex> --plan <1M|3M|12M>
                               [--provider <p>] [--rotating-pkey <hex>] [--duration <s>]
-  user-error set              <provider>:<payment-id>=<true|false>[,...]
-  user-error delete           <provider>:<payment-id>[,...]
   google-notification handle  <msgid>[,...]
   google-notification delete  <msgid>[,...]
   google-notification list
@@ -40,87 +38,6 @@ Run with --help-full for detailed command formats.
 
 DETAILED_EPILOG = """
 COMMAND FORMATS DETAILED:
-  user-error set "<provider>:<payment_id>=<flag>[,...]" (requires --config)
-    A ',' delimited string to instruct the DB to delete the specified rows from the user errors table
-    in the DB on startup. This value must be of the format
-
-      "<payment_provider integer>:<payment_id>=[true|false], ..."
-
-    For example
-
-      "1:the_google_order_id=true,2:the_apple_order_id=false"
-
-    Which will add the row that has a payment provider of 1 (which corresponds to the Google Play
-    Store) and has a payment ID that matches "google_order_id" to have an error. For the next entry
-    similarly it will set the Apple row to false (e.g. delete the row from the DB)
-
-    This is intended to be used to flush errors from the DB if they are encountered during the
-    handling of payment notifications for a specific user. Platform clients may be using the error
-    table to populate UI that indicates that a user should contact support, hence clearing this
-    value may clear the error prompt for said user.
-
-    Examples:
-      python cli.py user-error set "1:abc123token=true"
-      python cli.py user-error set "1:token1=true,1:token2=true,2:apple1=false"
-
-  user-error set "<provider>:<payment_id>=<flag>[,...]" (requires --config)
-    A ',' delimited string to instruct the DB to delete the specified rows from the user errors table
-    in the DB on startup. This value must be of the format
-
-      "<payment_provider integer>:<payment_id>=[true|false], ..."
-
-    For example
-
-      "1:the_google_order_id=true,2:the_apple_order_id=false"
-
-    Which will add the row that has a payment provider of 1 (which corresponds to the Google Play
-    Store) and has a payment ID that matches "google_order_id" to have an error. For the next entry
-    similarly it will set the Apple row to false (e.g. delete the row from the DB)
-
-    This is intended to be used to flush errors from the DB if they are encountered during the
-    handling of payment notifications for a specific user. Platform clients may be using the error
-    table to populate UI that indicates that a user should contact support, hence clearing this
-    value may clear the error prompt for said user.
-
-    Options:
-      provider:     Integer (1=Google Play Store, 2=iOS App Store)
-      payment_id:   String (google_payment_token or apple_original_tx_id)
-      flag:         true to add error, false to delete
-
-    Examples:
-      python cli.py --config config.ini user-error set "1:abc123token=true"
-      python cli.py --config config.ini user-error set "1:token1=true,1:token2=true,2:apple1=false"
-
-  user-error delete "<provider>:<payment_id>[,...]" (requires --config)
-    Same format as 'set' but only deletes (no =true/false)
-
-    Examples:
-      python cli.py --config config.ini user-error delete "1:abc123token"
-      python cli.py --config config.ini user-error delete "1:token1,1:token2,2:apple1"
-
-  voucher --config <ini> --master-pkey <hex> --plan <1M|3M|12M>
-          [--provider <p>] [--rotating-pkey <hex>] [--duration <s>]
-    Create a voucher payment and auto-redeem it. This is an admin command for granting
-    promotional or complimentary Session Pro subscriptions directly in the database.
-
-    Required:
-      --config <ini>          Path to config.ini file
-      --master-pkey <hex>     64-char hex master public key of the recipient
-      --plan <1M|3M|12M>      Subscription plan duration
-
-    Optional:
-      --provider <p>          stf (default) | google_play | app_store. The two store
-                              providers mint a payment the store never saw, for testing the
-                              per-provider code paths, and require provider_dry_run
-      --rotating-pkey <hex>   64-char hex rotating public key (generates new if omitted)
-      --duration <s>          Override duration in seconds
-
-    Examples:
-      python cli.py voucher --config config.ini --master-pkey abcdef... --plan 1M
-      python cli.py voucher --config config.ini --master-pkey abcdef... --plan 3M --rotating-pkey fedcba...
-      python cli.py voucher --config config.ini --master-pkey abcdef... --plan 12M --duration 5
-      python cli.py voucher --config config.ini --master-pkey abcdef... --plan 1M --provider google_play
-
   google-notification handle "<message_id>[,...]" (requires --config)
     A ',' delimited string of message IDs to instruct the DB to mark the specified rows as handled
     from the google notification history table in the DB on startup.
@@ -199,45 +116,6 @@ COMMAND FORMATS DETAILED:
       python cli.py --config config.ini report generate weekly --format csv --count 4
       python cli.py --config config.ini report generate monthly --count 3
 """
-
-
-def parse_set_user_error_arg(arg: str) -> list[tuple[base.PaymentProvider, str, bool]]:
-    """Parse a comma-separated string of errors into a list of (payment_provider, payment_id, set_flag)
-    tuples. Raises ValueError on malformed input."""
-    result: list[tuple[base.PaymentProvider, str, bool]] = []
-    if len(arg) == 0:
-        return result
-
-    for item in arg.split(','):
-        item = item.strip()
-        if ':' not in item or '=' not in item:
-            raise ValueError(
-                f"Invalid format for user error: '{item}'. Expected '<payment_provider>:<payment_id>=[true|false]'."
-            )
-        payment_provider_str, remainder = item.split(':', 1)
-        payment_id, set_flag_str = remainder.split('=', 1)
-        payment_provider_str = payment_provider_str.strip()
-
-        try:
-            payment_provider = base.PaymentProvider(payment_provider_str)
-        except Exception:
-            raise ValueError(f'Failed to parse payment provider ({payment_provider_str}) for item {item}')
-
-        if payment_provider == base.PaymentProvider.Nil:
-            raise ValueError(f'Nil payment provider cannot be used for errors (item {item})')
-        if payment_provider == base.PaymentProvider.SessionFoundation:
-            raise ValueError(f'A directly granted payment has no notifications, so it cannot error (item {item})')
-
-        set_flag = False
-        if set_flag_str.lower() == 'true':
-            set_flag = True
-        elif set_flag_str.lower() == 'false':
-            set_flag = False
-        else:
-            raise ValueError(f'Failed to parse set flag ({set_flag_str}) for item {item}')
-
-        result.append((payment_provider, payment_id, set_flag))
-    return result
 
 
 def parse_payment_id_list(arg: str) -> list[tuple[base.PaymentProvider, str]]:
@@ -341,105 +219,6 @@ def require_config(args: argparse.Namespace) -> CLIConfig:
 
     db.set_dsn(result.db_url)
     return result
-
-
-def cmd_user_error_set(args: argparse.Namespace, dry_run: bool) -> int:
-    require_config(args)
-    try:
-        items = parse_set_user_error_arg(args.items)
-    except ValueError as e:
-        print(f"ERROR: Failed to parse arguments:\n  {e}", file=sys.stderr)
-        return 1
-
-    if len(items) == 0:
-        print("No items to process")
-        return 0
-
-    try:
-        with db.connection() as conn:
-            count = 0
-            label = ''
-
-            for index, (payment_provider, payment_id, set_flag) in enumerate(items):
-                if index:
-                    label += '\n'
-                label += f'  {index:02d} {payment_provider.value}:{payment_id} = {set_flag}'
-
-                if dry_run:
-                    label += ' (dry-run)'
-                    count += 1
-                    continue
-
-                if set_flag:
-                    error = backend.UserError(provider=payment_provider)
-                    if payment_provider == base.PaymentProvider.GooglePlayStore:
-                        error.google_payment_token = payment_id
-                    else:
-                        assert payment_provider == base.PaymentProvider.iOSAppStore
-                        error.apple_original_tx_id = payment_id
-
-                    if backend.has_user_error(conn=conn, payment_provider=payment_provider, payment_id=payment_id):
-                        label += ' (skipped - already exists)'
-                    else:
-                        backend.add_user_error(
-                            conn, error=error, at=base.datetime_from_unix_ms(int(time.time() * 1000))
-                        )
-                        count += 1
-                        label += ' (added)'
-                else:
-                    if backend.delete_user_errors(conn=conn, payment_provider=payment_provider, payment_id=payment_id):
-                        count += 1
-                        label += ' (deleted)'
-                    else:
-                        label += ' (skipped - not found)'
-
-            print(f"Set {count}/{len(items)} user errors\n{label}")
-            return 0
-
-    except Exception as e:
-        print(f"ERROR: Database error: {e}", file=sys.stderr)
-        return 1
-
-
-def cmd_user_error_delete(args: argparse.Namespace, dry_run: bool) -> int:
-    require_config(args)
-    try:
-        items = parse_payment_id_list(args.items)
-    except ValueError as e:
-        print(f"ERROR: Failed to parse arguments:\n  {e}", file=sys.stderr)
-        return 1
-
-    if len(items) == 0:
-        print("No items to process")
-        return 0
-
-    try:
-        with db.connection() as conn:
-            count = 0
-            label = ''
-
-            for index, (payment_provider, payment_id) in enumerate(items):
-                if index:
-                    label += '\n'
-                label += f'  {index:02d} {payment_provider.value}:{payment_id}'
-
-                if dry_run:
-                    label += ' (dry-run)'
-                    count += 1
-                    continue
-
-                if backend.delete_user_errors(conn=conn, payment_provider=payment_provider, payment_id=payment_id):
-                    count += 1
-                    label += ' (deleted)'
-                else:
-                    label += ' (skipped - not found)'
-
-            print(f"Deleted {count}/{len(items)} user errors\n{label}")
-            return 0
-
-    except Exception as e:
-        print(f"ERROR: Database error: {e}", file=sys.stderr)
-        return 1
 
 
 def cmd_google_notification_handle(args: argparse.Namespace, dry_run: bool) -> int:
@@ -838,18 +617,6 @@ def main() -> int:
     voucher_parser.add_argument('--duration', type=int, help='Override duration in seconds')
 
     # User error commands
-    user_error_parser = subparsers.add_parser('user-error', help='Manage user errors')
-    user_error_subparsers = user_error_parser.add_subparsers(dest='user_error_command', help='User error subcommands')
-
-    user_error_set = user_error_subparsers.add_parser(
-        'set', help='Set user errors (format: <provider>:<payment-id>=true|false,...)'
-    )
-    user_error_set.add_argument('items', help='Comma-separated list of errors')
-
-    user_error_delete = user_error_subparsers.add_parser(
-        'delete', help='Delete user errors (format: <provider>:<payment-id>,...)'
-    )
-    user_error_delete.add_argument('items', help='Comma-separated list of payment IDs')
 
     # Google notification commands
     google_notif_parser = subparsers.add_parser(
@@ -910,15 +677,6 @@ def main() -> int:
 
     if args.command == 'voucher':
         return cmd_voucher(args)
-
-    elif args.command == 'user-error':
-        if args.user_error_command == 'set':
-            return cmd_user_error_set(args, dry_run)
-        elif args.user_error_command == 'delete':
-            return cmd_user_error_delete(args, dry_run)
-        else:
-            user_error_parser.print_help()
-            return 1
 
     elif args.command == 'google-notification':
         if args.google_notif_command == 'handle':

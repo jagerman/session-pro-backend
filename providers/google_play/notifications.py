@@ -278,11 +278,15 @@ def _process_notification_message(
 ) -> bool:
     """
     Process one queued RTDN message inside a single DB transaction and report whether it was handled
-    (True → ack + drop from the queue; False → leave for retry). Marking the message handled, and
-    recording or clearing the purchase token's user_error, all happen in the SAME transaction as
-    handle_parsed_notification — so a handling failure that sets tx.cancel rolls back that
-    bookkeeping too.  Extracted from the subscriber callback so this transaction-composition is
-    unit-testable (the loop itself, which owns the gRPC client, is not).
+    (True → ack; False → nack for redelivery). Marking the message handled happens in the SAME transaction
+    as handle_parsed_notification, so a handling failure that sets tx.cancel rolls back that bookkeeping
+    too. Extracted from the subscriber callback so this transaction-composition is unit-testable (the loop
+    itself, which owns the gRPC client, is not).
+
+    Where a failure becomes visible: the token's `google_reconcile_queue` row, which the drain stamps with
+    `attempts` and `last_error`. This used to also write a `user_error` row, surfaced to the account as the
+    wire's `error_report` — one undocumented bit with no reason and no remedy, which a handling failure then
+    rolled back anyway. Deleted rather than repointed; a stuck purchase is operator information.
     """
 
     handled = False
@@ -291,29 +295,13 @@ def _process_notification_message(
         # notification doesn't exist anymore (maybe someone deleted it
         # out-of-band, e.g. via the SET_GOOGLE_NOTIFICATION command) then we skip the notification.
         lookup = backend.google_notification_message_id_is_in_db(tx, msg.message_id)
-        user_is_in_error_state = backend.has_user_error(
-            conn=tx.conn, payment_provider=base.PaymentProvider.GooglePlayStore, payment_id=msg.parse.purchase_token
-        )
         if not lookup.present or lookup.present and lookup.handled:
             handled = True
         else:
             handled = handle_parsed_notification(tx, msg.parse, err)
 
-        # NOTE: Clear user error if success, or add one if we failed
-        if lookup.present:
-            if handled:
-                backend.google_set_notification_handled(tx, message_id=msg.message_id, delete=False)
-                if user_is_in_error_state:
-                    backend.delete_user_errors(
-                        tx.conn,
-                        payment_provider=base.PaymentProvider.GooglePlayStore,
-                        payment_id=msg.parse.purchase_token,
-                    )
-            elif not user_is_in_error_state:
-                user_error = backend.UserError()
-                user_error.provider = base.PaymentProvider.GooglePlayStore
-                user_error.google_payment_token = msg.parse.purchase_token
-                backend.add_user_error(tx, error=user_error, at=base.datetime_from_unix_ms(int(now_s * 1000)))
+        if lookup.present and handled:
+            backend.google_set_notification_handled(tx, message_id=msg.message_id, delete=False)
     return handled
 
 

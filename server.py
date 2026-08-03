@@ -299,7 +299,6 @@ def get_pro_status():
     auto_renewing = False
     expiry_ts = 0
     grace_period_duration = 0
-    error_report = 0
     latest_payment: dict[str, str | int | float | bool] | None = None
 
     with db.connection() as conn:
@@ -307,7 +306,6 @@ def get_pro_status():
             # Bind any payment the mule has registered for this key but that isn't yet redeemed, so a
             # status check right after purchase reflects it. No-op when there's nothing new.
             backend.reconcile_pending_payments(tx, master_pkey_nacl, redeemed_at=backend.to_redeemed_at(request_at))
-            error_report = int(backend.has_user_error_from_master_pkey(tx, master_pkey_nacl))
             user = backend.get_user(tx.conn, master_pkey_nacl)
             if user.found:
                 auto_renewing = user.auto_renewing
@@ -349,7 +347,6 @@ def get_pro_status():
             'auto_renewing': auto_renewing,
             'expiry_ts': expiry_ts,
             'grace_period_duration': grace_period_duration,
-            'error_report': error_report,
             'latest_payment': latest_payment,
         }
     )

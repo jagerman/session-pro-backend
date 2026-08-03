@@ -58,23 +58,6 @@ def test_cli_parse_helpers():
     # The CLI arg parsers raise ValueError on malformed input (no ErrorSink); command handlers catch it,
     # print "Failed to parse arguments", and exit 1. Here we pin the parse contract directly.
 
-    # parse_set_user_error_arg: "<provider>:<payment_id>=[true|false]", comma-separated.
-    assert cli.parse_set_user_error_arg('') == []
-    assert cli.parse_set_user_error_arg('google_play:tok1=true, app_store:otx2=false') == [
-        (base.PaymentProvider.GooglePlayStore, 'tok1', True),
-        (base.PaymentProvider.iOSAppStore, 'otx2', False),
-    ]
-    with pytest.raises(ValueError):
-        cli.parse_set_user_error_arg('google_play-tok1-true')  # no ':' / '='
-    with pytest.raises(ValueError):
-        cli.parse_set_user_error_arg('notaprovider:tok=true')  # bad provider (was swallowed into the sink)
-    with pytest.raises(ValueError):
-        cli.parse_set_user_error_arg('google_play:tok=maybe')  # bad flag
-    with pytest.raises(ValueError):
-        cli.parse_set_user_error_arg('nil:tok=true')  # Nil provider rejected
-    with pytest.raises(ValueError):
-        cli.parse_set_user_error_arg('stf:tok=true')  # a directly granted payment cannot error
-
     # parse_payment_id_list: "<provider>:<payment_id>", comma-separated.
     assert cli.parse_payment_id_list('') == []
     assert cli.parse_payment_id_list('google_play:tok1, stf:ord2') == [

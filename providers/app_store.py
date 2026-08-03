@@ -15,7 +15,6 @@ import psycopg
 import dataclasses
 import pprint
 import logging
-import time
 import traceback
 import uuid
 
@@ -1151,16 +1150,6 @@ def notifications_apple_app_connect_sandbox() -> flask.Response:
 
     # NOTE: Handle errors
     if err.has():
-        # NOTE: Record the error under the payment token if possible to propagate to clients
-        if decoded_notification.tx_info and decoded_notification.tx_info.originalTransactionId:
-            user_error = backend.UserError(
-                provider=base.PaymentProvider.iOSAppStore,
-                apple_original_tx_id=decoded_notification.tx_info.originalTransactionId,
-            )
-
-            with db.connection() as conn:
-                backend.add_user_error(conn, error=user_error, at=base.datetime_from_unix_ms(int(time.time() * 1000)))
-
         # NOTE: Log and abort request
         log.error(
             f'Failed to parse notification ({resp.signedDate}) signed payload was:\n'

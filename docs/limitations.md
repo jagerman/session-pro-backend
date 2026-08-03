@@ -126,17 +126,16 @@ to 1 day.
   message is *stored* first, so a deploy that adds the type applies the backlog. If a new *benign* type
   starts arriving in volume, add it to the no-op list above; do not soften the default.
 
-**A note on what "retry-loop" now means, and on `user_error`.** Nothing above retries an RTDN any more:
-the notification is acked as soon as its token is queued, and the failure happens later in the drain, which
-retries the TOKEN with a backoff and records `attempts` and `last_error` on its `google_reconcile_queue`
-row. That row is the durable record of a stuck purchase, and it is where an operator should look.
+**A note on what "retry-loop" now means.** Nothing above retries an RTDN any more: the notification is
+acked as soon as its token is queued, and the failure happens later in the drain, which retries the TOKEN
+with a backoff and records `attempts` and `last_error` on its `google_reconcile_queue` row. That row is the
+durable record of a stuck purchase, it has no retention limit, and it is where an operator should look.
 
-Consequently **no Google `user_error` can ever persist**: every remaining failure path in
-`_process_notification_message` sets `tx.cancel`, which rolls back the row written in the same transaction.
-So `get_pro_status`'s `error_report` is permanently 0 for Google accounts while Apple still populates it —
-a wire field that silently stopped meaning anything for one provider. It was never actionable by a user
-in any case: one undocumented bit, no reason, no remedy. Pending a decision to repoint it at the drain's
-`attempts` or to retire it, treat Google's `error_report` as dead and the queue row as the truth.
+There used to be a second signal here: a `user_errors` row, surfaced to the account as the wire's
+`error_report`. Both are deleted (migration `011`). It was one undocumented bit with no reason, no detail
+and no remedy — an internal handler failure shown to a user who could do nothing with it — and it had
+stopped meaning the same thing on each provider, since a Google handling failure rolled the row back in the
+same transaction while Apple wrote its own on a separate connection.
 
 ---
 

@@ -96,7 +96,7 @@ USERS_COLUMNS = ", ".join(
 )
 USERS_FROM = "users u JOIN generations g ON g.id = u.current_generation_id"
 
-# payments.payment_provider / .plan and user_errors.payment_provider store the string `code` directly
+# payments.payment_provider / .plan store the string `code` directly
 # (the lookup tables payment_providers/pro_plans use the code as their PRIMARY KEY, FK'd for validity).
 # So there's no id indirection: the enum's `.value` IS the stored value, and reads map it straight back
 # via base.PaymentProvider(...)/base.ProPlan(...).
@@ -199,13 +199,6 @@ AddRevocationIterator: typing.TypeAlias = tuple[
 GoogleUnhandledNotificationIterator: typing.TypeAlias = tuple[
     str, str | None, pendulum.DateTime  # message_id (opaque string)  # payload
 ]  # expiry_at
-
-
-@dataclasses.dataclass
-class UserError:
-    provider: base.PaymentProvider = base.PaymentProvider.Nil
-    apple_original_tx_id: str = ''
-    google_payment_token: str = ''
 
 
 @dataclasses.dataclass
@@ -2624,88 +2617,6 @@ def delete_expired_google_notifications(conn: psycopg.Connection, now: pendulum.
     return db.query(
         conn, '''DELETE FROM google_notification_history WHERE %s >= expires_at AND handled = TRUE''', now
     ).rowcount
-
-
-@db.transactional
-def add_user_error(tx: db.SQLTransaction, error: UserError, at: pendulum.DateTime):
-    match error.provider:
-        case base.PaymentProvider.SessionFoundation:
-            pass
-        case base.PaymentProvider.Nil:
-            pass
-        case base.PaymentProvider.GooglePlayStore:
-            assert len(error.google_payment_token) > 0
-            db.query(
-                tx.conn,
-                '''
-                INSERT INTO user_errors (payment_provider, payment_id, errored_at)
-                VALUES (%(provider)s, %(payment_id)s, %(ts)s)
-                ON CONFLICT DO NOTHING
-                ''',
-                provider=error.provider.value,
-                payment_id=error.google_payment_token,
-                ts=at,
-            )
-        case base.PaymentProvider.iOSAppStore:
-            assert len(error.apple_original_tx_id) > 0
-            db.query(
-                tx.conn,
-                '''
-                INSERT INTO user_errors (payment_provider, payment_id, errored_at)
-                VALUES (%(provider)s, %(payment_id)s, %(ts)s)
-                ON CONFLICT DO NOTHING
-                ''',
-                provider=error.provider.value,
-                payment_id=error.apple_original_tx_id,
-                ts=at,
-            )
-
-
-@db.transactional
-def has_user_error_from_master_pkey(tx: db.SQLTransaction, master_pkey: nacl.signing.VerifyKey) -> bool:
-    # NOTE: A directly granted payment has no provider notifications, so no user error can exist for it
-    return bool(
-        db.query_scalar(
-            tx.conn,
-            (f'''
-SELECT EXISTS (
-    SELECT 1
-    FROM payments p
-    LEFT JOIN app_store_payment_details  ad ON ad.payment_id = p.id
-    LEFT JOIN google_play_payment_details gd ON gd.payment_id = p.id
-    LEFT JOIN user_errors ue
-        ON (p.payment_provider = '{base.PaymentProvider.iOSAppStore.value}'     AND ad.original_tx_id = ue.payment_id)
-        OR (p.payment_provider = '{base.PaymentProvider.GooglePlayStore.value}' AND gd.payment_token  = ue.payment_id)
-    WHERE p.user_id = (SELECT id FROM users WHERE master_pkey = %s)
-    AND ue.payment_id IS NOT NULL
-) AS has_error;
-'''),
-            bytes(master_pkey),
-        )
-    )
-
-
-def has_user_error(conn: psycopg.Connection, payment_provider: base.PaymentProvider, payment_id: str) -> bool:
-    # Single SELECT on the given connection (mid-tx callers pass tx.conn). payment_provider is a string
-    # code (the lookup tables key on the code itself) — compared directly, never int()-cast.
-    row = db.query_one(
-        conn,
-        'SELECT 1 FROM user_errors WHERE payment_id = %s AND payment_provider = %s',
-        payment_id,
-        payment_provider.value,
-    )
-    return row is not None
-
-
-def delete_user_errors(conn: psycopg.Connection, payment_provider: base.PaymentProvider, payment_id: str) -> bool:
-    # Single statement on the given connection (mid-tx callers pass tx.conn); the pool is autocommit.
-    row = db.query(
-        conn,
-        'DELETE FROM user_errors WHERE payment_provider = %s AND payment_id = %s',
-        payment_provider.value,
-        payment_id,
-    )
-    return row.rowcount > 0
 
 
 @db.transactional

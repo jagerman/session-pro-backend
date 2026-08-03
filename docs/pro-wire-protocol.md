@@ -312,7 +312,7 @@ two fields; `user_status: never` is the state behind an `error_code: not_subscri
 
 The two read endpoints return these `result` shapes:
 - **`get_pro_status`** (cheap, hot path) — `{ user_status, auto_renewing, expiry_ts,
-  grace_period_duration, error_report, latest_payment }`. `latest_payment` is a single payment item (shape
+  grace_period_duration, latest_payment }`. `latest_payment` is a single payment item (shape
   below) or `null` when the account has no payments. No list, no pagination.
 - **`get_payment_details`** (paginated history) — `{ payments_total, items, next_cursor }`. `items` is one
   keyset page of payment items, newest-first, and carries **no** `user_status`; `payments_total` is the
