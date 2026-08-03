@@ -2771,11 +2771,23 @@ def google_notification_message_id_is_in_db(tx: db.SQLTransaction, message_id: s
     return result
 
 
-def google_payment_tokens_needing_ack(conn: psycopg.Connection) -> list[str]:
-    """Distinct Google purchase-tokens with an outstanding acknowledgement (needs_ack). The mule's
-    sweep acks each against Google and clears the flag via google_clear_needs_ack."""
-    rows = db.query(conn, '''SELECT DISTINCT payment_token FROM google_play_payment_details WHERE needs_ack''')
-    return [row[0] for row in rows]
+def google_payment_tokens_needing_ack(conn: psycopg.Connection) -> list[tuple[str, pendulum.DateTime]]:
+    """Google purchase-tokens with an outstanding acknowledgement, each with its EARLIEST purchase instant.
+
+    The mule's sweep acks each against Google and clears the flag via google_clear_needs_ack. It gets
+    `purchased_at` because that is the clock Google's three-day auto-refund runs on, so it is what tells the
+    sweep whether a failing ack is a blip or an emergency. The earliest cycle of the token is the
+    conservative choice: a token acknowledged as a whole is at risk from its oldest unacknowledged purchase.
+    """
+    rows = db.query(
+        conn,
+        '''SELECT   gd.payment_token, MIN(p.purchased_at)
+           FROM     google_play_payment_details gd
+                    JOIN payments p ON p.id = gd.payment_id
+           WHERE    gd.needs_ack
+           GROUP BY gd.payment_token''',
+    )
+    return [(row[0], row[1]) for row in rows]
 
 
 @db.transactional
@@ -2981,6 +2993,7 @@ def google_claim_due_reconciles(
                    SELECT   payment_token
                    FROM     google_reconcile_queue
                    WHERE    eligible_at <= %(now)s
+                     AND    parked_at IS NULL
                      AND    (leased_until IS NULL OR leased_until <= %(now)s)
                    ORDER BY eligible_at
                    FOR UPDATE SKIP LOCKED
@@ -3034,7 +3047,7 @@ def google_reconcile_done(tx: db.SQLTransaction, claim: GoogleReconcileClaim) ->
 
 @db.transactional
 def google_reconcile_failed(
-    tx: db.SQLTransaction, claim: GoogleReconcileClaim, retry_at: pendulum.DateTime, error: str
+    tx: db.SQLTransaction, claim: GoogleReconcileClaim, retry_at: pendulum.DateTime, error: str, park: bool = False
 ) -> None:
     """Record a failed attempt, release the lease, and back the token off to `retry_at`.
 
@@ -3043,6 +3056,11 @@ def google_reconcile_failed(
     keeps the due time it asked for. Otherwise a token whose reconcile is failing would have every fresh
     notification's urgency stomped by the backoff from an attempt that predates it, which contradicts
     enqueue's rule that new information only ever pulls work earlier.
+
+    `park` stops the automatic retries for good (see migration 012). It is subject to the same
+    newer-obligation rule as the backoff: a notification that arrived during this fetch describes a state
+    this attempt cannot have seen, so it gets its chance rather than being parked on the strength of a
+    failure that predates it.
     """
     db.query(
         tx.conn,
@@ -3051,14 +3069,45 @@ def google_reconcile_failed(
         SET    attempts     = attempts + 1,
                last_error   = %(error)s,
                leased_until = NULL,
-               eligible_at       = CASE WHEN revision = %(revision)s THEN %(retry_at)s ELSE eligible_at END
+               eligible_at  = CASE WHEN revision = %(revision)s THEN %(retry_at)s ELSE eligible_at END,
+               parked_at    = CASE WHEN %(park)s AND revision = %(revision)s THEN %(retry_at)s ELSE parked_at END
         WHERE  payment_token = %(token)s
     ''',
         token=claim.payment_token,
         revision=claim.revision,
         retry_at=retry_at,
         error=error,
+        park=park,
     )
+
+
+def google_parked_reconciles(conn: psycopg.Connection) -> list[tuple[str, int, str | None, pendulum.DateTime]]:
+    """Every token the drain has given up on, for an operator or a report. Never called by the drain."""
+    return [
+        (row[0], row[1], row[2], row[3])
+        for row in db.query(
+            conn,
+            '''SELECT payment_token, attempts, last_error, parked_at FROM google_reconcile_queue
+               WHERE parked_at IS NOT NULL ORDER BY parked_at''',
+        )
+    ]
+
+
+def google_unpark_reconcile(tx: db.SQLTransaction, payment_token: str, eligible_at: pendulum.DateTime) -> bool:
+    """Put a parked token back in the queue, due at `eligible_at`. Returns whether one was parked.
+
+    `attempts` is deliberately NOT reset: the count is the history of how much trouble this token has been,
+    and an operator un-parking it has not made the previous failures un-happen. It does mean the first retry
+    after un-parking uses the ceiling backoff, which is the right pace for something already known to fail.
+    """
+    rows = db.query(
+        tx.conn,
+        '''UPDATE google_reconcile_queue SET parked_at = NULL, eligible_at = %(eligible_at)s
+           WHERE payment_token = %(token)s AND parked_at IS NOT NULL''',
+        token=payment_token,
+        eligible_at=eligible_at,
+    )
+    return rows.rowcount > 0
 
 
 def _get_date_group_expr_sql(column: str, period: ReportPeriod) -> str:

@@ -115,8 +115,16 @@ def test_a_finished_token_leaves_the_queue(pg_database):
 
 
 def test_the_claim_takes_the_most_overdue_first_and_respects_its_limit(pg_database):
-    # Ordered by eligible_at so a backlog drains oldest-first rather than starving whatever fell behind, and
-    # limited so one pass cannot pull an unbounded batch into memory.
+    # WHICH tokens a limited claim selects: the most overdue, so a backlog drains oldest-first rather than
+    # starving whatever fell behind, and bounded so one pass cannot pull an unbounded batch into memory.
+    #
+    # Asserted as a SET, deliberately. The `ORDER BY eligible_at` lives in the subquery that feeds the
+    # UPDATE's `WHERE payment_token IN (...)`, and an UPDATE's RETURNING order is not constrained by it --
+    # so the sequence this comes back in is incidental, and an earlier version of this test pinned it by
+    # luck. It broke when a partial index changed the plan, which is exactly finding 3.4's shape: a test
+    # that passes because of physical row order tells you nothing about the property you meant.
+    #
+    # Nothing depends on the order anyway: the drain processes each claim independently.
     with TestingContext(pg_database) as ctx:
         now = base.datetime_from_unix_ms(1767225600000)
         with ctx.connection() as conn:
@@ -126,7 +134,7 @@ def test_the_claim_takes_the_most_overdue_first_and_respects_its_limit(pg_databa
 
             with db.transaction(conn) as tx:
                 claimed = backend.google_claim_due_reconciles(tx, now=now, lease_until=now + 1 * base.HOUR, limit=2)
-        assert [c.payment_token for c in claimed] == ['tok-0', 'tok-1']
+        assert sorted(c.payment_token for c in claimed) == ['tok-0', 'tok-1'], 'the two most overdue, not any two'
 
 
 def test_a_notification_arriving_mid_fetch_is_not_erased_by_the_fetch_that_missed_it(pg_database):
@@ -462,3 +470,77 @@ def test_a_streamed_notification_that_fails_to_handle_is_nacked(monkeypatch, pg_
                 conn, 'SELECT handled FROM google_notification_history WHERE message_id = %s', 'msg-unhandled'
             )
         assert handled is False, 'recorded, but not marked done -- so a redelivery retries it'
+
+
+def test_a_token_that_never_reconciles_is_parked_rather_than_retried_forever(pg_database):
+    # Without a cap a permanently-broken token retries at the six-hour ceiling indefinitely: four Play API
+    # fetches a day, forever, for a purchase that will never register. That is one row's worth of waste in
+    # isolation, but the failures are rarely isolated -- an unrecognised base plan is an ordinary Play Console
+    # action and breaks EVERY new purchase -- and the claim orders by `eligible_at`, so broken work is
+    # claimed ahead of fresh work.
+    #
+    # Parking stops the retries and nothing else: the row, its `attempts` and its `last_error` all stay.
+    with TestingContext(pg_database) as ctx:
+        now = base.datetime_from_unix_ms(1767225600000)
+        with ctx.connection() as conn:
+            with db.transaction(conn) as tx:
+                backend.google_enqueue_reconcile(tx, 'tok-doomed', now)
+
+            # Fail it up to one attempt short of the cap; it must still be claimable.
+            for attempt in range(google_play.notifications.RECONCILE_MAX_ATTEMPTS - 1):
+                with db.transaction(conn) as tx:
+                    claimed = backend.google_claim_due_reconciles(tx, now=now, lease_until=now, limit=10)
+                assert len(claimed) == 1, f'still queued at attempt {attempt}'
+                with db.transaction(conn) as tx:
+                    backend.google_reconcile_failed(tx, claimed[0], retry_at=now, error='boom', park=False)
+
+            # The last one parks it.
+            with db.transaction(conn) as tx:
+                claimed = backend.google_claim_due_reconciles(tx, now=now, lease_until=now, limit=10)
+            assert len(claimed) == 1
+            with db.transaction(conn) as tx:
+                backend.google_reconcile_failed(tx, claimed[0], retry_at=now, error='the last straw', park=True)
+
+            # Now it is invisible to the drain, however overdue it is.
+            with db.transaction(conn) as tx:
+                assert (
+                    backend.google_claim_due_reconciles(tx, now=now + 365 * base.DAY, lease_until=now, limit=10) == []
+                )
+
+            # But not forgotten: the token is the one fact about a subscription we cannot re-derive.
+            parked = backend.google_parked_reconciles(conn)
+            assert [row[0] for row in parked] == ['tok-doomed']
+            assert parked[0][1] == google_play.notifications.RECONCILE_MAX_ATTEMPTS
+            assert parked[0][2] == 'the last straw'
+
+            # And un-parking puts it straight back, which is what makes "deploy the fix and re-run" work.
+            with db.transaction(conn) as tx:
+                assert backend.google_unpark_reconcile(tx, 'tok-doomed', eligible_at=now) is True
+            with db.transaction(conn) as tx:
+                assert len(backend.google_claim_due_reconciles(tx, now=now, lease_until=now, limit=10)) == 1
+            assert backend.google_parked_reconciles(conn) == []
+
+
+def test_parking_yields_to_a_notification_that_arrived_during_the_fetch(pg_database):
+    # Parking is subject to the same newer-obligation rule as the backoff. A notification arriving mid-fetch
+    # describes a state that attempt cannot have seen, so it gets its chance rather than being parked on the
+    # strength of a failure that predates it -- otherwise the arrival of new information could be what
+    # finally condemns a token.
+    with TestingContext(pg_database) as ctx:
+        now = base.datetime_from_unix_ms(1767225600000)
+        with ctx.connection() as conn:
+            with db.transaction(conn) as tx:
+                backend.google_enqueue_reconcile(tx, 'tok', now)
+            with db.transaction(conn) as tx:
+                claimed = backend.google_claim_due_reconciles(tx, now=now, lease_until=now, limit=10)
+
+            # A notification lands while the fetch is in flight, bumping the revision.
+            with db.transaction(conn) as tx:
+                backend.google_enqueue_reconcile(tx, 'tok', now)
+
+            with db.transaction(conn) as tx:
+                backend.google_reconcile_failed(tx, claimed[0], retry_at=now + 6 * base.HOUR, error='boom', park=True)
+
+            assert backend.google_parked_reconciles(conn) == [], 'the newer obligation was not parked'
+            with db.transaction(conn) as tx:
+                assert len(backend.google_claim_due_reconciles(tx, now=now, lease_until=now, limit=10)) == 1

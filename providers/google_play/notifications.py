@@ -321,7 +321,7 @@ def _sweep_pending_acks() -> None:
         log.error(f'needs_ack sweep: failed to load pending acks. Error was {traceback.format_exc()}')
         return
 
-    for token in tokens:
+    for token, purchased_at in tokens:
         ack_err = base.ErrorSink()
         api.subscription_v1_acknowledge(purchase_token=token, err=ack_err)
         acked = not ack_err.has()
@@ -345,7 +345,25 @@ def _sweep_pending_acks() -> None:
                     f'Error was {traceback.format_exc()}'
                 )
         else:
-            log.warning(f'needs_ack sweep: ack still failing for {base.maybe_obfuscate(token)}; will retry next sweep')
+            # Escalated against Google's own clock, not ours: an unacknowledged purchase is automatically
+            # refunded and its entitlement revoked three days after purchase, so a failing ack is a blip on
+            # the first sweep and an emergency on the third day. Anchored on the purchase instant because
+            # that is when the store starts counting, and on the token's EARLIEST cycle because a token is
+            # acknowledged as a whole.
+            age = base.utc_now() - purchased_at
+            token_label = base.maybe_obfuscate(token)
+            if age >= ACK_DEADLINE_ALERT_AFTER:
+                log.critical(
+                    f'needs_ack sweep: ack has been failing for {token_label} since '
+                    f'{base.readable(purchased_at)} ({age.in_hours():.0f}h). Google auto-refunds an '
+                    f'unacknowledged purchase at {ACK_DEADLINE.in_hours():.0f}h and revokes the '
+                    f'entitlement with it — this needs intervention now'
+                )
+            else:
+                log.warning(
+                    f'needs_ack sweep: ack still failing for {token_label} '
+                    f'({age.in_hours():.0f}h since purchase); will retry next sweep'
+                )
 
 
 def thread_entry_point(
@@ -443,6 +461,13 @@ def thread_entry_point(
         if not context.kill_thread:
             context.sleep_event.wait(timeout=SUBSCRIBER_RECONNECT_DELAY_S)
             context.sleep_event.clear()
+
+    # Reaching here without being asked to stop means the loop gave up. The mule blocks on this thread and
+    # uWSGI respawns it, so the supervision is already right -- but a respawn loop is indistinguishable from
+    # health in the logs unless the exit says so. Everything inside is wrapped, so this needs a BaseException
+    # to happen at all, which is exactly why it should be loud rather than assumed impossible.
+    if not context.kill_thread:
+        log.critical('Google subscriber loop exited without being asked to stop; the mule will restart it')
 
 
 def _handle_streamed_message(message: typing.Any) -> None:
@@ -661,6 +686,31 @@ RECONCILE_LEASE = pendulum.duration(seconds=2 * RECONCILE_BATCH_LIMIT * api.SOCK
 RECONCILE_RETRY_MIN = pendulum.duration(minutes=1)
 RECONCILE_RETRY_MAX = pendulum.duration(hours=6)
 
+# Attempts before the drain stops retrying a token and parks it for manual review (see migration 012).
+#
+# 36 is about a week of wall clock: the doubling reaches the six-hour ceiling by the tenth attempt, having
+# spent ~14 h getting there, and the remaining 26 attempts are six hours each. A week is chosen against two
+# other clocks rather than picked round — it outlives Pub/Sub's 7-day message retention, so a token still
+# failing has outlived the notification that created it, and it is well past the three days after which
+# Google auto-refunds an unacknowledged purchase, so the subscriber has already been made whole. Retrying
+# past that point cannot help them; it only spends quota and crowds the queue.
+RECONCILE_MAX_ATTEMPTS = 36
+
+# Attempts before a token is reported as stuck rather than merely retrying. Two failures are a blip — a
+# hung fetch, a momentary DB error — and the backoff absorbs them silently. By the fifth, roughly half an
+# hour in, something is wrong that will not fix itself, and the operator should hear about it long before
+# the token is parked a week later.
+RECONCILE_STUCK_ATTEMPTS = 5
+
+# Google auto-refunds a purchase left unacknowledged for this long and revokes the entitlement with it:
+# "must be done within three days so that the purchase isn't automatically refunded and entitlement revoked"
+# -- https://developer.android.com/google/play/billing/integrate
+ACK_DEADLINE = 3 * base.DAY
+
+# When a failing acknowledgement stops being a blip and becomes an emergency. Two thirds of the way to the
+# deadline leaves a full day to act, and the sweep runs on every subscriber wake, so the alert repeats.
+ACK_DEADLINE_ALERT_AFTER = 2 * base.DAY
+
 
 def reconcile_retry_delay(attempts: int) -> pendulum.Duration:
     """Exponential backoff, bounded. `attempts` counts failures BEFORE this one."""
@@ -708,11 +758,28 @@ def drain_due_reconciles(at: pendulum.DateTime) -> int:
             with db.transaction(conn) as tx:
                 if err.has():
                     retry_at = at + reconcile_retry_delay(claim.attempts)
-                    log.error(
-                        f'Reconcile failed for {base.maybe_obfuscate(claim.payment_token)} '
-                        f'(attempt {claim.attempts + 1}, retrying at {base.readable(retry_at)}): {err.build()}'
-                    )
-                    backend.google_reconcile_failed(tx, claim, retry_at=retry_at, error=err.build())
+                    attempt = claim.attempts + 1
+                    park = attempt >= RECONCILE_MAX_ATTEMPTS
+                    token_label = base.maybe_obfuscate(claim.payment_token)
+                    if park:
+                        # The loudest thing this module says, because it is the end of the line: a purchase
+                        # that will now never register unless a human intervenes. The token is retained, so
+                        # clearing `parked_at` re-queues it once whatever broke is fixed.
+                        log.critical(
+                            f'Reconcile PARKED for {token_label} after {attempt} attempts — this purchase '
+                            f'will not register without intervention. Last error: {err.build()}'
+                        )
+                    elif attempt >= RECONCILE_STUCK_ATTEMPTS:
+                        log.error(
+                            f'Reconcile STUCK for {token_label} (attempt {attempt} of '
+                            f'{RECONCILE_MAX_ATTEMPTS}, retrying at {base.readable(retry_at)}): {err.build()}'
+                        )
+                    else:
+                        log.warning(
+                            f'Reconcile failed for {token_label} '
+                            f'(attempt {attempt}, retrying at {base.readable(retry_at)}): {err.build()}'
+                        )
+                    backend.google_reconcile_failed(tx, claim, retry_at=retry_at, error=err.build(), park=park)
                 else:
                     backend.google_reconcile_done(tx, claim)
 

@@ -160,10 +160,12 @@ under Analytics, which is why scanning the menu for it fails; the console's top 
    Cloud Storage types write messages to storage instead of delivering them. Our subscriber uses *streaming*
    pull, which is not a separate console option — it is a choice the client library makes within Pull mode.
 
-A **dead-letter topic** is worth configuring but is not required: a message that can never be handled is
-retained in `google_notification_history` and replayed at every subscriber start, so it is recoverable
-without one. Setting `max_delivery_attempts` moves that from "retried forever" to "parked somewhere an
-operator can see it".
+A **dead-letter topic is NOT worth configuring**, contrary to what this section said before the switchover.
+It parks a *message* that fails delivery repeatedly — and messages no longer fail: one is acked as soon as its
+purchase token is recorded, which is a single small write. The work that can fail now happens later, in the
+reconcile drain, against our own `google_reconcile_queue`. That queue has its own cap and parking (see
+`RECONCILE_MAX_ATTEMPTS` and `backend.google_parked_reconciles`), which is the equivalent mechanism in the
+place where the failures actually are.
 
 ## Operations
 

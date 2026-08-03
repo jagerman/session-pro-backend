@@ -180,14 +180,24 @@ is what the loud-guard is for.
 ---
 
 ## Observability gaps (not branches — silent conditions worth alerting on)
-- **A stuck reconcile token is silent.** `google_reconcile_queue.attempts` and `last_error` record a token
-  the drain cannot finish, and nothing alerts on it — a purchase can fail attribution or plan mapping
-  indefinitely with the evidence sitting in a table nobody reads. This replaces the old
-  `EXPIRED`/`ON_HOLD` over-entitlement detector, which was a branch of the deleted dispatch; the
-  over-entitlement question it asked is now answered by convergence plus
-  `refresh_entitlement_and_revoke_overreaching_proofs`.
-- **`appAccountToken` missing** (Apple) falls back to an empty `platform_obfuscated_account_id` rather than
-  flagging it — a payment can be registered unattributed to a user.
+- **`appAccountToken` missing (Apple)** falls back to an empty `platform_obfuscated_account_id` rather than
+  flagging it — a payment can be registered unattributed to a user. Google's equivalent gap was closed (see
+  the resubscription entry above); Apple's remains.
+
+**What now logs loudly, and at what level.** These were silent until this branch; the remaining gap is that
+nothing routes CRITICAL anywhere but the log.
+
+| condition | level | why that level |
+|---|---|---|
+| A reconcile token fails 5 times (`RECONCILE_STUCK_ATTEMPTS`) | ERROR | ~30 minutes in; past a blip, will not fix itself |
+| A reconcile token is parked at 36 attempts (`RECONCILE_MAX_ATTEMPTS`) | CRITICAL | end of the line — that purchase will not register without a human |
+| An unsupported store feature is reached (`handle_not_implemented`) | CRITICAL | a real customer bought or was refunded something we cannot process |
+| An acknowledgement has been failing 2 days (`ACK_DEADLINE_ALERT_AFTER`) | CRITICAL | Google auto-refunds and revokes at 3 days; one day left to act |
+| The subscriber loop exits unasked | CRITICAL | the mule restarts it, but a respawn loop otherwise looks like health |
+
+A parked token is retained, never deleted: clearing `parked_at` (`backend.google_unpark_reconcile`) re-queues
+it, which is what makes "deploy the fix, then re-run it" possible. `backend.google_parked_reconciles` lists
+them.
 
 ---
 

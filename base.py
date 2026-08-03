@@ -769,6 +769,17 @@ def validate_string_list(items: list[JSONValue]) -> typing.TypeGuard[list[str]]:
 
 
 def handle_not_implemented(name: str, err: ErrorSink):
+    """Report a store feature we do not support, loudly.
+
+    This is the single funnel for every dormant feature `docs/limitations.md` lists — prepaid plans,
+    one-time products, partial refunds. Reaching it means a real customer bought or was refunded something
+    this backend cannot process, so the ErrorSink alone is not enough: the sink tells the caller to decline
+    the write, and CRITICAL tells a human that a feature was enabled in a store console without the handler
+    to match. Every one of these is a paid-but-no-Pro or an unreflected refund until someone acts.
+    """
+    logging.getLogger('PROVIDER').critical(
+        f"Unsupported store feature '{name}' was reached — a customer is affected and this needs a handler"
+    )
     err.msg_list.append(f"'{name}' is not implemented!")
 
 
