@@ -1971,13 +1971,14 @@ def add_unredeemed_payment(
                     #   > improve recovery performance
                     #
                     # Source: https://support.google.com/googleplay/android-developer/answer/16631229
-                    # A flat cap, with no grace term subtracted. The quoted formula's subtraction was
-                    # applied to a column that then held our own latency allowance, which is not what
-                    # Google meant by it, and the sign is wrong regardless: the window in which a recovery
-                    # can arrive is the paid term plus grace plus hold, not minus. It does not need to be
-                    # tight, because the join that reaches here already bounds it — a subscription that
-                    # lapses past account hold cannot come back on the same purchase token, so a later
-                    # signup mints a new one and never matches this account through continuity.
+                    # Corroborated on the lifecycle page, which states the same calculation:
+                    # https://developer.android.com/google/play/billing/lifecycle/subscriptions
+                    # A flat 60 days, and it is EXACT rather than generous: the grace cancels out. The
+                    # window in which a recovery can still arrive is the paid term plus grace plus hold, and
+                    # Play sets hold to `60 days - grace`, so the sum is 60 days whatever the grace is set
+                    # to. Subtracting grace here — as this once did — took it off a window it was never
+                    # part of, and did so from a column that then held our own latency allowance rather
+                    # than any store's grace, so the number removed was not even the one the formula names.
                     auto_redeem_deadline_at = user.expiry_at
                     if user.auto_renewing:
                         auto_redeem_deadline_at += 60 * base.DAY
