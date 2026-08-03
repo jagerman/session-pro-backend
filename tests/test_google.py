@@ -4796,15 +4796,13 @@ def test_voided_notifications_reach_their_handler(monkeypatch, pg_database):
 
 
 def test_a_notification_type_google_adds_later_is_retained_not_discarded(monkeypatch, pg_database):
-    # The default arm in handle_subscription_notification is meant to catch a type Google introduces after
-    # us. It could not: an unrecognised notificationType is an unrecognised INT, and the shared enum
-    # coercion errs on those -- so the message died at parse, in the pull loop's discard branch, before it
-    # was ever written down. It would then redeliver until Pub/Sub's retention lapsed and be lost, which is
-    # worse than either option in the wedge-vs-ack question the default arm was written to answer.
+    # A type Google introduces after us used to die at parse: an unrecognised notificationType is an
+    # unrecognised INT, the shared enum coercion errs on those, and the message was discarded before it was
+    # ever written down -- so it redelivered until Pub/Sub's retention lapsed and was then lost.
     #
-    # Parsing now maps an unknown value to UNKNOWN, so the message is storable and reaches the arm that can
-    # report what it was -- which is what makes "retained until a deploy understands it" true rather than
-    # aspirational.
+    # Parsing now maps an unknown value to UNKNOWN, and because handling no longer consults the type at all,
+    # the outcome is better than "retained until a deploy understands it": the token is enqueued and its
+    # resource converged exactly as for a type we recognise. There is nothing left to teach the backend.
     monkeypatch.setattr('providers.google_play.api.package_name', 'network.loki.messenger')
     err = base.ErrorSink()
     decoded = google_play.decode_notification(
@@ -4824,10 +4822,18 @@ def test_a_notification_type_google_adds_later_is_retained_not_discarded(monkeyp
         'future type',
         err,
     )
-    # Parsed cleanly, so the pull loop stores it rather than discarding it.
+    # Parsed cleanly, so the subscriber stores it rather than discarding it.
     assert decoded is not None and not err.has(), err.msg_list
     assert decoded.sub_type == google_play.types.SubscriptionNotificationType.UNKNOWN
     assert decoded.payload_type == google_play.ParsedNotificationPayloadType.Subscription
+
+    # And it is handled, not merely retained: the token is queued for a reconcile like any other.
+    with TestingContext(pg_database) as ctx:
+        with ctx.connection() as conn:
+            with db.transaction(conn) as tx:
+                assert google_play.handle_parsed_notification(tx, decoded, err) is True
+            assert [r[0] for r in db.query(conn, 'SELECT payment_token FROM google_reconcile_queue')] == ['tok-future']
+    assert not err.has(), err.msg_list
     assert decoded.purchase_token == 'tok-future'
 
 

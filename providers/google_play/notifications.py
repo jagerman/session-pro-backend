@@ -853,10 +853,12 @@ def parse_notification(body: JSONObject, err: base.ErrorSink) -> ParsedNotificat
         result.payload_version = json_dict_require_str(subscription, "version", err)
         # Coerced by hand rather than through json_dict_require_int_coerce_to_enum, which ERRS on a value
         # it does not recognise. Erring here would reject a notificationType Google adds later before the
-        # message is written down, so it would redeliver until retention lapsed and then be lost — and the
-        # default arm in handle_subscription_notification, whose whole purpose is to catch exactly this,
-        # would never see it. Mapping to UNKNOWN keeps the message storable and lets it fail loudly at the
-        # place that can report what it was.
+        # message is written down, so it would redeliver until retention lapsed and then be lost.
+        #
+        # Mapping to UNKNOWN instead means a type we have never heard of is handled correctly rather than
+        # merely survived: handling does not consult the type at all any more, so the token is enqueued and
+        # its resource converged exactly as for a type we do know. The value is retained only so an operator
+        # reading the stored message can see what arrived.
         raw_sub_type = base.json_dict_require_int(subscription, "notificationType", err)
         result.sub_type = SubscriptionNotificationType._value2member_map_.get(  # type: ignore[assignment]
             raw_sub_type, SubscriptionNotificationType.UNKNOWN
