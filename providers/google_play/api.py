@@ -565,13 +565,16 @@ def pro_plan_from_base_plan_id(base_plan_id: str, err: ErrorSink) -> ProPlan:
             # traceback. (Under `python -O` the assert vanished, leaving exactly the behaviour written here
             # — the caller has always guarded on the sink, so `Nil` never reached a write either way.)
             #
-            # The caller declines to write and leaves the notification unacked, which is the right answer:
-            # we cannot invent an entitlement for a plan we do not know. Recovery is open-ended rather than
-            # racing a deadline — the payload is durably stored before handling, the prune only removes
-            # handled rows, and the startup drain reloads the rest — so deploying support for the plan
-            # registers the purchase whenever that happens. Pub/Sub's retention bounds only Google's own
-            # redelivery, which stops mattering once the payload is ours. It is still an emergency: the
-            # subscriber has paid and has no Pro until that deploy.
+            # The caller declines to write, which is the right answer: we cannot invent an entitlement for a
+            # plan we do not know. Recovery is open-ended rather than racing a deadline, but NOT via the
+            # notification — that was acked the moment its token was queued. The durable record is the
+            # token's `google_reconcile_queue` row, which the drain retries with a backoff and which has no
+            # retention limit at all, so deploying support for the plan registers the purchase on the next
+            # pass whenever that happens.
+            #
+            # It is still an emergency: the subscriber has paid and has no Pro until that deploy, and
+            # Google auto-refunds a purchase left unacknowledged for three days — which this one will be,
+            # since `needs_ack` is only written when the drain manages to register the payment.
             err.msg_list.append(f'Invalid google base_plan_id, unable to determine plan variant: {base_plan_id}')
 
     return result

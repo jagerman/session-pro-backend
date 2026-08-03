@@ -114,12 +114,18 @@ restart the service. It never clobbers your `[apple]`/`[google]` secrets in `con
 
 ### Google Pub/Sub subscription settings
 
-The backend consumes RTDNs through the client library's streaming subscriber, which means **three
+The backend consumes RTDNs through the client library's streaming subscriber, which means **several
 behaviours that used to be application code are now subscription configuration.** They are invisible to the
 test suite — nothing here can observe them — so they have to be checked by hand, once, per environment.
+Items 1 to 3 need setting; 4 and 5 are there to stop someone changing them.
 
-1. **Retry policy — set an exponential backoff.** This is the one that matters. The handler paces a failing
-   message by `nack()`ing it, and `nack()` has no backoff of its own: with no retry policy on the
+These are all on one page: console.cloud.google.com → hamburger menu → More products → Analytics →
+Pub/Sub → Subscriptions → the subscription named by `cloud_subscription_name` → Edit. (Pub/Sub is filed
+under Analytics, which is why scanning the menu for it fails; the console's top search bar finds it faster.)
+
+1. **Retry policy — set an exponential backoff.** This is the one that matters, and on the first real
+   deployment it was found set to "Retry immediately", so do NOT assume it is already correct. The handler
+   paces a failing message by `nack()`ing it, and `nack()` has no backoff of its own: with no retry policy on the
    subscription, Pub/Sub redelivers as fast as it can, and one persistently failing message becomes a hot
    loop against the database. The code this replaced carried its own 1 s → 600 s backoff, and that
    responsibility moved here rather than disappearing.
@@ -133,10 +139,23 @@ test suite — nothing here can observe them — so they have to be checked by h
    confirmed via `ack_with_response()`, which this code does not do. (If it is already enabled — the
    `EXACTLY_ONCE_ACKID_FAILURE` handling in the code this replaced suggests it may be — either turn it off
    or the ack path needs changing first.)
-3. **Ack deadline — the default (10 s) is fine.** The library extends the lease automatically for as long
+3. **Expiration period — set it to never expire.** If nothing connects to the subscription for its
+   expiration period (the default is 31 days) Google DELETES THE SUBSCRIPTION. Play keeps publishing to the
+   topic, the messages go nowhere, and recovery means recreating the queue with nothing to replay from. The
+   trigger needs a month of no subscriber activity, so it is unlikely — but a month-long outage is otherwise
+   survivable (unacked messages redeliver, the reconcile queue persists) and this turns it into total loss.
+   The 31-day default exists to stop abandoned experiments accumulating in a project, which is not what this
+   is.
+   ```bash
+   gcloud pubsub subscriptions update <subscription> --expiration-period=never
+   ```
+4. **Ack deadline — the default (10 s) is fine.** The library extends the lease automatically for as long
    as a callback runs, which the hand-rolled loop never did; a message parked in its retry queue past the
    deadline was silently redelivered while still held. Nothing needs setting here, but do not raise it in
    the belief that the handler needs the time.
+5. **Delivery type must stay Pull.** Push delivers to an HTTPS endpoint we do not host, and the BigQuery and
+   Cloud Storage types write messages to storage instead of delivering them. Our subscriber uses *streaming*
+   pull, which is not a separate console option — it is a choice the client library makes within Pull mode.
 
 A **dead-letter topic** is worth configuring but is not required: a message that can never be handled is
 retained in `google_notification_history` and replayed at every subscriber start, so it is recoverable

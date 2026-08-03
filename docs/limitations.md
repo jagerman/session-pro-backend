@@ -26,7 +26,8 @@ Keep this in sync with the code — it describes real branches, not intentions.
 ### Legend
 - **Consequence** — what happens to a real customer if the branch is hit in production.
 - **Fails** — *silent* (no human notified: RTDN retry-loop / swallowed / no-op) vs *loud-ish* (HTTP 500 +
-  provider retries) vs *crash* (raises). None currently alerts ops; that's what the Phase-4 loud-guard adds.
+  provider retries) vs *crash* (raises). **None of them alerts anyone today** — the loud-guard described at
+  the top of this file is the planned remedy and is not built.
 
 ---
 
@@ -38,7 +39,7 @@ Keep this in sync with the code — it describes real branches, not intentions.
 |---|---|---|---|---|
 | **One-time (managed) product** — `voidedPurchaseNotification` `productType=ONE_TIME` | offering any one-time / managed product SKU | `handle_voided_notification` appends `unsupported!` → `tx.cancel` → RTDN retry-loop | refunded one-time purchase keeps full Pro (over-entitlement) | loud-ish |
 | **One-time product purchase** — `OneTimeProduct` notification | offering any one-time / managed product SKU | mapped to `Nil` → silent no-op (the explicit `OneTimeProduct` error branch is dead code) | one-time purchase grants no Pro (paid-but-no-Pro) | silent |
-| **Prepaid base plan** — `prepaidPlan` line item (`providers/google_play/api.py`) | adding a prepaid (non-auto-renewing) base plan to a subscription | `handle_not_implemented('prepaidPlan')` → error propagates → RTDN retry-loop + purchase-token error state | prepaid subscriber's purchase never registers (paid-but-no-Pro); notification loops forever | silent |
+| **Prepaid base plan** — `prepaidPlan` line item (`providers/google_play/api.py`) | adding a prepaid (non-auto-renewing) base plan to a subscription | `handle_not_implemented('prepaidPlan')` fires in the drain's resource parse → the token stays in `google_reconcile_queue` and retries with a backoff | prepaid subscriber's purchase never registers (paid-but-no-Pro); the token retries indefinitely, with the reason in its `last_error` | silent |
 | **Partial / quantity-based refund** — `voidedPurchaseNotification` `refundType=QUANTITY_BASED_PARTIAL_REFUND` | issuing a partial refund (only possible on multi-quantity purchases) | `handle_voided_notification` appends `unsupported!` → `tx.cancel` → RTDN retry-loop | partial refund not reflected in entitlement | loud-ish |
 | **New / changed base plan** — `pro_plan_from_base_plan_id` | adding any base plan beyond the three known ones* | reported to the ErrorSink; the caller declines to write and the notification is retried | any purchase of the new plan registers no Pro until the plan is supported — recoverable, since the payload is retained and a later deploy applies it | loud-ish |
 
@@ -125,13 +126,17 @@ to 1 day.
   message is *stored* first, so a deploy that adds the type applies the backlog. If a new *benign* type
   starts arriving in volume, add it to the no-op list above; do not soften the default.
 
-**A note on what "retry-loop" does and does not mean.** A failure inside a *handler* sets `tx.cancel`,
-which rolls back the whole per-message transaction — **including the `user_error` row written in it**. So a
-handler-stage failure leaves **no persistent error state**: every retry re-adds and re-rolls back the same
-row, and nothing appears in the account's `error_report`. A persistent `user_error` forms only for
-*fetch/parse-stage* failures, whose early returns skip the tail and let the transaction commit (the prepaid
-row above is one). For everything else, the only signal is retry noise in the logs — which is a good deal
-weaker than "loud-ish" suggests, and is why nothing here substitutes for the loud-guard.
+**A note on what "retry-loop" now means, and on `user_error`.** Nothing above retries an RTDN any more:
+the notification is acked as soon as its token is queued, and the failure happens later in the drain, which
+retries the TOKEN with a backoff and records `attempts` and `last_error` on its `google_reconcile_queue`
+row. That row is the durable record of a stuck purchase, and it is where an operator should look.
+
+Consequently **no Google `user_error` can ever persist**: every remaining failure path in
+`_process_notification_message` sets `tx.cancel`, which rolls back the row written in the same transaction.
+So `get_pro_status`'s `error_report` is permanently 0 for Google accounts while Apple still populates it —
+a wire field that silently stopped meaning anything for one provider. It was never actionable by a user
+in any case: one undocumented bit, no reason, no remedy. Pending a decision to repoint it at the drain's
+`attempts` or to retire it, treat Google's `error_report` as dead and the queue row as the truth.
 
 ---
 
@@ -176,15 +181,22 @@ is what the loud-guard is for.
 ---
 
 ## Observability gaps (not branches — silent conditions worth alerting on)
-- **Google `EXPIRED`/`ON_HOLD` over-entitlement detector** revokes when a proof would outlive expiry but
-  raises **no alert** on that anomalous condition (`# TODO … devs need to be notified somehow`).
+- **A stuck reconcile token is silent.** `google_reconcile_queue.attempts` and `last_error` record a token
+  the drain cannot finish, and nothing alerts on it — a purchase can fail attribution or plan mapping
+  indefinitely with the evidence sitting in a table nobody reads. This replaces the old
+  `EXPIRED`/`ON_HOLD` over-entitlement detector, which was a branch of the deleted dispatch; the
+  over-entitlement question it asked is now answered by convergence plus
+  `refresh_entitlement_and_revoke_overreaching_proofs`.
 - **`appAccountToken` missing** (Apple) falls back to an empty `platform_obfuscated_account_id` rather than
   flagging it — a payment can be registered unattributed to a user.
 
 ---
 
-*Source: audit of `platform_google.py`, `platform_google_api.py`, `platform_apple.py` at branch
-`phase2-foundation` (2026-07-19). If you add a handler or change a branch, update the corresponding row.*
+*Source: audit of the provider paths at branch `phase2-foundation` (2026-07-19), revised on branch
+`simplify-google-processing` (2026-08-03) after the Google notification path became convergent — the files
+audited then (`platform_google.py`, `platform_google_api.py`, `platform_apple.py`) are now
+`providers/google_play/` and `providers/app_store.py`. If you add a handler or change a branch, update the
+corresponding row.*
 
 ---
 
@@ -283,22 +295,23 @@ changes on a revocation) is likewise intrinsic and accepted.
 
 *(Ref: wire spec §2.3.)*
 
-### Google RTDN ordering (accepted; the safety property is load-bearing)
+### Google RTDN ordering (not a limitation any more; kept because the reasoning matters)
 
 Google does not set Pub/Sub ordering keys on RTDNs, so notifications for one purchase token arrive out of
-order, both within a single pull and on a replay. The subscriber sorts a batch by `eventTimeMillis`, which
-orders only *within* that batch; across batches, ordering is handled by the handler failing and the message
-being retried with a back-off until whatever it depended on has landed. There is no reorder buffer.
+order, both within a single delivery and on a replay. **Nothing depends on their order**, because handling
+never reads the notification type: a notification records that its token owes a look, and a later drain
+fetches the resource and writes what it currently says. Two notifications collapse to one fetch, and a
+replay converges onto the same values.
 
-**What makes that safe is an invariant, not the sort:** every mutating branch in
-`handle_subscription_notification` gates on the `subscription_state` from a *freshly fetched* subscription
-resource, so a notification whose type no longer matches the store's current state does nothing rather than
-applying a stale change. The notification is a hint; the resource is the truth (as `google.md` says).
+This entry used to describe the opposite arrangement — a per-batch sort by `eventTimeMillis`, a per-message
+retry backoff, and a state-guard in every mutating branch of a type dispatch — and it warned that wiring any
+dormant branch without that guard would break ordering safety. None of that exists. The sort ordered only
+within one batch and so bought nothing across batches; the guard was needed only because the dispatch read
+the notification type in the first place.
 
-**Wiring any dormant branch above without that guard breaks it.** A handler that acts on the notification
-type alone will apply stale changes out of order. The same applies to a handler that needs a payment row to
-already exist: it will fail and retry until the row appears, which is correct but costs a `user_error` and
-error-level logs in the meantime.
+**The reason it is kept:** the failure it warned about is still available to anyone who reintroduces
+per-type handling. `docs/google.md` §2 states the rule and `CLAUDE.md` repeats it. `REVOKED` is the sole
+branch that reads a type, because a refund is the one fact the resource cannot express.
 
 ### Credits are not clawed back on refund (accepted)
 

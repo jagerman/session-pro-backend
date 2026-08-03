@@ -123,7 +123,7 @@ def init(
             app_credentials_path, scopes=['https://www.googleapis.com/auth/androidpublisher']
         )
         # Bound every Play API call with a socket timeout. googleapiclient's default httplib2 transport
-        # has NO timeout, so a hung Google request would block the mule's single-threaded pull loop
+        # has NO timeout, so a hung Google request would block the subscriber's single worker
         # indefinitely (there's no harakiri leash on the mule like there is on the request workers). 15s
         # is plenty; a timeout just fails the call, and the mule retries — nothing it does is time-critical.
         authed_http = google_auth_httplib2.AuthorizedHttp(api.credentials, http=httplib2.Http(timeout=15))
@@ -155,7 +155,8 @@ def start_subscriber(
     app_credentials_path: str | None,
 ) -> ThreadContext:
     '''
-    Initialise + start the Google Pub/Sub notification subscriber. Runs a background pull loop. All
+    Initialise + start the Google Pub/Sub notification subscriber. Runs a background streaming
+    subscriber. All
     Google/gRPC state is constructed here, so the caller (the maintenance mule) invokes this
     post-fork.
     '''
@@ -191,7 +192,10 @@ def stop_subscriber(context: ThreadContext) -> None:
     context.kill_thread = True
     context.sleep_event.set()
     if context.thread and context.thread.is_alive():
-        context.thread.join(timeout=1)
+        # Outlasts SUBSCRIBER_SHUTDOWN_GRACE_S deliberately: the loop spends that long waiting for an
+        # executing callback, so joining for less would return before the grace it configures could
+        # elapse, making the grace period decorative.
+        context.thread.join(timeout=SUBSCRIBER_SHUTDOWN_GRACE_S + 1)
 
 
 def handle_parsed_notification(tx: db.SQLTransaction, parse: ParsedNotification, err: base.ErrorSink) -> bool:
@@ -277,14 +281,14 @@ def _process_notification_message(
     (True → ack + drop from the queue; False → leave for retry). Marking the message handled, and
     recording or clearing the purchase token's user_error, all happen in the SAME transaction as
     handle_parsed_notification — so a handling failure that sets tx.cancel rolls back that
-    bookkeeping too.  Extracted from the Pub/Sub pull loop so this transaction-composition is
+    bookkeeping too.  Extracted from the subscriber callback so this transaction-composition is
     unit-testable (the loop itself, which owns the gRPC client, is not).
     """
 
     handled = False
     with db.transaction(conn) as tx:
-        # NOTE: By definition to be in the sorted list, the message must have also been submitted into the
-        # DB. So if for some reason the notification doesn't exist anymore (maybe someone deleted it
+        # NOTE: The caller records the message in the DB before reaching here. So if for some reason the
+        # notification doesn't exist anymore (maybe someone deleted it
         # out-of-band, e.g. via the SET_GOOGLE_NOTIFICATION command) then we skip the notification.
         lookup = backend.google_notification_message_id_is_in_db(tx, msg.message_id)
         user_is_in_error_state = backend.has_user_error(
@@ -315,13 +319,13 @@ def _process_notification_message(
 
 def _sweep_pending_acks() -> None:
     """Acknowledge to Google every Google purchase still flagged needs_ack, then clear the flag. This is
-    the SOLE acker: notification handling only records needs_ack, and the pull loop calls this once per
+    the SOLE acker: notification handling only records needs_ack, and the subscriber loop calls this once per
     iteration (right before blocking on the next pull), so a fresh purchase is acked the next cycle and a
     crash between committing a payment and acking it is picked up by the next sweep — startup included, no
     special case. Google 400s an already-acknowledged purchase with no cleanly-identifiable error, so on
     ANY ack failure we consult the authoritative acknowledgement_state and clear the flag iff Google
     already considers it acked (the "acked, then crashed before clearing" case); otherwise leave it set to
-    retry. Best-effort — never raises, so it can't break the pull loop."""
+    retry. Best-effort — never raises, so it can't break the subscriber loop."""
     try:
         with db.connection() as conn:
             tokens = backend.google_payment_tokens_needing_ack(conn)
@@ -851,12 +855,11 @@ def handle_voided_notification(tx: VoidedPurchaseTxFields, err: base.ErrorSink):
 def decode_notification(data: str | bytes, label: str, err: base.ErrorSink) -> ParsedNotification | None:
     '''JSON-decode and parse one RTDN payload, or None if it could not be decoded at all.
 
-    The decode gets its OWN guard rather than sharing the pull loop's batch handler, because both halves
-    raise on bad input: `json.loads` on a malformed payload, and `parse_notification` on a voided block
-    missing the fields its asserts require. Unguarded, one bad message unwinds to the batch handler and takes
-    the parsing, processing and acking of every other message in that pull with it — and they then redeliver
-    and meet the same message again. Notifications are unrelated events, so a failure is logged and skipped
-    rather than allowed to hold back its neighbours.
+    The decode gets its OWN guard because both halves raise on bad input: `json.loads` on a malformed
+    payload, and `parse_notification` on a voided block missing the fields its asserts require. Under the
+    batched pull loop this replaced, an unguarded raise unwound to the batch handler and took the parsing,
+    processing and acking of every other message in that pull with it; per-message callbacks make that
+    blast radius one message, so this now buys a clean skip rather than protecting the neighbours.
 
     Returning None is distinct from returning a parse with `err` set: the latter decoded fine and simply is
     not a notification we accept. Neither is acked, so Google redelivers and a transient cause gets another

@@ -57,11 +57,21 @@ holding back a checkpoint. Several handler branches raise rather than reporting 
 decode too.
 
 **A Google notification is a hint; the fetched subscription resource is the truth.** Google sets no
-ordering keys, so RTDNs arrive out of order and the subscriber only sorts within a batch. What makes that
-safe is that every mutating branch in `handle_subscription_notification` gates on the `subscription_state`
-of a freshly fetched resource, so a notification whose type no longer matches the store's current state
-does nothing. A branch that acts on the notification type alone applies stale changes, silently and out of
-order. `docs/limitations.md` has the detail, and lists the dormant branches this applies to.
+ordering keys, so RTDNs arrive out of order and replay out of order. Nothing here depends on their order,
+because **handling never reads the notification type.** A subscription notification records that its
+purchase token owes a look; a later drain fetches the resource and writes what it says. Two notifications
+for one token collapse into one fetch, a notification for a state we have never heard of is handled
+correctly anyway, and a replayed notification converges onto the same values.
+
+Do not reintroduce per-type handling. Dispatching on the type is what made this pipeline wrong for a year:
+it needs a guard on the freshly fetched `subscription_state` in every mutating branch to be safe at all, one
+branch that acts on the type alone applies stale changes silently, and several types then have no branch and
+wedge forever. `REVOKED` is the sole exception and the comment there says why — a refund is the one fact the
+resource cannot express, because Google reports a refunded subscription as merely expired.
+
+The corollary for writes: `expiry_at` is REVISABLE, and a payment row is keyed by `(payment_token,
+order_id)` so a billing cycle is a row rather than a new subscription. `docs/google.md` describes the flow
+end to end.
 
 **`revoked_at` means "entitlement stopped here".** `payments.revoked_at` holds the store's refund instant,
 and the entitlement granted up to that instant stands — the user really was subscribed until then. It must
@@ -98,7 +108,7 @@ inform indexes and migration risk, never meaning.
 | `docs/pro-wire-protocol.md` | Authoritative client contract, shared with libsession-util. Describes the protocol as it is: no decision rationale, and no history of fields that were removed. |
 | `docs/limitations.md` | Operator-facing: dormant provider branches that are safe only while a store feature is off, plus accepted trade-offs. Read before enabling anything in Play Console / App Store Connect. |
 | `docs/deploy.md` | Deploy guide and disaster-recovery runbook. |
-| `google.md` | Google Play lifecycle reference: what each notification means and how it is handled. |
+| `docs/google.md` | How Google Play subscriptions reach this backend, and what it does with them. |
 | `readme.md` | Developer setup, architecture narrative and CLI reference. |
 
 ## Conventions
