@@ -117,7 +117,9 @@ restart the service. It never clobbers your `[apple]`/`[google]` secrets in `con
 The backend consumes RTDNs through the client library's streaming subscriber, which means **several
 behaviours that used to be application code are now subscription configuration.** They are invisible to the
 test suite — nothing here can observe them — so they have to be checked by hand, once, per environment.
-Items 1 to 3 need setting; 4 and 5 are there to stop someone changing them.
+Items 1 to 3 need setting; 4 and 5 are there to stop someone changing them. On the first real deployment
+only two of the six were wrong: the retry policy (set to "Retry immediately") and the expiration period
+(left at the 31-day default).
 
 These are all on one page: console.cloud.google.com → hamburger menu → More products → Analytics →
 Pub/Sub → Subscriptions → the subscription named by `cloud_subscription_name` → Edit. (Pub/Sub is filed
@@ -133,7 +135,8 @@ under Analytics, which is why scanning the menu for it fails; the console's top 
    gcloud pubsub subscriptions update <subscription> \
        --min-retry-delay=10s --max-retry-delay=600s
    ```
-2. **Exactly-once delivery — leave it OFF.** The backend already provides the guarantee itself, by
+2. **Exactly-once delivery — leave it OFF** (it was already off on the first real deployment, so this is
+   a check rather than a change). The backend already provides the guarantee itself, by
    recording every message id before handling it and treating an already-handled id as a no-op, so enabling
    it buys nothing. It also makes plain `ack()` unreliable: under exactly-once an ack can fail and must be
    confirmed via `ack_with_response()`, which this code does not do. (If it is already enabled — the
