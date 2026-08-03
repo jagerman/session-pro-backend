@@ -5344,54 +5344,89 @@ def test_google_paused_and_deferred_notifications_converge_instead_of_wedging(mo
     # transaction and left the RTDN redelivering forever with the purchase token in an error state.
     #
     # There is no arm to be missing now -- handling does not consult the notification type -- so each of
-    # them records the token, fetches the resource and writes what it says. This asserts the property the
-    # limitations rows were really about: nothing is lost and nothing wedges.
+    # them records the token, fetches the resource and writes what it says. The arc below follows the
+    # documented lifecycle rather than a guess at it:
+    #
+    #   "A subscription pause takes effect only after the current billing period ends."
+    #   schedule change -> state ACTIVE, autoRenewEnabled true, user KEEPS access to the renewal date
+    #   pause effective -> state PAUSED, autoRenewEnabled true, user loses access
+    #   pause ends      -> SUBSCRIPTION_RECOVERED, and Google attempts to renew
+    #   -- https://developer.android.com/google/play/billing/lifecycle/subscriptions
+    #
+    # Note RECOVERED is also account-hold recovery: two different lifecycle events share one type, which is
+    # its own argument against dispatching on the type.
+    #
+    # What the docs do NOT state is what `expiryTime` holds while paused, so nothing here asserts a value
+    # Google has not promised. Every assertion is "the term is whatever the resource said", which is the
+    # property convergence actually provides.
+    kind = google_play.types.SubscriptionNotificationType
     with TestingContext(pg_database) as ctx:
         account_id = bytes(nacl.signing.SigningKey.generate().verify_key)
         token = 'tok-paused'
+        order_id = 'GPA.7777-0000-0000-00001'
+        paid_through = '2026-02-01T00:00:00.000Z'
 
-        # PAUSED. The resource carries `pausedStateContext` and a term that has run out, which is where a
-        # pause leaves the user: paid through the end of the cycle they bought, and no further.
-        paused = _google_snapshot(
-            state='SUBSCRIPTION_STATE_PAUSED',
-            expiry='2026-02-01T00:00:00.000Z',
-            order_id='GPA.7777-0000-0000-00001',
-            obfuscated_account_id=account_id,
-        )
-        paused['pausedStateContext'] = {'autoResumeTime': '2026-03-01T00:00:00.000Z'}
+        def snapshot(state: str, expiry: str) -> base.JSONObject:
+            return _google_snapshot(state=state, expiry=expiry, order_id=order_id, obfuscated_account_id=account_id)
 
-        handled, err = _drive_google_rtdn(
-            monkeypatch, ctx, notification_type=10, purchase_token=token, event_ms=1767225600000, snapshot=paused
-        )
-        assert handled is True and not err.has(), err.msg_list
-        rows = _payment_rows(ctx)
-        assert len(rows) == 1, 'the paused subscription is recorded, not left wedged'
-
-        # PAUSE_SCHEDULE_CHANGED against the same resource: idempotent, because the answer comes from the
-        # resource rather than from what the notification claims happened.
-        handled, err = _drive_google_rtdn(
-            monkeypatch, ctx, notification_type=11, purchase_token=token, event_ms=1767312000000, snapshot=paused
-        )
-        assert handled is True and not err.has(), err.msg_list
-        assert _payment_rows(ctx) == rows, 'nothing moved: the resource had not changed'
-
-        # DEFERRED, which is a term extension: the store states the new expiry and convergence takes it.
-        deferred = _google_snapshot(
-            state='SUBSCRIPTION_STATE_ACTIVE',
-            expiry='2026-03-15T00:00:00.000Z',
-            order_id='GPA.7777-0000-0000-00001',
-            obfuscated_account_id=account_id,
-        )
-        handled, err = _drive_google_rtdn(
-            monkeypatch, ctx, notification_type=20, purchase_token=token, event_ms=1767398400000, snapshot=deferred
-        )
-        assert handled is True and not err.has(), err.msg_list
-        assert len(_payment_rows(ctx)) == 1, 'same cycle, revised -- a deferral is not a new billing period'
-        with ctx.connection() as conn:
-            expiry = db.query_scalar(
-                conn,
-                '''SELECT p.expiry_at FROM payments p JOIN google_play_payment_details gd ON gd.payment_id = p.id
-                   WHERE gd.payment_token = %s''',
-                token,
+        def drive(notification: object, snap: base.JSONObject, event_ms: int) -> None:
+            handled, err = _drive_google_rtdn(
+                monkeypatch,
+                ctx,
+                notification_type=notification.value,  # type: ignore[attr-defined]
+                purchase_token=token,
+                event_ms=event_ms,
+                snapshot=snap,
             )
-        assert expiry == pendulum.datetime(2026, 3, 15), 'the deferred term, taken from the resource'
+            assert handled is True and not err.has(), err.msg_list
+
+        # Keyed by ORDER ID, not just the token: after a resume the same token has two cycles, and asking
+        # by token alone would silently answer for whichever row came back first.
+        def stored_expiry(cycle: str) -> pendulum.DateTime:
+            with ctx.connection() as conn:
+                return db.query_scalar(
+                    conn,
+                    '''SELECT p.expiry_at FROM payments p
+                       JOIN google_play_payment_details gd ON gd.payment_id = p.id
+                       WHERE gd.payment_token = %s AND gd.order_id = %s''',
+                    token,
+                    cycle,
+                )
+
+        # The user asks to pause. The subscription is still ACTIVE and they keep the term they paid for.
+        drive(kind.PAUSE_SCHEDULE_CHANGED, snapshot('SUBSCRIPTION_STATE_ACTIVE', paid_through), 1767225600000)
+        assert len(_payment_rows(ctx)) == 1, 'recorded, not left wedged'
+        assert stored_expiry(order_id) == pendulum.datetime(2026, 2, 1), 'a pause schedule takes nothing away'
+
+        # The billing period ends and the pause takes effect. `autoRenewEnabled` stays true even here.
+        paused = snapshot('SUBSCRIPTION_STATE_PAUSED', paid_through)
+        paused['pausedStateContext'] = {'autoResumeTime': '2026-03-01T00:00:00.000Z'}
+        drive(kind.PAUSED, paused, 1767312000000)
+        assert len(_payment_rows(ctx)) == 1, 'still one cycle: a pause is not a billing period'
+        assert stored_expiry(order_id) == pendulum.datetime(2026, 2, 1), 'still the term the store states'
+
+        # The pause ends and Google renews, which is a new cycle with a new order id.
+        resumed = _google_snapshot(
+            state='SUBSCRIPTION_STATE_ACTIVE',
+            expiry='2026-04-01T00:00:00.000Z',
+            order_id='GPA.7777-0000-0000-00002',
+            obfuscated_account_id=account_id,
+        )
+        drive(kind.RECOVERED, resumed, 1772323200000)
+        assert len(_payment_rows(ctx)) == 2, 'the resumed period is its own cycle'
+
+        # And a deferral, which extends a term in place rather than starting one. Applied to the cycle the
+        # user is actually in -- the resumed one -- which is the only cycle a real deferral could name.
+        drive(
+            kind.DEFERRED,
+            _google_snapshot(
+                state='SUBSCRIPTION_STATE_ACTIVE',
+                expiry='2026-05-15T00:00:00.000Z',
+                order_id='GPA.7777-0000-0000-00002',
+                obfuscated_account_id=account_id,
+            ),
+            1772409600000,
+        )
+        assert len(_payment_rows(ctx)) == 2, 'no new cycle: a deferral revises the term it is given'
+        assert stored_expiry('GPA.7777-0000-0000-00002') == pendulum.datetime(2026, 5, 15), 'from the resource'
+        assert stored_expiry(order_id) == pendulum.datetime(2026, 2, 1), 'and the earlier cycle is untouched'

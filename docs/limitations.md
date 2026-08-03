@@ -48,9 +48,19 @@ Keep this in sync with the code — it describes real branches, not intentions.
 above, on the grounds that the notification dispatch had no arm for them and so appended `unsupported!`,
 cancelled the transaction and left the RTDN redelivering forever. That dispatch no longer exists: handling
 does not consult the notification type at all, so each of these records the purchase token, fetches the
-subscription resource and writes what it says. A pause leaves the user paid through the cycle they bought
-and no further, which is what the resource states; a deferral states a later expiry, which convergence
-takes. Covered by `test_google_paused_and_deferred_notifications_converge_instead_of_wedging`.
+subscription resource and writes what it says.
+
+Play documents a pause as taking effect *only after the current billing period ends* — so a scheduled pause
+takes nothing away, the term the user paid for runs out normally, and resume (`SUBSCRIPTION_RECOVERED`,
+which is also the account-hold recovery type) renews into a fresh cycle. A deferral states a later expiry on
+the cycle it names, which convergence takes. Covered by
+`test_google_paused_and_deferred_notifications_converge_instead_of_wedging`, which follows that documented
+sequence.
+
+One thing Play does NOT document is what `expiryTime` holds while a subscription is paused; it says only
+that `PausedStateContext` carries the expected resume time. Nothing here depends on knowing: coverage is
+whatever the resource states, so the handling is right either way. It does mean an operator debugging a
+paused subscriber should read the resource rather than trust a rule of thumb about it.
 
 Enabling pause or issuing deferrals is therefore no longer gated on a code change. The remaining rows
 above are still dormant and still worth keeping off.
