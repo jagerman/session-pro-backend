@@ -14,7 +14,8 @@ notification type.
 Google Play does not deliver to our server. It publishes to a Google Cloud Pub/Sub topic, and the backend
 holds a streaming subscription to that topic's queue — `[google] cloud_project_id` and
 `cloud_subscription_name` in the ini name it. The subscriber runs in the maintenance mule, post-fork,
-because gRPC's background threads do not survive a fork (`notifications.init` has the detail).
+because gRPC's background threads do not survive a fork — the import comment inside
+`notifications.thread_entry_point` has that detail, and `init`'s covers why the thread is a daemon.
 
 Some of the delivery behaviour lives in the *queue's* configuration rather than in this repo — retry
 backoff, expiry, exactly-once. `docs/deploy.md` lists what must be set and why.
@@ -31,9 +32,10 @@ That shape is why handling is convergent. On arrival the backend:
 
 1. Records the message id and payload in `google_notification_history` — **before** handling, because the
    handler treats a missing history row as "already handled" and acks.
-2. Upserts the purchase token into `google_reconcile_queue`. This is the only durable step, and the only one
-   whose failure loses anything: a first sighting of a token cannot be recovered from anywhere else, since
-   no Play endpoint enumerates subscribers and no client route submits a token.
+2. Upserts the purchase token into `google_reconcile_queue`. Of the two writes this is the one that must
+   not be missing when the message is acked: a first sighting of a token cannot be recovered from anywhere
+   else, since no Play endpoint enumerates subscribers and no client route submits a token. Everything
+   downstream is re-derivable from the resource for as long as the token is known.
 3. Acks the message.
 
 `REVOKED` is the single exception that reads the type, because a refund is the one fact the resource cannot
@@ -63,8 +65,9 @@ The drain claims a batch (`FOR UPDATE SKIP LOCKED`), fetches each resource **out
 converges each in its own transaction — one bad token cannot cost the others. It runs from two places: the
 subscriber wakes it after a burst of messages, for latency, and the mule runs it periodically as a backstop
 for tokens enqueued while the subscriber was down. The backstop is not optional, and not because of proof
-latency: `needs_ack` is only written when the drain registers a payment, and **Google auto-refunds a
-purchase left unacknowledged for three days.**
+latency: `needs_ack` is only written when the drain registers a payment, and acknowledgement "must be done
+within three days so that the purchase isn't automatically refunded and entitlement revoked"
+(https://developer.android.com/google/play/billing/integrate).
 
 ## 4. What converging writes
 
@@ -120,7 +123,7 @@ must precede acknowledgement. That is the order the code uses; reversing it woul
 of ownership permanently.
 
 If all three fail the purchase is deliberately left unregistered, and therefore never acknowledged, and
-therefore auto-refunded by Google at three days. That is the better failure: the user is made whole
+therefore auto-refunded at three days (see §3 for the citation). That is the better failure: the user is made whole
 automatically, where acknowledging an unattributable purchase would strand paid money in a row no account
 could ever claim.
 
@@ -138,6 +141,14 @@ https://developer.android.com/google/play/billing/lifecycle/subscriptions:
 | `CANCELED` | `expiryTime` is "when the user should lose access" | converge it |
 | `PAUSED` | user loses access; `autoRenewEnabled` stays **true** | converge it |
 | `EXPIRED` | user loses access | converge it |
+| `PENDING` | payment not completed at signup; no item is owned yet | **cannot converge** — see below |
+
+`PENDING` is the exception to "no special handling", and the one worth knowing when debugging a purchase
+that never appears. A pending signup has no owned line item, so `parse_line_item` reports it and the
+reconcile declines to write — there is no order id to key a payment on and nothing has been charged. The
+token stays queued and retries until the payment completes or the signup lapses, which is the right
+behaviour but looks identical to a stuck token from the outside. `last_error` on the queue row distinguishes
+them.
 
 **Pause** is the clearest illustration. A pause "takes effect only after the current billing period ends",
 so nothing is back-dated: the paid term runs out normally, and resume arrives as `SUBSCRIPTION_RECOVERED` —

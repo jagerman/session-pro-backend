@@ -4186,15 +4186,15 @@ def test_google_expiry_is_revised_when_the_store_changes_the_term(monkeypatch, p
 
 
 def test_google_deferred_notification_is_harmless(monkeypatch, pg_database):
-    # REGRESSION for finding 3.8. DEFERRED shares an explicitly-unsupported arm with PAUSED and
-    # PAUSE_SCHEDULE_CHANGED: it appends `unsupported!` and cancels the transaction, so the message is never
-    # acked and is retried with backoff indefinitely, carrying a user_error on the token that surfaces in
-    # that account's error_report.
+    # REGRESSION for finding 3.8. DEFERRED used to share an explicitly-unsupported arm with PAUSED and
+    # PAUSE_SCHEDULE_CHANGED: it appended `unsupported!` and cancelled the transaction, so the message was
+    # never acked and retried with backoff indefinitely, flagging the token with a `user_error` that surfaced
+    # in that account's `error_report`. Both are gone -- the arm with the dispatch, the flag with the field.
     #
-    # Gratuitous, because the snapshot already carries everything needed: the current expiry, and the
-    # incoming product under deferredItemReplacement. A handler that converges on the snapshot has nothing to
-    # do here -- the deferral changes nothing yet -- and entitlement self-corrects at the next RENEWED
-    # regardless. The wedge exists purely because dispatch is on notification type.
+    # The wedge was gratuitous, because the snapshot already carries everything needed: the current expiry,
+    # and the incoming product under deferredItemReplacement. Converging on the snapshot has nothing to do
+    # here -- the deferral changes nothing yet -- and entitlement self-corrects at the next RENEWED
+    # regardless. The wedge existed purely because dispatch was on notification type.
     with TestingContext(pg_database) as ctx:
         account_id = bytes(nacl.signing.SigningKey(_UPGRADE_ACCOUNT_SEED).verify_key)
         token, order_id = 'tok-deferred', 'GPA.6000-0000-0000-00004'
