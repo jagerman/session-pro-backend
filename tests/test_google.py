@@ -5336,3 +5336,62 @@ def test_a_fall_discovered_by_converging_is_announced(monkeypatch, pg_database):
             assert after.expiry_at is not None and before.expiry_at is not None
             assert after.expiry_at < before.expiry_at, 'the entitlement fell'
             assert len(backend.get_revocations_list(conn)) == 1, 'and it was announced'
+
+
+def test_google_paused_and_deferred_notifications_converge_instead_of_wedging(monkeypatch, pg_database):
+    # `docs/limitations.md` listed PAUSED, PAUSE_SCHEDULE_CHANGED and DEFERRED among the notifications that
+    # wedge: the old dispatch had no arm for any of them, so it appended `unsupported!`, cancelled the
+    # transaction and left the RTDN redelivering forever with the purchase token in an error state.
+    #
+    # There is no arm to be missing now -- handling does not consult the notification type -- so each of
+    # them records the token, fetches the resource and writes what it says. This asserts the property the
+    # limitations rows were really about: nothing is lost and nothing wedges.
+    with TestingContext(pg_database) as ctx:
+        account_id = bytes(nacl.signing.SigningKey.generate().verify_key)
+        token = 'tok-paused'
+
+        # PAUSED. The resource carries `pausedStateContext` and a term that has run out, which is where a
+        # pause leaves the user: paid through the end of the cycle they bought, and no further.
+        paused = _google_snapshot(
+            state='SUBSCRIPTION_STATE_PAUSED',
+            expiry='2026-02-01T00:00:00.000Z',
+            order_id='GPA.7777-0000-0000-00001',
+            obfuscated_account_id=account_id,
+        )
+        paused['pausedStateContext'] = {'autoResumeTime': '2026-03-01T00:00:00.000Z'}
+
+        handled, err = _drive_google_rtdn(
+            monkeypatch, ctx, notification_type=10, purchase_token=token, event_ms=1767225600000, snapshot=paused
+        )
+        assert handled is True and not err.has(), err.msg_list
+        rows = _payment_rows(ctx)
+        assert len(rows) == 1, 'the paused subscription is recorded, not left wedged'
+
+        # PAUSE_SCHEDULE_CHANGED against the same resource: idempotent, because the answer comes from the
+        # resource rather than from what the notification claims happened.
+        handled, err = _drive_google_rtdn(
+            monkeypatch, ctx, notification_type=11, purchase_token=token, event_ms=1767312000000, snapshot=paused
+        )
+        assert handled is True and not err.has(), err.msg_list
+        assert _payment_rows(ctx) == rows, 'nothing moved: the resource had not changed'
+
+        # DEFERRED, which is a term extension: the store states the new expiry and convergence takes it.
+        deferred = _google_snapshot(
+            state='SUBSCRIPTION_STATE_ACTIVE',
+            expiry='2026-03-15T00:00:00.000Z',
+            order_id='GPA.7777-0000-0000-00001',
+            obfuscated_account_id=account_id,
+        )
+        handled, err = _drive_google_rtdn(
+            monkeypatch, ctx, notification_type=20, purchase_token=token, event_ms=1767398400000, snapshot=deferred
+        )
+        assert handled is True and not err.has(), err.msg_list
+        assert len(_payment_rows(ctx)) == 1, 'same cycle, revised -- a deferral is not a new billing period'
+        with ctx.connection() as conn:
+            expiry = db.query_scalar(
+                conn,
+                '''SELECT p.expiry_at FROM payments p JOIN google_play_payment_details gd ON gd.payment_id = p.id
+                   WHERE gd.payment_token = %s''',
+                token,
+            )
+        assert expiry == pendulum.datetime(2026, 3, 15), 'the deferred term, taken from the resource'

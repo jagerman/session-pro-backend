@@ -38,13 +38,22 @@ Keep this in sync with the code — it describes real branches, not intentions.
 |---|---|---|---|---|
 | **One-time (managed) product** — `voidedPurchaseNotification` `productType=ONE_TIME` | offering any one-time / managed product SKU | `handle_voided_notification` appends `unsupported!` → `tx.cancel` → RTDN retry-loop | refunded one-time purchase keeps full Pro (over-entitlement) | loud-ish |
 | **One-time product purchase** — `OneTimeProduct` notification | offering any one-time / managed product SKU | mapped to `Nil` → silent no-op (the explicit `OneTimeProduct` error branch is dead code) | one-time purchase grants no Pro (paid-but-no-Pro) | silent |
-| **Prepaid base plan** — `prepaidPlan` line item (`platform_google_api.py`) | adding a prepaid (non-auto-renewing) base plan to a subscription | `handle_not_implemented('prepaidPlan')` → error propagates → RTDN retry-loop + purchase-token error state | prepaid subscriber's purchase never registers (paid-but-no-Pro); notification loops forever | silent |
-| **Subscription pause** — `PAUSED` / `PAUSE_SCHEDULE_CHANGED` notifications | enabling **pause** on any base plan | appends `unsupported!` → `tx.cancel` → RTDN retry-loop | paused user may stay entitled; notification stuck | silent |
-| **Deferred billing / recurrence change** — `DEFERRED` notification | issuing a deferred upgrade/downgrade or recurrence-date extension | same as pause (retry-loop + token error) | deferred renewal mis-timed; notification stuck | silent |
+| **Prepaid base plan** — `prepaidPlan` line item (`providers/google_play/api.py`) | adding a prepaid (non-auto-renewing) base plan to a subscription | `handle_not_implemented('prepaidPlan')` → error propagates → RTDN retry-loop + purchase-token error state | prepaid subscriber's purchase never registers (paid-but-no-Pro); notification loops forever | silent |
 | **Partial / quantity-based refund** — `voidedPurchaseNotification` `refundType=QUANTITY_BASED_PARTIAL_REFUND` | issuing a partial refund (only possible on multi-quantity purchases) | `handle_voided_notification` appends `unsupported!` → `tx.cancel` → RTDN retry-loop | partial refund not reflected in entitlement | loud-ish |
 | **New / changed base plan** — `pro_plan_from_base_plan_id` | adding any base plan beyond the three known ones* | reported to the ErrorSink; the caller declines to write and the notification is retried | any purchase of the new plan registers no Pro until the plan is supported — recoverable, since the payload is retained and a later deploy applies it | loud-ish |
 
 \* known base plans: `session-pro-{1-month,3-months,12-months}`.
+
+**No longer dormant — `PAUSED`, `PAUSE_SCHEDULE_CHANGED` and `DEFERRED`.** These were rows in the table
+above, on the grounds that the notification dispatch had no arm for them and so appended `unsupported!`,
+cancelled the transaction and left the RTDN redelivering forever. That dispatch no longer exists: handling
+does not consult the notification type at all, so each of these records the purchase token, fetches the
+subscription resource and writes what it says. A pause leaves the user paid through the cycle they bought
+and no further, which is what the resource states; a deferral states a later expiry, which convergence
+takes. Covered by `test_google_paused_and_deferred_notifications_converge_instead_of_wedging`.
+
+Enabling pause or issuing deferrals is therefore no longer gated on a code change. The remaining rows
+above are still dormant and still worth keeping off.
 
 **Store-config invariant — never set a base plan's grace period to 0 days.**
 

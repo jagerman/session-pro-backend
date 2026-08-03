@@ -866,7 +866,7 @@ def parse_notification(body: JSONObject, err: base.ErrorSink) -> ParsedNotificat
         if result.sub_type == SubscriptionNotificationType.UNKNOWN:
             log.warning(
                 f'Google sent subscription notificationType {raw_sub_type}, which this backend does not '
-                f'know. Retained for retry; it will apply itself once the type is supported.'
+                f'know. Handled anyway -- the type is not consulted -- and recorded here so it can be seen.'
             )
         result.payload_type = ParsedNotificationPayloadType.Subscription
 
