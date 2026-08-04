@@ -1807,12 +1807,16 @@ def add_unredeemed_payment(
     is a credit (a one-time store product is neither renewing nor a credit). The default suits the
     auto-renewing subscriptions that are all any provider registers today; anything else must say so."""
 
+    # Says what is being recorded, not what state it will end in: this function may auto-redeem the payment
+    # a few dozen lines below, so calling it "unredeemed" here described something that was true for about a
+    # millisecond. The outcome is logged at the auto-redeem instead. `purchased` is the STORE's purchase
+    # instant -- it was previously labelled `unredeemed`, which named a different concept entirely.
     if log.getEffectiveLevel() <= logging.INFO:
         payment_tx_label = payment_provider_tx_log_label_safe(payment_tx)
         log.info(
-            f'Unredeemed payment (payment={payment_tx_label}, plan={plan.name}, '
+            f'Registering payment (payment={payment_tx_label}, plan={plan.name}, '
             f'expiry={base.readable(expiry_at) if expiry_at else "on exhaustion"}, '
-            f'unredeemed={base.readable(purchased_at)}, '
+            f'purchased={base.readable(purchased_at)}, '
             f'refund={base.readable(platform_refund_expiry_at)})'
         )
 
@@ -1977,17 +1981,30 @@ def add_unredeemed_payment(
                         auto_redeem_deadline_at += 60 * base.DAY
                 else:
                     assert payment_tx.provider == base.PaymentProvider.iOSAppStore
-                    # NOTE: We don't currently configure a grace period/account hold period for Apple
-                    # hnote the grace and account hold concept is merged together in Apple).
+                    # Apple merges grace and account hold into one billing-retry period, so the window is
+                    # the paid term plus whatever grace the store declared for this subscription. That is
+                    # zero when no grace applies, which makes the test an equality on the boundary -- a
+                    # contiguous renewal's purchase instant IS the previous cycle's expiry, so it passes
+                    # with no margin. It is not zero once a grace period is configured in App Store
+                    # Connect, which is the case this window was really written for.
                     auto_redeem_deadline_at = user.expiry_at
                     if user.auto_renewing:
                         auto_redeem_deadline_at += user.grace_period
 
-                # NOTE: Unredeemed unix timestamp represents now (as this is the timestamp we are marking
-                # the payment as having been registered), so we compare (now) to the deadline. If we are
-                # before the deadline we are eligible to auto-redeem this payment and assign it to the
-                # previous known master public key.
-                if purchased_at <= auto_redeem_deadline_at:
+                # The store's purchase instant against the deadline: inside it, this is a continuation of a
+                # subscription we already know the owner of, so bind it for them rather than making the
+                # payment wait for their next request.
+                if purchased_at > auto_redeem_deadline_at:
+                    # Outside the window: the subscription lapsed far enough that this is a fresh start
+                    # rather than a continuation, so the payment waits for its owner to claim it. Logged
+                    # because from the outside this is indistinguishable from an auto-redeem that failed.
+                    log.info(
+                        f'Payment left for its owner to claim '
+                        f'(payment={payment_provider_tx_log_label_safe(payment_tx)}): purchased '
+                        f'{base.readable(purchased_at)} is past the auto-redeem deadline '
+                        f'{base.readable(auto_redeem_deadline_at)}'
+                    )
+                else:
                     # Bind THIS renewal to the owner we just resolved from the store's subscription
                     # continuity, matched by the renewal's own identifier — NOT the master-key-derived
                     # account-id. We already hold the full master key, so there's no need to route through
@@ -2003,6 +2020,10 @@ def add_unredeemed_payment(
                             _redeem_payment_for_user(
                                 tx, master_pkey, payment_tx, redeemed_at=to_redeemed_at(purchased_at)
                             )
+                        log.info(
+                            f'Auto-redeemed payment (payment={payment_provider_tx_log_label_safe(payment_tx)}) '
+                            f'to the account that owns the previous cycle of this subscription'
+                        )
                     except base.ApiError as e:
                         log.error(
                             f'Failed to auto-redeem a payment we witnessed from. '

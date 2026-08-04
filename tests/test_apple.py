@@ -1824,9 +1824,11 @@ def test_platform_apple(pg_database):
             )
             assert not err.has(), err.msg_list
 
-            # NOTE: This is a no-op, but in this test we haven't advanced time past the expiry yet
-            # so actually the subscription should still be marked unredeemed in the database hence
-            # check that the 1 week plan remains unchanged
+            # NOTE: EXPIRED now clears auto_renewing (it used to be a pure no-op). In THIS sequence the
+            # flag was already false -- e05 turned auto-renew off before the expiry -- so the assertion
+            # below passes either way; test_apple_expiry_after_billing_retry_clears_auto_renewing covers
+            # the case where it is still true going in. Nothing else changes: we have not advanced time
+            # past the expiry, so the plan and its dates remain as they were.
             payment_list = backend.get_payments_list(conn)
             assert len(payment_list) == 2
 
@@ -2198,3 +2200,80 @@ def test_platform_apple(pg_database):
             assert payments[0].apple.tx_id == e00_sub_to_3_months_tx_info.transactionId
             assert payments[0].apple.web_line_order_tx_id == e00_sub_to_3_months_tx_info.webOrderLineItemId
             assert payments[0].revoked_at == base.datetime_from_unix_ms(e02_apple_refund_tx_info.revocationDate)
+
+
+def test_apple_expiry_after_billing_retry_clears_auto_renewing(pg_database):
+    # EXPIRED used to be a pure no-op, on the reasoning that a proof carries its own expiry and self-expires.
+    # True for entitlement, and it left `auto_renewing` set forever: a long-dead subscription kept reporting
+    # itself as renewing, with whatever store grace it last carried still attached. `get_pro_status` then
+    # told a client an expired account was `auto_renewing: true` with a non-zero grace_period_duration.
+    #
+    # Harmless for coverage -- both terms are added to a term already in the past -- but simply untrue, and
+    # newly visible now that a real grace period is configured in App Store Connect rather than the 1 hour
+    # that column used to hold.
+    #
+    # The recorded sequence's expiry cannot cover this: it is a VOLUNTARY expiry, so auto-renew was already
+    # off before the subscription ended. This is the billing-retry shape, where it is still on.
+    pool = backend.bootstrap_db(database_url=pg_database())
+    assert pool
+    master_key = nacl.signing.SigningKey.generate()
+    now = base.round_datetime_to_next_day(base.utc_now())
+    err = base.ErrorSink()
+
+    tx_ids = base.PaymentProviderTransaction(
+        provider=base.PaymentProvider.iOSAppStore,
+        apple_original_tx_id='9000000000000001',
+        apple_tx_id='9000000000000001',
+        apple_web_line_order_tx_id='9000000000000002',
+    )
+
+    with db.connection() as conn:
+        # A live, renewing subscription carrying a store grace -- the state an Apple subscriber is in while
+        # their card is failing.
+        backend.add_unredeemed_payment(
+            conn,
+            payment_tx=tx_ids,
+            plan=base.ProPlan.OneMonth,
+            expiry_at=now + 30 * base.DAY,
+            purchased_at=now,
+            platform_refund_expiry_at=now,
+            platform_obfuscated_account_id=app_store.uuid_from_master_pk(bytes(master_key.verify_key)),
+            err=err,
+        )
+        assert not err.has(), err.msg_list
+        with db.transaction(conn) as tx:
+            assert backend.update_payment_renewal_info(
+                tx, payment_tx=tx_ids, grace_period=3 * base.DAY, auto_renewing=True, err=err
+            )
+        assert not err.has(), err.msg_list
+
+        before = backend.get_payments_list(conn)[-1]
+        assert before.auto_renewing is True and before.grace_period == 3 * base.DAY
+
+        # The retries run out and Apple gives up.
+        body = app_store.AppleResponseBodyV2DecodedPayload()
+        body.notificationType = app_store.AppleNotificationV2.EXPIRED
+        body.subtype = app_store.AppleSubtype.BILLING_RETRY
+        body.notificationUUID = 'a1b2c3d4-0000-0000-0000-00000000e001'
+        # The handler stamps the notification history from this, and asserts it is present.
+        body.signedDate = base.unix_ms_from_datetime(now)
+        tx_info = app_store.AppleJWSTransactionDecodedPayload()
+        tx_info.transactionId = tx_ids.apple_tx_id
+        tx_info.originalTransactionId = tx_ids.apple_original_tx_id
+        tx_info.webOrderLineItemId = tx_ids.apple_web_line_order_tx_id
+
+        assert app_store.handle_notification(
+            decoded_notification=app_store.DecodedNotification(body=body, tx_info=tx_info),
+            conn=conn,
+            notification_retry_duration=pendulum.duration(),
+            err=err,
+        )
+        assert not err.has(), err.msg_list
+
+        after = backend.get_payments_list(conn)[-1]
+        assert after.auto_renewing is False, 'no renewal is coming, and the row should say so'
+        # The grace value is left alone -- it is a store fact about what was granted, and the coverage
+        # arithmetic already ignores it once nothing is renewing.
+        assert after.grace_period == 3 * base.DAY
+        assert after.expiry_at == before.expiry_at, 'the term itself is untouched'
+    pool.close()

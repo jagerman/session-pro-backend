@@ -917,7 +917,15 @@ def handle_notification_tx(
             payment_tx = payment_tx_from_apple_jws_transaction(tx, err)
             if not err.has():
                 if not decoded_notification.body.subtype:
-                    log.debug(f'{notif_type} for {payment_tx_id_label(payment_tx)}: Grace period ended')
+                    # NO subtype means the opposite of what this once logged: per Apple, a subtype-less
+                    # DID_FAIL_TO_RENEW is "the subscription isn't in a grace period and you can stop
+                    # providing the service". Nothing is written -- the term has already lapsed, so coverage
+                    # ends by arithmetic -- but the message matters, because this is the branch that fires
+                    # when a grace period is configured and did NOT apply to this subscriber.
+                    log.debug(
+                        f'{notif_type} for {payment_tx_id_label(payment_tx)}: billing failed with no grace '
+                        f'period; service stops at the paid term'
+                    )
 
                 elif decoded_notification.body.subtype == AppleSubtype.GRACE_PERIOD:
                     # `gracePeriodExpiresDate` is an ABSOLUTE ms-epoch timestamp per the App Store
@@ -994,9 +1002,20 @@ def handle_notification_tx(
                 # A notification without a subtype indicates that the subscription expired for some
                 # other reason.
                 #
-                # NOTE: No-op, the Session Pro proof already has a baked in expiry date and will
-                # self-expire itself.
-                pass
+                # Entitlement needs nothing here -- the proof carries its own expiry and the coverage
+                # arithmetic already reads the term as past. What DOES need saying is that no renewal is
+                # coming: `auto_renewing` gates both the store's grace and our latency allowance, and until
+                # this it was never cleared, so a long-dead subscription kept reporting itself as renewing
+                # with its full grace still attached. Harmless for entitlement, since the terms are added to
+                # an expiry already in the past -- but `get_pro_status` reported an expired account as
+                # `auto_renewing: true` with a non-zero `grace_period_duration`, which is simply untrue.
+                #
+                # Cleared HERE and not on GRACE_PERIOD_EXPIRED: when grace ends, Apple carries on retrying
+                # for up to 60 days, so a renewal is still being attempted and the flag is still honest.
+                # EXPIRED is where the attempts stop.
+                backend.update_payment_renewal_info(
+                    sql_tx, payment_tx=payment_tx, grace_period=None, auto_renewing=False, err=err
+                )
 
             elif decoded_notification.body.notificationType == AppleNotificationV2.GRACE_PERIOD_EXPIRED:
                 # A notification type that indicates that the billing grace period has ended without
