@@ -77,9 +77,18 @@ From the fetched resource:
   term the store has shortened, extended or deferred actually reach the database.
 - **`auto_renewing`** — `autoRenewingPlan.autoRenewEnabled`, read from the resource rather than inferred
   from why we were woken.
-- **`grace_period`** — always NULL for Google. Play applies grace by *extending* `expiryTime`, so a Google
-  row's grace is already inside its expiry; writing it beside the expiry as well counted it twice. The
-  column is written (not skipped) so a row stamped by the retired per-type dispatch self-heals.
+- **`grace_period`** — NULL, except while the resource reports `IN_GRACE_PERIOD` and the expiry it states is
+  LATER than the one already on file. Play applies grace by *extending* `expiryTime`, so the resource stops
+  stating the paid-through date once a renewal fails — but the previous notification recorded it and the row
+  still holds it. In that case the stored term is kept and the difference becomes the grace, which makes
+  Google report the same shape Apple does natively, and lets a client say "your payment failed on the 3rd,
+  you have Pro until the 6th" rather than showing a renewal date that silently moved.
+
+  Anchoring on the STORED value is what keeps this idempotent — the term stops moving for the duration of
+  the grace, so re-converging recomputes the same difference. It is exact only when we saw the term before
+  it was extended: a first sighting already in grace has nothing to anchor on and stores the extended date
+  as-is. Outside grace the column is written to NULL rather than left alone, so a row stamped by the retired
+  per-type dispatch self-heals.
 - **`needs_ack`** — whether the store still reports the purchase as unacknowledged.
 
 Two things convergence will not overrule: a **revoked** row is terminal and left entirely alone, and a

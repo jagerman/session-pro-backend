@@ -40,6 +40,7 @@ from .api import SubscriptionPlanEventTransaction, VoidedPurchaseTxFields
 from .types import (
     SubscriptionNotificationType,
     SubscriptionsV2AcknowledgementState,
+    SubscriptionsV2State,
     RefundType,
     ProductType,
     SubscriptionV2Data,
@@ -833,8 +834,20 @@ def reconcile_google_subscription(
     needs_ack = tx_event.purchase_acknowledged != SubscriptionsV2AcknowledgementState.ACKNOWLEDGED
     expiry_at = base.datetime_from_unix_ms(tx_event.expiry_time.unix_milliseconds)
 
+    # From the resource's own state, never from the notification type. A grace-extended `expiryTime` is
+    # indistinguishable from any other extension by its value alone, so this is what lets the converge keep
+    # the paid term and record the extension beside it rather than overwriting one with the other.
+    in_grace = tx_event.subscription_state == SubscriptionsV2State.IN_GRACE_PERIOD
+
     converged = backend.google_converge_payment(
-        tx, payment_tx=payment_tx, expiry_at=expiry_at, auto_renewing=auto_renewing, needs_ack=needs_ack, at=at, err=err
+        tx,
+        payment_tx=payment_tx,
+        expiry_at=expiry_at,
+        auto_renewing=auto_renewing,
+        in_grace=in_grace,
+        needs_ack=needs_ack,
+        at=at,
+        err=err,
     )
     if err.has():
         return

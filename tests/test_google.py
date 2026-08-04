@@ -519,6 +519,15 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             assert len(user.token) == backend.BLAKE2B_DIGEST_SIZE
             assert user.expiry_at == base.datetime_from_unix_ms(tx.expiry_at)
 
+    def store_extension(paid_tx: TestTx, grace_tx: TestTx) -> pendulum.Duration:
+        """How much the store added to the paid term when the renewal failed.
+
+        Play applies grace by extending `expiryTime`, and the converge keeps the two apart: the row holds the
+        paid term it already knew, and this difference in `grace_period`. So a grace step asserts the
+        PURCHASE's expiry with the extension beside it, which is what lets a client say "your payment failed
+        on the 3rd, you have Pro until the 6th" rather than showing a renewal date that moved."""
+        return base.duration_from_ms(grace_tx.expiry_at - paid_tx.expiry_at)
+
     def assert_payment_details(
         tx: TestTx,
         pro_status: server.UserProStatus,
@@ -559,8 +568,9 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             # to undo. What the account is SERVED past that instant is the separate duration below.
             assert res_expiry_ts == to_s(tx.expiry_at), json.dumps(result, indent=1)
             # And the pair reconciles: expiry + duration is when serving stops, which is the same instant
-            # `user_status` flips. Google declares no separate grace, so this is our allowance alone.
-            expected_served_past = base.seconds_from_duration(base.RENEWAL_LATENCY_ALLOWANCE)
+            # `user_status` flips. That is the store's grace -- for Google, the extension the converge keeps
+            # separate from the paid term -- plus our own allowance.
+            expected_served_past = base.seconds_from_duration(grace_duration + base.RENEWAL_LATENCY_ALLOWANCE)
             assert res_grace_period_duration == (expected_served_past if res_auto_renewing else 0), json.dumps(
                 result, indent=1
             )
@@ -1049,11 +1059,11 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             # tx_grace, not tx_subscribe: entering grace now converges the TERM as well as the grace period.
             # The old IN_GRACE branch wrote only the grace duration and left expiry_at wherever the purchase
             # had put it, so the resource's own view of the term never reached the payment row.
-            tx=tx_grace,
+            tx=tx_subscribe,
             pro_status=server.UserProStatus.Active,
             payment_status=base.PaymentStatus.Redeemed,
             auto_renew=True,
-            grace_duration=pendulum.duration(),
+            grace_duration=store_extension(tx_subscribe, tx_grace),
             platform_refund_expiry_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
@@ -1066,11 +1076,11 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
         assert_payment_details(
             # tx_grace for the same reason as above: the grace notification converged the term, so the row
             # this is asserting on carries the resource's expiry rather than the purchase's.
-            tx=tx_grace,
+            tx=tx_subscribe,
             pro_status=server.UserProStatus.Expired,
             payment_status=base.PaymentStatus.Expired,
             auto_renew=True,
-            grace_duration=pendulum.duration(),
+            grace_duration=store_extension(tx_subscribe, tx_grace),
             platform_refund_expiry_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
@@ -1581,11 +1591,11 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
         # own view of the expiry is what reached the payment row.
         tx_grace = test_notification(grace, ctx)
         assert_payment_details(
-            tx=tx_grace,
+            tx=tx_resubscribe,
             pro_status=server.UserProStatus.Active,
             payment_status=base.PaymentStatus.Redeemed,
             auto_renew=True,
-            grace_duration=pendulum.duration(),
+            grace_duration=store_extension(tx_resubscribe, tx_grace),
             platform_refund_expiry_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
@@ -1594,11 +1604,11 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
         # Now that payments up to the expiry time has been expired, this user's status should be expired
         run_prune_at_end_of_day(event_ms=tx_grace.event_ms)
         assert_payment_details(
-            tx=tx_grace,
+            tx=tx_resubscribe,
             pro_status=server.UserProStatus.Expired,
             payment_status=base.PaymentStatus.Expired,
             auto_renew=True,
-            grace_duration=pendulum.duration(),
+            grace_duration=store_extension(tx_resubscribe, tx_grace),
             platform_refund_expiry_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
@@ -1606,9 +1616,9 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
         )
 
         """8. User fails to renew (enter account hold)"""
-        test_notification(hold, ctx)
+        tx_hold = test_notification(hold, ctx)
         assert_payment_details(
-            tx=tx_grace,
+            tx=tx_hold,
             pro_status=server.UserProStatus.Expired,
             payment_status=base.PaymentStatus.Expired,
             auto_renew=True,
@@ -1805,11 +1815,11 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             # tx_grace, not tx_subscribe: entering grace now converges the TERM as well as the grace period.
             # The old IN_GRACE branch wrote only the grace duration and left expiry_at wherever the purchase
             # had put it, so the resource's own view of the term never reached the payment row.
-            tx=tx_grace,
+            tx=tx_subscribe,
             pro_status=server.UserProStatus.Active,
             payment_status=base.PaymentStatus.Redeemed,
             auto_renew=True,
-            grace_duration=pendulum.duration(),
+            grace_duration=store_extension(tx_subscribe, tx_grace),
             platform_refund_expiry_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
@@ -1819,11 +1829,11 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
         assert_payment_details(
             # tx_grace for the same reason as above: the grace notification converged the term, so the row
             # this is asserting on carries the resource's expiry rather than the purchase's.
-            tx=tx_grace,
+            tx=tx_subscribe,
             pro_status=server.UserProStatus.Expired,
             payment_status=base.PaymentStatus.Expired,
             auto_renew=True,
-            grace_duration=pendulum.duration(),
+            grace_duration=store_extension(tx_subscribe, tx_grace),
             platform_refund_expiry_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
@@ -2051,11 +2061,11 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             # tx_grace, not tx_subscribe: entering grace now converges the TERM as well as the grace period.
             # The old IN_GRACE branch wrote only the grace duration and left expiry_at wherever the purchase
             # had put it, so the resource's own view of the term never reached the payment row.
-            tx=tx_grace,
+            tx=tx_subscribe,
             pro_status=server.UserProStatus.Active,
             payment_status=base.PaymentStatus.Redeemed,
             auto_renew=True,
-            grace_duration=pendulum.duration(),
+            grace_duration=store_extension(tx_subscribe, tx_grace),
             platform_refund_expiry_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
@@ -2066,11 +2076,11 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
         assert_payment_details(
             # tx_grace for the same reason as above: the grace notification converged the term, so the row
             # this is asserting on carries the resource's expiry rather than the purchase's.
-            tx=tx_grace,
+            tx=tx_subscribe,
             pro_status=server.UserProStatus.Expired,
             payment_status=base.PaymentStatus.Expired,
             auto_renew=True,
-            grace_duration=pendulum.duration(),
+            grace_duration=store_extension(tx_subscribe, tx_grace),
             platform_refund_expiry_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
@@ -2078,11 +2088,11 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
         )
 
         """3. User fails to renew (enter account hold)"""
-        test_notification(hold, ctx)
+        tx_hold = test_notification(hold, ctx)
         assert_payment_details(
             # tx_grace for the same reason as above: the grace notification converged the term, so the row
             # this is asserting on carries the resource's expiry rather than the purchase's.
-            tx=tx_grace,
+            tx=tx_hold,
             pro_status=server.UserProStatus.Expired,
             payment_status=base.PaymentStatus.Expired,
             auto_renew=True,
@@ -2277,11 +2287,11 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             # tx_grace, not tx_subscribe: entering grace now converges the TERM as well as the grace period.
             # The old IN_GRACE branch wrote only the grace duration and left expiry_at wherever the purchase
             # had put it, so the resource's own view of the term never reached the payment row.
-            tx=tx_grace,
+            tx=tx_subscribe,
             pro_status=server.UserProStatus.Active,
             payment_status=base.PaymentStatus.Redeemed,
             auto_renew=True,
-            grace_duration=pendulum.duration(),
+            grace_duration=store_extension(tx_subscribe, tx_grace),
             platform_refund_expiry_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
@@ -2291,11 +2301,11 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
         assert_payment_details(
             # tx_grace for the same reason as above: the grace notification converged the term, so the row
             # this is asserting on carries the resource's expiry rather than the purchase's.
-            tx=tx_grace,
+            tx=tx_subscribe,
             pro_status=server.UserProStatus.Expired,
             payment_status=base.PaymentStatus.Expired,
             auto_renew=True,
-            grace_duration=pendulum.duration(),
+            grace_duration=store_extension(tx_subscribe, tx_grace),
             platform_refund_expiry_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
@@ -2303,11 +2313,11 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
         )
 
         """3. User fails to renew (enter account hold)"""
-        test_notification(hold, ctx)
+        tx_hold = test_notification(hold, ctx)
         assert_payment_details(
             # tx_grace for the same reason as above: the grace notification converged the term, so the row
             # this is asserting on carries the resource's expiry rather than the purchase's.
-            tx=tx_grace,
+            tx=tx_hold,
             pro_status=server.UserProStatus.Expired,
             payment_status=base.PaymentStatus.Expired,
             auto_renew=True,
@@ -2747,11 +2757,11 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
         """3. User fails to renew (enter grace period)"""
         tx_grace = test_notification(grace, ctx)
         assert_payment_details(
-            tx=tx_grace,
+            tx=tx_change_plan,
             pro_status=server.UserProStatus.Active,
             payment_status=base.PaymentStatus.Redeemed,
             auto_renew=True,
-            grace_duration=pendulum.duration(),
+            grace_duration=store_extension(tx_change_plan, tx_grace),
             platform_refund_expiry_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
@@ -2760,11 +2770,11 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
 
         # Now that payments up to the expiry time has been expired, this user's status should be expired
         assert_payment_details(
-            tx=tx_grace,
+            tx=tx_change_plan,
             pro_status=server.UserProStatus.Expired,
             payment_status=base.PaymentStatus.Expired,
             auto_renew=True,
-            grace_duration=pendulum.duration(),
+            grace_duration=store_extension(tx_change_plan, tx_grace),
             platform_refund_expiry_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
@@ -3040,11 +3050,11 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
         """2. User fails to renew (enter grace period)"""
         tx_grace = test_notification(grace, ctx)
         assert_payment_details(
-            tx=tx_grace,
+            tx=tx_change_plan,
             pro_status=server.UserProStatus.Active,
             payment_status=base.PaymentStatus.Redeemed,
             auto_renew=True,
-            grace_duration=pendulum.duration(),
+            grace_duration=store_extension(tx_change_plan, tx_grace),
             platform_refund_expiry_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
@@ -3052,11 +3062,11 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
         run_prune_at_end_of_day(event_ms=tx_grace.event_ms)
         # Now that payments up to the expiry time has been expired, this user's status should be expired
         assert_payment_details(
-            tx=tx_grace,
+            tx=tx_change_plan,
             pro_status=server.UserProStatus.Expired,
             payment_status=base.PaymentStatus.Expired,
             auto_renew=True,
-            grace_duration=pendulum.duration(),
+            grace_duration=store_extension(tx_change_plan, tx_grace),
             platform_refund_expiry_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
@@ -3064,9 +3074,9 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
         )
 
         """3. User fails to renew (enter account hold)"""
-        test_notification(hold, ctx)
+        tx_hold = test_notification(hold, ctx)
         assert_payment_details(
-            tx=tx_grace,
+            tx=tx_hold,
             pro_status=server.UserProStatus.Expired,
             payment_status=base.PaymentStatus.Expired,
             auto_renew=True,
@@ -4852,7 +4862,9 @@ def test_a_voided_purchase_with_unset_types_is_reported_not_asserted(monkeypatch
         assert any('not handled' in msg for msg in err.msg_list), err.msg_list
 
 
-def _converge(ctx, token: str, order_id: str, *, expiry, auto_renewing=True, needs_ack=False, at=None) -> bool:
+def _converge(
+    ctx, token: str, order_id: str, *, expiry, auto_renewing=True, in_grace=False, needs_ack=False, at=None
+) -> bool:
     payment_tx = base.PaymentProviderTransaction(
         provider=base.PaymentProvider.GooglePlayStore, google_payment_token=token, google_order_id=order_id
     )
@@ -4864,6 +4876,7 @@ def _converge(ctx, token: str, order_id: str, *, expiry, auto_renewing=True, nee
                 payment_tx=payment_tx,
                 expiry_at=expiry,
                 auto_renewing=auto_renewing,
+                in_grace=in_grace,
                 needs_ack=needs_ack,
                 at=at if at is not None else base.utc_now(),
                 err=err,

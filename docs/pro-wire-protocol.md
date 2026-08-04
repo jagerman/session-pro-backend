@@ -338,14 +338,20 @@ The account-level pair is self-consistent: `expiry_ts + grace_period_duration` i
 backend stops serving, and is the same instant `user_status` flips from `active` to `expired`. A client that
 wants "am I still Pro?" should read `user_status`; a client that wants "until when?" can add the two.
 
-**`expiry_ts` reports the end of the term the store currently states, which is not always the paid-through
-date.** Apple leaves its expiry alone and declares grace separately, so an Apple subscription in grace
-reports the paid term with the grace beside it. Google Play instead applies grace by *extending* its own
-expiry, and the backend does not know the configured amount to subtract — so a Google subscription in grace
-reports an `expiry_ts` that already includes the grace, with only the allowance beside it. The stop-serving
-arithmetic above holds in both cases; what differs is how the same window is split between the two fields.
-A client displaying a renewal date should expect it to move forward by the grace period when a Google
-renewal fails, which is not a renewal and not an error.
+**`expiry_ts` is the paid-through date on both stores, including during a grace period.** The two stores
+report it differently — Apple leaves its expiry alone and declares grace separately, while Google Play
+applies grace by *extending* its own expiry — but the backend normalises them, so a subscription in grace
+reports the term the customer actually paid for, with the grace in `grace_period_duration` beside it.
+
+That is what lets a client say something true while a payment is failing: *"your subscription expired 13
+hours ago and your payment hasn't gone through — you keep Pro for another 2 days."* Both halves come from
+this pair, and neither requires the client to know which store the subscription is on.
+
+**One case where the Google value is approximate.** The backend recovers the paid term by remembering what
+the term was before the store extended it. If the very first thing it ever hears about a subscription is a
+grace-period notification — no earlier renewal to have recorded the term — there is nothing to anchor on,
+and `expiry_ts` will report the extended date with a zero `grace_period_duration`. Rare, and the
+stop-serving arithmetic above still holds; only the split between the two fields is lost.
 
 ### 5.3 Pagination cursor (`get_payment_details`)
 

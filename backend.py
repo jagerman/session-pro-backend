@@ -2826,6 +2826,7 @@ def google_converge_payment(
     payment_tx: base.PaymentProviderTransaction,
     expiry_at: pendulum.DateTime,
     auto_renewing: bool,
+    in_grace: bool,
     needs_ack: bool,
     at: pendulum.DateTime,
     err: base.ErrorSink,
@@ -2847,13 +2848,31 @@ def google_converge_payment(
       expiry past the instant entitlement actually stopped.
     * A CLAIMED row's ownership. Convergence adjusts the terms of a payment, never who holds it.
 
-    `grace_period` is written as a constant NULL rather than taken from the caller. The column records a
-    store grace declared SEPARATELY from the store's own expiry, and Play instead applies grace by EXTENDING
-    `expiryTime` — so on a Google row the grace is already inside the `expiry_at` above, and a second copy
-    beside it would be counted twice. Writing rather than leaving the column alone is deliberate: a row the
-    retired `IN_GRACE_PERIOD` branch stamped with the base plan's real grace would otherwise keep that day
-    forever, since nothing else would ever write the column again — and it is exactly those rows, the ones
-    in grace when this shipped, that convergence would then double-count.
+    `grace_period` is DERIVED here rather than taken from the caller, and this is the one place the two
+    stores are made to look alike. Play applies grace by EXTENDING `expiryTime`, so the resource never states
+    the paid-through date once a renewal has failed — but we already know it, because the previous
+    notification stored it and this row still holds it. So when the resource says IN_GRACE_PERIOD and the new
+    expiry is LATER than the one on file, the stored expiry is kept as the paid term and the difference
+    becomes the grace, exactly as Apple's `gracePeriodExpiresDate - expiresDate` does.
+
+    Coverage is identical either way — `expiry + grace + allowance` — but the split is what lets a client say
+    "your payment failed on the 3rd, you have Pro until the 6th" instead of showing a renewal date that
+    silently jumped forward.
+
+    Anchoring on the STORED value, not on a computed one, is what keeps this idempotent: `expiry_at` stops
+    moving for the duration of the grace, so re-converging the same snapshot recomputes the same difference
+    and writes the same row. That matters beyond tidiness — a spurious move re-draws the account's
+    proof-expiry offset, which is the privacy mechanism.
+
+    Two limits worth knowing. If our FIRST sighting of a token is already in grace there is nothing to anchor
+    on, so the extended expiry is stored as-is and the grace reads as zero; the property is "exact whenever
+    we saw the term before it was extended", not "always". And this gates on the resource's
+    `subscription_state`, never on the notification type — reading the store's own account of itself, which
+    is the opposite of the type dispatch this pipeline deleted.
+
+    Outside grace the column is written to NULL rather than left alone, deliberately: a row the retired
+    `IN_GRACE_PERIOD` branch stamped with the base plan's real grace would otherwise keep that day forever,
+    and it is exactly those rows that convergence would then double-count.
 
     Idempotency is the load-bearing property, not an optimisation: re-running this against an unchanged
     snapshot must leave `users.expiry_at` untouched, because a move there re-draws the account's
@@ -2871,9 +2890,15 @@ def google_converge_payment(
         tx.conn,
         '''
         UPDATE payments p
-        SET    expiry_at     = %(expiry_at)s,
+        SET    expiry_at     = CASE WHEN %(in_grace)s AND p.expiry_at IS NOT NULL
+                                          AND %(expiry_at)s > p.expiry_at
+                                    THEN p.expiry_at
+                                    ELSE %(expiry_at)s END,
                auto_renewing = %(auto_renewing)s,
-               grace_period  = NULL
+               grace_period  = CASE WHEN %(in_grace)s AND p.expiry_at IS NOT NULL
+                                         AND %(expiry_at)s > p.expiry_at
+                                    THEN %(expiry_at)s - p.expiry_at
+                                    ELSE NULL END
         FROM   google_play_payment_details gd
         WHERE  gd.payment_id = p.id
           AND  gd.payment_token = %(token)s AND gd.order_id = %(order_id)s
@@ -2884,6 +2909,7 @@ def google_converge_payment(
         order_id=payment_tx.google_order_id,
         expiry_at=expiry_at,
         auto_renewing=auto_renewing,
+        in_grace=in_grace,
     )
 
     # RETURNING breaks rowcount (see update_payment_renewal_info), so the fetch is what tells us whether a

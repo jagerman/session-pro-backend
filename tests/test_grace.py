@@ -18,12 +18,26 @@ import db
 from tests.helpers import _CreditFixture, _redeem_and_prove
 
 
-def _converge(conn, sub: base.PaymentProviderTransaction, expiry_at: pendulum.DateTime, auto_renewing: bool, at):
+def _converge(
+    conn,
+    sub: base.PaymentProviderTransaction,
+    expiry_at: pendulum.DateTime,
+    auto_renewing: bool,
+    at,
+    in_grace: bool = False,
+):
     """What the reconcile does when Play's subscription resource is fetched: write what it now says."""
     err = base.ErrorSink()
     with db.transaction(conn) as tx:
         converged = backend.google_converge_payment(
-            tx, payment_tx=sub, expiry_at=expiry_at, auto_renewing=auto_renewing, needs_ack=False, at=at, err=err
+            tx,
+            payment_tx=sub,
+            expiry_at=expiry_at,
+            auto_renewing=auto_renewing,
+            in_grace=in_grace,
+            needs_ack=False,
+            at=at,
+            err=err,
         )
     assert not err.msg_list, err.msg_list
     assert converged, 'the fixture seeded this (token, order id), so there is a row to converge'
@@ -230,3 +244,54 @@ def test_a_mid_term_refund_still_publishes_a_revocation(pg_database):
         assert not err.msg_list, err.msg_list
         assert len(backend.get_revocations_list(conn)) > before, 'a refund mid-term is not a lapse'
     pool.close()
+
+
+def test_google_grace_keeps_the_paid_term_and_records_the_extension(pg_database):
+    # Play applies grace by EXTENDING `expiryTime`, so once a renewal fails the resource no longer states the
+    # paid-through date. We know it anyway: the previous notification stored it, and the row still holds it.
+    # So a grace converge keeps the stored term and records the difference as the grace, which is exactly the
+    # shape Apple reports natively.
+    #
+    # This is what lets a client say "your payment failed on the 3rd, you have Pro until the 6th" rather than
+    # showing a renewal date that silently moved forward.
+    pool = backend.bootstrap_db(database_url=pg_database())
+    assert pool
+    with db.connection() as conn:
+        T = base.round_datetime_to_next_day(base.utc_now())
+        f = _CreditFixture(conn, T)
+        term = T + 30 * base.DAY
+        sub = f.subscribe(expiry_at=term)
+
+        def row():
+            return db.query_one(
+                conn,
+                '''SELECT p.expiry_at, p.grace_period FROM payments p
+                   JOIN google_play_payment_details gd ON gd.payment_id = p.id
+                   WHERE gd.payment_token = %s''',
+                sub.google_payment_token,
+            )
+
+        # The renewal fails and Play extends its own expiry by the plan's day.
+        _converge(conn, sub, expiry_at=term + 1 * base.DAY, auto_renewing=True, at=term, in_grace=True)
+
+        expiry, grace = row()
+        assert expiry == term, 'the paid term is preserved, not overwritten by the extension'
+        assert grace == 1 * base.DAY, 'and the extension is recorded beside it'
+        assert backend.account_coverage_end(backend.get_user(conn, f.pkey)) == (
+            term + 1 * base.DAY + base.RENEWAL_LATENCY_ALLOWANCE
+        ), 'coverage is unchanged by the split -- it is only reported differently'
+
+        # Re-converging the same snapshot must not move anything. Anchoring on the STORED expiry rather than
+        # a computed one is what makes that true, and it matters beyond tidiness: a spurious move re-draws
+        # the account's proof-expiry offset, which is the privacy mechanism.
+        _converge(conn, sub, expiry_at=term + 1 * base.DAY, auto_renewing=True, at=term, in_grace=True)
+        assert row() == (term, 1 * base.DAY), 'idempotent'
+
+        # Play extends further; the anchor holds, so the grace simply grows.
+        _converge(conn, sub, expiry_at=term + 2 * base.DAY, auto_renewing=True, at=term, in_grace=True)
+        assert row() == (term, 2 * base.DAY)
+
+        # The payment finally goes through on the SAME cycle: state leaves grace, so the extension is
+        # cleared and the term is whatever the store now says.
+        _converge(conn, sub, expiry_at=term + 30 * base.DAY, auto_renewing=True, at=term, in_grace=False)
+        assert row() == (term + 30 * base.DAY, None), 'out of grace, the resource is taken at its word again'
