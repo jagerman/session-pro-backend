@@ -80,7 +80,10 @@ class DecodedNotification:
     renewal_info: AppleJWSRenewalInfoDecodedPayload | None = None
 
 
-FLASK_ROUTE_NOTIFICATIONS_APPLE_APP_CONNECT_SANDBOX: str = '/apple_notifications_v2'
+# Where Apple posts App Store Server Notifications V2. ONE endpoint serving both environments, registered
+# whatever `sandbox_env` says: which environment a notification describes is a field inside the signed
+# payload, not a property of the URL it arrived at.
+FLASK_ROUTE_NOTIFICATIONS_APPLE: str = '/apple_notifications_v2'
 FLASK_CONFIG_PLATFORM_APPLE_CORE_KEY: str = 'session_pro_backend_platform_apple_core'
 
 # The object containing routes that you register onto a Flask app to turn it
@@ -605,12 +608,12 @@ def handle_notification_tx(
 
                     else:
                         # Reported, exactly as the DID_CHANGE_RENEWAL_STATUS and DID_FAIL_TO_RENEW subtype
-                        # chains report theirs. Without this the chain simply ended, so a subtype Apple adds
-                        # later would fall through every branch with an empty sink, be recorded handled, and
-                        # never be seen again — and on this notification type in particular, what would be
-                        # swallowed is a renewal-preference change: a downgrade we failed to record, or an
-                        # upgrade whose old plan we failed to revoke. Unreachable today (Apple documents
-                        # exactly the three above), which is why the wrong version of it was invisible.
+                        # chains report theirs. A subtype chain that just ends swallows anything Apple adds
+                        # later: an empty sink is success, so the notification is recorded handled and never
+                        # seen again. Here that would be a renewal-preference change — a downgrade left
+                        # unrecorded, or an upgrade whose old plan is left unrevoked. Unreachable while Apple
+                        # documents exactly the three subtypes above, which is what makes the omission a
+                        # silent one rather than a failing one.
                         err.msg_list.append(
                             f'Received TX: {print_obj(tx)}, with unrecognised subtype '
                             f'({decoded_notification.body.subtype}) for a DID_CHANGE_RENEWAL_PREF notification'
@@ -1008,8 +1011,7 @@ def handle_notification_tx(
 
         if not err.has():
             if decoded_notification.body.notificationType == AppleNotificationV2.EXPIRED:
-                # Not a no-op, whatever the grouping suggests -- see below. The blanket "No-op" that used to
-                # be logged here for the whole group said otherwise on the one branch of it that writes.
+                # The one branch in this group that writes, whatever the grouping suggests -- see below.
                 log.debug(
                     f'{notif_type} for {payment_tx_id_label(payment_tx)}: '
                     f'the store has stopped trying to renew this subscription'
@@ -1060,9 +1062,9 @@ def handle_notification_tx(
                 # A notification type that indicates the App Store declined a refund request. Nothing to do:
                 # we only ever act on a refund that was GRANTED (REFUND), and this says one was not.
                 #
-                # It reaches this branch by name rather than by falling off the end of the chain. It is
-                # listed in the condition above, but the tail of the chain asserted PRICE_INCREASE, so the
-                # first declined refund would have raised — a 500 back to Apple, redelivered forever.
+                # Named explicitly rather than left to the tail of the chain, which asserts PRICE_INCREASE:
+                # every type in this group's condition needs a branch, or it reaches that assert and raises,
+                # which the webhook turns into a 500 and Apple retries until it gives up.
                 log.debug(f'{notif_type} for {payment_tx_id_label(payment_tx)}: No-op; the refund was refused')
 
             elif decoded_notification.body.notificationType == AppleNotificationV2.CONSUMPTION_REQUEST:
@@ -1155,8 +1157,8 @@ def handle_notification(
     return result
 
 
-@flask_blueprint.route(FLASK_ROUTE_NOTIFICATIONS_APPLE_APP_CONNECT_SANDBOX, methods=['POST'])
-def notifications_apple_app_connect_sandbox() -> flask.Response:
+@flask_blueprint.route(FLASK_ROUTE_NOTIFICATIONS_APPLE, methods=['POST'])
+def notifications_apple_app_store_v2() -> flask.Response:
     # NOTE: Extract notification from payload. get_json_from_flask_request returns the parsed dict or raises
     # (base.ApiError) on a malformed body. This is an Apple webhook, so a parse failure must return 500 (so
     # Apple redelivers) rather than the client fail-envelope — catch the error and abort instead of letting
