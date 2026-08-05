@@ -60,6 +60,32 @@ log_path               = /var/log/pro-backend/backend.log
 ; name    = ops
 ; url     = https://hooks.example.org/...
 
+[logging]
+
+; level: the level every logger gets unless named individually below. One of DEBUG, INFO, WARNING, ERROR
+; or CRITICAL, case-insensitive. Defaults to INFO.
+;
+; INFO is the "what is this backend doing" tier: one line per payment action -- a purchase registered, a
+; renewal, a cancellation, entering or leaving a grace period. Useful while bringing a deployment up or
+; chasing a report about a specific subscriber; noisy at steady state, so production usually wants WARNING.
+;
+; DEBUG adds the steps WITHIN each of those actions, including a line per provider notification. It is for
+; working out why something did what it did, not for leaving on.
+;
+; WARNING and above are always worth reading and are never routine: a failing acknowledgement, a purchase
+; that could not be attributed, a reconcile that has given up (see docs/limitations.md for what each means).
+; level = info
+
+; level-<logger>: override the level for one logger, by the name that appears in the log line. The
+; application's own are `pro`, `backend`, `google` and `apple`; any other name reaches a third-party logger,
+; so `level-werkzeug = error` quietens Flask's request log without touching anything else.
+;
+; The common shape while debugging one provider:
+;   level = warning
+;   level-google = debug
+; level-apple = info
+
+
 [apple]
 ; App Store Connect > Users and Access > Integrations > In-App Purchase keys.
 app_id                 =

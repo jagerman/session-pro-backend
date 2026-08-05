@@ -54,7 +54,7 @@ from .types import (
     json_dict_require_google_timestamp,
 )
 
-log = logging.Logger('GOOGLE')
+log = logging.getLogger('google')
 
 # NOTE: Globals specifically for interacting with the Google APIs
 credentials: service_account.Credentials | None = None

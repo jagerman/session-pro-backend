@@ -326,6 +326,72 @@ class LogFormatter(logging.Formatter):
         return result
 
 
+# Every logger this application writes through, by the name that appears in the log line and in the
+# `[logging]` config section's `level-<name>` keys.
+#
+# Named, and fetched with `getLogger`, because both matter. `logging.Logger('X')` builds an object OUTSIDE
+# the logging manager's registry, so a second `logging.Logger('X')` elsewhere is a DIFFERENT logger with the
+# same name -- which is what `main.py` and `maintenance.py` each had for 'PRO'. Nothing could configure them
+# both, and their level stayed NOTSET, which is why every level was on regardless of intent.
+LOG_CATEGORIES: tuple[str, ...] = ('pro', 'backend', 'google', 'apple')
+
+LOG_FORMAT = '%(asctime)s %(levelname)s %(name)s %(message)s'
+
+
+def install_log_handler(logger: logging.Logger, level: int, use_colour: bool = True) -> None:
+    '''Give one logger a console handler at `level`, replacing whatever it had.
+
+    Handlers are cleared first, unconditionally: startup attaches a bootstrap handler before the config is
+    read -- otherwise a config error would have nowhere to go -- and the mule inherits the master's handlers
+    across the fork, so without this a line is emitted once per accumulated handler.
+
+    Used for Flask's `app.logger` as well as our own categories, which is why it takes a logger rather than
+    a name: that one is created by the app factory and named after the import path.'''
+    logger.handlers.clear()
+    if use_colour:
+        import coloredlogs
+
+        coloredlogs.install(logger=logger, level=level, fmt=LOG_FORMAT, milliseconds=True, isatty=True)
+    else:
+        handler = logging.StreamHandler()
+        handler.setFormatter(LogFormatter(LOG_FORMAT))
+        logger.addHandler(handler)
+    logger.setLevel(level)
+
+
+def bootstrap_logging() -> None:
+    '''Minimal handlers so a failure BEFORE the config is read has somewhere to go.
+
+    `configure_logging` replaces whatever this installed once the config is known, so the only lines that
+    ever come out of here are startup errors -- which is why it is unconditional and unconfigurable.'''
+    handler = logging.StreamHandler()
+    handler.setFormatter(LogFormatter(LOG_FORMAT))
+    for name in LOG_CATEGORIES:
+        logger = logging.getLogger(name)
+        logger.handlers.clear()
+        logger.addHandler(handler)
+
+
+def configure_logging(default_level: int, per_logger_levels: dict[str, int], use_colour: bool = True) -> None:
+    '''Install log handlers and apply levels. Call once, as soon as the config has been read.
+
+    `per_logger_levels` overrides `default_level` for a named logger, and is not restricted to this
+    application's own categories -- `level-werkzeug = error` works, which is the point of keying it on the
+    logger name rather than a fixed enum.
+
+    Colour goes through coloredlogs with `isatty=True`, matching session-pysogs: under uWSGI the vassal's
+    `logto` captures stderr into a file, so the escapes end up in the log rather than on a terminal, which is
+    what `tail`/`less -R` want anyway. Set `use_colour=False` for a consumer that cannot cope.
+    '''
+    for name in LOG_CATEGORIES:
+        install_log_handler(logging.getLogger(name), per_logger_levels.get(name, default_level), use_colour)
+
+    # Anything named that is not one of ours: third-party loggers an operator wants turned up or down.
+    for name, level in per_logger_levels.items():
+        if name not in LOG_CATEGORIES:
+            logging.getLogger(name).setLevel(level)
+
+
 @dataclasses.dataclass
 class ErrorSink:
     '''

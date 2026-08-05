@@ -16,7 +16,7 @@ import pendulum
 
 import base
 
-log = logging.getLogger('PRO')
+log = logging.getLogger('pro')
 
 
 class ConfigError(ValueError):
@@ -60,6 +60,12 @@ class ParsedArgs:
     # How long a renewing subscription is honoured past its paid-through instant while we wait to learn
     # whether it renewed. Ours, not a store's — see base.RENEWAL_LATENCY_ALLOWANCE.
     renewal_latency_allowance: pendulum.Duration = base.RENEWAL_LATENCY_ALLOWANCE
+    # `[logging] level` -- the level every logger gets unless named individually below. INFO rather
+    # than DEBUG so a fresh deploy is production-shaped: DEBUG adds a line per provider notification.
+    log_level: int = logging.INFO
+    # `[logging] level-<name>` -- per-logger overrides, keyed by the name in the log line. Not
+    # restricted to this application's categories, so `level-werkzeug = error` works too.
+    log_levels: dict[str, int] = dataclasses.field(default_factory=dict)
 
     session_webhooks: list[SessionWebhook] = dataclasses.field(default_factory=list)
 
@@ -136,6 +142,37 @@ def parse_args() -> ParsedArgs:
                 errors.append(f'voucher_processing_window must not be negative, got {window_s}')
             else:
                 result.voucher_processing_window = base.duration_from_seconds(window_s)
+
+        if ini_parser.has_section('logging'):
+            logging_section: configparser.SectionProxy = ini_parser['logging']
+
+            def parse_level(key: str, raw: str) -> int | None:
+                # `getLevelName` maps a name to its number, but for anything it does not recognise it
+                # returns the STRING 'Level <name>' rather than raising -- so an unrecognised value has to
+                # be rejected here or it silently becomes a non-level and filters nothing.
+                level = logging.getLevelName(raw.strip().upper())
+                if isinstance(level, int):
+                    return level
+                errors.append(f'[logging] {key} must be one of DEBUG, INFO, WARNING, ERROR, CRITICAL; got "{raw}"')
+                return None
+
+            for key, raw in logging_section.items():
+                if key == 'level':
+                    level = parse_level(key, raw)
+                    if level is not None:
+                        result.log_level = level
+                elif key.startswith('level-'):
+                    # The logger NAME, verbatim after the prefix. configparser lower-cases keys, which is
+                    # why the categories were renamed to lowercase: `level-google` has to be able to name
+                    # the logger that writes the line.
+                    name = key[len('level-') :]
+                    level = parse_level(key, raw)
+                    if not name:
+                        errors.append('[logging] "level-" needs a logger name after the dash')
+                    elif level is not None:
+                        result.log_levels[name] = level
+                else:
+                    errors.append(f'[logging] unrecognised option "{key}" (expected level or level-<name>)')
 
         webhook_index = 0
         while True:

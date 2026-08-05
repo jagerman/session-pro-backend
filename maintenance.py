@@ -38,7 +38,7 @@ import backend
 import config
 import db
 
-log = logging.getLogger('PRO')
+log = logging.getLogger('pro')
 
 # How often the loop wakes to look for due tasks. Well below every task interval, so a task runs within a
 # second of becoming due; a wake with nothing due costs a few comparisons.
@@ -132,20 +132,17 @@ def loop(tasks: list[Task], stop: threading.Event) -> None:
 
 def run() -> None:
     # The mule forks from the uWSGI master *after* main.entry_point() ran, so the shared loggers arrive with
-    # the master's handlers already attached. Clear them before installing the mule's own, otherwise every
-    # line is emitted once per inherited handler. uWSGI's `logto` captures this StreamHandler's stderr into
-    # the vassal log, same as the workers.
-    handler = logging.StreamHandler()
-    handler.setFormatter(base.LogFormatter('%(asctime)s %(levelname)s %(name)s %(message)s'))
-    for logger in (log, backend.log):
-        logger.handlers.clear()
-        logger.addHandler(handler)
+    # the master's handlers already attached; `configure_logging` clears them, otherwise every line is
+    # emitted once per inherited handler. uWSGI's `logto` captures this process's stderr into the vassal
+    # log, same as the workers. Bootstrap first so a config failure has somewhere to go.
+    base.bootstrap_logging()
 
     try:
         parsed = config.parse_args()
     except config.ConfigError as e:
         log.error(f'Maintenance mule failed to start, invalid configuration:\n  {e}')
         sys.exit(1)
+    base.configure_logging(parsed.log_level, parsed.log_levels)
     base.UNSAFE_LOGGING = parsed.unsafe_logging
     db.set_dsn(parsed.db_url)
     base.PROVIDER_TESTING_ENV = parsed.provider_testing_env
@@ -166,8 +163,6 @@ def run() -> None:
         # is built HERE rather than inherited: the mule forks from the master, which never builds it.
         from providers import app_store
 
-        app_store.log.handlers.clear()
-        app_store.log.addHandler(handler)
         core: app_store.Core = app_store.init(
             key_id=parsed.apple_key_id,
             issuer_id=parsed.apple_issuer_id,
@@ -189,9 +184,6 @@ def run() -> None:
         # start_subscriber is: the drain FETCHES from Google, and the dry-run stub answers with a synthetic
         # active subscription that would be converged onto real rows.
         from providers import google_play
-
-        google_play.notifications.log.handlers.clear()
-        google_play.notifications.log.addHandler(handler)
 
         def _drain_google_reconciles() -> None:
             drained = google_play.drain_due_reconciles(at=base.utc_now())

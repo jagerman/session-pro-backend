@@ -18,7 +18,7 @@ import psycopg
 
 import db
 
-log = logging.getLogger('PRO')
+log = logging.getLogger('pro')
 
 SCHEMA_DIR = pathlib.Path(__file__).parent / 'schema'
 

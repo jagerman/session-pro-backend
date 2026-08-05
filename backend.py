@@ -20,7 +20,7 @@ import psycopg_pool
 
 ZERO_BYTES32 = bytes(32)
 BLAKE2B_DIGEST_SIZE = 32
-log = logging.Logger("BACKEND")
+log = logging.getLogger('backend')
 # 16-byte domain-separation prefix on the signed MESSAGE (signatures are Ed25519 over the message
 # directly — no BLAKE2b, so this is a domain prefix, not a hash personalisation; see signed_message).
 DOMAIN_SIZE = 16

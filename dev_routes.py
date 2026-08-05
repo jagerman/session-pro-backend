@@ -30,7 +30,7 @@ import db
 import minting
 import server
 
-log = logging.getLogger('PRO')
+log = logging.getLogger('pro')
 
 FLASK_ROUTE_DEV_ADD_PAYMENT = '/dev/add_payment'
 

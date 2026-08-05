@@ -61,7 +61,7 @@ import backend
 import db
 import server
 
-log = logging.Logger('APPLE')
+log = logging.getLogger('apple')
 
 
 @dataclasses.dataclass

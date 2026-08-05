@@ -24,7 +24,7 @@ import config
 
 from . import api, notifications
 
-log = logging.getLogger('PRO')
+log = logging.getLogger('pro')
 
 
 def run() -> None:
