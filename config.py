@@ -47,7 +47,6 @@ class ParsedArgs:
     with_provider_app_store: bool = False
     with_provider_google_play: bool = False
 
-    provider_testing_env: bool = False
     provider_dry_run: bool = False
 
     dev_endpoints: bool = False
@@ -113,7 +112,6 @@ def parse_args() -> ParsedArgs:
         result.with_provider_app_store = base_section.getboolean(option='with_provider_app_store', fallback=False)
         result.with_provider_google_play = base_section.getboolean(option='with_provider_google_play', fallback=False)
 
-        result.provider_testing_env = base_section.getboolean(option='provider_testing_env', fallback=False)
         result.provider_dry_run = base_section.getboolean(option='provider_dry_run', fallback=False)
 
         result.dev_endpoints = base_section.getboolean(option='dev_endpoints', fallback=False)
@@ -242,9 +240,6 @@ def parse_args() -> ParsedArgs:
     result.with_provider_google_play = base.os_get_boolean_env(
         'SESH_PRO_BACKEND_WITH_PROVIDER_GOOGLE_PLAY', result.with_provider_google_play
     )
-    result.provider_testing_env = base.os_get_boolean_env(
-        'SESH_PRO_BACKEND_PROVIDER_TESTING_ENV', result.provider_testing_env
-    )
     result.provider_dry_run = base.os_get_boolean_env('SESH_PRO_BACKEND_PROVIDER_DRY_RUN', result.provider_dry_run)
     result.dev_endpoints = base.os_get_boolean_env('SESH_PRO_BACKEND_DEV_ENDPOINTS', result.dev_endpoints)
 
@@ -280,14 +275,6 @@ def parse_args() -> ParsedArgs:
                     'Provider app_store was enabled in production mode (e.g. not sandbox mode)'
                     ' but the production_app_id was not specified'
                 )
-
-        if result.apple_sandbox_env:
-            if not result.provider_testing_env:
-                log.warning(
-                    'Provider app_store was enabled in sandbox mode but provider_testing_env was not set to true.'
-                    ' You want to set this to true, overriding the flag to true'
-                )
-                result.provider_testing_env = True
 
         if not errors:
             try:

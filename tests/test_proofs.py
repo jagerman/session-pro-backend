@@ -37,7 +37,7 @@ def test_proof_reports_account_expiry(pg_database):
         # Proof validity rides the rolling clamp (~30 days); the account entitlement runs the full year, so
         # account_expiry_ts is the TRUE expiry exactly -- max() only ever reads back the proof's own expiry
         # in the closing window where the over-provision overtakes the true end, which is nowhere near here.
-        shape = base.proof_expiry_shape()
+        shape = base.PROOF_EXPIRY_SHAPE
         offset = backend.get_user(conn, master_key.verify_key).proof_expiry_offset
         assert proof.expiry_at == base.round_datetime_up_onto_offset_grid(
             now + shape.clamp + shape.renewal_lead, period=shape.grid, offset_seconds=offset
@@ -74,7 +74,7 @@ def test_expired_proof_fail_carries_account_expiry(pg_database):
         # buys up to a day past the true expiry, so an hour later is not yet lapsed as far as proofs go --
         # see test_lapsed_account_keeps_proofs_through_the_over_provision) -> subscription_expired, with the
         # past TRUE expiry attached (never the over-provisioned one).
-        request_at = account_expiry + base.proof_expiry_shape().max_proof_lifetime
+        request_at = account_expiry + base.PROOF_EXPIRY_SHAPE.max_proof_lifetime
         with db.transaction(conn) as tx:
             with pytest.raises(base.FailError) as excinfo:
                 backend.build_current_entitlement_proof(
@@ -101,7 +101,7 @@ def test_proof_expiry_offset_is_random_per_account_and_per_cycle(pg_database):
     backend_key = nacl.signing.SigningKey.generate()
     rotating_key = nacl.signing.SigningKey.generate()
     now = base.utc_now()
-    shape = base.proof_expiry_shape()
+    shape = base.PROOF_EXPIRY_SHAPE
 
     with db.connection() as conn:
         across_accounts = [
@@ -137,7 +137,7 @@ def test_proof_is_identical_for_requests_in_the_same_grid_period(pg_database):
     master_key = nacl.signing.SigningKey.generate()
     rotating_key = nacl.signing.SigningKey.generate()
     now = base.utc_now()
-    shape = base.proof_expiry_shape()
+    shape = base.PROOF_EXPIRY_SHAPE
 
     with db.connection() as conn:
         # A year-long plan, so every request below sits in the sliding arm where the expiry would otherwise
@@ -229,7 +229,7 @@ def test_proof_expiry_lands_on_the_account_grid(pg_database):
     # entitlement to the following midnight plus the length, and the assertion would then hold or fail
     # depending on where the account's random offset fell relative to the time of day.
     now = base.round_datetime_to_next_day(base.utc_now())
-    shape = base.proof_expiry_shape()
+    shape = base.PROOF_EXPIRY_SHAPE
 
     with db.connection() as conn:
         # Sliding arm: a year-long plan, so the `min` always takes the clamp.
@@ -284,7 +284,7 @@ def test_lapsed_account_keeps_proofs_through_the_over_provision(pg_database):
     # midnight plus the length, and this test is about the over-provision, not about that anchoring.
     now = base.round_datetime_to_next_day(base.utc_now())
     true_expiry = now + pendulum.duration(hours=1)
-    shape = base.proof_expiry_shape()
+    shape = base.PROOF_EXPIRY_SHAPE
 
     with db.connection() as conn:
         offset = _grant_and_get_offset(conn, backend_key, master_key, rotating_key, now, true_expiry)

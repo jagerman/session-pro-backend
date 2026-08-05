@@ -172,13 +172,18 @@ def unix_seconds_float_from_datetime(value: pendulum.DateTime) -> float:
 #
 # One value across providers, because it describes OUR pipeline's latency, and our pipeline is not slower
 # for Apple. Settable as `renewal_latency_allowance` in the [base] config so it can be raised ahead of
-# planned maintenance; a provider testing environment overrides it at runtime, since an hour would swamp a
-# subscription whose "day" is ten seconds.
+# planned maintenance.
+#
+# It has a FLOOR set by the clients rather than by anything on this side: every client runs a renewal timer
+# one hour before expiry, and that timer must not outlast this allowance, or the client wakes to renew after
+# we have stopped honouring the old term and the subscriber sees Pro flicker off. The floor holds in a
+# provider testing deployment too — the same clients, the same fixed hour, however fast the store's test
+# clock runs. A compressed clock changes how long a subscription lasts, not when a client wakes up.
 RENEWAL_LATENCY_ALLOWANCE: pendulum.Duration = 1 * HOUR
 
 # NOTE: Global variables
 UNSAFE_LOGGING = False
-PROVIDER_TESTING_ENV = False
+
 # When set, every payment provider treats all of its OUTBOUND interactions as already-succeeded and
 # performs no external side-effect: mutations (e.g. Google acknowledge) become no-ops and gating reads
 # return a synthetic success. Each provider module owns what dry-run means for it (see providers/).
@@ -217,31 +222,17 @@ class ProofExpiryShape:
         return self.clamp + self.renewal_lead + self.grid
 
 
-# The real-world shape. `clamp` is 29 d rather than 30 so that the whole expression stays just over 30 d.
+# `clamp` is 29 d rather than 30 so that the whole expression stays just over 30 d. `renewal_lead` is the
+# clients' one-hour pre-expiry renewal timer plus a minute of slack, so a client that wakes to renew is
+# still holding a valid proof when it does.
+#
+# One shape in every deployment, a store's compressed test clock included: `renewal_lead` is denominated in
+# CLIENT behaviour, and a client's renewal timer is a fixed hour however fast a test subscription runs.
+# Scaling it down puts the client's wake-up after the expiry of the proof it holds. Same floor, same
+# reason, as RENEWAL_LATENCY_ALLOWANCE.
 PROOF_EXPIRY_SHAPE: ProofExpiryShape = ProofExpiryShape(
     clamp=29 * DAY, renewal_lead=pendulum.duration(seconds=3660), grid=1 * DAY
 )
-
-# The same shape scaled to the compressed clock a provider testing environment runs on (Google's license
-# testers get a "day" that lasts 10 s — see round_datetime_to_next_day_with_provider_testing_support). Left
-# uncompressed, a ten-second test subscription would be handed a proof valid for a real day and a bit,
-# which makes expiry unobservable in QA; scaled, the arms and the over-provision keep their proportions so
-# a compressed run exercises the same behaviour. `renewal_lead` becomes a nominal one second: the real
-# value encodes a client renewing an hour ahead, which is a client behaviour that does not compress and is
-# meaningless against a ten-second subscription. Unlike the day-rounding helper this is not conditioned on
-# the payment provider — the grid is per ACCOUNT, and an account can hold payments from several — which is
-# harmless because the flag is only ever set in a dedicated test deployment.
-PROVIDER_TESTING_PROOF_EXPIRY_SHAPE: ProofExpiryShape = ProofExpiryShape(
-    clamp=pendulum.duration(seconds=290),  # 29 compressed days
-    renewal_lead=pendulum.duration(seconds=1),
-    grid=pendulum.duration(seconds=10),  # one compressed day
-)
-
-
-def proof_expiry_shape() -> ProofExpiryShape:
-    '''Read at call time, never captured in a constant: PROVIDER_TESTING_ENV is set during startup (and
-    swapped in and out by tests), so a value frozen at import would be the wrong one.'''
-    return PROVIDER_TESTING_PROOF_EXPIRY_SHAPE if PROVIDER_TESTING_ENV else PROOF_EXPIRY_SHAPE
 
 
 assert REVOCATION_RETAIN_FOR >= PROOF_EXPIRY_SHAPE.max_proof_lifetime

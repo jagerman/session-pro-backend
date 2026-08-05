@@ -68,16 +68,6 @@ refund_deadline_duration_ms: int = base.MILLISECONDS_IN_DAY * 2
 # under the worker still holding it.
 SOCKET_TIMEOUT_S: int = 15
 
-# Google's testing environment compresses a "day" to 10s, so OUR renewal-latency allowance — an hour in
-# production — would swamp an entire test subscription and make its lifecycle impossible to reason about.
-# This replaces it under PROVIDER_TESTING_ENV (see base.RENEWAL_LATENCY_ALLOWANCE, which the mule and the
-# test context assign it to).
-#
-# It compresses our own value to match a compressed timeline. It is NOT Google's grace period: that is
-# configured per base plan in the Play Console, and Google applies it by extending the `expiryTime` it
-# reports rather than by telling us a number.
-testing_renewal_latency_allowance_ms: int = 10 * 1000
-
 
 def get_publisher_service() -> googleapiclient.discovery.Resource:
     assert credentials, "Platform google initialisation has not been called yet"

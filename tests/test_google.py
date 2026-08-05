@@ -23,7 +23,7 @@ import db
 from tests.helpers import (
     derived_status,
     TestingContext,
-    round_datetime_to_next_day_with_provider_testing_support,
+    round_datetime_to_next_store_day,
     _redeem_and_prove,
     _prove_at,
     _grant_voucher,
@@ -430,8 +430,8 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
 
     def run_prune_at_end_of_day(event_ms: int):
         boundary_ms = base.unix_ms_from_datetime(
-            round_datetime_to_next_day_with_provider_testing_support(
-                payment_provider=base.PaymentProvider.GooglePlayStore, at=base.datetime_from_unix_ms(event_ms)
+            round_datetime_to_next_store_day(
+                at=base.datetime_from_unix_ms(event_ms), compressed=ctx.compressed_store_day
             )
         )
         end_of_day = base.datetime_from_unix_ms(event_ms + boundary_ms)
@@ -646,7 +646,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
         )
         return tx, platform_refund_expiry_unix_tx_ms
 
-    with TestingContext(pg_database, provider_testing_env=True) as ctx:
+    with TestingContext(pg_database, compressed_store_day=True) as ctx:
         """
         1. User purchases 1-month subscription
         2. User cancels
@@ -852,7 +852,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             unix_ts_ms=refund_tx.event_ms + 1000,
         )
 
-    with TestingContext(pg_database, provider_testing_env=True) as ctx:
+    with TestingContext(pg_database, compressed_store_day=True) as ctx:
         """
         1. User purchases 1-month subscription
         2. User enters grace period as subscription fails to renew
@@ -1138,7 +1138,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             unix_ts_ms=tx_expire.event_ms,
         )
 
-    with TestingContext(pg_database, provider_testing_env=True) as ctx:
+    with TestingContext(pg_database, compressed_store_day=True) as ctx:
         """
         1. User purchases 1-month subscription
         2. User renews 1-month subscription
@@ -1647,7 +1647,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             unix_ts_ms=tx_grace.event_ms + store_grace.milliseconds,
         )
 
-    with TestingContext(pg_database, provider_testing_env=True) as ctx:
+    with TestingContext(pg_database, compressed_store_day=True) as ctx:
         """
         1. User purchases 1-month subscription
         2. User enters grace period as they fail to renew
@@ -1855,7 +1855,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             unix_ts_ms=tx_grace.event_ms + store_grace.milliseconds,
         )
 
-    with TestingContext(pg_database, provider_testing_env=True) as ctx:
+    with TestingContext(pg_database, compressed_store_day=True) as ctx:
         """
         1. User purchases 1-month subscription
         2. User enters grace period as they fail to renew
@@ -2118,7 +2118,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             unix_ts_ms=tx_grace.event_ms + store_grace.milliseconds,
         )
 
-    with TestingContext(pg_database, provider_testing_env=True) as ctx:
+    with TestingContext(pg_database, compressed_store_day=True) as ctx:
         """
         1. User purchases 1-month subscription
         2. User enters grace period as they fail to renew
@@ -2359,7 +2359,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             ctx=ctx,
         )
 
-    with TestingContext(pg_database, provider_testing_env=True) as ctx:
+    with TestingContext(pg_database, compressed_store_day=True) as ctx:
         """
         1. User purchases 1-month subscription
         2. User changes to 3-month plan
@@ -2547,7 +2547,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             ctx=ctx,
         )
 
-    with TestingContext(pg_database, provider_testing_env=True) as ctx:
+    with TestingContext(pg_database, compressed_store_day=True) as ctx:
         """
         1. User purchases 1-month subscription
         2. User changes to 3-month plan
@@ -2801,7 +2801,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             ctx=ctx,
         )
 
-    with TestingContext(pg_database, provider_testing_env=True) as ctx:
+    with TestingContext(pg_database, compressed_store_day=True) as ctx:
         """
         1. User purchases 1-month subscription
         2. User changes to 3-month plan
@@ -3107,7 +3107,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             ctx=ctx,
         )
 
-    with TestingContext(pg_database, provider_testing_env=True) as ctx:
+    with TestingContext(pg_database, compressed_store_day=True) as ctx:
         """
         1. User purchases 1-month subscription
         2. User changes to 3-month plan
@@ -3379,7 +3379,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             ctx=ctx,
         )
 
-    with TestingContext(pg_database, provider_testing_env=True) as ctx:
+    with TestingContext(pg_database, compressed_store_day=True) as ctx:
         """
         1. User purchases 3-month subscription
         2. Renews
@@ -3387,7 +3387,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
         3. Expires
         """
 
-    with TestingContext(pg_database, provider_testing_env=True) as ctx:
+    with TestingContext(pg_database, compressed_store_day=True) as ctx:
         """
         1. User purchases 12-month subscription
         2. Renews
@@ -3395,21 +3395,21 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
         3. Expires
         """
 
-    with TestingContext(pg_database, provider_testing_env=True) as ctx:
+    with TestingContext(pg_database, compressed_store_day=True) as ctx:
         """
         1. User purchases 3-month subscription
         2. User changes to 1-month subscription
         3. Renews
         """
 
-    with TestingContext(pg_database, provider_testing_env=True) as ctx:
+    with TestingContext(pg_database, compressed_store_day=True) as ctx:
         """
         1. User purchases 12-month subscription
         2. User changes to 1-month subscription
         3. Renews
         """
 
-    with TestingContext(pg_database, provider_testing_env=True) as ctx:
+    with TestingContext(pg_database, compressed_store_day=True) as ctx:
         """
         1. User purchases 1-month subscription
         2. Developer refunds subscription (removing entitlement)
@@ -3552,7 +3552,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             revoke_unix_ts_ms=tx_refund_a.event_ms,
         )
 
-    with TestingContext(pg_database, provider_testing_env=True) as ctx:
+    with TestingContext(pg_database, compressed_store_day=True) as ctx:
         """
         1. User purchases 1-month subscription
         2. Developer refunds subscription (removing entitlement)
@@ -3560,7 +3560,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
         4. User renews
         """
 
-    with TestingContext(pg_database, provider_testing_env=True) as ctx:
+    with TestingContext(pg_database, compressed_store_day=True) as ctx:
         """
         1. User purchases 12-month subscription
         2. Developer refunds subscription (removing entitlement)
@@ -3568,7 +3568,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
         4. User renews
         """
 
-    with TestingContext(pg_database, provider_testing_env=True) as ctx:
+    with TestingContext(pg_database, compressed_store_day=True) as ctx:
         """
         1. User purchases 1-month subscription, but does not redeem it.
         2. Developer refunds subscription (removing entitlement)
@@ -4446,7 +4446,7 @@ def test_shrinking_the_expiry_never_serves_a_later_proof_in_the_pinned_arm(monke
     # survivor has to outlast every outstanding proof (or the revocation broadcasts and mints a fresh
     # generation, which re-draws by design) while still falling inside the clamp at request time. That needs
     # the request to sit at least a grid period plus the renewal lead after the revocation.
-    shape = base.proof_expiry_shape()
+    shape = base.PROOF_EXPIRY_SHAPE
     with TestingContext(pg_database) as ctx:
         master_key = nacl.signing.SigningKey(_UPGRADE_ACCOUNT_SEED)
         rotating_key = nacl.signing.SigningKey.generate()

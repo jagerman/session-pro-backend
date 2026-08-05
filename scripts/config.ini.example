@@ -27,8 +27,11 @@ unsafe_logging         = false
 ; credentials and no calls off-box. For local/integration testing ONLY — never enable on a real instance.
 provider_dry_run       = false
 
-; provider_testing_env=true selects the Apple sandbox / Google test environments, which is
-; what a testing deployment wants. Set both provider toggles per your deploy.env.
+; provider_testing_env marks a deployment as pointed at a store's test environment, where a "day" can last
+; ten seconds. Set it on a test instance; [apple] sandbox_env force-enables it if you forget. It selects no
+; store environment itself -- Apple's is sandbox_env -- and no backend behaviour is conditioned on it: proof
+; expiry and renewal_latency_allowance are denominated in CLIENT behaviour, and a client's one-hour renewal
+; timer does not shrink because a test subscription does.
 with_provider_app_store    = false
 with_provider_google_play   = false
 provider_testing_env   = true

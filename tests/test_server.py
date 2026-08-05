@@ -265,7 +265,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
 
     # The payment runs 90 days, so the proof sits on the rolling clamp: request_at + the clamp + the renewal
     # lead, rounded up onto this account's own expiry grid. On a grid point, so NOT midnight-aligned.
-    shape = base.proof_expiry_shape()
+    shape = base.PROOF_EXPIRY_SHAPE
     with db.transaction(db_conn) as tx:
         proof_expiry_offset = backend.get_user_and_payments(tx, master_key.verify_key).user.proof_expiry_offset
     assert 0 <= proof_expiry_offset < shape.offset_range
@@ -765,7 +765,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
     # NOTE: Generating a proof once the deadline AND the proof over-provision are both spent must fail —
     # entitlement expired → FailError. The over-provision (renewal lead + the account's offset, ≤ ~25 h) is
     # what a proof issued at the deadline already certifies, so we honour re-fetches until it runs out.
-    unix_ts_ms = pro_proof_deadline_unix_ts_ms + base.ms_from_duration(base.proof_expiry_shape().max_proof_lifetime)
+    unix_ts_ms = pro_proof_deadline_unix_ts_ms + base.ms_from_duration(base.PROOF_EXPIRY_SHAPE.max_proof_lifetime)
     hash_to_sign = backend.make_generate_pro_proof_message(
         master_pkey=master_key.verify_key,
         rotating_pkey=rotating_key.verify_key,

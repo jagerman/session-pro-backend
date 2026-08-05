@@ -907,7 +907,7 @@ def new_proof_expiry_offset() -> int:
     '''
     # Reducing a 64-bit draw modulo the period leaves a bias of ~1 part in 10^15 — far below any skew that
     # could cluster anything, so it is accepted rather than rejection-sampled away.
-    return int.from_bytes(nacl.utils.random(8), 'big') % base.proof_expiry_shape().offset_range
+    return int.from_bytes(nacl.utils.random(8), 'big') % base.PROOF_EXPIRY_SHAPE.offset_range
 
 
 def _offset_redrawn_if_expiry_extends(expiry: pendulum.DateTime | None) -> str:
@@ -1080,7 +1080,7 @@ def refresh_entitlement_and_revoke_overreaching_proofs(
     # `at` whenever `at` fell just after midnight. This accepts the same worst case uniformly instead of
     # letting the wall clock decide which accounts get it. Testing environments compress the grid, so the
     # comparison follows them without needing a provider-aware special case.
-    if prior_expiry <= at + base.proof_expiry_shape().grid:
+    if prior_expiry <= at + base.PROOF_EXPIRY_SHAPE.grid:
         return False
 
     # The furthest any outstanding proof can reach: a proof reaches at most `max_proof_lifetime` past its
@@ -1088,7 +1088,7 @@ def refresh_entitlement_and_revoke_overreaching_proofs(
     # now goes beyond this. If what survives covers that, every proof we have signed is still honest and
     # there is nothing to announce.
     if surviving_now is not None and surviving_now >= at + base.DEFAULT_TIMESTAMP_TOLERANCE + (
-        base.proof_expiry_shape().max_proof_lifetime
+        base.PROOF_EXPIRY_SHAPE.max_proof_lifetime
     ):
         return False
 
@@ -1661,9 +1661,8 @@ def update_payment_renewal_info(
         kwparams['grace_period'] = grace_period
 
     # The providers differ ONLY in how a payment is identified, so that is all the match produces: a
-    # `detail_table WHERE ...` fragment, used by both statements below. Writing out the whole statement per
-    # provider — as the TODO this replaces complained about — meant the read below would have had to be
-    # written three times as well, which is the shape that lets two of the three drift.
+    # `detail_table WHERE ...` fragment that both statements below share. Per-provider copies of the
+    # statements themselves would need the read and the write kept in step three times over.
     payment_selector: str = ''
     match payment_tx.provider:
         case base.PaymentProvider.Nil:
@@ -2399,7 +2398,7 @@ def _build_proof_clamped_expiry_time(
     extension keeps the luck from settling on the same accounts. `shape.max_proof_lifetime` bounds the
     resulting proof lifetime.
     '''
-    shape = base.proof_expiry_shape()
+    shape = base.PROOF_EXPIRY_SHAPE
     # The stored column's own range (a day — the schema CHECK), NOT the current shape's: a database written
     # before the shape changed still holds day-wide offsets, which the grid helper reduces modulo the period.
     assert 0 <= proof_expiry_offset < base.PROOF_EXPIRY_SHAPE.offset_range
@@ -2977,17 +2976,15 @@ def google_converge_payment(
     # what actually moved rather than restating what we asked for — a converge that changes nothing is the
     # common case and must be distinguishable from one that renews, cancels or opens a grace period.
     #
-    # `FOR UPDATE` is not extra caution on top of the reconcile lease: the lease only serialises drain
-    # against drain on one token, never drain against the notification thread stamping a REVOKED. The single
-    # UPDATE this replaced was atomic against that by construction, and splitting it into a read and a write
-    # is what opened the window — so the lock restores exactly what the read-before-write spent. Concretely
-    # it is what makes the assert below sound: without it a revoke landing in between would leave the UPDATE
-    # matching nothing, and a log line would have crashed the drain.
+    # `FOR UPDATE` is what makes the assert below sound, and the reconcile lease does not cover it: the lease
+    # serialises drain against drain on one token, never drain against the notification thread stamping a
+    # REVOKED. A revoke landing between the read and the write leaves the UPDATE matching nothing, and a
+    # log line would then crash the drain.
     #
     # `OF p` locks the payments row only, so the assert additionally rests on `google_play_payment_details`'
     # key columns never being rewritten (`needs_ack` is the sole column anything updates, and nothing deletes
-    # a detail row). That is convention, not constraint: a future writer that moves a token or order id
-    # between these two statements would make the assert reachable.
+    # a detail row). That is convention, not constraint: a writer that moved a token or order id between
+    # these two statements would make the assert reachable.
     before = db.query_one(
         tx.conn,
         '''

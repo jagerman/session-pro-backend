@@ -50,14 +50,7 @@ def test_duration_constants_are_exact_spans():
         for name, value in sorted(vars(base).items())
         if isinstance(value, pendulum.Duration) and not name.startswith('_')
     ]
-    named += [
-        (f'{shape_name}.{field}', getattr(shape_value, field))
-        for shape_name, shape_value in (
-            ('PROOF_EXPIRY_SHAPE', base.PROOF_EXPIRY_SHAPE),
-            ('PROVIDER_TESTING_PROOF_EXPIRY_SHAPE', base.PROVIDER_TESTING_PROOF_EXPIRY_SHAPE),
-        )
-        for field in ('clamp', 'renewal_lead', 'grid')
-    ]
+    named += [(f'PROOF_EXPIRY_SHAPE.{field}', getattr(shape, field)) for field in ('clamp', 'renewal_lead', 'grid')]
     named += [('PROOF_EXPIRY_SHAPE.max_proof_lifetime', shape.max_proof_lifetime)]
     assert len(named) >= 10, named  # a rename must not silently empty this out
 

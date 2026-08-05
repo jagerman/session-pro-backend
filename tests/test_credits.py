@@ -380,7 +380,7 @@ def test_credit_expiry_obfuscation_is_not_perturbed_by_draining(pg_database):
         # The published expiry is a grid point at or after the account's, never its exact instant unless the
         # grid happens to land there. It can sit up to the renewal lead plus one whole grid period past it:
         # that is the over-provision, not slack in this assertion.
-        shape = base.proof_expiry_shape()
+        shape = base.PROOF_EXPIRY_SHAPE
         assert first.expiry_at >= expiry_before
         assert first.expiry_at - expiry_before <= shape.renewal_lead + shape.grid
     pool.close()

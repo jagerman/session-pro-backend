@@ -100,13 +100,16 @@ with_provider_app_store          = false
 # configured if this is set
 with_provider_google_play         = false
 
-# Turn this on if you intend to pull test-notifications from Google/Apple and work with subscription
-# payments that have a modified duration (e.g. Google modifies a 1-day subscription to 10 seconds). This
-# will modify some functionality with event timestamps to ensure that these timespans are respected
+# Marks a deployment as pointed at a store's test environment, where subscriptions run on a compressed
+# clock (Google gives a license tester a "day" that lasts 10 seconds). Set it on a test instance; [apple]
+# sandbox_env force-enables it if you forget.
 #
-# One example is rounding timestamps to Google/Apple's modified timespan to determine whether or not
-# a revocation overlaps with the expiry of a payment. If there's an overlap the backend can skip
-# issuing a revocation (which is an expensive operation).
+# It selects no store environment itself -- Apple's is [apple] sandbox_env -- and no backend behaviour is
+# conditioned on it. In particular the proof expiry shape and renewal_latency_allowance do NOT follow the
+# store's compressed clock: both are denominated in client behaviour, and a client's one-hour pre-expiry
+# renewal timer is a fixed hour no matter how fast a test subscription runs. Scaling either one down puts
+# the client's renewal attempt after the expiry of the proof it is holding, which makes renewal untestable
+# in the only environment it can be tested in.
 provider_testing_env         = false
 
 # How old an account's voucher checkpoint must be, in seconds, before the maintenance mule charges it

@@ -148,7 +148,6 @@ def run() -> None:
     base.configure_logging(parsed.log_level, parsed.log_levels)
     base.UNSAFE_LOGGING = parsed.unsafe_logging
     db.set_dsn(parsed.db_url)
-    base.PROVIDER_TESTING_ENV = parsed.provider_testing_env
     base.RENEWAL_LATENCY_ALLOWANCE = parsed.renewal_latency_allowance
     base.PROVIDER_DRY_RUN = parsed.provider_dry_run
 
