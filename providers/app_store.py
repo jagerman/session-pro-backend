@@ -603,6 +603,19 @@ def handle_notification_tx(
                         # grace column is store data Apple has not sent for this transaction.
                         sql_tx.cancel = err.has()
 
+                    else:
+                        # Reported, exactly as the DID_CHANGE_RENEWAL_STATUS and DID_FAIL_TO_RENEW subtype
+                        # chains report theirs. Without this the chain simply ended, so a subtype Apple adds
+                        # later would fall through every branch with an empty sink, be recorded handled, and
+                        # never be seen again — and on this notification type in particular, what would be
+                        # swallowed is a renewal-preference change: a downgrade we failed to record, or an
+                        # upgrade whose old plan we failed to revoke. Unreachable today (Apple documents
+                        # exactly the three above), which is why the wrong version of it was invisible.
+                        err.msg_list.append(
+                            f'Received TX: {print_obj(tx)}, with unrecognised subtype '
+                            f'({decoded_notification.body.subtype}) for a DID_CHANGE_RENEWAL_PREF notification'
+                        )
+
     elif decoded_notification.body.notificationType == AppleNotificationV2.OFFER_REDEEMED:
         # A notification type that, along with its subtype, indicates that a customer with an active
         # subscription redeemed a subscription offer.
