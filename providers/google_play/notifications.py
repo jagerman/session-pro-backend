@@ -46,7 +46,7 @@ from .types import (
     SubscriptionV2Data,
 )
 
-log = logging.getLogger('google')
+log = logging.getLogger('google_play')
 
 # How long the subscriber loop waits before doing its periodic work when nothing wakes it. A FLOOR, not a
 # schedule: a callback sets the event as soon as it commits, so an arriving notification is serviced in

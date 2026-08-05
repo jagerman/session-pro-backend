@@ -152,9 +152,12 @@ unsafe_logging               = false
 level                        = info
 
 # level-<logger>: override one logger by the name that appears in its log lines. Ours are `pro`,
-# `backend`, `google` and `apple`; any other name reaches a third-party logger, so
-# `level-werkzeug = error` quietens Flask's request log on its own.
-level-google                 = debug
+# `backend`, `google_play` and `app_store` -- they match the module each comes from, and
+# deliberately do NOT shadow a library namespace (a logger named `google` is the parent of
+# every `google.*` logger the Play/Pub-Sub libraries use, and would turn all of them up with
+# it). Any other name reaches a third-party logger, so `level-werkzeug = error` quietens
+# Flask's request log, and `level-google.api_core = warning` quietens Pub/Sub's stream churn.
+level-google_play            = debug
 
 # NOTE: The [apple] section and its fields are only required if `with_provider_app_store` is defined
 [apple]

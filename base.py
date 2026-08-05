@@ -324,7 +324,7 @@ class LogFormatter(logging.Formatter):
 # the logging manager's registry, so a second `logging.Logger('X')` elsewhere is a DIFFERENT logger with the
 # same name -- which is what `main.py` and `maintenance.py` each had for 'PRO'. Nothing could configure them
 # both, and their level stayed NOTSET, which is why every level was on regardless of intent.
-LOG_CATEGORIES: tuple[str, ...] = ('pro', 'backend', 'google', 'apple')
+LOG_CATEGORIES: tuple[str, ...] = ('pro', 'backend', 'google_play', 'app_store')
 
 LOG_FORMAT = '%(asctime)s %(levelname)s %(name)s %(message)s'
 
@@ -824,7 +824,7 @@ def handle_not_implemented(name: str, err: ErrorSink):
     the write, and CRITICAL tells a human that a feature was enabled in a store console without the handler
     to match. Every one of these is a paid-but-no-Pro or an unreflected refund until someone acts.
     """
-    logging.getLogger('PROVIDER').critical(
+    logging.getLogger('pro').critical(
         f"Unsupported store feature '{name}' was reached — a customer is affected and this needs a handler"
     )
     err.msg_list.append(f"'{name}' is not implemented!")
