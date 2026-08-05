@@ -6,6 +6,7 @@ refund does and does not do to them.
 import nacl.signing
 import nacl.bindings
 import nacl.public
+import logging
 import pendulum
 import psycopg
 import pytest
@@ -597,4 +598,50 @@ def test_refund_during_store_grace_is_announced(pg_database):
         # The refund cut coverage from T+16d back to T, so the proofs already signed overstate the account
         # and the fall has to be announced.
         assert len(backend.get_revocations_list(conn)) > before
+    pool.close()
+
+
+def test_renewal_info_reaches_a_minted_payment(pg_database, caplog):
+    # `update_payment_renewal_info` builds one statement from a per-provider selector fragment. Nothing in
+    # production ever updates the renewal info of a minted Session Foundation payment -- a voucher has no
+    # renewal to change -- so this is the only thing that executes that fragment at all, and an SQL fragment
+    # no test has ever run is how this repo accumulates dormant branches that turn out not to work.
+    #
+    # It also pins the restatement rule, which is what the fragment shares with the other two providers: a
+    # minted credit is already non-renewing, so setting auto_renewing False changes nothing and must not be
+    # reported as though a subscriber had just cancelled. Two unrelated store events writing one value is
+    # ordinary (an Apple cancellation, then the EXPIRED that follows it weeks later), and inventing an event
+    # for the second is what this rule exists to stop.
+    pool = backend.bootstrap_db(database_url=pg_database())
+    assert pool
+    master_key = nacl.signing.SigningKey.generate()
+    err = base.ErrorSink()
+    with db.connection() as conn:
+        with db.transaction(conn) as tx:
+            minted = minting.mint_payment(
+                tx,
+                master_pkey=master_key.verify_key,
+                provider=base.PaymentProvider.SessionFoundation,
+                plan=base.ProPlan.OneMonth,
+                now=base.utc_now(),
+                duration=30 * base.DAY,
+            )
+
+        with caplog.at_level(logging.DEBUG, logger='backend'):
+            assert backend.update_payment_renewal_info(
+                conn, payment_tx=minted.payment_tx, grace_period=None, auto_renewing=False, err=err
+            ), err.msg_list
+        assert not err.has(), err.msg_list
+
+        row = db.query_one(
+            conn,
+            'SELECT auto_renewing FROM payments WHERE id IN'
+            ' (SELECT payment_id FROM stf_payment_details WHERE order_id = %s)',
+            minted.payment_tx.stf_order_id,
+        )
+        assert row is not None and row[0] is False, 'the statement built for stf_payment_details must land'
+
+        renewal_lines = [r for r in caplog.records if r.name == 'backend' and 'Payment (' in r.message]
+        assert len(renewal_lines) == 1, [r.message for r in renewal_lines]
+        assert renewal_lines[0].levelno == logging.DEBUG, 'a restatement is not a payment action'
     pool.close()

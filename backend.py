@@ -1660,79 +1660,81 @@ def update_payment_renewal_info(
         sql_set_fields += 'grace_period = %(grace_period)s'
         kwparams['grace_period'] = grace_period
 
-    # NOTE: Execute the statement
-    # TODO: Improve this switch statement by writing to kwparams then have 1 single db.query()
-    # statement that expands those parameters.
-    result_set: db.Result | None = None
+    # The providers differ ONLY in how a payment is identified, so that is all the match produces: a
+    # `detail_table WHERE ...` fragment, used by both statements below. Writing out the whole statement per
+    # provider — as the TODO this replaces complained about — meant the read below would have had to be
+    # written three times as well, which is the shape that lets two of the three drift.
+    payment_selector: str = ''
     match payment_tx.provider:
         case base.PaymentProvider.Nil:
             pass
 
         case base.PaymentProvider.GooglePlayStore:
-            result_set = db.query(
-                tx.conn,
-                f'''
-                UPDATE    payments
-                SET       {sql_set_fields}
-                WHERE     id IN (SELECT payment_id FROM google_play_payment_details
-                                   WHERE payment_token = %(token)s AND order_id = %(order_id)s)
-                RETURNING (SELECT master_pkey FROM users WHERE users.id = payments.user_id)
-            ''',
-                token=payment_tx.google_payment_token,
-                order_id=payment_tx.google_order_id,
-                **kwparams,
-            )
+            payment_selector = 'google_play_payment_details WHERE payment_token = %(token)s AND order_id = %(order_id)s'
+            kwparams['token'] = payment_tx.google_payment_token
+            kwparams['order_id'] = payment_tx.google_order_id
 
         case base.PaymentProvider.iOSAppStore:
-            result_set = db.query(
-                tx.conn,
-                f'''
-                UPDATE    payments
-                SET       {sql_set_fields}
-                WHERE     id IN (SELECT payment_id FROM app_store_payment_details
-                                   WHERE original_tx_id = %(orig_tx_id)s AND tx_id = %(tx_id)s
-                                     AND web_line_order_tx_id = %(line_order_tx_id)s)
-                RETURNING (SELECT master_pkey FROM users WHERE users.id = payments.user_id)
-            ''',
-                orig_tx_id=payment_tx.apple_original_tx_id,
-                tx_id=payment_tx.apple_tx_id,
-                line_order_tx_id=payment_tx.apple_web_line_order_tx_id,
-                **kwparams,
+            payment_selector = (
+                'app_store_payment_details WHERE original_tx_id = %(orig_tx_id)s AND tx_id = %(tx_id)s'
+                ' AND web_line_order_tx_id = %(line_order_tx_id)s'
             )
+            kwparams['orig_tx_id'] = payment_tx.apple_original_tx_id
+            kwparams['tx_id'] = payment_tx.apple_tx_id
+            kwparams['line_order_tx_id'] = payment_tx.apple_web_line_order_tx_id
 
         case base.PaymentProvider.SessionFoundation:
-            result_set = db.query(
-                tx.conn,
-                f'''
-                UPDATE    payments
-                SET       {sql_set_fields}
-                WHERE     id IN (SELECT payment_id FROM stf_payment_details
-                                   WHERE order_id = %(stf_order_id)s)
-                RETURNING (SELECT master_pkey FROM users WHERE users.id = payments.user_id)
-            ''',
-                stf_order_id=payment_tx.stf_order_id,
-                **kwparams,
-            )
+            payment_selector = 'stf_payment_details WHERE order_id = %(stf_order_id)s'
+            kwparams['stf_order_id'] = payment_tx.stf_order_id
+
+    assert payment_selector, 'Nil is the only provider with no selector, and verify_payment_provider_tx rejects it'
+
+    # What the row says now, so the log below can tell a change from a restatement. Two unrelated store
+    # events legitimately write the same value — a cancellation, then the EXPIRED that follows it weeks
+    # later, both clearing `auto_renewing` — and reporting the second as though a subscriber had just
+    # cancelled invents an event. No lock, unlike the Google converge: nothing here depends on the read
+    # being the row the UPDATE then touches, so a concurrent write can only make one log line stale, and
+    # the write itself is unaffected either way.
+    before = db.query_one(
+        tx.conn,
+        f'SELECT auto_renewing, grace_period FROM payments WHERE id IN (SELECT payment_id FROM {payment_selector})',
+        **kwparams,
+    )
+
+    result_set = db.query(
+        tx.conn,
+        f'''
+        UPDATE    payments
+        SET       {sql_set_fields}
+        WHERE     id IN (SELECT payment_id FROM {payment_selector})
+        RETURNING (SELECT master_pkey FROM users WHERE users.id = payments.user_id)
+    ''',
+        **kwparams,
+    )
 
     # NOTE: A `RETURNING` clause seems to break rowcount (returns 0 even on row modification), so we
     # use fetchone instead. The RETURNING expression resolves the payment's owner master_pkey via the
     # users FK (NULL if the payment isn't redeemed yet).
-    assert result_set
-    row = typing.cast(tuple[bytes] | None, result_set.fetchone())
+    row = result_set.fetchone()
     result = row is not None
 
     # Phrased as what the store just told us about the subscription rather than as "renewal info updated":
     # these arrive when a subscriber cancels, resubscribes, or is granted a grace period, and that is what
-    # someone reads the line to find out. An argument of None means "not being changed" and says nothing.
-    # Reported only once the write has landed, so the line is a record of what happened rather than of what
-    # was attempted -- the no-matching-payment case is reported through `err` below instead.
-    if result and log.getEffectiveLevel() <= logging.INFO:
-        renewal = {None: '', True: 'will renew', False: 'cancelled; will not renew'}[auto_renewing]
-        grace = '' if grace_period is None else f'granted a grace period of {grace_period.in_words()}'
-        log.info(
-            f'Payment ({payment_provider_tx_log_label_safe(payment_tx)}): '
-            f'{"; ".join(it for it in (renewal, grace) if it)}'
-        )
+    # someone reads the line to find out. Reported after the write, so the line records what happened rather
+    # than what was attempted — the no-matching-payment case is reported through `err` below instead.
+    if result and before is not None:
+        old_auto_renewing, old_grace = before
+        changes: list[str] = []
+        if auto_renewing is not None and auto_renewing != old_auto_renewing:
+            changes.append('will renew' if auto_renewing else 'cancelled; will not renew')
+        if grace_period is not None and grace_period != old_grace:
+            changes.append(f'granted a grace period of {grace_period.in_words()}')
+
+        label = payment_provider_tx_log_label_safe(payment_tx)
+        if changes:
+            log.info(f'Payment ({label}): {"; ".join(changes)}')
+        elif log.getEffectiveLevel() <= logging.DEBUG:
+            log.debug(f'Payment ({label}): the store restated what we already had')
 
     # NOTE: Update the user's expiry to the latest known expiry
     if row and row[0]:
