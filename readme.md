@@ -77,10 +77,6 @@ supplies the throwaway PostgreSQL each test runs against.
 #   Unix socket: postgresql:///database?host=/var/run/postgresql&port=5432&user=<user>
 db_url                       = postgresql://user:password@localhost:5432/session_pro
 
-# Set the path where logs and rotated logs will be stored (omit this value/line to opt out of
-# logging to a file completely)
-log_path                     = <path/to/log>
-
 # Stub ALL payment-provider egress (Apple/Google): outbound mutations become no-ops and gating reads
 # return synthetic success. This lets you exercise the payment flow locally/in integration tests with
 # no provider credentials and no calls off-box. For testing ONLY — never enable on a real instance.
@@ -100,17 +96,6 @@ with_provider_app_store          = false
 # configured if this is set
 with_provider_google_play         = false
 
-# Marks a deployment as pointed at a store's test environment, where subscriptions run on a compressed
-# clock (Google gives a license tester a "day" that lasts 10 seconds). Set it on a test instance; [apple]
-# sandbox_env force-enables it if you forget.
-#
-# It selects no store environment itself -- Apple's is [apple] sandbox_env -- and no backend behaviour is
-# conditioned on it. In particular the proof expiry shape and renewal_latency_allowance do NOT follow the
-# store's compressed clock: both are denominated in client behaviour, and a client's one-hour pre-expiry
-# renewal timer is a fixed hour no matter how fast a test subscription runs. Scaling either one down puts
-# the client's renewal attempt after the expiry of the proof it is holding, which makes renewal untestable
-# in the only environment it can be tested in.
-provider_testing_env         = false
 
 # How old an account's voucher checkpoint must be, in seconds, before the maintenance mule charges it
 # again (default 86400, i.e. 24h). This does not change how much is charged -- that is always the span
@@ -158,6 +143,10 @@ level                        = info
 # it). Any other name reaches a third-party logger, so `level-werkzeug = error` quietens
 # Flask's request log, and `level-google.api_core = warning` quietens Pub/Sub's stream churn.
 level-google_play            = debug
+
+# path: file for the app's own logging, used ONLY for non-uWSGI/CLI invocations. Under uWSGI it is
+# IGNORED -- the vassal's `logto` captures stdout/stderr and rotates it. Omit to log to a file never.
+path                         = <path/to/log>
 
 # NOTE: The [apple] section and its fields are only required if `with_provider_app_store` is defined
 [apple]
@@ -210,7 +199,6 @@ SESH_PRO_BACKEND_DB_URL                    = <...>
 SESH_PRO_BACKEND_KEY_PATH                  = <...>
 SESH_PRO_BACKEND_LOG_PATH                  = <...>
 SESH_PRO_BACKEND_PROVIDER_DRY_RUN          = [0|1]
-SESH_PRO_BACKEND_PROVIDER_TESTING_ENV      = [0|1]
 SESH_PRO_BACKEND_DEV_ENDPOINTS             = [0|1]
 SESH_PRO_BACKEND_WITH_PROVIDER_APP_STORE   = [0|1]
 SESH_PRO_BACKEND_WITH_PROVIDER_GOOGLE_PLAY = [0|1]

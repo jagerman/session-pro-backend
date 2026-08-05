@@ -27,14 +27,11 @@ unsafe_logging         = false
 ; credentials and no calls off-box. For local/integration testing ONLY — never enable on a real instance.
 provider_dry_run       = false
 
-; provider_testing_env marks a deployment as pointed at a store's test environment, where a "day" can last
-; ten seconds. Set it on a test instance; [apple] sandbox_env force-enables it if you forget. It selects no
-; store environment itself -- Apple's is sandbox_env -- and no backend behaviour is conditioned on it: proof
-; expiry and renewal_latency_allowance are denominated in CLIENT behaviour, and a client's one-hour renewal
-; timer does not shrink because a test subscription does.
+; Which stores this instance ingests payments from. Each requires its matching section below to be filled
+; in ([apple] / [google]); startup fails if one is enabled without its credentials. Both off is a valid
+; instance -- it serves proofs for entitlements already on record and mints nothing new.
 with_provider_app_store    = false
-with_provider_google_play   = false
-provider_testing_env   = true
+with_provider_google_play  = false
 
 ; voucher_processing_window: how old an account's voucher checkpoint must be, in SECONDS, before the
 ; maintenance mule charges it again. Defaults to 86400 (24h). It does not change how much is charged --
@@ -51,11 +48,6 @@ provider_testing_env   = true
 ; applies immediately on reload, including to subscriptions bought before the change. Capped at 604800 (7
 ; days), because it extends every renewing subscriber's entitlement and a units slip would be expensive.
 ; renewal_latency_allowance = 3600
-
-; log_path: file for the app's own logging, used ONLY for non-uWSGI/CLI invocations. Under uWSGI
-; (the normal deployment) it is IGNORED — the vassal's `logto` captures stdout/stderr to the log
-; file and rotates it, which also avoids two processes writing/rotating the same file unsafely.
-log_path               = /var/log/pro-backend/backend.log
 
 ; Optional outbound notification webhooks; add [session_webhook.1], etc. as needed.
 ; [session_webhook.0]
@@ -80,13 +72,21 @@ log_path               = /var/log/pro-backend/backend.log
 ; level = info
 
 ; level-<logger>: override the level for one logger, by the name that appears in the log line. The
-; application's own are `pro`, `backend`, `google` and `apple`; any other name reaches a third-party logger,
-; so `level-werkzeug = error` quietens Flask's request log without touching anything else.
+; application's own are `pro`, `backend`, `google_play` and `app_store` -- they match the module each comes
+; from, and deliberately do NOT shadow a library namespace (a logger named `google` would be the PARENT of
+; every `google.*` logger the Play and Pub/Sub libraries use, and turning ours up would turn all of theirs
+; up with it). Any other name reaches a third-party logger, so `level-werkzeug = error` quietens Flask's
+; request log, and `level-google.api_core = warning` quietens Pub/Sub's half-hourly stream reconnects.
 ;
 ; The common shape while debugging one provider:
 ;   level = warning
-;   level-google = debug
-; level-apple = info
+;   level-google_play = debug
+; level-app_store = info
+
+; path: file for the app's own logging, used ONLY for non-uWSGI/CLI invocations. Under uWSGI
+; (the normal deployment) it is IGNORED — the vassal's `logto` captures stdout/stderr to the log
+; file and rotates it, which also avoids two processes writing/rotating the same file unsafely.
+path = /var/log/pro-backend/backend.log
 
 
 [apple]

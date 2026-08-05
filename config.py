@@ -106,7 +106,6 @@ def parse_args() -> ParsedArgs:
         base_section: configparser.SectionProxy = ini_parser['base']
         result.db_url = base_section.get(option='db_url', fallback='')
         result.backend_key_path = base_section.get(option='backend_key_path', fallback='')
-        result.log_path = base_section.get(option='log_path', fallback='')
         result.unsafe_logging = base_section.getboolean(option='unsafe_logging', fallback=False)
 
         result.with_provider_app_store = base_section.getboolean(option='with_provider_app_store', fallback=False)
@@ -159,10 +158,12 @@ def parse_args() -> ParsedArgs:
                     level = parse_level(key, raw)
                     if level is not None:
                         result.log_level = level
+                elif key == 'path':
+                    result.log_path = raw.strip()
                 elif key.startswith('level-'):
                     # The logger NAME, verbatim after the prefix. configparser lower-cases keys, which is
-                    # why the categories were renamed to lowercase: `level-google` has to be able to name
-                    # the logger that writes the line.
+                    # why the categories are lowercase: `level-google_play` has to be able to name the
+                    # logger that writes the line.
                     name = key[len('level-') :]
                     level = parse_level(key, raw)
                     if not name:
@@ -170,7 +171,7 @@ def parse_args() -> ParsedArgs:
                     elif level is not None:
                         result.log_levels[name] = level
                 else:
-                    errors.append(f'[logging] unrecognised option "{key}" (expected level or level-<name>)')
+                    errors.append(f'[logging] unrecognised option "{key}" (expected level, level-<name> or path)')
 
         webhook_index = 0
         while True:
