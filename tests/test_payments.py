@@ -181,7 +181,9 @@ def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_d
     master_key: nacl.signing.SigningKey = nacl.signing.SigningKey.generate()
     rotating_key: nacl.signing.SigningKey = nacl.signing.SigningKey.generate()
     now: pendulum.DateTime = base.utc_now()
-    redeemed_at: pendulum.DateTime = base.round_datetime_to_next_day(now)
+    # The redeem is stamped with the request instant, unrounded, so this is both when the payments below are
+    # claimed and the anchor their expiries are expressed against.
+    redeemed_at: pendulum.DateTime = now
 
     @dataclasses.dataclass
     class Scenario:
@@ -476,7 +478,8 @@ def test_backend_same_user_stacks_subscription_and_auto_redeem(monkeypatch, pg_d
             assert payments_list[3].google_order_id == auto_redeem_scenarios[1].google_order_id
             assert payments_list[3].google_payment_token == auto_redeem_google_payment_token
             assert payments_list[3].master_pkey == bytes(auto_redeem_user_master_key.verify_key)
-            assert payments_list[3].redeemed_at == backend.to_redeemed_at(payments_list[3].purchased_at)
+            # The auto-redeem stamps the store's purchase instant, unrounded.
+            assert payments_list[3].redeemed_at == payments_list[3].purchased_at
             assert payments_list[3].auto_renewing
             assert payments_list[3].grace_period == auto_redeem_scenarios[1].grace_period
 

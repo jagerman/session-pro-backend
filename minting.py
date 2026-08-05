@@ -175,7 +175,7 @@ def mint_payment(
         # key. Binds the exact minted payment by its own identifier, so a directly granted payment (which has no store
         # account-id to reconcile against) is claimed too. No provider egress: the reflow moved Google's
         # purchase-acknowledgement to the mule, so redeeming here never reaches a store.
-        backend.redeem_minted_payment(tx, master_pkey, payment_tx, backend.to_redeemed_at(now))
+        backend.redeem_minted_payment(tx, master_pkey, payment_tx, now)
         result.redeemed = True
         # Read the account's entitlement end back rather than predicting it: a credit stacks on whatever
         # coverage is already there, so the answer depends on the account, not on the length granted.

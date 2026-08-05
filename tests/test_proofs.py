@@ -279,9 +279,8 @@ def test_lapsed_account_keeps_proofs_through_the_over_provision(pg_database):
     backend_key = nacl.signing.SigningKey.generate()
     master_key = nacl.signing.SigningKey.generate()
     rotating_key = nacl.signing.SigningKey.generate()
-    # A day boundary, because a credit's clock starts at its day-rounded redemption instant (see
-    # to_redeemed_at): granting at an arbitrary time of day would put the account's expiry at the following
-    # midnight plus the length, and this test is about the over-provision, not about that anchoring.
+    # A day boundary purely so the arithmetic below is readable: this test is about the over-provision, not
+    # about where in the day the grant lands.
     now = base.round_datetime_to_next_day(base.utc_now())
     true_expiry = now + pendulum.duration(hours=1)
     shape = base.PROOF_EXPIRY_SHAPE

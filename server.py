@@ -305,7 +305,7 @@ def get_pro_status():
         with db.transaction(conn) as tx:
             # Bind any payment the mule has registered for this key but that isn't yet redeemed, so a
             # status check right after purchase reflects it. No-op when there's nothing new.
-            backend.reconcile_pending_payments(tx, master_pkey_nacl, redeemed_at=backend.to_redeemed_at(request_at))
+            backend.reconcile_pending_payments(tx, master_pkey_nacl, redeemed_at=request_at)
             user = backend.get_user(tx.conn, master_pkey_nacl)
             if user.found:
                 auto_renewing = user.auto_renewing
@@ -401,7 +401,7 @@ def get_payment_details():
         with db.transaction(conn) as tx:
             # Bind any mule-registered-but-unredeemed payment for this key first, so a details check
             # right after purchase includes it (only redeemed payments are user-scoped/visible below).
-            backend.reconcile_pending_payments(tx, master_pkey_nacl, redeemed_at=backend.to_redeemed_at(request_at))
+            backend.reconcile_pending_payments(tx, master_pkey_nacl, redeemed_at=request_at)
             # One keyset page, newest-first. Each item's status is derived against the *request*
             # clock `ts` (signed, anti-replay-bounded to ≈now), never a second time.time() read.
             # The query is user-scoped and only redeemed payments carry a user_id, so unredeemed

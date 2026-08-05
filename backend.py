@@ -380,11 +380,6 @@ def user_payment_tx_to_safe_string(tx: UserPaymentTransaction) -> str:
     return f'{tx.provider.name}, {ids}'
 
 
-def to_redeemed_at(at: pendulum.DateTime) -> pendulum.DateTime:
-    # Round up to the next UTC-day boundary (masks the exact instant the payment was redeemed).
-    return base.round_datetime_to_next_day(at)
-
-
 # The bytes we Ed25519-sign directly (NO pre-hash — wire spec §1): a 16-byte domain prefix then the fields,
 # each encoded by TYPE — VerifyKey/bytes verbatim (fixed-width, self-delimiting); datetime → its UNIX
 # **seconds** then decimal ASCII (pass an int explicitly if you ever need other units); int as canonical
@@ -1040,7 +1035,7 @@ def refresh_entitlement_and_revoke_overreaching_proofs(
     # payment is invisible to that judgement: we would revoke every outstanding proof for an account whose
     # coverage never actually lapsed. Claim-all and idempotent — the same bind the owner's next request
     # performs, just early. Stamped with OUR clock, never `at`: a store's instant can be days old.
-    reconcile_pending_payments(tx, master_pkey, redeemed_at=to_redeemed_at(base.utc_now()))
+    reconcile_pending_payments(tx, master_pkey, redeemed_at=base.utc_now())
     _update_user_expiry_grace_and_renew_flag_from_payment_list(tx, master_pkey)
 
     # The honest question is the DELTA, so ask it first and exactly: if the account ends up covering at
@@ -2037,9 +2032,7 @@ def add_unredeemed_payment(
                     # transaction; we log it for internal visibility.
                     try:
                         with tx.conn.transaction():
-                            _redeem_payment_for_user(
-                                tx, master_pkey, payment_tx, redeemed_at=to_redeemed_at(purchased_at)
-                            )
+                            _redeem_payment_for_user(tx, master_pkey, payment_tx, redeemed_at=purchased_at)
                         log.info(
                             f'Auto-redeemed payment (payment={payment_provider_tx_log_label_safe(payment_tx)}) '
                             f'to the account that owns the previous cycle of this subscription'
@@ -2616,7 +2609,7 @@ def generate_pro_proof(
         # redeem call. A no-op when there's nothing new. Then build the proof from the current entitlement
         # (build_current_entitlement_proof raises the truthful "no Pro" slug if there's still nothing, which
         # the client treats as "not yet — retry").
-        reconcile_pending_payments(tx, master_pkey, redeemed_at=to_redeemed_at(request_at))
+        reconcile_pending_payments(tx, master_pkey, redeemed_at=request_at)
         return build_current_entitlement_proof(tx, master_pkey, rotating_pkey, request_at, signing_key)
 
 

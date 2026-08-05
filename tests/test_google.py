@@ -422,11 +422,9 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
         # account-id (the reflow replaces the old /add_pro_payment round-trip).
         with ctx.connection() as conn:
             backend.reconcile_pending_payments(
-                conn,
-                user_ctx.master_key.verify_key,
-                redeemed_at=backend.to_redeemed_at(base.datetime_from_unix_ms(tx.event_ms)),
+                conn, user_ctx.master_key.verify_key, redeemed_at=base.datetime_from_unix_ms(tx.event_ms)
             )
-        return base.unix_ms_from_datetime(base.round_datetime_to_next_day(base.datetime_from_unix_ms(tx.event_ms)))
+        return tx.event_ms
 
     def run_prune_at_end_of_day(event_ms: int):
         boundary_ms = base.unix_ms_from_datetime(
@@ -477,7 +475,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
     def assert_has_payment(
         tx: TestTx,
         plan: base.ProPlan,
-        redeemed_ts_ms_rounded: int,
+        redeemed_ts_ms: int,
         platform_refund_expiry_at: int,
         user_ctx: TestUserCtx,
         ctx: TestingContext,
@@ -491,9 +489,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             assert derived_status(payment) == base.PaymentStatus.Redeemed
             assert payment.plan == plan
             assert payment.payment_provider == base.PaymentProvider.GooglePlayStore
-            assert payment.redeemed_at is not None and payment.redeemed_at == base.datetime_from_unix_ms(
-                redeemed_ts_ms_rounded
-            )
+            assert payment.redeemed_at is not None and payment.redeemed_at == base.datetime_from_unix_ms(redeemed_ts_ms)
             assert payment.expiry_at == base.datetime_from_unix_ms(tx.expiry_at)
             assert payment.grace_period is None
             assert payment.platform_refund_expiry_at == base.datetime_from_unix_ms(platform_refund_expiry_at)
@@ -620,7 +616,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
     ):
         tx, platform_refund_expiry_unix_tx_ms = test_make_purchase(purchase=purchase, plan=plan, ctx=ctx)
         # Redeem subscription payment
-        redeemed_ts_ms_rounded = add_payment(tx=tx, user_ctx=user_ctx, ctx=ctx)
+        redeemed_ts_ms = add_payment(tx=tx, user_ctx=user_ctx, ctx=ctx)
         with ctx.connection() as conn:
             assert not backend.get_unredeemed_payments_list(conn)
 
@@ -628,7 +624,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
         assert_has_payment(
             tx=tx,
             plan=plan,
-            redeemed_ts_ms_rounded=redeemed_ts_ms_rounded,
+            redeemed_ts_ms=redeemed_ts_ms,
             platform_refund_expiry_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
@@ -2338,9 +2334,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
         assert_has_payment(
             tx=tx,
             plan=base.ProPlan.OneMonth,
-            redeemed_ts_ms_rounded=base.unix_ms_from_datetime(
-                backend.to_redeemed_at(base.datetime_from_unix_ms(tx.event_ms))
-            ),
+            redeemed_ts_ms=tx.event_ms,
             platform_refund_expiry_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
