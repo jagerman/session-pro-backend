@@ -5,6 +5,7 @@ notification be acked the moment it arrives.
 
 import dataclasses
 import json
+import threading
 
 import pendulum
 
@@ -544,3 +545,33 @@ def test_parking_yields_to_a_notification_that_arrived_during_the_fetch(pg_datab
             assert backend.google_parked_reconciles(conn) == [], 'the newer obligation was not parked'
             with db.transaction(conn) as tx:
                 assert len(backend.google_claim_due_reconciles(tx, now=now, lease_until=now, limit=10)) == 1
+
+
+def test_init_api_prepares_the_drain_without_a_subscriber(monkeypatch):
+    # The drain's prerequisite, isolated: a process can reach Google without running the Pub/Sub subscriber.
+    # That is the whole point of the split — the maintenance mule owes the reconcile backstop precisely
+    # BECAUSE it is not the process running the subscriber, so it cannot get its API state as a side effect
+    # of starting one.
+    monkeypatch.setattr('providers.google_play.api.package_name', '')
+    monkeypatch.setattr('providers.google_play.api.subscription_product_id', '')
+    monkeypatch.setattr('providers.google_play.api.credentials', None)
+    monkeypatch.setattr('providers.google_play.api.publisher_service', None)
+    threads_before = threading.active_count()
+
+    # No credentials path: the identifiers still land, which is what `api` reads for every call. Building the
+    # authed client needs a real service-account file, so that half is not exercised here.
+    google_play.init_api(
+        package_name='network.loki.messenger', subscription_product_id='pro', app_credentials_path=None
+    )
+    assert google_play.api.package_name == 'network.loki.messenger'
+    assert google_play.api.subscription_product_id == 'pro'
+
+    # No subscriber, and nothing that needs stopping: no thread, and none of the grpc machinery the
+    # subscriber pulls in.
+    assert threading.active_count() == threads_before
+
+    # Idempotent, because the drain calls it on every pass rather than tracking whether it has run.
+    google_play.init_api(
+        package_name='network.loki.messenger', subscription_product_id='pro', app_credentials_path=None
+    )
+    assert google_play.api.package_name == 'network.loki.messenger'

@@ -188,6 +188,19 @@ def run() -> None:
         from providers import google_play
 
         def _drain_google_reconciles() -> None:
+            # The drain FETCHES the subscription resource, and `api` reaches Google through module globals
+            # that only this sets — a mule is its own process, so the subscriber having initialised them in
+            # the Google mule does nothing for us here. Idempotent and local (no network, no socket, no
+            # thread), so it costs a file read on the first pass and two comparisons afterwards.
+            #
+            # Called from inside the task rather than at mule startup so unreadable Google credentials fail
+            # this task and are logged by the loop, instead of killing a mule that also owes the DB prune and
+            # the Apple catch-up.
+            google_play.init_api(
+                package_name=parsed.google_package_name,
+                subscription_product_id=parsed.google_subscription_product_id,
+                app_credentials_path=parsed.google_cloud_app_credentials_path,
+            )
             drained = google_play.drain_due_reconciles(at=base.utc_now())
             if drained:
                 # A count of tokens looked at; most converge to what we already had. The ones that changed

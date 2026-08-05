@@ -106,6 +106,41 @@ class SortedMessage:
     raw: object | None = None  # a pubsub message at runtime; only ever str()'d, so untyped here
 
 
+def init_api(package_name: str, subscription_product_id: str, app_credentials_path: str | None) -> None:
+    '''Build the Play Developer API client and record the identifiers every call needs, in the globals
+    `api` reads them from. Idempotent, so a caller may call it on every use rather than tracking whether
+    it has run.
+
+    EVERY process that reaches Google has to call this, not just the one that runs the Pub/Sub subscriber:
+    `api.credentials` / `api.publisher_service` are module globals (Google's callbacks take no per-callback
+    context), and a mule is a separate process with its own copy. The reconcile-queue drain fetches the
+    subscription resource, and it runs in the maintenance mule as well as from the subscriber's pull loop —
+    a process that registers the task without calling this asserts on every attempt instead.
+
+    Split out of `init` so a process can have this WITHOUT the subscriber. It is everything Google except
+    the subscriber: no thread, no socket (httplib2 connects on first request), no grpc — that arrives with
+    `google-cloud-pubsub`, imported inside the subscriber thread — and no network, because the discovery
+    document for androidpublisher v3 ships with the client library and is read from disk. So a mule that
+    only reconciles pays a file read and a key parse for it.
+
+    The memo is `publisher_service`, deliberately not `credentials`: if the file loads but the client fails
+    to build, credentials are set while the service is not, and only re-reading gets out of that — guarding
+    on credentials instead would leave `get_publisher_service` asserting forever with no route back.'''
+    if app_credentials_path and api.publisher_service is None:
+        api.credentials = service_account.Credentials.from_service_account_file(
+            app_credentials_path, scopes=['https://www.googleapis.com/auth/androidpublisher']
+        )
+        # Bound every Play API call with a socket timeout. googleapiclient's default httplib2 transport
+        # has NO timeout, so a hung Google request would block the subscriber's single worker
+        # indefinitely (there's no harakiri leash on the mule like there is on the request workers). 15s
+        # is plenty; a timeout just fails the call, and the mule retries — nothing it does is time-critical.
+        authed_http = google_auth_httplib2.AuthorizedHttp(api.credentials, http=httplib2.Http(timeout=15))
+        api.publisher_service = googleapiclient.discovery.build('androidpublisher', 'v3', http=authed_http)
+
+    api.package_name = package_name
+    api.subscription_product_id = subscription_product_id
+
+
 def init(
     cloud_project_id: str,
     package_name: str,
@@ -119,19 +154,11 @@ def init(
         " so it needs global variables"
     )
 
-    if app_credentials_path:
-        api.credentials = service_account.Credentials.from_service_account_file(
-            app_credentials_path, scopes=['https://www.googleapis.com/auth/androidpublisher']
-        )
-        # Bound every Play API call with a socket timeout. googleapiclient's default httplib2 transport
-        # has NO timeout, so a hung Google request would block the subscriber's single worker
-        # indefinitely (there's no harakiri leash on the mule like there is on the request workers). 15s
-        # is plenty; a timeout just fails the call, and the mule retries — nothing it does is time-critical.
-        authed_http = google_auth_httplib2.AuthorizedHttp(api.credentials, http=httplib2.Http(timeout=15))
-        api.publisher_service = googleapiclient.discovery.build('androidpublisher', 'v3', http=authed_http)
-
-    api.package_name = package_name
-    api.subscription_product_id = subscription_product_id
+    init_api(
+        package_name=package_name,
+        subscription_product_id=subscription_product_id,
+        app_credentials_path=app_credentials_path,
+    )
 
     # NOTE: Setup thread for caller to use. daemon=True is load-bearing for uWSGI reloads: a callback
     # already executing cannot be interrupted (no Python thread can), and CPython's interpreter shutdown
