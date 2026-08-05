@@ -2610,7 +2610,17 @@ def generate_pro_proof(
         # (build_current_entitlement_proof raises the truthful "no Pro" slug if there's still nothing, which
         # the client treats as "not yet — retry").
         reconcile_pending_payments(tx, master_pkey, redeemed_at=request_at)
-        return build_current_entitlement_proof(tx, master_pkey, rotating_pkey, request_at, signing_key)
+        proof = build_current_entitlement_proof(tx, master_pkey, rotating_pkey, request_at, signing_key)
+
+    # Logged after the commit, and at INFO: signing a proof is the one action this endpoint exists to
+    # perform, and this line is the only record of what was certified for whom and until when. The DEBUG
+    # line above is the request that asked; a request that is REFUSED raises and reports nothing here.
+    log.info(
+        f'Issued Pro proof (master={base.maybe_obfuscate_bytes(master_pkey)}, '
+        f'rotating={base.maybe_obfuscate_bytes(rotating_pkey)}, '
+        f'expiry={base.readable(proof.expiry_at)}, account expiry={base.readable(proof.account_expiry_at)})'
+    )
+    return proof
 
 
 # Housekeeping deletes, one table each. All are pure storage reclamation: nothing here affects a live
