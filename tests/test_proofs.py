@@ -16,7 +16,14 @@ import backend
 import base
 import db
 
-from tests.helpers import _grant_voucher, _redeem_and_prove, TestingContext, _grant_and_get_offset, _prove_at
+from tests.helpers import (
+    _grant_voucher,
+    _redeem_and_prove,
+    TestingContext,
+    _grant_and_get_offset,
+    _prove_at,
+    round_datetime_to_next_day,
+)
 
 
 def test_proof_reports_account_expiry(pg_database):
@@ -28,7 +35,7 @@ def test_proof_reports_account_expiry(pg_database):
     backend_key = nacl.signing.SigningKey.generate()
     master_key = nacl.signing.SigningKey.generate()
     rotating_key = nacl.signing.SigningKey.generate()
-    now = base.round_datetime_to_next_day(base.utc_now())
+    now = round_datetime_to_next_day(base.utc_now())
     account_expiry = now + 365 * base.DAY
 
     with db.connection() as conn:
@@ -64,7 +71,7 @@ def test_expired_proof_fail_carries_account_expiry(pg_database):
     backend_key = nacl.signing.SigningKey.generate()
     master_key = nacl.signing.SigningKey.generate()
     rotating_key = nacl.signing.SigningKey.generate()
-    granted_at = base.round_datetime_to_next_day(base.utc_now())
+    granted_at = round_datetime_to_next_day(base.utc_now())
     account_expiry = granted_at + pendulum.duration(hours=1)
 
     with db.connection() as conn:
@@ -228,7 +235,7 @@ def test_proof_expiry_lands_on_the_account_grid(pg_database):
     # starts at its day-rounded redemption instant, so granting at any other time of day would run the
     # entitlement to the following midnight plus the length, and the assertion would then hold or fail
     # depending on where the account's random offset fell relative to the time of day.
-    now = base.round_datetime_to_next_day(base.utc_now())
+    now = round_datetime_to_next_day(base.utc_now())
     shape = base.PROOF_EXPIRY_SHAPE
 
     with db.connection() as conn:
@@ -281,7 +288,7 @@ def test_lapsed_account_keeps_proofs_through_the_over_provision(pg_database):
     rotating_key = nacl.signing.SigningKey.generate()
     # A day boundary purely so the arithmetic below is readable: this test is about the over-provision, not
     # about where in the day the grant lands.
-    now = base.round_datetime_to_next_day(base.utc_now())
+    now = round_datetime_to_next_day(base.utc_now())
     true_expiry = now + pendulum.duration(hours=1)
     shape = base.PROOF_EXPIRY_SHAPE
 

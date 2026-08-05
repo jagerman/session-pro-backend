@@ -37,7 +37,7 @@ from appstoreserverlibrary.models.ConsumptionRequestReason import (
     ConsumptionRequestReason as AppleConsumptionRequestReason,
 )
 
-from tests.helpers import derived_status, TestingContext, _redeem_and_prove
+from tests.helpers import derived_status, TestingContext, _redeem_and_prove, round_datetime_to_next_day
 
 
 def test_apple_catchup_isolates_a_bad_notification(monkeypatch, pg_database):
@@ -210,7 +210,7 @@ def test_apple_refund_reversal_reinstates_and_rolls_generation(pg_database):
     master_key = nacl.signing.SigningKey.generate()
     rotating_key = nacl.signing.SigningKey.generate()
     now = base.utc_now()
-    redeemed_at = base.round_datetime_to_next_day(now)
+    redeemed_at = round_datetime_to_next_day(now)
     original_tx = os.urandom(8).hex()
     tx_id = os.urandom(8).hex()
     expiry_at = redeemed_at + 90 * base.DAY
@@ -418,7 +418,7 @@ def test_platform_apple(pg_database):
         # call. This renewal is dated in the past, so we assert the binding (proof issuance is covered by
         # the generate_pro_proof tests).
         with test.connection() as conn:
-            redeemed_at = base.round_datetime_to_next_day(base.datetime_from_unix_ms(tx_info.signedDate))
+            redeemed_at = round_datetime_to_next_day(base.datetime_from_unix_ms(tx_info.signedDate))
             assert backend.reconcile_pending_payments(conn, master_key.verify_key, redeemed_at=redeemed_at) == 1
             assert not backend.get_unredeemed_payments_list(conn)
             assert backend.get_user(conn, master_key.verify_key).found
@@ -1586,7 +1586,7 @@ def test_platform_apple(pg_database):
 
         # NOTE: Then redeem the payment (reconcile binds it by the master-key-derived account-id).
         with test.connection() as conn:
-            redeemed_at = base.round_datetime_to_next_day(
+            redeemed_at = round_datetime_to_next_day(
                 base.datetime_from_unix_ms(e00_sub_to_3_months_tx_info.purchaseDate)
             )
             assert backend.reconcile_pending_payments(conn, master_key.verify_key, redeemed_at=redeemed_at) == 1
@@ -2209,7 +2209,7 @@ def test_apple_expiry_after_billing_retry_clears_auto_renewing(pg_database):
     pool = backend.bootstrap_db(database_url=pg_database())
     assert pool
     master_key = nacl.signing.SigningKey.generate()
-    now = base.round_datetime_to_next_day(base.utc_now())
+    now = round_datetime_to_next_day(base.utc_now())
     err = base.ErrorSink()
 
     tx_ids = base.PaymentProviderTransaction(
@@ -2282,7 +2282,7 @@ def test_apple_declined_refund_is_handled_rather_than_raising(pg_database):
     pool = backend.bootstrap_db(database_url=pg_database())
     assert pool
     master_key = nacl.signing.SigningKey.generate()
-    now = base.round_datetime_to_next_day(base.utc_now())
+    now = round_datetime_to_next_day(base.utc_now())
     err = base.ErrorSink()
 
     tx_ids = base.PaymentProviderTransaction(

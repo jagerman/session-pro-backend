@@ -572,16 +572,6 @@ def readable(value: pendulum.DateTime) -> str:
     return value.astimezone(pendulum.UTC).isoformat(sep=' ', timespec='milliseconds')
 
 
-def round_datetime_to_start_of_day(value: pendulum.DateTime) -> pendulum.DateTime:
-    return value.astimezone(pendulum.UTC).replace(hour=0, minute=0, second=0, microsecond=0)
-
-
-def round_datetime_to_next_day(value: pendulum.DateTime) -> pendulum.DateTime:
-    # Ceil to the next UTC midnight; a value already exactly at midnight stays put.
-    start = round_datetime_to_start_of_day(value)
-    return start if start == value else start + 1 * DAY
-
-
 def round_datetime_up_onto_offset_grid(
     value: pendulum.DateTime, period: pendulum.Duration, offset_seconds: int
 ) -> pendulum.DateTime:

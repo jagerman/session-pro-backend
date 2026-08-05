@@ -15,7 +15,7 @@ import base
 import minting
 import db
 
-from tests.helpers import _grant_voucher, _redeem_and_prove, _CreditFixture
+from tests.helpers import _grant_voucher, _redeem_and_prove, _CreditFixture, round_datetime_to_next_day
 
 
 def test_credit_stacks_on_nothing(pg_database):
@@ -24,7 +24,7 @@ def test_credit_stacks_on_nothing(pg_database):
     pool = backend.bootstrap_db(database_url=pg_database())
     assert pool
     with db.connection() as conn:
-        T = base.round_datetime_to_next_day(base.utc_now())
+        T = round_datetime_to_next_day(base.utc_now())
         f = _CreditFixture(conn, T)
         f.mint(30 * base.DAY)
         assert f.expiry() == T + 30 * base.DAY
@@ -39,7 +39,7 @@ def test_live_credit_has_no_expiry_until_it_runs_out(pg_database):
     pool = backend.bootstrap_db(database_url=pg_database())
     assert pool
     with db.connection() as conn:
-        T = base.round_datetime_to_next_day(base.utc_now())
+        T = round_datetime_to_next_day(base.utc_now())
         f = _CreditFixture(conn, T)
         credit = f.mint(30 * base.DAY)
 
@@ -91,7 +91,7 @@ def test_credit_stacks_on_a_live_subscription(pg_database):
     pool = backend.bootstrap_db(database_url=pg_database())
     assert pool
     with db.connection() as conn:
-        T = base.round_datetime_to_next_day(base.utc_now())
+        T = round_datetime_to_next_day(base.utc_now())
         f = _CreditFixture(conn, T)
         f.subscribe(expiry_at=T + 30 * base.DAY)
         assert f.expiry() == T + 30 * base.DAY
@@ -106,7 +106,7 @@ def test_credit_is_not_drained_or_absorbed_while_a_subscription_covers(pg_databa
     pool = backend.bootstrap_db(database_url=pg_database())
     assert pool
     with db.connection() as conn:
-        T = base.round_datetime_to_next_day(base.utc_now())
+        T = round_datetime_to_next_day(base.utc_now())
         f = _CreditFixture(conn, T)
         f.subscribe(expiry_at=T + 30 * base.DAY)
         credit = f.mint(30 * base.DAY)
@@ -133,7 +133,7 @@ def test_three_credits_stack_with_and_without_a_subscription(pg_database):
     pool = backend.bootstrap_db(database_url=pg_database())
     assert pool
     with db.connection() as conn:
-        T = base.round_datetime_to_next_day(base.utc_now())
+        T = round_datetime_to_next_day(base.utc_now())
         f = _CreditFixture(conn, T)
         f.subscribe(expiry_at=T + 30 * base.DAY)
         for _ in range(3):
@@ -162,7 +162,7 @@ def test_credit_only_account_actually_drains(pg_database):
     pool = backend.bootstrap_db(database_url=pg_database())
     assert pool
     with db.connection() as conn:
-        T = base.round_datetime_to_next_day(base.utc_now())
+        T = round_datetime_to_next_day(base.utc_now())
         f = _CreditFixture(conn, T)
         credit = f.mint(30 * base.DAY)
         assert f.expiry() == T + 30 * base.DAY  # so users.expiry_at IS in the future
@@ -179,7 +179,7 @@ def test_credit_exhaustion_does_not_slide(pg_database):
     pool = backend.bootstrap_db(database_url=pg_database())
     assert pool
     with db.connection() as conn:
-        T = base.round_datetime_to_next_day(base.utc_now())
+        T = round_datetime_to_next_day(base.utc_now())
         f = _CreditFixture(conn, T)
         credit = f.mint(30 * base.DAY)
 
@@ -203,7 +203,7 @@ def test_credit_multi_day_catchup_and_clock_skew(pg_database):
     pool = backend.bootstrap_db(database_url=pg_database())
     assert pool
     with db.connection() as conn:
-        T = base.round_datetime_to_next_day(base.utc_now())
+        T = round_datetime_to_next_day(base.utc_now())
         f = _CreditFixture(conn, T)
         a = f.mint(3 * base.DAY)
         b = f.mint(30 * base.DAY)
@@ -226,7 +226,7 @@ def test_credit_stale_after_gates_which_accounts_are_visited(pg_database):
     pool = backend.bootstrap_db(database_url=pg_database())
     assert pool
     with db.connection() as conn:
-        T = base.round_datetime_to_next_day(base.utc_now())
+        T = round_datetime_to_next_day(base.utc_now())
         f = _CreditFixture(conn, T)
         credit = f.mint(30 * base.DAY)
 
@@ -246,7 +246,7 @@ def test_credit_granted_while_covered_drains_only_after_the_lapse(pg_database):
     pool = backend.bootstrap_db(database_url=pg_database())
     assert pool
     with db.connection() as conn:
-        T = base.round_datetime_to_next_day(base.utc_now())
+        T = round_datetime_to_next_day(base.utc_now())
         f = _CreditFixture(conn, T)
         f.subscribe(expiry_at=T + 30 * base.DAY, auto_renewing=False)  # cancelled: covers to term end
         credit = f.mint(10 * base.DAY)
@@ -273,7 +273,7 @@ def test_credit_sampled_coverage_charges_a_whole_late_span(pg_database):
     pool = backend.bootstrap_db(database_url=pg_database())
     assert pool
     with db.connection() as conn:
-        T = base.round_datetime_to_next_day(base.utc_now())
+        T = round_datetime_to_next_day(base.utc_now())
         f = _CreditFixture(conn, T)
         f.subscribe(expiry_at=T + 30 * base.DAY, auto_renewing=False)
         credit = f.mint(30 * base.DAY)
@@ -293,7 +293,7 @@ def test_credit_dark_gap_charges_nobody_and_a_regrant_restarts_the_clock(pg_data
     pool = backend.bootstrap_db(database_url=pg_database())
     assert pool
     with db.connection() as conn:
-        T = base.round_datetime_to_next_day(base.utc_now())
+        T = round_datetime_to_next_day(base.utc_now())
         f = _CreditFixture(conn, T)
         first = f.mint(10 * base.DAY)
 
@@ -326,7 +326,7 @@ def test_credit_expiry_is_unmoved_by_unrelated_recomputes(pg_database):
     pool = backend.bootstrap_db(database_url=pg_database())
     assert pool
     with db.connection() as conn:
-        T = base.round_datetime_to_next_day(base.utc_now())
+        T = round_datetime_to_next_day(base.utc_now())
         f = _CreditFixture(conn, T)
         f.mint(30 * base.DAY)
         before = f.expiry()
@@ -354,7 +354,7 @@ def test_credit_expiry_obfuscation_is_not_perturbed_by_draining(pg_database):
     backend_key = nacl.signing.SigningKey.generate()
     rotating_key = nacl.signing.SigningKey.generate()
     with db.connection() as conn:
-        T = base.round_datetime_to_next_day(base.utc_now())
+        T = round_datetime_to_next_day(base.utc_now())
         f = _CreditFixture(conn, T)
         # Short enough that the proof pins to the account's expiry rather than the ~30d sliding cap.
         f.mint(20 * base.DAY)
@@ -393,7 +393,7 @@ def test_credit_survives_a_refund_and_grant_order_is_irrelevant(pg_database):
     pool = backend.bootstrap_db(database_url=pg_database())
     assert pool
     with db.connection() as conn:
-        T = base.round_datetime_to_next_day(base.utc_now())
+        T = round_datetime_to_next_day(base.utc_now())
         REFUND_AT = T + 60 * base.DAY
         err = base.ErrorSink()
 
@@ -429,7 +429,7 @@ def test_revoking_a_credit_drops_exactly_its_remaining(pg_database):
     pool = backend.bootstrap_db(database_url=pg_database())
     assert pool
     with db.connection() as conn:
-        T = base.round_datetime_to_next_day(base.utc_now())
+        T = round_datetime_to_next_day(base.utc_now())
         f = _CreditFixture(conn, T)
         f.subscribe(expiry_at=T + 30 * base.DAY)
         keep = f.mint(10 * base.DAY)
@@ -454,7 +454,7 @@ def test_credit_does_not_make_a_subscriber_look_non_renewing(pg_database):
     pool = backend.bootstrap_db(database_url=pg_database())
     assert pool
     with db.connection() as conn:
-        T = base.round_datetime_to_next_day(base.utc_now())
+        T = round_datetime_to_next_day(base.utc_now())
         f = _CreditFixture(conn, T)
         f.subscribe(expiry_at=T + 30 * base.DAY, grace=2 * base.DAY)
         f.mint(365 * base.DAY)
@@ -481,7 +481,7 @@ def test_minted_credit_never_claims_to_renew(pg_database):
     pool = backend.bootstrap_db(database_url=pg_database())
     assert pool
     with db.connection() as conn:
-        T = base.round_datetime_to_next_day(base.utc_now())
+        T = round_datetime_to_next_day(base.utc_now())
         for provider in (
             base.PaymentProvider.SessionFoundation,
             base.PaymentProvider.GooglePlayStore,
@@ -519,7 +519,7 @@ def test_credit_sub_day_length(pg_database):
     pool = backend.bootstrap_db(database_url=pg_database())
     assert pool
     with db.connection() as conn:
-        T = base.round_datetime_to_next_day(base.utc_now())
+        T = round_datetime_to_next_day(base.utc_now())
         f = _CreditFixture(conn, T)
         credit = f.mint(base.duration_from_seconds(30))
         assert f.expiry() == T + base.duration_from_seconds(30)
@@ -540,7 +540,7 @@ def test_grant_voucher(pg_database):
     backend_key = nacl.signing.SigningKey.generate()
     master_key = nacl.signing.SigningKey.generate()
     rotating_key = nacl.signing.SigningKey.generate()
-    now = base.round_datetime_to_next_day(base.utc_now())
+    now = round_datetime_to_next_day(base.utc_now())
 
     with db.connection() as conn:
         assert not backend.get_user(conn, master_key.verify_key).found
@@ -574,7 +574,7 @@ def test_refund_during_store_grace_is_announced(pg_database):
     rotating_key = nacl.signing.SigningKey.generate()
 
     with db.connection() as conn:
-        T = base.round_datetime_to_next_day(base.utc_now())
+        T = round_datetime_to_next_day(base.utc_now())
         err = base.ErrorSink()
 
         # A subscription whose paid term ends today, in a 16-day store grace: the account is covered well

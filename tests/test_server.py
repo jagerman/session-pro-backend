@@ -18,6 +18,8 @@ import psycopg_pool
 from providers import google_play
 from vendor import onion_req
 import backend
+
+from tests.helpers import round_datetime_to_next_day
 import base
 import server
 import db
@@ -53,7 +55,7 @@ def test_server_add_payment_flow(monkeypatch, pg_database):
     start_unix_ts_ms = int(time.time() * 1000)
     unix_ts_ms = start_unix_ts_ms  # ms, for the wire bodies
     request_at = base.datetime_from_unix_ms(unix_ts_ms)  # datetime, for hashes + DB seeding
-    next_day_at = base.round_datetime_to_next_day(request_at)
+    next_day_at = round_datetime_to_next_day(request_at)
     master_key = nacl.signing.SigningKey.generate()
     rotating_key = nacl.signing.SigningKey.generate()
     payment_tx = base.PaymentProviderTransaction()

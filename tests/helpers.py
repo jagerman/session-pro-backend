@@ -97,6 +97,18 @@ class TestingContext:
             yield conn
 
 
+def round_datetime_to_next_day(value: pendulum.DateTime) -> pendulum.DateTime:
+    """Ceil to the next UTC midnight; a value already exactly at midnight stays put.
+
+    Test scaffolding. The backend rounds nothing to a day — the proof expiry lands on a per-account grid
+    and every other instant is stored as it happened — so this exists for the two things tests want from
+    it: the day boundaries the recorded Google sequences were captured against (see
+    round_datetime_to_next_store_day), and a `now` with no sub-second part, so a test comparing against a
+    whole-second wire value is not defeated by microseconds. Only the first of those actually needs a DAY."""
+    start = value.astimezone(pendulum.UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+    return start if start == value else start + 1 * base.DAY
+
+
 def round_datetime_to_next_store_day(at: pendulum.DateTime, compressed: bool) -> pendulum.DateTime:
     """Round `at` up to the next day boundary, or to the next ten seconds when a store is running a license
     tester's compressed "day".
@@ -105,7 +117,7 @@ def round_datetime_to_next_store_day(at: pendulum.DateTime, compressed: bool) ->
     clock a store is running. The recorded Google RTDN sequences were captured against the compressed one,
     so their assertions have to land on those boundaries."""
     if not compressed:
-        return base.round_datetime_to_next_day(at)
+        return round_datetime_to_next_day(at)
     google_day = pendulum.duration(seconds=10)
     elapsed = at - base.EPOCH
     units = -((-elapsed) // google_day)  # ceil-divide the duration
@@ -148,10 +160,8 @@ def _grant_voucher(conn, master_key, at, duration, plan=None):
 def _grant_and_get_offset(conn, backend_key, master_key, rotating_key, granted_at, expiry_at, plan=None):
     """Grant a voucher long enough to run to `expiry_at` and return the account's proof-expiry offset.
 
-    `granted_at` must be a UTC day boundary for the entitlement to end exactly at `expiry_at`: a credit is
-    anchored at its day-rounded redemption instant, so granting at any other time of day runs the
-    entitlement to the following midnight plus the length. Callers that assert on the resulting expiry need
-    `base.round_datetime_to_next_day` first; callers that only read the offset back do not care."""
+    The credit is anchored at `granted_at` exactly — the redemption instant is stored as it happened — so
+    the entitlement ends at `expiry_at` whatever time of day the grant lands on."""
     _grant_voucher(conn, master_key, at=granted_at, duration=expiry_at - granted_at, plan=plan)
     return backend.get_user(conn, master_key.verify_key).proof_expiry_offset
 

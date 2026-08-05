@@ -16,7 +16,7 @@ import base
 from providers import app_store
 import db
 
-from tests.helpers import pk_hex, derived_status, _redeem_and_prove
+from tests.helpers import pk_hex, derived_status, _redeem_and_prove, round_datetime_to_next_day
 
 
 def test_reconcile_pending_payments(pg_database):
@@ -28,7 +28,7 @@ def test_reconcile_pending_payments(pg_database):
 
     master = nacl.signing.SigningKey.generate()
     other = nacl.signing.SigningKey.generate()
-    now = base.round_datetime_to_next_day(base.utc_now())
+    now = round_datetime_to_next_day(base.utc_now())
 
     def seed_google(conn, master_vk):
         tx = base.PaymentProviderTransaction()
@@ -72,7 +72,7 @@ def test_generate_pro_proof_auto_redeems(pg_database):
     backend_key = nacl.signing.SigningKey.generate()
     master_key = nacl.signing.SigningKey.generate()
     rotating_key = nacl.signing.SigningKey.generate()
-    now = base.round_datetime_to_next_day(base.utc_now())
+    now = round_datetime_to_next_day(base.utc_now())
 
     with db.connection() as conn:
         # A mule-registered, unredeemed Google payment bound to the master key.
@@ -129,7 +129,7 @@ def test_provider_dry_run_redeems_google_without_egress(monkeypatch, pg_database
     master_key = nacl.signing.SigningKey.generate()
     rotating_key = nacl.signing.SigningKey.generate()
     now = base.utc_now()
-    redeemed_at = base.round_datetime_to_next_day(now)
+    redeemed_at = round_datetime_to_next_day(now)
 
     db_conn = db_engine.getconn()
     try:
@@ -570,7 +570,7 @@ def test_renewal_binds_by_identifier_not_account_id(pg_database):
     assert pool
     owner = nacl.signing.SigningKey.generate()  # the payment's stored account-id
     binder = nacl.signing.SigningKey.generate()  # who we actually bind it to
-    now = base.round_datetime_to_next_day(base.utc_now())
+    now = round_datetime_to_next_day(base.utc_now())
 
     def seed_google(conn, account_id_key):
         tx = base.PaymentProviderTransaction()
@@ -632,7 +632,7 @@ def test_revocation_cutting_refund_rolls_generation(monkeypatch, pg_database):
     master_key = nacl.signing.SigningKey.generate()
     rotating_key = nacl.signing.SigningKey.generate()
     now = base.utc_now()
-    redeemed_at = base.round_datetime_to_next_day(now)
+    redeemed_at = round_datetime_to_next_day(now)
 
     db_conn = db_engine.getconn()
 
@@ -698,7 +698,7 @@ def test_revocation_skips_broadcast_when_an_unclaimed_payment_survives(pg_databa
     master_key = nacl.signing.SigningKey.generate()
     rotating_key = nacl.signing.SigningKey.generate()
     now = base.utc_now()
-    redeemed_at = base.round_datetime_to_next_day(now)
+    redeemed_at = round_datetime_to_next_day(now)
 
     db_conn = db_engine.getconn()
 
@@ -762,7 +762,7 @@ def test_payment_binding_rejects_mismatched_master_key(pg_database):
     owner = nacl.signing.SigningKey.generate()
     attacker = nacl.signing.SigningKey.generate()
     now = base.utc_now()
-    redeemed_at = base.round_datetime_to_next_day(now)
+    redeemed_at = round_datetime_to_next_day(now)
 
     db_conn = db_engine.getconn()
     try:
