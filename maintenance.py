@@ -98,7 +98,7 @@ def _prune() -> None:
             except Exception:
                 log.error(f'Prune of {name} failed:\n{traceback.format_exc()}')
                 counts.append(f'{name}=FAILED')
-    log.info(f'Pruned expired rows ({", ".join(counts)})')
+    log.debug(f'Pruned expired rows ({", ".join(counts)})')
 
 
 def _drain_credits(window: pendulum.Duration) -> None:
@@ -106,7 +106,10 @@ def _drain_credits(window: pendulum.Duration) -> None:
     with db.connection() as conn:
         visited = backend.drain_due_credits(conn, now=now, stale_after=window)
     if visited:
-        log.info(f'Drained credits for {visited} account(s)')
+        # How many accounts the pass LOOKED at, which is not a payment event -- an account is visited on
+        # every window whether or not its credits had anything to give. What was actually charged, and any
+        # credit that ran out, is reported by the drain itself.
+        log.debug(f'Drained credits for {visited} account(s)')
 
 
 def loop(tasks: list[Task], stop: threading.Event) -> None:
@@ -188,7 +191,9 @@ def run() -> None:
         def _drain_google_reconciles() -> None:
             drained = google_play.drain_due_reconciles(at=base.utc_now())
             if drained:
-                log.info(f'Reconciled {drained} Google subscription(s)')
+                # A count of tokens looked at; most converge to what we already had. The ones that changed
+                # something say so individually, at INFO, from the converge.
+                log.debug(f'Reconciled {drained} Google subscription(s)')
 
         tasks.append(
             Task(name='google-reconcile', interval_s=GOOGLE_RECONCILE_INTERVAL_S, run=_drain_google_reconciles)

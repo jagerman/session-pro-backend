@@ -229,6 +229,14 @@ def handle_parsed_notification(tx: db.SQLTransaction, parse: ParsedNotification,
                     payment_token=parse.purchase_token,
                     eligible_at=event_at if event_at < enqueue_now else enqueue_now,
                 )
+                # DEBUG because a notification is not itself an event: it says only that this token needs a
+                # look, and whatever it turns out to have changed is reported by the converge. The type is
+                # logged all the same — it is the store's own account of why it woke us, and it is the last
+                # place the type is visible now that nothing dispatches on it.
+                log.debug(
+                    f'RTDN {reflect_enum(parse.sub_type)} for {base.maybe_obfuscate(parse.purchase_token)}: '
+                    f'queued for reconcile at {base.readable(min(event_at, enqueue_now))}'
+                )
 
                 # The one fact the resource cannot express, so the one thing the type still decides. A
                 # revoked subscription reads EXPIRED with a back-dated term, which is indistinguishable from
@@ -251,6 +259,10 @@ def handle_parsed_notification(tx: db.SQLTransaction, parse: ParsedNotification,
                 tx.cancel = True
         case ParsedNotificationPayloadType.Voided:
             try:
+                log.debug(
+                    f'Voided purchase RTDN ({reflect_enum(parse.voided.product_type)}, '
+                    f'{reflect_enum(parse.voided.refund_type)}); a subscription revocation arrives separately'
+                )
                 handle_voided_notification(parse.voided, err)
             except Exception:
                 err.msg_list.append(f"Handling notification failed: {traceback.format_exc()}")
@@ -266,7 +278,9 @@ def handle_parsed_notification(tx: db.SQLTransaction, parse: ParsedNotification,
             tx.cancel = True
 
         case ParsedNotificationPayloadType.Test:
-            pass
+            # Logged because this is what somebody clicking "Send test notification" in the Play Console is
+            # looking for: the one message whose whole purpose is to prove the pipeline is connected.
+            log.info('Received a Google Play test notification; the Pub/Sub pipeline is connected')
 
     result = not err.has()
     if err.has():
@@ -340,6 +354,9 @@ def _sweep_pending_acks() -> None:
             try:
                 with db.connection() as conn:
                     backend.google_clear_needs_ack(conn, payment_token=token)
+                # INFO rather than DEBUG: this is the step that stops Google auto-refunding the purchase at
+                # three days, so "did it ever happen" is a question worth being able to answer from the log.
+                log.info(f'Acknowledged Google purchase {base.maybe_obfuscate(token)}')
             except Exception:
                 log.error(
                     f'needs_ack sweep: acked but failed to clear flag for {base.maybe_obfuscate(token)}. '
@@ -741,6 +758,7 @@ def drain_due_reconciles(at: pendulum.DateTime) -> int:
     for claim in claims:
         err = base.ErrorSink()
         try:
+            log.debug(f'Reconciling {base.maybe_obfuscate(claim.payment_token)} (attempt {claim.attempts + 1})')
             # Outside any transaction, on purpose. See above.
             details = api.fetch_subscription_v2_details(api.package_name, claim.payment_token, err)
             if err.has() or details is None:
@@ -838,6 +856,14 @@ def reconcile_google_subscription(
     # indistinguishable from any other extension by its value alone, so this is what lets the converge keep
     # the paid term and record the extension beside it rather than overwriting one with the other.
     in_grace = tx_event.subscription_state == SubscriptionsV2State.IN_GRACE_PERIOD
+
+    # The resource as fetched, before anything is written from it: the input to every decision below, and
+    # the only record of what the store actually said if a converge later looks wrong.
+    log.debug(
+        f'Subscription resource for {base.maybe_obfuscate(purchase_token)}: '
+        f'{reflect_enum(tx_event.subscription_state)}, plan={tx_event.pro_plan.name}, '
+        f'expiry={base.readable(expiry_at)}, auto_renewing={auto_renewing}, needs_ack={needs_ack}'
+    )
 
     converged = backend.google_converge_payment(
         tx,

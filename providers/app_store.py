@@ -230,6 +230,13 @@ def handle_notification_tx(
     assert decoded_notification.body.notificationType is not None
     notif_type = decoded_notification.body.notificationType.name
 
+    # Every branch below narrates what it decided at DEBUG, but a branch that decides nothing narrates
+    # nothing, so without this a notification we accepted and ignored is indistinguishable from one that
+    # never arrived. Type + subtype is also what an App Store Connect notification history entry is keyed
+    # by, which is what makes a log line matchable against Apple's own record of the delivery.
+    subtype = decoded_notification.body.subtype
+    log.debug(f'Apple notification {notif_type}{f"+{subtype.name}" if subtype else ""} received')
+
     # NOTE: Exhaustively handle all the notification types defined by Apple:
     #
     #   Notification Types
@@ -987,9 +994,14 @@ def handle_notification_tx(
             err.msg_list.append(f'{notif_type} is missing TX info {print_obj(tx)}')
 
         if not err.has():
-            log.debug(f'{notif_type} for {payment_tx_id_label(payment_tx)}: No-op')
-
             if decoded_notification.body.notificationType == AppleNotificationV2.EXPIRED:
+                # Not a no-op, whatever the grouping suggests -- see below. The blanket "No-op" that used to
+                # be logged here for the whole group said otherwise on the one branch of it that writes.
+                log.debug(
+                    f'{notif_type} for {payment_tx_id_label(payment_tx)}: '
+                    f'the store has stopped trying to renew this subscription'
+                )
+
                 # A notification type that, along with its subtype, indicates that a subscription
                 # expired. If the subtype is VOLUNTARY, the subscription expired after the customer
                 # turned off subscription renewal. If the subtype is BILLING_RETRY, the subscription
@@ -1026,7 +1038,10 @@ def handle_notification_tx(
                 #
                 # NOTE: No-op, the Session Pro proofs have an expiry date embedded into them and that is
                 # handled by the backend itself.
-                pass
+                log.debug(
+                    f'{notif_type} for {payment_tx_id_label(payment_tx)}: No-op; the store keeps retrying, '
+                    f'so the subscription still counts as renewing'
+                )
 
             elif decoded_notification.body.notificationType == AppleNotificationV2.CONSUMPTION_REQUEST:
                 # A notification type that indicates that the customer initiated a refund request for
@@ -1047,7 +1062,9 @@ def handle_notification_tx(
                 #
                 # We avoid all this because all we need to do when a user refunds is cancel their membership
                 # by issueing a revocation by the backend.
-                pass
+                log.debug(
+                    f'{notif_type} for {payment_tx_id_label(payment_tx)}: No-op; we send Apple no consumption data'
+                )
 
             else:  # Price increase
                 assert decoded_notification.body.notificationType == AppleNotificationV2.PRICE_INCREASE
@@ -1061,7 +1078,7 @@ def handle_notification_tx(
                 # If the price increase doesn’t require customer consent, the subtype is ACCEPTED.
                 #
                 # NOTE: No-op, the apps do not respond to price increases
-                pass
+                log.debug(f'{notif_type} for {payment_tx_id_label(payment_tx)}: No-op')
 
     # NOTE: Erroneous cases, scenarios we don't support/should never receive a notification for
     elif (
@@ -1186,20 +1203,20 @@ def trigger_test_notification(client: AppleAppStoreServerAPIClient, verifier: Ap
         return
     try:
         response_test_notif: AppleSendTestNotificationResponse = client.request_test_notification()
-        log.debug('Send test notif: ', response_test_notif)
+        log.debug(f'Send test notif: {response_test_notif}')
 
         notification_token = response_test_notif.testNotificationToken
         if notification_token:
             response_check_test_notif: AppleCheckTestNotificationResponse = client.get_test_notification_status(
                 test_notification_token=notification_token
             )
-            log.debug('Check test notif: ', response_check_test_notif)
+            log.debug(f'Check test notif: {response_check_test_notif}')
             if response_check_test_notif.signedPayload:
                 decoded_response: AppleResponseBodyV2DecodedPayload = verifier.verify_and_decode_notification(
                     signed_payload=response_check_test_notif.signedPayload
                 )
                 if base.UNSAFE_LOGGING:
-                    log.info('Decoded test response: ', decoded_response)
+                    log.debug(f'Decoded test response: {decoded_response}')
     except AppleAPIException as e:
         log.error(f'Failed to decode test notification: {e}')
 
@@ -1225,7 +1242,7 @@ def catchup_on_missed_notifications(core: Core, sql_conn: psycopg.Connection, no
     history_req.onlyFailures = True
     history_req.startDate = base.unix_ms_from_datetime(start_at)
     history_req.endDate = base.unix_ms_from_datetime(at)
-    log.info(f'Checking for missed notifications from {base.readable(start_at)} => {base.readable(at)}')
+    log.debug(f'Checking for missed notifications from {base.readable(start_at)} => {base.readable(at)}')
 
     if checkpoint_at != base.EPOCH and checkpoint_at < oldest_available:
         # Nothing has been handled since before Apple's retention window, so the notifications in between

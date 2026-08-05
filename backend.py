@@ -1092,6 +1092,11 @@ def refresh_entitlement_and_revoke_overreaching_proofs(
     ):
         return False
 
+    log.info(
+        f'Revoking the outstanding proofs of {base.maybe_obfuscate_bytes(bytes(master_pkey))}: coverage fell from '
+        f'{base.readable(prior_expiry)} to '
+        f'{base.readable(surviving_now) if surviving_now is not None else "nothing"}'
+    )
     revoke_master_pkey_proofs_and_allocate_new_gen_id(tx, master_pkey, created_at=at)
     return True
 
@@ -1319,6 +1324,10 @@ def reconcile_pending_payments(
     user_id = get_or_create_user_and_generation(tx, master_pkey, issued_at=redeemed_at)[0]
     db.query(tx.conn, 'UPDATE payments SET user_id = %(user_id)s WHERE id = ANY(%(ids)s)', user_id=user_id, ids=claimed)
     _ensure_active_generation(tx, master_pkey, issued_at=redeemed_at)
+    log.info(
+        f'Redeemed {len(claimed)} payment(s) for {base.maybe_obfuscate_bytes(bytes(master_pkey))} '
+        f'at {base.readable(redeemed_at)}'
+    )
     return len(claimed)
 
 
@@ -1412,6 +1421,10 @@ def redeem_minted_payment(
     )
     assert len(row_result.fetchall()) == 1, 'a freshly-minted payment must redeem exactly once'
     _ensure_active_generation(tx, master_pkey, issued_at=redeemed_at)
+    log.info(
+        f'Redeemed minted payment ({payment_provider_tx_log_label_safe(payment_tx)}) to '
+        f'{base.maybe_obfuscate_bytes(bytes(master_pkey))}'
+    )
 
 
 def verify_payment_provider_tx(payment_tx: base.PaymentProviderTransaction, err: base.ErrorSink):
@@ -1623,13 +1636,6 @@ def update_payment_renewal_info(
     you want to opt out of updating.
     """
 
-    if log.getEffectiveLevel() <= logging.INFO:
-        payment_tx_label = payment_provider_tx_log_label_safe(payment_tx)
-        log.info(
-            f'Update renewal info (payment={payment_tx_label}, grace period ms={grace_period}, '
-            f'auto_renewing={auto_renewing})'
-        )
-
     result = False
     verify_payment_provider_tx(payment_tx, err)
     if len(err.msg_list) > 0:
@@ -1714,6 +1720,19 @@ def update_payment_renewal_info(
     assert result_set
     row = typing.cast(tuple[bytes] | None, result_set.fetchone())
     result = row is not None
+
+    # Phrased as what the store just told us about the subscription rather than as "renewal info updated":
+    # these arrive when a subscriber cancels, resubscribes, or is granted a grace period, and that is what
+    # someone reads the line to find out. An argument of None means "not being changed" and says nothing.
+    # Reported only once the write has landed, so the line is a record of what happened rather than of what
+    # was attempted -- the no-matching-payment case is reported through `err` below instead.
+    if result and log.getEffectiveLevel() <= logging.INFO:
+        renewal = {None: '', True: 'will renew', False: 'cancelled; will not renew'}[auto_renewing]
+        grace = '' if grace_period is None else f'granted a grace period of {grace_period.in_words()}'
+        log.info(
+            f'Payment ({payment_provider_tx_log_label_safe(payment_tx)}): '
+            f'{"; ".join(it for it in (renewal, grace) if it)}'
+        )
 
     # NOTE: Update the user's expiry to the latest known expiry
     if row and row[0]:
@@ -2268,6 +2287,17 @@ def drain_due_credits(tx: db.SQLTransaction, now: pendulum.DateTime, stale_after
         for payment_id, new_remaining in drained.updated:
             spent_so_far += remaining_before[payment_id] - new_remaining
             emptied_at = checkpoint + spent_so_far if new_remaining == pendulum.duration() else None
+            if emptied_at is not None:
+                log.info(
+                    f'Credit {payment_id} of {base.maybe_obfuscate_bytes(bytes(master_pkey))} ran out at '
+                    f'{base.readable(emptied_at)}'
+                )
+            elif log.getEffectiveLevel() <= logging.DEBUG:
+                log.debug(
+                    f'Charged {(remaining_before[payment_id] - new_remaining).in_words()} against credit '
+                    f'{payment_id} of {base.maybe_obfuscate_bytes(bytes(master_pkey))}; '
+                    f'{new_remaining.in_words()} left'
+                )
             db.query(
                 tx.conn,
                 '''
@@ -2562,7 +2592,9 @@ def generate_pro_proof(
     master_sig: bytes,
     rotating_sig: bytes,
 ) -> ProSubscriptionProof:
-    log.info(f'Get pro proof (master={base.maybe_obfuscate_bytes(master_pkey)}, ts={base.readable(request_at)})')
+    # DEBUG, not INFO: a client re-requests its proof routinely, so this is request traffic rather than
+    # something happening to a payment. The redeem it may trigger below reports itself at INFO.
+    log.debug(f'Get pro proof (master={base.maybe_obfuscate_bytes(master_pkey)}, ts={base.readable(request_at)})')
 
     # Authenticate the request (raises FailError(bad_signature) / invalid_request on failure).
     message: bytes = make_generate_pro_proof_message(
@@ -2820,6 +2852,59 @@ def google_clear_needs_ack(tx: db.SQLTransaction, payment_token: str) -> None:
     )
 
 
+def _log_google_convergence(
+    payment_tx: base.PaymentProviderTransaction,
+    old_expiry: pendulum.DateTime | None,
+    old_auto_renewing: bool,
+    old_grace: pendulum.Duration | None,
+    new_expiry: pendulum.DateTime,
+    new_auto_renewing: bool,
+    new_grace: pendulum.Duration | None,
+) -> None:
+    """Report what a converge did to one payment: INFO when the row moved, DEBUG when it did not.
+
+    The split is the whole point. A converge runs on every notification and every reconcile pass, and the
+    great majority write back what was already there — an operator watching INFO wants the renewal, the
+    cancellation and the grace period, not the several hundred confirmations that nothing changed.
+
+    Phrased as what happened to the subscription rather than as a column diff, because the columns do not
+    say it on their own: an expiry moving later is a renewal, unless a grace period appeared at the same
+    time, in which case the term did not move at all and the store extended it (see the caller's docstring).
+    """
+    changes: list[str] = []
+    if new_expiry != old_expiry:
+        if old_expiry is None:
+            changes.append(f'term set to {base.readable(new_expiry)}')
+        elif new_expiry > old_expiry:
+            changes.append(f'renewed through {base.readable(new_expiry)}')
+        else:
+            changes.append(f'term shortened to {base.readable(new_expiry)} (was {base.readable(old_expiry)})')
+
+    # "store grace runs to", never "covered until": what we actually serve is that instant plus the renewal
+    # latency allowance, which is ours and applied on read. Calling the store's number the coverage would
+    # misreport the horizon by an hour to anyone reading this line to explain a proof.
+    if new_grace != old_grace:
+        if new_grace is None:
+            changes.append('grace period ended')
+        elif old_grace is None:
+            changes.append(f'entered the store grace period, which runs to {base.readable(new_expiry + new_grace)}')
+        else:
+            changes.append(f'store grace period revised, now running to {base.readable(new_expiry + new_grace)}')
+
+    if new_auto_renewing != old_auto_renewing:
+        changes.append('renewal re-enabled' if new_auto_renewing else 'cancelled; will not renew')
+
+    # Labelled the same way as every other payment line, so one account's history greps out of the log as a
+    # whole rather than in provider-specific dialects.
+    if changes:
+        log.info(f'Payment ({payment_provider_tx_log_label_safe(payment_tx)}): {"; ".join(changes)}')
+    elif log.getEffectiveLevel() <= logging.DEBUG:
+        log.debug(
+            f'Payment ({payment_provider_tx_log_label_safe(payment_tx)}): unchanged by the store snapshot '
+            f'(expiry={base.readable(new_expiry)}, grace={new_grace}, auto_renewing={new_auto_renewing})'
+        )
+
+
 @db.transactional
 def google_converge_payment(
     tx: db.SQLTransaction,
@@ -2843,8 +2928,8 @@ def google_converge_payment(
     Two things the snapshot does NOT get to overrule:
 
     * A REVOKED row is terminal and is left entirely alone. Google reports a refunded subscription as
-      expired, but it does not report *that money came back* — that is the void feed's job — so converging a
-      revoked row on the resource would quietly undo a refund we already recorded, and could extend its
+      expired, but it does not report *that money came back* — that arrives as its own RTDN — so converging
+      a revoked row on the resource would quietly undo a refund we already recorded, and could extend its
       expiry past the instant entitlement actually stopped.
     * A CLAIMED row's ownership. Convergence adjusts the terms of a payment, never who holds it.
 
@@ -2886,6 +2971,38 @@ def google_converge_payment(
 
     assert payment_tx.provider == base.PaymentProvider.GooglePlayStore, 'Google-only: keyed on (token, order id)'
 
+    # Read the row before writing it, under the same predicates the UPDATE uses, so the log below can report
+    # what actually moved rather than restating what we asked for — a converge that changes nothing is the
+    # common case and must be distinguishable from one that renews, cancels or opens a grace period.
+    #
+    # `FOR UPDATE` is not extra caution on top of the reconcile lease: the lease only serialises drain
+    # against drain on one token, never drain against the notification thread stamping a REVOKED. The single
+    # UPDATE this replaced was atomic against that by construction, and splitting it into a read and a write
+    # is what opened the window — so the lock restores exactly what the read-before-write spent. Concretely
+    # it is what makes the assert below sound: without it a revoke landing in between would leave the UPDATE
+    # matching nothing, and a log line would have crashed the drain.
+    #
+    # `OF p` locks the payments row only, so the assert additionally rests on `google_play_payment_details`'
+    # key columns never being rewritten (`needs_ack` is the sole column anything updates, and nothing deletes
+    # a detail row). That is convention, not constraint: a future writer that moves a token or order id
+    # between these two statements would make the assert reachable.
+    before = db.query_one(
+        tx.conn,
+        '''
+        SELECT p.expiry_at, p.auto_renewing, p.grace_period
+        FROM   payments p JOIN google_play_payment_details gd ON gd.payment_id = p.id
+        WHERE  gd.payment_token = %(token)s AND gd.order_id = %(order_id)s
+          AND  p.revoked_at IS NULL
+        FOR    UPDATE OF p
+    ''',
+        token=payment_tx.google_payment_token,
+        order_id=payment_tx.google_order_id,
+    )
+    if before is None:
+        # Either no such payment or a revoked one; both are "nothing to converge".
+        return False
+    old_expiry, old_auto_renewing, old_grace = before
+
     rows = db.query(
         tx.conn,
         '''
@@ -2903,7 +3020,8 @@ def google_converge_payment(
         WHERE  gd.payment_id = p.id
           AND  gd.payment_token = %(token)s AND gd.order_id = %(order_id)s
           AND  p.revoked_at IS NULL
-        RETURNING (SELECT master_pkey FROM users WHERE users.id = p.user_id)
+        RETURNING (SELECT master_pkey FROM users WHERE users.id = p.user_id),
+                  p.expiry_at, p.auto_renewing, p.grace_period
     ''',
         token=payment_tx.google_payment_token,
         order_id=payment_tx.google_order_id,
@@ -2913,10 +3031,20 @@ def google_converge_payment(
     )
 
     # RETURNING breaks rowcount (see update_payment_renewal_info), so the fetch is what tells us whether a
-    # row matched. Absent means either no such payment or a revoked one; both are "nothing to converge".
-    row = typing.cast(tuple[bytes | None] | None, rows.fetchone())
-    if row is None:
-        return False
+    # row matched. It reports the values as WRITTEN, so the grace split is described by the rule that
+    # performed it rather than by a second copy of that rule here.
+    row = rows.fetchone()
+    assert row is not None, 'the SELECT ... FOR UPDATE above matched, so the UPDATE must too'
+    owner_pkey, new_expiry, new_auto_renewing, new_grace = row
+    _log_google_convergence(
+        payment_tx,
+        old_expiry=old_expiry,
+        old_auto_renewing=old_auto_renewing,
+        old_grace=old_grace,
+        new_expiry=new_expiry,
+        new_auto_renewing=new_auto_renewing,
+        new_grace=new_grace,
+    )
 
     db.query(
         tx.conn,
@@ -2938,8 +3066,8 @@ def google_converge_payment(
     # certifying a horizon the account no longer has. Safe on the paths where nothing fell: the rule claims
     # pending payments before deciding, so an upgrade's replacement is bound first, the delta gate sees no
     # fall, and it returns without announcing anything.
-    if row[0] is not None:
-        refresh_entitlement_and_revoke_overreaching_proofs(tx, nacl.signing.VerifyKey(bytes(row[0])), at=at)
+    if owner_pkey is not None:
+        refresh_entitlement_and_revoke_overreaching_proofs(tx, nacl.signing.VerifyKey(bytes(owner_pkey)), at=at)
     return True
 
 

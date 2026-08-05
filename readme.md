@@ -129,6 +129,30 @@ unsafe_logging               = false
 # url     = <url...>
 # name    = <display name...>
 
+# NOTE: The [logging] section is optional; without it everything logs at INFO.
+[logging]
+
+# Default level for every logger: DEBUG, INFO, WARNING, ERROR or CRITICAL (case-insensitive).
+#
+# The tiers mean something specific here, and code added to this repo is expected to keep to them:
+#
+#   INFO     One line per payment action -- a purchase registered or redeemed, a renewal, a
+#            cancellation, a grace period beginning or ending, an acknowledgement, a credit running
+#            out, a proof revocation broadcast. Nothing that repeats on a timer, and nothing that
+#            merely confirms a converge changed nothing.
+#   DEBUG    The steps within those actions: a notification arriving, a subscription resource as
+#            fetched, a reconcile attempt, a client requesting its proof, the periodic sweeps.
+#   WARNING+ Never routine, always worth reading: a failing acknowledgement, an unattributable
+#            purchase, a reconcile that has given up. See docs/limitations.md.
+#
+# Production usually wants WARNING, since INFO's volume follows the subscriber count.
+level                        = info
+
+# level-<logger>: override one logger by the name that appears in its log lines. Ours are `pro`,
+# `backend`, `google` and `apple`; any other name reaches a third-party logger, so
+# `level-werkzeug = error` quietens Flask's request log on its own.
+level-google                 = debug
+
 # NOTE: The [apple] section and its fields are only required if `with_provider_app_store` is defined
 [apple]
 
