@@ -23,9 +23,9 @@ information from the DB.
 - `main.py`: Entry point of application that setups the basic environment for the
 database and then hands over control flow to Flask to handle HTTP requests.
 
-- `cli.py`: Command-line interface for database operations. Use this for user error
-  management, Google notification handling, revocations, report generation, and DB
-  inspection. Run `python cli.py --help` for detailed usage information.
+- `cli.py`: Command-line interface for database operations. Use this for Google notification
+  handling, revocations, vouchers, report generation, and DB inspection. Run
+  `python cli.py --help` for detailed usage information.
 
 - `providers/app_store.py`: iOS App Store layer that exposes a HTTP route to
 receive subscription notifications and turns the purchases they describe into
@@ -336,8 +336,6 @@ python cli.py --config config.ini voucher --master-pkey 0xabcd... --plan 12M
 # google_play/app_store mint a payment the store never saw, for exercising the per-provider paths;
 # both need provider_dry_run. Omit --provider for the default, stf.
 python cli.py --config config.ini voucher --master-pkey 0xabcd... --plan 1M --provider google_play
-
-# User error management (requires --config)
 
 # Google notification management (requires --config)
 python cli.py --config config.ini google-notification handle "12345"
