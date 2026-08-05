@@ -1043,6 +1043,15 @@ def handle_notification_tx(
                     f'so the subscription still counts as renewing'
                 )
 
+            elif decoded_notification.body.notificationType == AppleNotificationV2.REFUND_DECLINED:
+                # A notification type that indicates the App Store declined a refund request. Nothing to do:
+                # we only ever act on a refund that was GRANTED (REFUND), and this says one was not.
+                #
+                # It reaches this branch by name rather than by falling off the end of the chain. It is
+                # listed in the condition above, but the tail of the chain asserted PRICE_INCREASE, so the
+                # first declined refund would have raised — a 500 back to Apple, redelivered forever.
+                log.debug(f'{notif_type} for {payment_tx_id_label(payment_tx)}: No-op; the refund was refused')
+
             elif decoded_notification.body.notificationType == AppleNotificationV2.CONSUMPTION_REQUEST:
                 # A notification type that indicates that the customer initiated a refund request for
                 # a consumable in-app purchase or auto-renewable subscription, and the App Store is

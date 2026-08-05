@@ -2277,3 +2277,62 @@ def test_apple_expiry_after_billing_retry_clears_auto_renewing(pg_database):
         assert after.grace_period == 3 * base.DAY
         assert after.expiry_at == before.expiry_at, 'the term itself is untouched'
     pool.close()
+
+
+def test_apple_declined_refund_is_handled_rather_than_raising(pg_database):
+    # REFUND_DECLINED is listed among the notifications this handler accepts, but the chain that dispatches
+    # them ended in `assert notificationType == PRICE_INCREASE`, so the first declined refund would have
+    # raised. The webhook turns a raise into a 500, which Apple answers by redelivering -- so the failure
+    # mode was a notification that could never be accepted, retried until Apple gave up on it.
+    #
+    # There is nothing to DO with a declined refund: it says a refund we never acted on was refused. The
+    # requirement is only that it be accepted and change nothing.
+    pool = backend.bootstrap_db(database_url=pg_database())
+    assert pool
+    master_key = nacl.signing.SigningKey.generate()
+    now = base.round_datetime_to_next_day(base.utc_now())
+    err = base.ErrorSink()
+
+    tx_ids = base.PaymentProviderTransaction(
+        provider=base.PaymentProvider.iOSAppStore,
+        apple_original_tx_id='9000000000000011',
+        apple_tx_id='9000000000000011',
+        apple_web_line_order_tx_id='9000000000000012',
+    )
+
+    with db.connection() as conn:
+        backend.add_unredeemed_payment(
+            conn,
+            payment_tx=tx_ids,
+            plan=base.ProPlan.OneMonth,
+            expiry_at=now + 30 * base.DAY,
+            purchased_at=now,
+            platform_refund_expiry_at=now,
+            platform_obfuscated_account_id=app_store.uuid_from_master_pk(bytes(master_key.verify_key)),
+            err=err,
+        )
+        assert not err.has(), err.msg_list
+        before = backend.get_payments_list(conn)[-1]
+
+        body = app_store.AppleResponseBodyV2DecodedPayload()
+        body.notificationType = app_store.AppleNotificationV2.REFUND_DECLINED
+        body.notificationUUID = 'a1b2c3d4-0000-0000-0000-00000000e002'
+        body.signedDate = base.unix_ms_from_datetime(now)
+        tx_info = app_store.AppleJWSTransactionDecodedPayload()
+        tx_info.transactionId = tx_ids.apple_tx_id
+        tx_info.originalTransactionId = tx_ids.apple_original_tx_id
+        tx_info.webOrderLineItemId = tx_ids.apple_web_line_order_tx_id
+
+        assert app_store.handle_notification(
+            decoded_notification=app_store.DecodedNotification(body=body, tx_info=tx_info),
+            conn=conn,
+            notification_retry_duration=pendulum.duration(),
+            err=err,
+        )
+        assert not err.has(), err.msg_list
+
+        after = backend.get_payments_list(conn)[-1]
+        assert after.revoked_at is None, 'a refused refund revokes nothing'
+        assert after.expiry_at == before.expiry_at
+        assert after.auto_renewing == before.auto_renewing
+    pool.close()
