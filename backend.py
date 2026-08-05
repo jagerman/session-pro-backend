@@ -671,6 +671,42 @@ def get_user_payments_page(
     return [payment_row_from_dict(r) for r in db.query(tx.conn, sql, row_factory=db.dict_row, **params)]
 
 
+def get_account_latest_payment(tx: db.SQLTransaction, master_pkey: nacl.signing.VerifyKey) -> PaymentRow | None:
+    '''The account's latest payment that still stands: newest by the STORE's purchase instant, preferring one
+    that has not been revoked. `None` only when the account has no payments at all.
+
+    Ordered on `purchased_at`, never on `p.id`. The id is assigned when we first WITNESS a payment, so it
+    orders by delivery: a notification we accept late — the Apple catch-up drains failures up to 30 days
+    on, and a backlog after an outage does the same — lands a row for an old cycle above a newer purchase.
+    An account that moved between stores then reports the store it left. `purchased_at` is what the store
+    itself says about when the payment happened, which is the question being asked; the id only breaks ties.
+
+    Revoked rows sort last rather than being filtered out, which is one `ORDER BY` doing two jobs. Skipping
+    them is the point: buy on a second store by mistake, reverse it, and the account goes back to reporting
+    the subscription it actually still has, as soon as the revocation lands. Keeping them as the last resort
+    is equally deliberate — an account whose every payment was refunded still gets an item, because `null`
+    means "never had a payment" to a client and at least one of them renders an absent item as a default
+    provider, which is the same wrong-store answer by another road.
+
+    This is the LATEST payment, which is not necessarily the one whose coverage reaches furthest: a voucher
+    stacks its length on top of a subscription, so an account holding both has an entitlement that outlives
+    the payment named here. `users.expiry_at` (the sibling `expiry_ts`) is the account-level answer and comes
+    from `_lookup_user_expiry`; do not expect the two to agree.'''
+    row = db.query_one(
+        tx.conn,
+        f'''
+        SELECT   {PAYMENTS_COLUMNS}
+        FROM     {PAYMENTS_FROM}
+        WHERE    p.user_id = (SELECT id FROM users WHERE master_pkey = %s)
+        ORDER BY (p.revoked_at IS NULL) DESC, p.purchased_at DESC, p.id DESC
+        LIMIT    1
+        ''',
+        bytes(master_pkey),
+        row_factory=db.dict_row,
+    )
+    return payment_row_from_dict(row) if row is not None else None
+
+
 def get_user_payments_count(tx: db.SQLTransaction, master_pkey: nacl.signing.VerifyKey) -> int:
     return db.query_scalar(
         tx.conn,

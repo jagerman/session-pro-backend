@@ -337,9 +337,14 @@ def get_pro_status():
                 if backend.is_generation_revoked(tx.conn, user.current_generation_id, request_at):
                     user_pro_status = UserProStatus.Expired
 
-                page = backend.get_user_payments_page(tx, master_pkey_nacl, limit=1, before_id=None)
-                if page:
-                    latest_payment = _payment_item_wire(page[0], request_at)
+                # The newest payment that still stands, by the STORE's purchase instant — not the most
+                # recently recorded one, which orders by when we happened to witness it. Clients read the
+                # provider off this item to decide where a subscription is managed, so naming a store the
+                # user has left is a wrong answer, not a cosmetic one. It answers "what did you buy last",
+                # deliberately NOT the same question as the account-level expiry above (§5.2).
+                newest_payment = backend.get_account_latest_payment(tx, master_pkey_nacl)
+                if newest_payment is not None:
+                    latest_payment = _payment_item_wire(newest_payment, request_at)
 
     return make_success_response(
         {

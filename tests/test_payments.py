@@ -16,7 +16,7 @@ import base
 from providers import app_store
 import db
 
-from tests.helpers import pk_hex, derived_status, _redeem_and_prove, round_datetime_to_next_day
+from tests.helpers import pk_hex, derived_status, _redeem_and_prove, _grant_voucher, round_datetime_to_next_day
 
 
 def test_reconcile_pending_payments(pg_database):
@@ -61,6 +61,189 @@ def test_reconcile_pending_payments(pg_database):
         # A key with no payments claims nothing AND must not spawn a user row.
         assert backend.reconcile_pending_payments(conn, other.verify_key, redeemed_at=now) == 0
         assert not backend.get_user(conn, other.verify_key).found
+    pool.close()
+
+
+def _seed_store_payment(
+    conn, master_vk, provider: base.PaymentProvider, purchased_at, expiry_at, auto_renewing: bool = True
+) -> base.PaymentProviderTransaction:
+    '''Register one store subscription cycle for `master_vk` and claim it, as the mule + a client would.'''
+    tx = base.PaymentProviderTransaction()
+    tx.provider = provider
+    if provider == base.PaymentProvider.GooglePlayStore:
+        tx.google_payment_token = os.urandom(backend.BLAKE2B_DIGEST_SIZE).hex()
+        tx.google_order_id = os.urandom(backend.BLAKE2B_DIGEST_SIZE).hex()
+        account_id: bytes | str = bytes(master_vk)
+    else:
+        tx.apple_original_tx_id = os.urandom(8).hex()
+        tx.apple_tx_id = os.urandom(8).hex()
+        tx.apple_web_line_order_tx_id = os.urandom(8).hex()
+        account_id = app_store.uuid_from_master_pk(bytes(master_vk))
+    err = base.ErrorSink()
+    backend.add_unredeemed_payment(
+        conn,
+        payment_tx=tx,
+        plan=base.ProPlan.OneMonth,
+        purchased_at=purchased_at,
+        expiry_at=expiry_at,
+        platform_refund_expiry_at=base.EPOCH,
+        platform_obfuscated_account_id=account_id,
+        err=err,
+        auto_renewing=auto_renewing,
+    )
+    assert not err.msg_list, err.msg_list
+    assert backend.reconcile_pending_payments(conn, master_vk, redeemed_at=purchased_at) >= 1
+    return tx
+
+
+def test_latest_payment_orders_on_purchase_not_on_when_we_heard(pg_database):
+    # An account that moved from one store to another must report the store it is ON, not the one it left.
+    # Clients read `payment_provider` off this item to decide where a subscription is managed, so the wrong
+    # answer sends a Play subscriber to the App Store to cancel a subscription that is not there.
+    #
+    # `payments.id` cannot decide this: it is assigned when we first WITNESS a payment, so a notification
+    # accepted late lands a row for an old cycle above a newer purchase.
+    pool = backend.bootstrap_db(database_url=pg_database())
+    assert pool
+    master = nacl.signing.SigningKey.generate()
+    apple_at = round_datetime_to_next_day(base.utc_now())
+
+    with db.connection() as conn:
+        # Apple first: a burst of short cycles that all lapse (the shape a sandbox subscription leaves).
+        for cycle in range(3):
+            _seed_store_payment(
+                conn,
+                master.verify_key,
+                base.PaymentProvider.iOSAppStore,
+                purchased_at=apple_at + cycle * base.HOUR,
+                expiry_at=apple_at + (cycle + 1) * base.HOUR,
+            )
+        # Then Google, a day later and still live.
+        google_at = apple_at + 24 * base.HOUR
+        google_tx = _seed_store_payment(
+            conn,
+            master.verify_key,
+            base.PaymentProvider.GooglePlayStore,
+            purchased_at=google_at,
+            expiry_at=google_at + 30 * base.DAY,
+        )
+
+        # Register one more Apple cycle LAST, as a notification we accepted late would: purchased back with
+        # the others, but holding the highest id in the table. This is the trap.
+        _seed_store_payment(
+            conn,
+            master.verify_key,
+            base.PaymentProvider.iOSAppStore,
+            purchased_at=apple_at + 3 * base.HOUR,
+            expiry_at=apple_at + 4 * base.HOUR,
+        )
+
+        with db.transaction(conn) as tx:
+            newest_witnessed = backend.get_user_payments_page(tx, master.verify_key, limit=1, before_id=None)[0]
+            assert newest_witnessed.payment_provider == base.PaymentProvider.iOSAppStore, 'trap not set up'
+
+            latest = backend.get_account_latest_payment(tx, master.verify_key)
+            assert latest is not None
+            assert latest.payment_provider == base.PaymentProvider.GooglePlayStore
+            assert latest.google_payment_token == google_tx.google_payment_token
+    pool.close()
+
+
+def test_latest_payment_falls_back_past_a_revoked_purchase(pg_database):
+    # Buy on a second store by mistake, reverse it: the account goes back to reporting the subscription it
+    # actually still has, as soon as the revocation lands. A revoked payment is the newest thing that
+    # happened but not a payment that stands, and it is the standing one a client needs.
+    pool = backend.bootstrap_db(database_url=pg_database())
+    assert pool
+    master = nacl.signing.SigningKey.generate()
+    at = round_datetime_to_next_day(base.utc_now())
+
+    with db.connection() as conn:
+        apple_tx = _seed_store_payment(
+            conn, master.verify_key, base.PaymentProvider.iOSAppStore, purchased_at=at, expiry_at=at + 30 * base.DAY
+        )
+        google_tx = _seed_store_payment(
+            conn,
+            master.verify_key,
+            base.PaymentProvider.GooglePlayStore,
+            purchased_at=at + base.HOUR,
+            expiry_at=at + base.HOUR + 30 * base.DAY,
+        )
+        with db.transaction(conn) as tx:
+            latest = backend.get_account_latest_payment(tx, master.verify_key)
+            assert latest is not None
+            assert latest.payment_provider == base.PaymentProvider.GooglePlayStore, 'the mistaken buy is newest'
+
+        # The user reverses the Google purchase.
+        err = base.ErrorSink()
+        with db.transaction(conn) as tx:
+            assert backend.add_google_revocation(
+                tx, google_payment_token=google_tx.google_payment_token, revoke_at=at + 2 * base.HOUR, err=err
+            )
+        assert not err.msg_list, err.msg_list
+
+        with db.transaction(conn) as tx:
+            latest = backend.get_account_latest_payment(tx, master.verify_key)
+            assert latest is not None
+            assert latest.payment_provider == base.PaymentProvider.iOSAppStore
+            assert latest.apple.original_tx_id == apple_tx.apple_original_tx_id
+    pool.close()
+
+
+def test_latest_payment_of_an_all_revoked_account_is_still_a_payment(pg_database):
+    # Revoked rows sort last, they are not filtered away: an account whose every payment was refunded must
+    # still get an item. `null` means "never had a payment" to a client, and at least one renders an absent
+    # item as a default provider — the same wrong-store answer by another road.
+    pool = backend.bootstrap_db(database_url=pg_database())
+    assert pool
+    master = nacl.signing.SigningKey.generate()
+    at = round_datetime_to_next_day(base.utc_now())
+
+    with db.connection() as conn:
+        google_tx = _seed_store_payment(
+            conn, master.verify_key, base.PaymentProvider.GooglePlayStore, purchased_at=at, expiry_at=at + 30 * base.DAY
+        )
+        err = base.ErrorSink()
+        with db.transaction(conn) as tx:
+            assert backend.add_google_revocation(
+                tx, google_payment_token=google_tx.google_payment_token, revoke_at=at + base.HOUR, err=err
+            )
+        assert not err.msg_list, err.msg_list
+
+        with db.transaction(conn) as tx:
+            latest = backend.get_account_latest_payment(tx, master.verify_key)
+            assert latest is not None
+            assert latest.payment_provider == base.PaymentProvider.GooglePlayStore
+            assert latest.revoked_at is not None
+    pool.close()
+
+
+def test_latest_payment_is_the_newest_payment_not_the_longest_coverage(pg_database):
+    # A voucher stacks its length on top of the subscription, so the account's entitlement outlives the
+    # payment named here. That divergence is intended: this field answers "what did you buy last", while
+    # `users.expiry_at` (the wire's account-level `expiry_ts`) answers "how long are you covered".
+    pool = backend.bootstrap_db(database_url=pg_database())
+    assert pool
+    master = nacl.signing.SigningKey.generate()
+    at = round_datetime_to_next_day(base.utc_now())
+
+    with db.connection() as conn:
+        _seed_store_payment(
+            conn,
+            master.verify_key,
+            base.PaymentProvider.GooglePlayStore,
+            purchased_at=at,
+            expiry_at=at + 2 * base.HOUR,
+            auto_renewing=False,
+        )
+        _grant_voucher(conn, master, at=at + base.HOUR, duration=30 * base.DAY)
+
+        with db.transaction(conn) as tx:
+            latest = backend.get_account_latest_payment(tx, master.verify_key)
+        assert latest is not None
+        assert latest.payment_provider == base.PaymentProvider.SessionFoundation, 'the voucher was bought last'
+        # The account is covered well past the voucher's own receipt figure, and past the subscription too.
+        assert backend.get_user(conn, master.verify_key).expiry_at > at + 2 * base.HOUR
     pool.close()
 
 
