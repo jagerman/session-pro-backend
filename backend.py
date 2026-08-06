@@ -2638,27 +2638,36 @@ def generate_pro_proof(
     message: bytes = make_generate_pro_proof_message(
         master_pkey=master_pkey, rotating_pkey=rotating_pkey, request_at=request_at
     )
-    internal_verify_add_payment_and_get_proof_common_arguments(
-        signing_key=signing_key,
-        master_pkey=master_pkey,
-        rotating_pkey=rotating_pkey,
-        message=message,
-        master_sig=master_sig,
-        rotating_sig=rotating_sig,
-    )
+    # Every outcome below is reported, so a proof request always ends in exactly one INFO line. Without the
+    # refusal half, a client being turned away is indistinguishable from a client that never asked — and the
+    # two have completely different causes.
+    try:
+        internal_verify_add_payment_and_get_proof_common_arguments(
+            signing_key=signing_key,
+            master_pkey=master_pkey,
+            rotating_pkey=rotating_pkey,
+            message=message,
+            master_sig=master_sig,
+            rotating_sig=rotating_sig,
+        )
 
-    with db.transaction(conn) as tx:
-        # Reconcile first: claim any payment the mule has already registered for this key but that hasn't
-        # been redeemed yet, so a client's post-purchase proof request binds it right here — no separate
-        # redeem call. A no-op when there's nothing new. Then build the proof from the current entitlement
-        # (build_current_entitlement_proof raises the truthful "no Pro" slug if there's still nothing, which
-        # the client treats as "not yet — retry").
-        reconcile_pending_payments(tx, master_pkey, redeemed_at=request_at)
-        proof = build_current_entitlement_proof(tx, master_pkey, rotating_pkey, request_at, signing_key)
+        with db.transaction(conn) as tx:
+            # Reconcile first: claim any payment the mule has already registered for this key but that
+            # hasn't been redeemed yet, so a client's post-purchase proof request binds it right here — no
+            # separate redeem call. A no-op when there's nothing new. Then build the proof from the current
+            # entitlement (build_current_entitlement_proof raises the truthful "no Pro" slug if there's
+            # still nothing, which the client treats as "not yet — retry").
+            reconcile_pending_payments(tx, master_pkey, redeemed_at=request_at)
+            proof = build_current_entitlement_proof(tx, master_pkey, rotating_pkey, request_at, signing_key)
+    except base.FailError as e:
+        # The CODE, never `str(e)`: those messages carry the master key unobfuscated, and this is the one
+        # place a refusal reaches a log file. Re-raised untouched — the wire envelope is the caller's.
+        log.info(f'Refused Pro proof (master={base.maybe_obfuscate_bytes(master_pkey)}, reason={e.code.value})')
+        raise
 
     # Logged after the commit, and at INFO: signing a proof is the one action this endpoint exists to
     # perform, and this line is the only record of what was certified for whom and until when. The DEBUG
-    # line above is the request that asked; a request that is REFUSED raises and reports nothing here.
+    # line above is the request that asked.
     log.info(
         f'Issued Pro proof (master={base.maybe_obfuscate_bytes(master_pkey)}, '
         f'rotating={base.maybe_obfuscate_bytes(rotating_pkey)}, '

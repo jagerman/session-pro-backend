@@ -5,6 +5,7 @@ is told when it cannot have one.
 
 import itertools
 import json
+import logging
 import nacl.signing
 import nacl.bindings
 import nacl.public
@@ -466,3 +467,38 @@ def test_bump_revocation_ticket(pg_database):
     finally:
         db_engine.putconn(conn)
         db_engine.close()
+
+
+def test_a_proof_request_always_reports_exactly_one_outcome(pg_database, caplog):
+    # Issued and refused are equally worth recording: with only the issued half, a client being turned
+    # away looks identical in the log to a client that never asked, and those have opposite causes. The
+    # refusal carries the CODE and not the exception message, which holds the master key unobfuscated.
+    pool = backend.bootstrap_db(database_url=pg_database())
+    assert pool
+    backend_key = nacl.signing.SigningKey.generate()
+    master_key = nacl.signing.SigningKey.generate()
+    rotating_key = nacl.signing.SigningKey.generate()
+    now = round_datetime_to_next_day(base.utc_now())
+
+    def proof_lines() -> list[str]:
+        return [r.message for r in caplog.records if r.name == 'backend' and 'Pro proof' in r.message]
+
+    with db.connection() as conn:
+        # A key with no entitlement at all: refused, and said so once.
+        with caplog.at_level(logging.INFO, logger='backend'):
+            with pytest.raises(base.FailError) as excinfo:
+                _redeem_and_prove(conn, backend_key, master_key, rotating_key, now)
+        assert excinfo.value.code == base.ErrorCode.not_subscribed
+        assert len(proof_lines()) == 1, proof_lines()
+        assert proof_lines()[0].startswith('Refused Pro proof')
+        assert 'reason=not_subscribed' in proof_lines()[0]
+        assert bytes(master_key.verify_key).hex() not in proof_lines()[0], 'the key must be obfuscated'
+
+        # The same key once it has one: issued, and said so once.
+        caplog.clear()
+        _grant_voucher(conn, master_key, at=now, duration=30 * base.DAY)
+        with caplog.at_level(logging.INFO, logger='backend'):
+            _redeem_and_prove(conn, backend_key, master_key, rotating_key, now)
+        assert len(proof_lines()) == 1, proof_lines()
+        assert proof_lines()[0].startswith('Issued Pro proof')
+    pool.close()
