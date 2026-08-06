@@ -90,8 +90,12 @@ RUN printf '%s\n' \
     'plugins = python3,http' \
     'http = :80' \
     'module = main:flask_app' \
-    '# Singleton background work (the Google Pub/Sub subscriber) runs in ONE mule, not per-worker.' \
-    'mule = mule:run' \
+    '# Singleton background work runs in mules, not per-worker. Two of them, matching the paths in' \
+    "# the backend's own scripts/uwsgi/pro-backend.ini — keep them in step: a mule whose module can't" \
+    '# be imported is crippled and respawned forever, which uWSGI reports only in its own log while' \
+    '# the HTTP side keeps serving, so it stays invisible until someone reads the container output.' \
+    'mule = providers.google_play.mule:run' \
+    'mule = maintenance:run' \
     'master = true' \
     'processes = 4' \
     '# MUST be enabled: the mule runs the subscriber pull loop on a thread, and without this uWSGI' \
