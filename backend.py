@@ -892,13 +892,17 @@ def verify_db(conn: psycopg.Connection, err: base.ErrorSink) -> bool:
                 )
 
         if it.revoked_at is None and it.redeemed_at is not None:
-            # Redeemed (and not revoked): a redeemed payment must not have expired before it was redeemed.
-            # A live credit has no expiry yet, so there is nothing to compare.
-            if it.expiry_at is not None and it.expiry_at < it.redeemed_at:
-                redeemed_date = it.redeemed_at.strftime('%Y-%m-%d')
+            # A term cannot end before it began. Compared against the PURCHASE instant, not the redemption
+            # one: binding a payment whose term has already run out is legitimate and routine -- a
+            # notification we accept late, or a backlog drained after an outage, arrives for a cycle that
+            # has since ended, and the entitlement fold handles that on its own. Both instants here are the
+            # store's own, so this checks the store against itself. A live credit has no expiry yet, so
+            # there is nothing to compare.
+            if it.expiry_at is not None and it.expiry_at < it.purchased_at:
+                purchased_date = it.purchased_at.strftime('%Y-%m-%d')
                 expiry_date = it.expiry_at.strftime('%Y-%m-%d')
                 err.msg_list.append(
-                    f'Payment #{index} was expired ({expiry_date}) before it was activated ({redeemed_date})'
+                    f'Payment #{index} expired ({expiry_date}) before it was purchased ({purchased_date})'
                 )
 
         # NOTE: Verify the plan, it should always be set once it enters the DB..
@@ -2068,7 +2072,11 @@ def add_unredeemed_payment(
                     # transaction; we log it for internal visibility.
                     try:
                         with tx.conn.transaction():
-                            _redeem_payment_for_user(tx, master_pkey, payment_tx, redeemed_at=purchased_at)
+                            # OUR clock, not `purchased_at`: this is when we bound the payment, and the
+                            # store's instant can be days old by the time we see it (a catch-up drain, a
+                            # backlog after an outage). `purchased_at` above is the store's own fact and
+                            # belongs in the deadline test; it is not a redemption time.
+                            _redeem_payment_for_user(tx, master_pkey, payment_tx, redeemed_at=base.utc_now())
                         log.info(
                             f'Auto-redeemed payment (payment={payment_provider_tx_log_label_safe(payment_tx)}) '
                             f'to the account that owns the previous cycle of this subscription'

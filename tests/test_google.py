@@ -475,7 +475,11 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
     def assert_has_payment(
         tx: TestTx,
         plan: base.ProPlan,
-        redeemed_ts_ms: int,
+        # The instant the test itself claimed the payment at, when it drove the redeem. `None` where the
+        # MULE auto-redeemed it instead: that stamps our clock at the moment the notification was handled,
+        # which a test cannot predict, so all it can check is that the stamp is set and not before the
+        # purchase it belongs to.
+        redeemed_ts_ms: int | None,
         platform_refund_expiry_at: int,
         user_ctx: TestUserCtx,
         ctx: TestingContext,
@@ -489,7 +493,11 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
             assert derived_status(payment) == base.PaymentStatus.Redeemed
             assert payment.plan == plan
             assert payment.payment_provider == base.PaymentProvider.GooglePlayStore
-            assert payment.redeemed_at is not None and payment.redeemed_at == base.datetime_from_unix_ms(redeemed_ts_ms)
+            assert payment.redeemed_at is not None
+            if redeemed_ts_ms is not None:
+                assert payment.redeemed_at == base.datetime_from_unix_ms(redeemed_ts_ms)
+            else:
+                assert payment.redeemed_at >= payment.purchased_at
             assert payment.expiry_at == base.datetime_from_unix_ms(tx.expiry_at)
             assert payment.grace_period is None
             assert payment.platform_refund_expiry_at == base.datetime_from_unix_ms(platform_refund_expiry_at)
@@ -2334,7 +2342,7 @@ def test_google_platform_handle_notification(monkeypatch, pg_database):
         assert_has_payment(
             tx=tx,
             plan=base.ProPlan.OneMonth,
-            redeemed_ts_ms=tx.event_ms,
+            redeemed_ts_ms=None,  # the mule auto-redeemed this one
             platform_refund_expiry_at=platform_refund_expiry_unix_tx_ms,
             user_ctx=user_ctx,
             ctx=ctx,
