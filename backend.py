@@ -20,7 +20,7 @@ import psycopg_pool
 
 ZERO_BYTES32 = bytes(32)
 BLAKE2B_DIGEST_SIZE = 32
-log = logging.Logger("BACKEND")
+log = logging.getLogger('backend')
 # 16-byte domain-separation prefix on the signed MESSAGE (signatures are Ed25519 over the message
 # directly — no BLAKE2b, so this is a domain prefix, not a hash personalisation; see signed_message).
 DOMAIN_SIZE = 16
@@ -380,11 +380,6 @@ def user_payment_tx_to_safe_string(tx: UserPaymentTransaction) -> str:
     return f'{tx.provider.name}, {ids}'
 
 
-def to_redeemed_at(at: pendulum.DateTime) -> pendulum.DateTime:
-    # Round up to the next UTC-day boundary (masks the exact instant the payment was redeemed).
-    return base.round_datetime_to_next_day(at)
-
-
 # The bytes we Ed25519-sign directly (NO pre-hash — wire spec §1): a 16-byte domain prefix then the fields,
 # each encoded by TYPE — VerifyKey/bytes verbatim (fixed-width, self-delimiting); datetime → its UNIX
 # **seconds** then decimal ASCII (pass an int explicitly if you ever need other units); int as canonical
@@ -676,6 +671,42 @@ def get_user_payments_page(
     return [payment_row_from_dict(r) for r in db.query(tx.conn, sql, row_factory=db.dict_row, **params)]
 
 
+def get_account_latest_payment(tx: db.SQLTransaction, master_pkey: nacl.signing.VerifyKey) -> PaymentRow | None:
+    '''The account's latest payment that still stands: newest by the STORE's purchase instant, preferring one
+    that has not been revoked. `None` only when the account has no payments at all.
+
+    Ordered on `purchased_at`, never on `p.id`. The id is assigned when we first WITNESS a payment, so it
+    orders by delivery: a notification we accept late — the Apple catch-up drains failures up to 30 days
+    on, and a backlog after an outage does the same — lands a row for an old cycle above a newer purchase.
+    An account that moved between stores then reports the store it left. `purchased_at` is what the store
+    itself says about when the payment happened, which is the question being asked; the id only breaks ties.
+
+    Revoked rows sort last rather than being filtered out, which is one `ORDER BY` doing two jobs. Skipping
+    them is the point: buy on a second store by mistake, reverse it, and the account goes back to reporting
+    the subscription it actually still has, as soon as the revocation lands. Keeping them as the last resort
+    is equally deliberate — an account whose every payment was refunded still gets an item, because `null`
+    means "never had a payment" to a client and at least one of them renders an absent item as a default
+    provider, which is the same wrong-store answer by another road.
+
+    This is the LATEST payment, which is not necessarily the one whose coverage reaches furthest: a voucher
+    stacks its length on top of a subscription, so an account holding both has an entitlement that outlives
+    the payment named here. `users.expiry_at` (the sibling `expiry_ts`) is the account-level answer and comes
+    from `_lookup_user_expiry`; do not expect the two to agree.'''
+    row = db.query_one(
+        tx.conn,
+        f'''
+        SELECT   {PAYMENTS_COLUMNS}
+        FROM     {PAYMENTS_FROM}
+        WHERE    p.user_id = (SELECT id FROM users WHERE master_pkey = %s)
+        ORDER BY (p.revoked_at IS NULL) DESC, p.purchased_at DESC, p.id DESC
+        LIMIT    1
+        ''',
+        bytes(master_pkey),
+        row_factory=db.dict_row,
+    )
+    return payment_row_from_dict(row) if row is not None else None
+
+
 def get_user_payments_count(tx: db.SQLTransaction, master_pkey: nacl.signing.VerifyKey) -> int:
     return db.query_scalar(
         tx.conn,
@@ -861,13 +892,17 @@ def verify_db(conn: psycopg.Connection, err: base.ErrorSink) -> bool:
                 )
 
         if it.revoked_at is None and it.redeemed_at is not None:
-            # Redeemed (and not revoked): a redeemed payment must not have expired before it was redeemed.
-            # A live credit has no expiry yet, so there is nothing to compare.
-            if it.expiry_at is not None and it.expiry_at < it.redeemed_at:
-                redeemed_date = it.redeemed_at.strftime('%Y-%m-%d')
+            # A term cannot end before it began. Compared against the PURCHASE instant, not the redemption
+            # one: binding a payment whose term has already run out is legitimate and routine -- a
+            # notification we accept late, or a backlog drained after an outage, arrives for a cycle that
+            # has since ended, and the entitlement fold handles that on its own. Both instants here are the
+            # store's own, so this checks the store against itself. A live credit has no expiry yet, so
+            # there is nothing to compare.
+            if it.expiry_at is not None and it.expiry_at < it.purchased_at:
+                purchased_date = it.purchased_at.strftime('%Y-%m-%d')
                 expiry_date = it.expiry_at.strftime('%Y-%m-%d')
                 err.msg_list.append(
-                    f'Payment #{index} was expired ({expiry_date}) before it was activated ({redeemed_date})'
+                    f'Payment #{index} expired ({expiry_date}) before it was purchased ({purchased_date})'
                 )
 
         # NOTE: Verify the plan, it should always be set once it enters the DB..
@@ -907,7 +942,7 @@ def new_proof_expiry_offset() -> int:
     '''
     # Reducing a 64-bit draw modulo the period leaves a bias of ~1 part in 10^15 — far below any skew that
     # could cluster anything, so it is accepted rather than rejection-sampled away.
-    return int.from_bytes(nacl.utils.random(8), 'big') % base.proof_expiry_shape().offset_range
+    return int.from_bytes(nacl.utils.random(8), 'big') % base.PROOF_EXPIRY_SHAPE.offset_range
 
 
 def _offset_redrawn_if_expiry_extends(expiry: pendulum.DateTime | None) -> str:
@@ -1040,7 +1075,7 @@ def refresh_entitlement_and_revoke_overreaching_proofs(
     # payment is invisible to that judgement: we would revoke every outstanding proof for an account whose
     # coverage never actually lapsed. Claim-all and idempotent — the same bind the owner's next request
     # performs, just early. Stamped with OUR clock, never `at`: a store's instant can be days old.
-    reconcile_pending_payments(tx, master_pkey, redeemed_at=to_redeemed_at(base.utc_now()))
+    reconcile_pending_payments(tx, master_pkey, redeemed_at=base.utc_now())
     _update_user_expiry_grace_and_renew_flag_from_payment_list(tx, master_pkey)
 
     # The honest question is the DELTA, so ask it first and exactly: if the account ends up covering at
@@ -1080,7 +1115,7 @@ def refresh_entitlement_and_revoke_overreaching_proofs(
     # `at` whenever `at` fell just after midnight. This accepts the same worst case uniformly instead of
     # letting the wall clock decide which accounts get it. Testing environments compress the grid, so the
     # comparison follows them without needing a provider-aware special case.
-    if prior_expiry <= at + base.proof_expiry_shape().grid:
+    if prior_expiry <= at + base.PROOF_EXPIRY_SHAPE.grid:
         return False
 
     # The furthest any outstanding proof can reach: a proof reaches at most `max_proof_lifetime` past its
@@ -1088,10 +1123,15 @@ def refresh_entitlement_and_revoke_overreaching_proofs(
     # now goes beyond this. If what survives covers that, every proof we have signed is still honest and
     # there is nothing to announce.
     if surviving_now is not None and surviving_now >= at + base.DEFAULT_TIMESTAMP_TOLERANCE + (
-        base.proof_expiry_shape().max_proof_lifetime
+        base.PROOF_EXPIRY_SHAPE.max_proof_lifetime
     ):
         return False
 
+    log.info(
+        f'Revoking the outstanding proofs of {base.maybe_obfuscate_bytes(bytes(master_pkey))}: coverage fell from '
+        f'{base.readable(prior_expiry)} to '
+        f'{base.readable(surviving_now) if surviving_now is not None else "nothing"}'
+    )
     revoke_master_pkey_proofs_and_allocate_new_gen_id(tx, master_pkey, created_at=at)
     return True
 
@@ -1319,6 +1359,10 @@ def reconcile_pending_payments(
     user_id = get_or_create_user_and_generation(tx, master_pkey, issued_at=redeemed_at)[0]
     db.query(tx.conn, 'UPDATE payments SET user_id = %(user_id)s WHERE id = ANY(%(ids)s)', user_id=user_id, ids=claimed)
     _ensure_active_generation(tx, master_pkey, issued_at=redeemed_at)
+    log.info(
+        f'Redeemed {len(claimed)} payment(s) for {base.maybe_obfuscate_bytes(bytes(master_pkey))} '
+        f'at {base.readable(redeemed_at)}'
+    )
     return len(claimed)
 
 
@@ -1412,6 +1456,10 @@ def redeem_minted_payment(
     )
     assert len(row_result.fetchall()) == 1, 'a freshly-minted payment must redeem exactly once'
     _ensure_active_generation(tx, master_pkey, issued_at=redeemed_at)
+    log.info(
+        f'Redeemed minted payment ({payment_provider_tx_log_label_safe(payment_tx)}) to '
+        f'{base.maybe_obfuscate_bytes(bytes(master_pkey))}'
+    )
 
 
 def verify_payment_provider_tx(payment_tx: base.PaymentProviderTransaction, err: base.ErrorSink):
@@ -1623,13 +1671,6 @@ def update_payment_renewal_info(
     you want to opt out of updating.
     """
 
-    if log.getEffectiveLevel() <= logging.INFO:
-        payment_tx_label = payment_provider_tx_log_label_safe(payment_tx)
-        log.info(
-            f'Update renewal info (payment={payment_tx_label}, grace period ms={grace_period}, '
-            f'auto_renewing={auto_renewing})'
-        )
-
     result = False
     verify_payment_provider_tx(payment_tx, err)
     if len(err.msg_list) > 0:
@@ -1654,66 +1695,80 @@ def update_payment_renewal_info(
         sql_set_fields += 'grace_period = %(grace_period)s'
         kwparams['grace_period'] = grace_period
 
-    # NOTE: Execute the statement
-    # TODO: Improve this switch statement by writing to kwparams then have 1 single db.query()
-    # statement that expands those parameters.
-    result_set: db.Result | None = None
+    # The providers differ ONLY in how a payment is identified, so that is all the match produces: a
+    # `detail_table WHERE ...` fragment that both statements below share. Per-provider copies of the
+    # statements themselves would need the read and the write kept in step three times over.
+    payment_selector: str = ''
     match payment_tx.provider:
         case base.PaymentProvider.Nil:
             pass
 
         case base.PaymentProvider.GooglePlayStore:
-            result_set = db.query(
-                tx.conn,
-                f'''
-                UPDATE    payments
-                SET       {sql_set_fields}
-                WHERE     id IN (SELECT payment_id FROM google_play_payment_details
-                                   WHERE payment_token = %(token)s AND order_id = %(order_id)s)
-                RETURNING (SELECT master_pkey FROM users WHERE users.id = payments.user_id)
-            ''',
-                token=payment_tx.google_payment_token,
-                order_id=payment_tx.google_order_id,
-                **kwparams,
-            )
+            payment_selector = 'google_play_payment_details WHERE payment_token = %(token)s AND order_id = %(order_id)s'
+            kwparams['token'] = payment_tx.google_payment_token
+            kwparams['order_id'] = payment_tx.google_order_id
 
         case base.PaymentProvider.iOSAppStore:
-            result_set = db.query(
-                tx.conn,
-                f'''
-                UPDATE    payments
-                SET       {sql_set_fields}
-                WHERE     id IN (SELECT payment_id FROM app_store_payment_details
-                                   WHERE original_tx_id = %(orig_tx_id)s AND tx_id = %(tx_id)s
-                                     AND web_line_order_tx_id = %(line_order_tx_id)s)
-                RETURNING (SELECT master_pkey FROM users WHERE users.id = payments.user_id)
-            ''',
-                orig_tx_id=payment_tx.apple_original_tx_id,
-                tx_id=payment_tx.apple_tx_id,
-                line_order_tx_id=payment_tx.apple_web_line_order_tx_id,
-                **kwparams,
+            payment_selector = (
+                'app_store_payment_details WHERE original_tx_id = %(orig_tx_id)s AND tx_id = %(tx_id)s'
+                ' AND web_line_order_tx_id = %(line_order_tx_id)s'
             )
+            kwparams['orig_tx_id'] = payment_tx.apple_original_tx_id
+            kwparams['tx_id'] = payment_tx.apple_tx_id
+            kwparams['line_order_tx_id'] = payment_tx.apple_web_line_order_tx_id
 
         case base.PaymentProvider.SessionFoundation:
-            result_set = db.query(
-                tx.conn,
-                f'''
-                UPDATE    payments
-                SET       {sql_set_fields}
-                WHERE     id IN (SELECT payment_id FROM stf_payment_details
-                                   WHERE order_id = %(stf_order_id)s)
-                RETURNING (SELECT master_pkey FROM users WHERE users.id = payments.user_id)
-            ''',
-                stf_order_id=payment_tx.stf_order_id,
-                **kwparams,
-            )
+            payment_selector = 'stf_payment_details WHERE order_id = %(stf_order_id)s'
+            kwparams['stf_order_id'] = payment_tx.stf_order_id
+
+    assert payment_selector, 'Nil is the only provider with no selector, and verify_payment_provider_tx rejects it'
+
+    # What the row says now, so the log below can tell a change from a restatement. Two unrelated store
+    # events legitimately write the same value — a cancellation, then the EXPIRED that follows it weeks
+    # later, both clearing `auto_renewing` — and reporting the second as though a subscriber had just
+    # cancelled invents an event. No lock, unlike the Google converge: nothing here depends on the read
+    # being the row the UPDATE then touches, so a concurrent write can only make one log line stale, and
+    # the write itself is unaffected either way.
+    before = db.query_one(
+        tx.conn,
+        f'SELECT auto_renewing, grace_period FROM payments WHERE id IN (SELECT payment_id FROM {payment_selector})',
+        **kwparams,
+    )
+
+    result_set = db.query(
+        tx.conn,
+        f'''
+        UPDATE    payments
+        SET       {sql_set_fields}
+        WHERE     id IN (SELECT payment_id FROM {payment_selector})
+        RETURNING (SELECT master_pkey FROM users WHERE users.id = payments.user_id)
+    ''',
+        **kwparams,
+    )
 
     # NOTE: A `RETURNING` clause seems to break rowcount (returns 0 even on row modification), so we
     # use fetchone instead. The RETURNING expression resolves the payment's owner master_pkey via the
     # users FK (NULL if the payment isn't redeemed yet).
-    assert result_set
-    row = typing.cast(tuple[bytes] | None, result_set.fetchone())
+    row = result_set.fetchone()
     result = row is not None
+
+    # Phrased as what the store just told us about the subscription rather than as "renewal info updated":
+    # these arrive when a subscriber cancels, resubscribes, or is granted a grace period, and that is what
+    # someone reads the line to find out. Reported after the write, so the line records what happened rather
+    # than what was attempted — the no-matching-payment case is reported through `err` below instead.
+    if result and before is not None:
+        old_auto_renewing, old_grace = before
+        changes: list[str] = []
+        if auto_renewing is not None and auto_renewing != old_auto_renewing:
+            changes.append('will renew' if auto_renewing else 'cancelled; will not renew')
+        if grace_period is not None and grace_period != old_grace:
+            changes.append(f'granted a grace period of {grace_period.in_words()}')
+
+        label = payment_provider_tx_log_label_safe(payment_tx)
+        if changes:
+            log.info(f'Payment ({label}): {"; ".join(changes)}')
+        elif log.getEffectiveLevel() <= logging.DEBUG:
+            log.debug(f'Payment ({label}): the store restated what we already had')
 
     # NOTE: Update the user's expiry to the latest known expiry
     if row and row[0]:
@@ -2017,9 +2072,11 @@ def add_unredeemed_payment(
                     # transaction; we log it for internal visibility.
                     try:
                         with tx.conn.transaction():
-                            _redeem_payment_for_user(
-                                tx, master_pkey, payment_tx, redeemed_at=to_redeemed_at(purchased_at)
-                            )
+                            # OUR clock, not `purchased_at`: this is when we bound the payment, and the
+                            # store's instant can be days old by the time we see it (a catch-up drain, a
+                            # backlog after an outage). `purchased_at` above is the store's own fact and
+                            # belongs in the deadline test; it is not a redemption time.
+                            _redeem_payment_for_user(tx, master_pkey, payment_tx, redeemed_at=base.utc_now())
                         log.info(
                             f'Auto-redeemed payment (payment={payment_provider_tx_log_label_safe(payment_tx)}) '
                             f'to the account that owns the previous cycle of this subscription'
@@ -2268,6 +2325,17 @@ def drain_due_credits(tx: db.SQLTransaction, now: pendulum.DateTime, stale_after
         for payment_id, new_remaining in drained.updated:
             spent_so_far += remaining_before[payment_id] - new_remaining
             emptied_at = checkpoint + spent_so_far if new_remaining == pendulum.duration() else None
+            if emptied_at is not None:
+                log.info(
+                    f'Credit {payment_id} of {base.maybe_obfuscate_bytes(bytes(master_pkey))} ran out at '
+                    f'{base.readable(emptied_at)}'
+                )
+            elif log.getEffectiveLevel() <= logging.DEBUG:
+                log.debug(
+                    f'Charged {(remaining_before[payment_id] - new_remaining).in_words()} against credit '
+                    f'{payment_id} of {base.maybe_obfuscate_bytes(bytes(master_pkey))}; '
+                    f'{new_remaining.in_words()} left'
+                )
             db.query(
                 tx.conn,
                 '''
@@ -2367,7 +2435,7 @@ def _build_proof_clamped_expiry_time(
     extension keeps the luck from settling on the same accounts. `shape.max_proof_lifetime` bounds the
     resulting proof lifetime.
     '''
-    shape = base.proof_expiry_shape()
+    shape = base.PROOF_EXPIRY_SHAPE
     # The stored column's own range (a day — the schema CHECK), NOT the current shape's: a database written
     # before the shape changed still holds day-wide offsets, which the grid helper reduces modulo the period.
     assert 0 <= proof_expiry_offset < base.PROOF_EXPIRY_SHAPE.offset_range
@@ -2562,29 +2630,50 @@ def generate_pro_proof(
     master_sig: bytes,
     rotating_sig: bytes,
 ) -> ProSubscriptionProof:
-    log.info(f'Get pro proof (master={base.maybe_obfuscate_bytes(master_pkey)}, ts={base.readable(request_at)})')
+    # DEBUG, not INFO: a client re-requests its proof routinely, so this is request traffic rather than
+    # something happening to a payment. The redeem it may trigger below reports itself at INFO.
+    log.debug(f'Get pro proof (master={base.maybe_obfuscate_bytes(master_pkey)}, ts={base.readable(request_at)})')
 
     # Authenticate the request (raises FailError(bad_signature) / invalid_request on failure).
     message: bytes = make_generate_pro_proof_message(
         master_pkey=master_pkey, rotating_pkey=rotating_pkey, request_at=request_at
     )
-    internal_verify_add_payment_and_get_proof_common_arguments(
-        signing_key=signing_key,
-        master_pkey=master_pkey,
-        rotating_pkey=rotating_pkey,
-        message=message,
-        master_sig=master_sig,
-        rotating_sig=rotating_sig,
-    )
+    # Every outcome below is reported, so a proof request always ends in exactly one INFO line. Without the
+    # refusal half, a client being turned away is indistinguishable from a client that never asked — and the
+    # two have completely different causes.
+    try:
+        internal_verify_add_payment_and_get_proof_common_arguments(
+            signing_key=signing_key,
+            master_pkey=master_pkey,
+            rotating_pkey=rotating_pkey,
+            message=message,
+            master_sig=master_sig,
+            rotating_sig=rotating_sig,
+        )
 
-    with db.transaction(conn) as tx:
-        # Reconcile first: claim any payment the mule has already registered for this key but that hasn't
-        # been redeemed yet, so a client's post-purchase proof request binds it right here — no separate
-        # redeem call. A no-op when there's nothing new. Then build the proof from the current entitlement
-        # (build_current_entitlement_proof raises the truthful "no Pro" slug if there's still nothing, which
-        # the client treats as "not yet — retry").
-        reconcile_pending_payments(tx, master_pkey, redeemed_at=to_redeemed_at(request_at))
-        return build_current_entitlement_proof(tx, master_pkey, rotating_pkey, request_at, signing_key)
+        with db.transaction(conn) as tx:
+            # Reconcile first: claim any payment the mule has already registered for this key but that
+            # hasn't been redeemed yet, so a client's post-purchase proof request binds it right here — no
+            # separate redeem call. A no-op when there's nothing new. Then build the proof from the current
+            # entitlement (build_current_entitlement_proof raises the truthful "no Pro" slug if there's
+            # still nothing, which the client treats as "not yet — retry").
+            reconcile_pending_payments(tx, master_pkey, redeemed_at=request_at)
+            proof = build_current_entitlement_proof(tx, master_pkey, rotating_pkey, request_at, signing_key)
+    except base.FailError as e:
+        # The CODE, never `str(e)`: those messages carry the master key unobfuscated, and this is the one
+        # place a refusal reaches a log file. Re-raised untouched — the wire envelope is the caller's.
+        log.info(f'Refused Pro proof (master={base.maybe_obfuscate_bytes(master_pkey)}, reason={e.code.value})')
+        raise
+
+    # Logged after the commit, and at INFO: signing a proof is the one action this endpoint exists to
+    # perform, and this line is the only record of what was certified for whom and until when. The DEBUG
+    # line above is the request that asked.
+    log.info(
+        f'Issued Pro proof (master={base.maybe_obfuscate_bytes(master_pkey)}, '
+        f'rotating={base.maybe_obfuscate_bytes(rotating_pkey)}, '
+        f'expiry={base.readable(proof.expiry_at)}, account expiry={base.readable(proof.account_expiry_at)})'
+    )
+    return proof
 
 
 # Housekeeping deletes, one table each. All are pure storage reclamation: nothing here affects a live
@@ -2820,6 +2909,59 @@ def google_clear_needs_ack(tx: db.SQLTransaction, payment_token: str) -> None:
     )
 
 
+def _log_google_convergence(
+    payment_tx: base.PaymentProviderTransaction,
+    old_expiry: pendulum.DateTime | None,
+    old_auto_renewing: bool,
+    old_grace: pendulum.Duration | None,
+    new_expiry: pendulum.DateTime,
+    new_auto_renewing: bool,
+    new_grace: pendulum.Duration | None,
+) -> None:
+    """Report what a converge did to one payment: INFO when the row moved, DEBUG when it did not.
+
+    The split is the whole point. A converge runs on every notification and every reconcile pass, and the
+    great majority write back what was already there — an operator watching INFO wants the renewal, the
+    cancellation and the grace period, not the several hundred confirmations that nothing changed.
+
+    Phrased as what happened to the subscription rather than as a column diff, because the columns do not
+    say it on their own: an expiry moving later is a renewal, unless a grace period appeared at the same
+    time, in which case the term did not move at all and the store extended it (see the caller's docstring).
+    """
+    changes: list[str] = []
+    if new_expiry != old_expiry:
+        if old_expiry is None:
+            changes.append(f'term set to {base.readable(new_expiry)}')
+        elif new_expiry > old_expiry:
+            changes.append(f'renewed through {base.readable(new_expiry)}')
+        else:
+            changes.append(f'term shortened to {base.readable(new_expiry)} (was {base.readable(old_expiry)})')
+
+    # "store grace runs to", never "covered until": what we actually serve is that instant plus the renewal
+    # latency allowance, which is ours and applied on read. Calling the store's number the coverage would
+    # misreport the horizon by an hour to anyone reading this line to explain a proof.
+    if new_grace != old_grace:
+        if new_grace is None:
+            changes.append('grace period ended')
+        elif old_grace is None:
+            changes.append(f'entered the store grace period, which runs to {base.readable(new_expiry + new_grace)}')
+        else:
+            changes.append(f'store grace period revised, now running to {base.readable(new_expiry + new_grace)}')
+
+    if new_auto_renewing != old_auto_renewing:
+        changes.append('renewal re-enabled' if new_auto_renewing else 'cancelled; will not renew')
+
+    # Labelled the same way as every other payment line, so one account's history greps out of the log as a
+    # whole rather than in provider-specific dialects.
+    if changes:
+        log.info(f'Payment ({payment_provider_tx_log_label_safe(payment_tx)}): {"; ".join(changes)}')
+    elif log.getEffectiveLevel() <= logging.DEBUG:
+        log.debug(
+            f'Payment ({payment_provider_tx_log_label_safe(payment_tx)}): unchanged by the store snapshot '
+            f'(expiry={base.readable(new_expiry)}, grace={new_grace}, auto_renewing={new_auto_renewing})'
+        )
+
+
 @db.transactional
 def google_converge_payment(
     tx: db.SQLTransaction,
@@ -2843,8 +2985,8 @@ def google_converge_payment(
     Two things the snapshot does NOT get to overrule:
 
     * A REVOKED row is terminal and is left entirely alone. Google reports a refunded subscription as
-      expired, but it does not report *that money came back* — that is the void feed's job — so converging a
-      revoked row on the resource would quietly undo a refund we already recorded, and could extend its
+      expired, but it does not report *that money came back* — that arrives as its own RTDN — so converging
+      a revoked row on the resource would quietly undo a refund we already recorded, and could extend its
       expiry past the instant entitlement actually stopped.
     * A CLAIMED row's ownership. Convergence adjusts the terms of a payment, never who holds it.
 
@@ -2886,6 +3028,36 @@ def google_converge_payment(
 
     assert payment_tx.provider == base.PaymentProvider.GooglePlayStore, 'Google-only: keyed on (token, order id)'
 
+    # Read the row before writing it, under the same predicates the UPDATE uses, so the log below can report
+    # what actually moved rather than restating what we asked for — a converge that changes nothing is the
+    # common case and must be distinguishable from one that renews, cancels or opens a grace period.
+    #
+    # `FOR UPDATE` is what makes the assert below sound, and the reconcile lease does not cover it: the lease
+    # serialises drain against drain on one token, never drain against the notification thread stamping a
+    # REVOKED. A revoke landing between the read and the write leaves the UPDATE matching nothing, and a
+    # log line would then crash the drain.
+    #
+    # `OF p` locks the payments row only, so the assert additionally rests on `google_play_payment_details`'
+    # key columns never being rewritten (`needs_ack` is the sole column anything updates, and nothing deletes
+    # a detail row). That is convention, not constraint: a writer that moved a token or order id between
+    # these two statements would make the assert reachable.
+    before = db.query_one(
+        tx.conn,
+        '''
+        SELECT p.expiry_at, p.auto_renewing, p.grace_period
+        FROM   payments p JOIN google_play_payment_details gd ON gd.payment_id = p.id
+        WHERE  gd.payment_token = %(token)s AND gd.order_id = %(order_id)s
+          AND  p.revoked_at IS NULL
+        FOR    UPDATE OF p
+    ''',
+        token=payment_tx.google_payment_token,
+        order_id=payment_tx.google_order_id,
+    )
+    if before is None:
+        # Either no such payment or a revoked one; both are "nothing to converge".
+        return False
+    old_expiry, old_auto_renewing, old_grace = before
+
     rows = db.query(
         tx.conn,
         '''
@@ -2903,7 +3075,8 @@ def google_converge_payment(
         WHERE  gd.payment_id = p.id
           AND  gd.payment_token = %(token)s AND gd.order_id = %(order_id)s
           AND  p.revoked_at IS NULL
-        RETURNING (SELECT master_pkey FROM users WHERE users.id = p.user_id)
+        RETURNING (SELECT master_pkey FROM users WHERE users.id = p.user_id),
+                  p.expiry_at, p.auto_renewing, p.grace_period
     ''',
         token=payment_tx.google_payment_token,
         order_id=payment_tx.google_order_id,
@@ -2913,10 +3086,20 @@ def google_converge_payment(
     )
 
     # RETURNING breaks rowcount (see update_payment_renewal_info), so the fetch is what tells us whether a
-    # row matched. Absent means either no such payment or a revoked one; both are "nothing to converge".
-    row = typing.cast(tuple[bytes | None] | None, rows.fetchone())
-    if row is None:
-        return False
+    # row matched. It reports the values as WRITTEN, so the grace split is described by the rule that
+    # performed it rather than by a second copy of that rule here.
+    row = rows.fetchone()
+    assert row is not None, 'the SELECT ... FOR UPDATE above matched, so the UPDATE must too'
+    owner_pkey, new_expiry, new_auto_renewing, new_grace = row
+    _log_google_convergence(
+        payment_tx,
+        old_expiry=old_expiry,
+        old_auto_renewing=old_auto_renewing,
+        old_grace=old_grace,
+        new_expiry=new_expiry,
+        new_auto_renewing=new_auto_renewing,
+        new_grace=new_grace,
+    )
 
     db.query(
         tx.conn,
@@ -2938,8 +3121,8 @@ def google_converge_payment(
     # certifying a horizon the account no longer has. Safe on the paths where nothing fell: the rule claims
     # pending payments before deciding, so an upgrade's replacement is bound first, the delta gate sees no
     # fall, and it returns without announcing anything.
-    if row[0] is not None:
-        refresh_entitlement_and_revoke_overreaching_proofs(tx, nacl.signing.VerifyKey(bytes(row[0])), at=at)
+    if owner_pkey is not None:
+        refresh_entitlement_and_revoke_overreaching_proofs(tx, nacl.signing.VerifyKey(bytes(owner_pkey)), at=at)
     return True
 
 

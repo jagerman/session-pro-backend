@@ -305,7 +305,7 @@ def get_pro_status():
         with db.transaction(conn) as tx:
             # Bind any payment the mule has registered for this key but that isn't yet redeemed, so a
             # status check right after purchase reflects it. No-op when there's nothing new.
-            backend.reconcile_pending_payments(tx, master_pkey_nacl, redeemed_at=backend.to_redeemed_at(request_at))
+            backend.reconcile_pending_payments(tx, master_pkey_nacl, redeemed_at=request_at)
             user = backend.get_user(tx.conn, master_pkey_nacl)
             if user.found:
                 auto_renewing = user.auto_renewing
@@ -337,9 +337,14 @@ def get_pro_status():
                 if backend.is_generation_revoked(tx.conn, user.current_generation_id, request_at):
                     user_pro_status = UserProStatus.Expired
 
-                page = backend.get_user_payments_page(tx, master_pkey_nacl, limit=1, before_id=None)
-                if page:
-                    latest_payment = _payment_item_wire(page[0], request_at)
+                # The newest payment that still stands, by the STORE's purchase instant — not the most
+                # recently recorded one, which orders by when we happened to witness it. Clients read the
+                # provider off this item to decide where a subscription is managed, so naming a store the
+                # user has left is a wrong answer, not a cosmetic one. It answers "what did you buy last",
+                # deliberately NOT the same question as the account-level expiry above (§5.2).
+                newest_payment = backend.get_account_latest_payment(tx, master_pkey_nacl)
+                if newest_payment is not None:
+                    latest_payment = _payment_item_wire(newest_payment, request_at)
 
     return make_success_response(
         {
@@ -401,7 +406,7 @@ def get_payment_details():
         with db.transaction(conn) as tx:
             # Bind any mule-registered-but-unredeemed payment for this key first, so a details check
             # right after purchase includes it (only redeemed payments are user-scoped/visible below).
-            backend.reconcile_pending_payments(tx, master_pkey_nacl, redeemed_at=backend.to_redeemed_at(request_at))
+            backend.reconcile_pending_payments(tx, master_pkey_nacl, redeemed_at=request_at)
             # One keyset page, newest-first. Each item's status is derived against the *request*
             # clock `ts` (signed, anti-replay-bounded to ≈now), never a second time.time() read.
             # The query is user-scoped and only redeemed payments carry a user_id, so unredeemed

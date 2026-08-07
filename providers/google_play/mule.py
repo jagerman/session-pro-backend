@@ -19,33 +19,32 @@ import threading
 
 import base
 import db
-import backend
 import config
 
-from . import api, notifications
+from . import notifications
 
-log = logging.getLogger('PRO')
+log = logging.getLogger('pro')
 
 
 def run() -> None:
-    # The mule forks from the uWSGI master *after* main.entry_point() ran, so the shared backend (and
-    # later google) loggers arrive with the master's handlers already attached. Clear them before
-    # installing the mule's own, otherwise every mule log line is emitted once per inherited handler.
-    # uWSGI's `logto` captures this StreamHandler's stderr into the vassal log, same as the workers.
-    handler = logging.StreamHandler()
-    handler.setFormatter(base.LogFormatter('%(asctime)s %(levelname)s %(name)s %(message)s'))
-    for logger in (log, backend.log):
-        logger.handlers.clear()
-        logger.addHandler(handler)
+    # The mule forks from the uWSGI master *after* main.entry_point() ran, so the shared loggers arrive with
+    # the master's handlers already attached; `configure_logging` clears them, otherwise every line is
+    # emitted once per inherited handler. uWSGI's `logto` captures this process's stderr into the vassal
+    # log, same as the workers. Bootstrap first so a config failure has somewhere to go.
+    base.bootstrap_logging()
 
     try:
         parsed = config.parse_args()
     except config.ConfigError as e:
-        log.error(f'Maintenance mule failed to start, invalid configuration:\n  {e}')
+        log.error(f'Google mule failed to start, invalid configuration:\n  {e}')
         sys.exit(1)
+    base.configure_logging(parsed.log_level, parsed.log_levels)
     base.UNSAFE_LOGGING = parsed.unsafe_logging
     db.set_dsn(parsed.db_url)
-    base.PROVIDER_TESTING_ENV = parsed.provider_testing_env
+    # Every global the coverage arithmetic reads has to be set in EVERY entry point: this process converges
+    # payments and judges revocations, so one it leaves at the module default is one it silently disagrees
+    # with the workers about.
+    base.RENEWAL_LATENCY_ALLOWANCE = parsed.renewal_latency_allowance
     base.PROVIDER_DRY_RUN = parsed.provider_dry_run
 
     if not parsed.with_provider_google_play:
@@ -55,10 +54,6 @@ def run() -> None:
         threading.Event().wait()
         return
 
-    notifications.log.handlers.clear()
-    notifications.log.addHandler(handler)
-    if base.PROVIDER_TESTING_ENV:
-        base.RENEWAL_LATENCY_ALLOWANCE = base.duration_from_ms(api.testing_renewal_latency_allowance_ms)
     context = notifications.start_subscriber(
         cloud_project_id=parsed.google_cloud_project_id,
         package_name=parsed.google_package_name,

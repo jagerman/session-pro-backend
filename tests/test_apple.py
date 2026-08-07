@@ -37,7 +37,7 @@ from appstoreserverlibrary.models.ConsumptionRequestReason import (
     ConsumptionRequestReason as AppleConsumptionRequestReason,
 )
 
-from tests.helpers import derived_status, TestingContext, _redeem_and_prove
+from tests.helpers import derived_status, TestingContext, _redeem_and_prove, round_datetime_to_next_day
 
 
 def test_apple_catchup_isolates_a_bad_notification(monkeypatch, pg_database):
@@ -210,7 +210,7 @@ def test_apple_refund_reversal_reinstates_and_rolls_generation(pg_database):
     master_key = nacl.signing.SigningKey.generate()
     rotating_key = nacl.signing.SigningKey.generate()
     now = base.utc_now()
-    redeemed_at = base.round_datetime_to_next_day(now)
+    redeemed_at = round_datetime_to_next_day(now)
     original_tx = os.urandom(8).hex()
     tx_id = os.urandom(8).hex()
     expiry_at = redeemed_at + 90 * base.DAY
@@ -418,7 +418,7 @@ def test_platform_apple(pg_database):
         # call. This renewal is dated in the past, so we assert the binding (proof issuance is covered by
         # the generate_pro_proof tests).
         with test.connection() as conn:
-            redeemed_at = base.round_datetime_to_next_day(base.datetime_from_unix_ms(tx_info.signedDate))
+            redeemed_at = round_datetime_to_next_day(base.datetime_from_unix_ms(tx_info.signedDate))
             assert backend.reconcile_pending_payments(conn, master_key.verify_key, redeemed_at=redeemed_at) == 1
             assert not backend.get_unredeemed_payments_list(conn)
             assert backend.get_user(conn, master_key.verify_key).found
@@ -1586,7 +1586,7 @@ def test_platform_apple(pg_database):
 
         # NOTE: Then redeem the payment (reconcile binds it by the master-key-derived account-id).
         with test.connection() as conn:
-            redeemed_at = base.round_datetime_to_next_day(
+            redeemed_at = round_datetime_to_next_day(
                 base.datetime_from_unix_ms(e00_sub_to_3_months_tx_info.purchaseDate)
             )
             assert backend.reconcile_pending_payments(conn, master_key.verify_key, redeemed_at=redeemed_at) == 1
@@ -1675,8 +1675,10 @@ def test_platform_apple(pg_database):
             assert payment_list[1].payment_provider == base.PaymentProvider.iOSAppStore
             assert payment_list[1].auto_renewing
             assert payment_list[1].purchased_at == base.datetime_from_unix_ms(e01_upgrade_to_1wk_tx_info.purchaseDate)
-            assert payment_list[1].redeemed_at == backend.to_redeemed_at(
-                base.datetime_from_unix_ms(e01_upgrade_to_1wk_tx_info.purchaseDate)
+            # The mule auto-redeemed this cycle, stamping OUR clock -- unpredictable here,
+            # so all that can be checked is that it is set and not before the purchase.
+            assert (
+                payment_list[1].redeemed_at is not None and payment_list[1].redeemed_at >= payment_list[1].purchased_at
             )
             assert payment_list[1].expiry_at == base.datetime_from_unix_ms(e01_upgrade_to_1wk_tx_info.expiresDate)
             assert payment_list[1].grace_period is None
@@ -1730,8 +1732,11 @@ def test_platform_apple(pg_database):
             assert payment_list[-1].auto_renewing
 
             assert payment_list[-1].purchased_at == base.datetime_from_unix_ms(e01_upgrade_to_1wk_tx_info.purchaseDate)
-            assert payment_list[-1].redeemed_at == backend.to_redeemed_at(
-                base.datetime_from_unix_ms(e01_upgrade_to_1wk_tx_info.purchaseDate)
+            # The mule auto-redeemed this cycle, stamping OUR clock -- unpredictable here,
+            # so all that can be checked is that it is set and not before the purchase.
+            assert (
+                payment_list[-1].redeemed_at is not None
+                and payment_list[-1].redeemed_at >= payment_list[-1].purchased_at
             )
             assert payment_list[-1].expiry_at == base.datetime_from_unix_ms(e01_upgrade_to_1wk_tx_info.expiresDate)
             assert payment_list[-1].grace_period is None
@@ -1786,8 +1791,11 @@ def test_platform_apple(pg_database):
             assert payment_list[-1].payment_provider == base.PaymentProvider.iOSAppStore
             assert payment_list[-1].auto_renewing
             assert payment_list[-1].purchased_at == base.datetime_from_unix_ms(e01_upgrade_to_1wk_tx_info.purchaseDate)
-            assert payment_list[-1].redeemed_at == backend.to_redeemed_at(
-                base.datetime_from_unix_ms(e01_upgrade_to_1wk_tx_info.purchaseDate)
+            # The mule auto-redeemed this cycle, stamping OUR clock -- unpredictable here,
+            # so all that can be checked is that it is set and not before the purchase.
+            assert (
+                payment_list[-1].redeemed_at is not None
+                and payment_list[-1].redeemed_at >= payment_list[-1].purchased_at
             )
             assert payment_list[-1].expiry_at == base.datetime_from_unix_ms(e01_upgrade_to_1wk_tx_info.expiresDate)
             assert payment_list[-1].grace_period is None
@@ -1838,8 +1846,11 @@ def test_platform_apple(pg_database):
             assert payment_list[-1].payment_provider == base.PaymentProvider.iOSAppStore
             assert not payment_list[-1].auto_renewing
             assert payment_list[-1].purchased_at == base.datetime_from_unix_ms(e01_upgrade_to_1wk_tx_info.purchaseDate)
-            assert payment_list[-1].redeemed_at == backend.to_redeemed_at(
-                base.datetime_from_unix_ms(e01_upgrade_to_1wk_tx_info.purchaseDate)
+            # The mule auto-redeemed this cycle, stamping OUR clock -- unpredictable here,
+            # so all that can be checked is that it is set and not before the purchase.
+            assert (
+                payment_list[-1].redeemed_at is not None
+                and payment_list[-1].redeemed_at >= payment_list[-1].purchased_at
             )
             assert payment_list[-1].expiry_at == base.datetime_from_unix_ms(e01_upgrade_to_1wk_tx_info.expiresDate)
             assert payment_list[-1].grace_period is None
@@ -2217,7 +2228,7 @@ def test_apple_expiry_after_billing_retry_clears_auto_renewing(pg_database):
     pool = backend.bootstrap_db(database_url=pg_database())
     assert pool
     master_key = nacl.signing.SigningKey.generate()
-    now = base.round_datetime_to_next_day(base.utc_now())
+    now = round_datetime_to_next_day(base.utc_now())
     err = base.ErrorSink()
 
     tx_ids = base.PaymentProviderTransaction(
@@ -2276,4 +2287,63 @@ def test_apple_expiry_after_billing_retry_clears_auto_renewing(pg_database):
         # arithmetic already ignores it once nothing is renewing.
         assert after.grace_period == 3 * base.DAY
         assert after.expiry_at == before.expiry_at, 'the term itself is untouched'
+    pool.close()
+
+
+def test_apple_declined_refund_is_handled_rather_than_raising(pg_database):
+    # REFUND_DECLINED is listed among the notifications this handler accepts, but the chain that dispatches
+    # them ended in `assert notificationType == PRICE_INCREASE`, so the first declined refund would have
+    # raised. The webhook turns a raise into a 500, which Apple answers by redelivering -- so the failure
+    # mode was a notification that could never be accepted, retried until Apple gave up on it.
+    #
+    # There is nothing to DO with a declined refund: it says a refund we never acted on was refused. The
+    # requirement is only that it be accepted and change nothing.
+    pool = backend.bootstrap_db(database_url=pg_database())
+    assert pool
+    master_key = nacl.signing.SigningKey.generate()
+    now = round_datetime_to_next_day(base.utc_now())
+    err = base.ErrorSink()
+
+    tx_ids = base.PaymentProviderTransaction(
+        provider=base.PaymentProvider.iOSAppStore,
+        apple_original_tx_id='9000000000000011',
+        apple_tx_id='9000000000000011',
+        apple_web_line_order_tx_id='9000000000000012',
+    )
+
+    with db.connection() as conn:
+        backend.add_unredeemed_payment(
+            conn,
+            payment_tx=tx_ids,
+            plan=base.ProPlan.OneMonth,
+            expiry_at=now + 30 * base.DAY,
+            purchased_at=now,
+            platform_refund_expiry_at=now,
+            platform_obfuscated_account_id=app_store.uuid_from_master_pk(bytes(master_key.verify_key)),
+            err=err,
+        )
+        assert not err.has(), err.msg_list
+        before = backend.get_payments_list(conn)[-1]
+
+        body = app_store.AppleResponseBodyV2DecodedPayload()
+        body.notificationType = app_store.AppleNotificationV2.REFUND_DECLINED
+        body.notificationUUID = 'a1b2c3d4-0000-0000-0000-00000000e002'
+        body.signedDate = base.unix_ms_from_datetime(now)
+        tx_info = app_store.AppleJWSTransactionDecodedPayload()
+        tx_info.transactionId = tx_ids.apple_tx_id
+        tx_info.originalTransactionId = tx_ids.apple_original_tx_id
+        tx_info.webOrderLineItemId = tx_ids.apple_web_line_order_tx_id
+
+        assert app_store.handle_notification(
+            decoded_notification=app_store.DecodedNotification(body=body, tx_info=tx_info),
+            conn=conn,
+            notification_retry_duration=pendulum.duration(),
+            err=err,
+        )
+        assert not err.has(), err.msg_list
+
+        after = backend.get_payments_list(conn)[-1]
+        assert after.revoked_at is None, 'a refused refund revokes nothing'
+        assert after.expiry_at == before.expiry_at
+        assert after.auto_renewing == before.auto_renewing
     pool.close()

@@ -13,6 +13,7 @@ local image = docker_base + 'debian-sid';
 // The project's runtime deps that Debian packages. pip then adds only the unpackaged rest (the
 // Apple/Google SDKs) on top. This is the set to bake into a prebuilt CI image.
 local app_deb_deps = [
+  'python3-coloredlogs',
   'python3-flask',
   'python3-nacl',
   'python3-pendulum',

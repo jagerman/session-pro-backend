@@ -50,14 +50,7 @@ def test_duration_constants_are_exact_spans():
         for name, value in sorted(vars(base).items())
         if isinstance(value, pendulum.Duration) and not name.startswith('_')
     ]
-    named += [
-        (f'{shape_name}.{field}', getattr(shape_value, field))
-        for shape_name, shape_value in (
-            ('PROOF_EXPIRY_SHAPE', base.PROOF_EXPIRY_SHAPE),
-            ('PROVIDER_TESTING_PROOF_EXPIRY_SHAPE', base.PROVIDER_TESTING_PROOF_EXPIRY_SHAPE),
-        )
-        for field in ('clamp', 'renewal_lead', 'grid')
-    ]
+    named += [(f'PROOF_EXPIRY_SHAPE.{field}', getattr(shape, field)) for field in ('clamp', 'renewal_lead', 'grid')]
     named += [('PROOF_EXPIRY_SHAPE.max_proof_lifetime', shape.max_proof_lifetime)]
     assert len(named) >= 10, named  # a rename must not silently empty this out
 
@@ -94,6 +87,27 @@ def test_no_stdlib_datetime_arithmetic_in_source():
                 if needle in code:
                     violations.append(f'{path}:{lineno}: {needle} — {advice}')
     assert not violations, 'stdlib datetime / calendar-duration usage:\n' + '\n'.join(violations)
+
+
+def test_every_process_that_drains_reconciles_initialises_the_google_api():
+    # `api.credentials` / `api.publisher_service` are module globals and a mule is its own process, so a
+    # process that registers the reconcile drain without calling `init_api` asserts on every attempt — and
+    # the queue's retry ladder turns that into a token abandoned after 36 tries, which for an
+    # unacknowledged purchase means Google refunds the customer at the three-day mark. The failure is a
+    # missing call in one process rather than anything wrong at either end, so nothing but a scan sees it.
+    #
+    # `providers/google_play` is exempt: `init_api` lives there, and the subscriber's own drain call is on
+    # the far side of `start_subscriber`, which does the initialising.
+    skip_dirs = {'vendor', '__pycache__', '.venv', '.git', 'tests'}
+
+    violations: list[str] = []
+    for path in sorted(pathlib.Path('.').glob('**/*.py')):
+        if skip_dirs & set(path.parts) or path.parts[:2] == ('providers', 'google_play'):
+            continue
+        source = path.read_text()
+        if 'drain_due_reconciles' in source and 'init_api' not in source:
+            violations.append(f'{path}: calls drain_due_reconciles without init_api')
+    assert not violations, 'Google API reached from an uninitialised process:\n' + '\n'.join(violations)
 
 
 def test_google_duration_parser():

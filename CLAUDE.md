@@ -117,3 +117,11 @@ inform indexes and migration risk, never meaning.
   is the older accumulate-then-check style, still used through the provider paths.
 - The wire speaks integer seconds; the payment providers speak milliseconds. Convert only in `base`'s
   converters, at those two boundaries.
+- Log levels carry a contract, because production runs at WARNING and a test deployment at INFO. **INFO is
+  one line per payment action** — a purchase registered or redeemed, a renewal, a cancellation, a grace
+  period starting or ending, a credit running out, a revocation broadcast — and nothing that repeats on a
+  timer or reports that nothing changed. **DEBUG is the steps inside those actions**: a notification
+  arriving, a resource as fetched, a reconcile attempt, a proof request. WARNING and above must never be
+  routine. Loggers are `logging.getLogger('pro'|'backend'|'google'|'apple')`; a `logging.Logger(...)`
+  constructed directly is outside the manager's registry and cannot be configured (see `[logging]` in
+  `scripts/config.ini.example`).

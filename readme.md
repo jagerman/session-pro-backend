@@ -77,10 +77,6 @@ supplies the throwaway PostgreSQL each test runs against.
 #   Unix socket: postgresql:///database?host=/var/run/postgresql&port=5432&user=<user>
 db_url                       = postgresql://user:password@localhost:5432/session_pro
 
-# Set the path where logs and rotated logs will be stored (omit this value/line to opt out of
-# logging to a file completely)
-log_path                     = <path/to/log>
-
 # Stub ALL payment-provider egress (Apple/Google): outbound mutations become no-ops and gating reads
 # return synthetic success. This lets you exercise the payment flow locally/in integration tests with
 # no provider credentials and no calls off-box. For testing ONLY — never enable on a real instance.
@@ -100,14 +96,6 @@ with_provider_app_store          = false
 # configured if this is set
 with_provider_google_play         = false
 
-# Turn this on if you intend to pull test-notifications from Google/Apple and work with subscription
-# payments that have a modified duration (e.g. Google modifies a 1-day subscription to 10 seconds). This
-# will modify some functionality with event timestamps to ensure that these timespans are respected
-#
-# One example is rounding timestamps to Google/Apple's modified timespan to determine whether or not
-# a revocation overlaps with the expiry of a payment. If there's an overlap the backend can skip
-# issuing a revocation (which is an expensive operation).
-provider_testing_env         = false
 
 # How old an account's voucher checkpoint must be, in seconds, before the maintenance mule charges it
 # again (default 86400, i.e. 24h). This does not change how much is charged -- that is always the span
@@ -128,6 +116,37 @@ unsafe_logging               = false
 # enabled = False
 # url     = <url...>
 # name    = <display name...>
+
+# NOTE: The [logging] section is optional; without it everything logs at INFO.
+[logging]
+
+# Default level for every logger: DEBUG, INFO, WARNING, ERROR or CRITICAL (case-insensitive).
+#
+# The tiers mean something specific here, and code added to this repo is expected to keep to them:
+#
+#   INFO     One line per payment action -- a purchase registered or redeemed, a renewal, a
+#            cancellation, a grace period beginning or ending, an acknowledgement, a credit running
+#            out, a proof revocation broadcast. Nothing that repeats on a timer, and nothing that
+#            merely confirms a converge changed nothing.
+#   DEBUG    The steps within those actions: a notification arriving, a subscription resource as
+#            fetched, a reconcile attempt, a client requesting its proof, the periodic sweeps.
+#   WARNING+ Never routine, always worth reading: a failing acknowledgement, an unattributable
+#            purchase, a reconcile that has given up. See docs/limitations.md.
+#
+# Production usually wants WARNING, since INFO's volume follows the subscriber count.
+level                        = info
+
+# level-<logger>: override one logger by the name that appears in its log lines. Ours are `pro`,
+# `backend`, `google_play` and `app_store` -- they match the module each comes from, and
+# deliberately do NOT shadow a library namespace (a logger named `google` is the parent of
+# every `google.*` logger the Play/Pub-Sub libraries use, and would turn all of them up with
+# it). Any other name reaches a third-party logger, so `level-werkzeug = error` quietens
+# Flask's request log, and `level-google.api_core = warning` quietens Pub/Sub's stream churn.
+level-google_play            = debug
+
+# path: file for the app's own logging, used ONLY for non-uWSGI/CLI invocations. Under uWSGI it is
+# IGNORED -- the vassal's `logto` captures stdout/stderr and rotates it. Omit to log to a file never.
+path                         = <path/to/log>
 
 # NOTE: The [apple] section and its fields are only required if `with_provider_app_store` is defined
 [apple]
@@ -180,7 +199,6 @@ SESH_PRO_BACKEND_DB_URL                    = <...>
 SESH_PRO_BACKEND_KEY_PATH                  = <...>
 SESH_PRO_BACKEND_LOG_PATH                  = <...>
 SESH_PRO_BACKEND_PROVIDER_DRY_RUN          = [0|1]
-SESH_PRO_BACKEND_PROVIDER_TESTING_ENV      = [0|1]
 SESH_PRO_BACKEND_DEV_ENDPOINTS             = [0|1]
 SESH_PRO_BACKEND_WITH_PROVIDER_APP_STORE   = [0|1]
 SESH_PRO_BACKEND_WITH_PROVIDER_GOOGLE_PLAY = [0|1]

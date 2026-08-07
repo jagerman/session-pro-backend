@@ -15,7 +15,7 @@ import backend
 import base
 import db
 
-from tests.helpers import _CreditFixture, _redeem_and_prove
+from tests.helpers import _CreditFixture, _redeem_and_prove, round_datetime_to_next_day
 
 
 def _converge(
@@ -50,7 +50,7 @@ def test_google_grace_is_counted_once(pg_database):
     pool = backend.bootstrap_db(database_url=pg_database())
     assert pool
     with db.connection() as conn:
-        T = base.round_datetime_to_next_day(base.utc_now())
+        T = round_datetime_to_next_day(base.utc_now())
         f = _CreditFixture(conn, T)
         sub = f.subscribe(expiry_at=T + 30 * base.DAY)
 
@@ -90,7 +90,7 @@ def test_apple_grace_is_counted_once(pg_database):
     pool = backend.bootstrap_db(database_url=pg_database())
     assert pool
     with db.connection() as conn:
-        T = base.round_datetime_to_next_day(base.utc_now())
+        T = round_datetime_to_next_day(base.utc_now())
         f = _CreditFixture(conn, T)
         f.subscribe(expiry_at=T + 30 * base.DAY, grace=16 * base.DAY)
 
@@ -111,7 +111,7 @@ def test_grace_is_dropped_the_moment_a_renewal_stops_being_attempted(pg_database
     pool = backend.bootstrap_db(database_url=pg_database())
     assert pool
     with db.connection() as conn:
-        T = base.round_datetime_to_next_day(base.utc_now())
+        T = round_datetime_to_next_day(base.utc_now())
         f = _CreditFixture(conn, T)
         sub = f.subscribe(expiry_at=T + 30 * base.DAY, grace=16 * base.DAY)
         assert backend.account_coverage_end(backend.get_user(conn, f.pkey)) == (
@@ -137,7 +137,7 @@ def test_grace_recovering_extends_from_the_new_term(pg_database):
     pool = backend.bootstrap_db(database_url=pg_database())
     assert pool
     with db.connection() as conn:
-        T = base.round_datetime_to_next_day(base.utc_now())
+        T = round_datetime_to_next_day(base.utc_now())
         f = _CreditFixture(conn, T)
         sub = f.subscribe(expiry_at=T + 30 * base.DAY)
         _converge(conn, sub, expiry_at=T + 31 * base.DAY, auto_renewing=True, at=T + 30 * base.DAY)
@@ -166,7 +166,7 @@ def test_an_ordinary_lapse_publishes_no_revocation(pg_database):
     rotating_key = nacl.signing.SigningKey.generate()
 
     with db.connection() as conn:
-        T = base.round_datetime_to_next_day(base.utc_now())
+        T = round_datetime_to_next_day(base.utc_now())
         f = _CreditFixture(conn, T)
         # A term ending at midday, which is where one ordinarily falls -- see the test below for what
         # happens when it does not.
@@ -207,7 +207,7 @@ def test_a_lapse_near_midnight_publishes_no_revocation(pg_database):
     rotating_key = nacl.signing.SigningKey.generate()
 
     with db.connection() as conn:
-        T = base.round_datetime_to_next_day(base.utc_now())
+        T = round_datetime_to_next_day(base.utc_now())
         lapses_at = T + 30 * base.DAY + 23 * base.HOUR + pendulum.duration(minutes=30)
         f = _CreditFixture(conn, T)
         sub = f.subscribe(expiry_at=lapses_at)
@@ -230,7 +230,7 @@ def test_a_mid_term_refund_still_publishes_a_revocation(pg_database):
     rotating_key = nacl.signing.SigningKey.generate()
 
     with db.connection() as conn:
-        T = base.round_datetime_to_next_day(base.utc_now())
+        T = round_datetime_to_next_day(base.utc_now())
         f = _CreditFixture(conn, T)
         sub = f.subscribe(expiry_at=T + 365 * base.DAY)
         _redeem_and_prove(conn, backend_key, f.master_key, rotating_key, T)
@@ -257,7 +257,7 @@ def test_google_grace_keeps_the_paid_term_and_records_the_extension(pg_database)
     pool = backend.bootstrap_db(database_url=pg_database())
     assert pool
     with db.connection() as conn:
-        T = base.round_datetime_to_next_day(base.utc_now())
+        T = round_datetime_to_next_day(base.utc_now())
         f = _CreditFixture(conn, T)
         term = T + 30 * base.DAY
         sub = f.subscribe(expiry_at=term)

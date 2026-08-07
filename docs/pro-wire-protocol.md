@@ -314,6 +314,22 @@ The two read endpoints return these `result` shapes:
 - **`get_pro_status`** (cheap, hot path) — `{ user_status, auto_renewing, expiry_ts,
   grace_period_duration, latest_payment }`. `latest_payment` is a single payment item (shape
   below) or `null` when the account has no payments. No list, no pagination.
+
+  **`latest_payment` is the account's newest payment that still stands** — newest by the store's own
+  purchase instant (`purchased_ts`), preferring one that has not been revoked. Two consequences a client can
+  rely on: on an account with payments on more than one store, `payment_provider` names the store the user
+  most recently bought from, never one whose notifications merely arrived late; and when a purchase is
+  refunded the item reverts to the payment that still stands, so a mistaken second-store purchase stops
+  being reported once its revocation lands.
+
+  It is the LATEST payment, not the longest-lasting one. A voucher stacks its length on top of a
+  subscription, so an account holding both is covered past the end of the payment named here — the
+  account-level `expiry_ts`/`grace_period_duration` beside it are the coverage answer, and the two are not
+  expected to agree. Nor is the item necessarily `active`: it can read `expired` or `revoked` while
+  `user_status` is `active`.
+
+  `null` means the account has never had a payment, and nothing else. An account whose payments have all
+  lapsed, or all been refunded, still gets an item.
 - **`get_payment_details`** (paginated history) — `{ payments_total, items, next_cursor }`. `items` is one
   keyset page of payment items, newest-first, and carries **no** `user_status`; `payments_total` is the
   account's total payment count; `next_cursor` (§5.3) is the pagination token, or `null` at end-of-data.

@@ -17,17 +17,13 @@ import config
 import db
 import server
 
-log = logging.Logger('PRO')
+log = logging.getLogger('pro')
 webhook_loggers: list[base.AsyncSessionWebhookLogHandler] = []
 
 
 def entry_point() -> flask.Flask:
-    log_formatter = base.LogFormatter('%(asctime)s %(levelname)s %(name)s %(message)s')
-    console_logger = logging.StreamHandler()
-    console_logger.setFormatter(log_formatter)
-    # NOTE: Setup console logger
-    log.addHandler(console_logger)
-    backend.log.addHandler(console_logger)
+    # Enough logging to report a bad config; the real levels are not known until it is read.
+    base.bootstrap_logging()
 
     # NOTE: Parse arguments from .INI if present and environment variables, then setup global variables
     try:
@@ -35,9 +31,11 @@ def entry_point() -> flask.Flask:
     except config.ConfigError as e:
         log.error(f'Failed to startup, invalid configuration options:\n  {e}')
         sys.exit(1)
+
+    base.configure_logging(parsed_args.log_level, parsed_args.log_levels)
+    log_formatter = base.LogFormatter(base.LOG_FORMAT)  # webhook handlers format their own records
     base.UNSAFE_LOGGING = parsed_args.unsafe_logging
     db.set_dsn(parsed_args.db_url)
-    base.PROVIDER_TESTING_ENV = parsed_args.provider_testing_env
     base.RENEWAL_LATENCY_ALLOWANCE = parsed_args.renewal_latency_allowance
     base.PROVIDER_DRY_RUN = parsed_args.provider_dry_run
 
@@ -55,7 +53,8 @@ def entry_point() -> flask.Flask:
             webhook_logger.setFormatter(log_formatter)
             webhook_loggers.append(webhook_logger)
 
-            # NOTE: Setup loggers (main, backend, google, apple)
+            # Console handlers came from configure_logging; these are additional sinks, so they are
+            # ADDED rather than replacing anything.
             log.addHandler(webhook_logger)
             backend.log.addHandler(webhook_logger)
 
@@ -64,7 +63,6 @@ def entry_point() -> flask.Flask:
     if parsed_args.with_provider_google_play:
         from providers import google_play
 
-        google_play.log.addHandler(console_logger)
         for handler in webhook_loggers:
             google_play.log.addHandler(handler)
 
@@ -110,10 +108,6 @@ def entry_point() -> flask.Flask:
             startup_log += '    log_path is set but ignored under uWSGI (the vassal `logto` owns the log file)\n'
         if parsed_args.unsafe_logging:
             startup_log += '    Unsafe logging enabled (this must NOT be used in production)\n'
-        if parsed_args.provider_testing_env:
-            startup_log += (
-                '    Platform testing environment enabled (special behaviour for rounding timestamps to EOD)\n'
-            )
         if parsed_args.provider_dry_run:
             startup_log += '    provider_dry_run ENABLED: all payment-provider egress is stubbed (NO FOR PRODUCTION)\n'
         if parsed_args.dev_endpoints:
@@ -122,10 +116,13 @@ def entry_point() -> flask.Flask:
                 ' ANY unauthenticated caller (NOT FOR PRODUCTION)\n'
             )
         if parsed_args.with_provider_app_store:
-            label = 'Sandbox' if parsed_args.apple_sandbox_env else 'Production'
-            startup_log += f'    Platform: {label} Apple iOS App Store notification handling enabled\n'
+            # The environment named here is the App Store Server API's (which endpoint we call and which
+            # root certs verify it), NOT a property of the notification route: Apple posts to the same
+            # endpoint either way, and which environment a notification came from is a field inside it.
+            env = 'sandbox' if parsed_args.apple_sandbox_env else 'production'
+            startup_log += f'    Platform: Apple App Store notifications enabled ({env} API environment)\n'
         if parsed_args.with_provider_google_play:
-            startup_log += '    Platform: Google Play Store notification handling enabled\n'
+            startup_log += '    Platform: Google Play notifications enabled\n'
         for it in parsed_args.session_webhooks:
             if it.enabled:
                 startup_log += f'    Webhook Logger: Enabled (display name: {it.name})\n'
@@ -144,7 +141,7 @@ def entry_point() -> flask.Flask:
         # Flask lazily attaches its own default_handler to app.logger the first time it's accessed
         # (the addHandler below triggers that); remove it so app records aren't emitted twice — once
         # in Flask's format and once in ours.
-        result.logger.addHandler(console_logger)
+        base.install_log_handler(result.logger, parsed_args.log_levels.get('flask', parsed_args.log_level))
         result.logger.removeHandler(flask.logging.default_handler)
         for handler in webhook_loggers:
             result.logger.addHandler(handler)
@@ -155,7 +152,6 @@ def entry_point() -> flask.Flask:
             # Import the Apple provider only if enabled — zero footprint when disabled.
             from providers import app_store
 
-            app_store.log.addHandler(console_logger)
             for handler in webhook_loggers:
                 app_store.log.addHandler(handler)
             core: app_store.Core = app_store.init(

@@ -38,7 +38,7 @@ import backend
 import config
 import db
 
-log = logging.getLogger('PRO')
+log = logging.getLogger('pro')
 
 # How often the loop wakes to look for due tasks. Well below every task interval, so a task runs within a
 # second of becoming due; a wake with nothing due costs a few comparisons.
@@ -98,7 +98,7 @@ def _prune() -> None:
             except Exception:
                 log.error(f'Prune of {name} failed:\n{traceback.format_exc()}')
                 counts.append(f'{name}=FAILED')
-    log.info(f'Pruned expired rows ({", ".join(counts)})')
+    log.debug(f'Pruned expired rows ({", ".join(counts)})')
 
 
 def _drain_credits(window: pendulum.Duration) -> None:
@@ -106,7 +106,10 @@ def _drain_credits(window: pendulum.Duration) -> None:
     with db.connection() as conn:
         visited = backend.drain_due_credits(conn, now=now, stale_after=window)
     if visited:
-        log.info(f'Drained credits for {visited} account(s)')
+        # How many accounts the pass LOOKED at, which is not a payment event -- an account is visited on
+        # every window whether or not its credits had anything to give. What was actually charged, and any
+        # credit that ran out, is reported by the drain itself.
+        log.debug(f'Drained credits for {visited} account(s)')
 
 
 def loop(tasks: list[Task], stop: threading.Event) -> None:
@@ -132,23 +135,19 @@ def loop(tasks: list[Task], stop: threading.Event) -> None:
 
 def run() -> None:
     # The mule forks from the uWSGI master *after* main.entry_point() ran, so the shared loggers arrive with
-    # the master's handlers already attached. Clear them before installing the mule's own, otherwise every
-    # line is emitted once per inherited handler. uWSGI's `logto` captures this StreamHandler's stderr into
-    # the vassal log, same as the workers.
-    handler = logging.StreamHandler()
-    handler.setFormatter(base.LogFormatter('%(asctime)s %(levelname)s %(name)s %(message)s'))
-    for logger in (log, backend.log):
-        logger.handlers.clear()
-        logger.addHandler(handler)
+    # the master's handlers already attached; `configure_logging` clears them, otherwise every line is
+    # emitted once per inherited handler. uWSGI's `logto` captures this process's stderr into the vassal
+    # log, same as the workers. Bootstrap first so a config failure has somewhere to go.
+    base.bootstrap_logging()
 
     try:
         parsed = config.parse_args()
     except config.ConfigError as e:
         log.error(f'Maintenance mule failed to start, invalid configuration:\n  {e}')
         sys.exit(1)
+    base.configure_logging(parsed.log_level, parsed.log_levels)
     base.UNSAFE_LOGGING = parsed.unsafe_logging
     db.set_dsn(parsed.db_url)
-    base.PROVIDER_TESTING_ENV = parsed.provider_testing_env
     base.RENEWAL_LATENCY_ALLOWANCE = parsed.renewal_latency_allowance
     base.PROVIDER_DRY_RUN = parsed.provider_dry_run
 
@@ -166,8 +165,6 @@ def run() -> None:
         # is built HERE rather than inherited: the mule forks from the master, which never builds it.
         from providers import app_store
 
-        app_store.log.handlers.clear()
-        app_store.log.addHandler(handler)
         core: app_store.Core = app_store.init(
             key_id=parsed.apple_key_id,
             issuer_id=parsed.apple_issuer_id,
@@ -190,13 +187,25 @@ def run() -> None:
         # active subscription that would be converged onto real rows.
         from providers import google_play
 
-        google_play.notifications.log.handlers.clear()
-        google_play.notifications.log.addHandler(handler)
-
         def _drain_google_reconciles() -> None:
+            # The drain FETCHES the subscription resource, and `api` reaches Google through module globals
+            # that only this sets — a mule is its own process, so the subscriber having initialised them in
+            # the Google mule does nothing for us here. Idempotent and local (no network, no socket, no
+            # thread), so it costs a file read on the first pass and two comparisons afterwards.
+            #
+            # Called from inside the task rather than at mule startup so unreadable Google credentials fail
+            # this task and are logged by the loop, instead of killing a mule that also owes the DB prune and
+            # the Apple catch-up.
+            google_play.init_api(
+                package_name=parsed.google_package_name,
+                subscription_product_id=parsed.google_subscription_product_id,
+                app_credentials_path=parsed.google_cloud_app_credentials_path,
+            )
             drained = google_play.drain_due_reconciles(at=base.utc_now())
             if drained:
-                log.info(f'Reconciled {drained} Google subscription(s)')
+                # A count of tokens looked at; most converge to what we already had. The ones that changed
+                # something say so individually, at INFO, from the converge.
+                log.debug(f'Reconciled {drained} Google subscription(s)')
 
         tasks.append(
             Task(name='google-reconcile', interval_s=GOOGLE_RECONCILE_INTERVAL_S, run=_drain_google_reconciles)

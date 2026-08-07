@@ -105,7 +105,7 @@ fi
 apt-get install -y \
     ca-certificates curl git gnupg lsb-release rsync \
     python3 python3-venv python3-pip \
-    python3-flask python3-nacl python3-pendulum python3-psycopg python3-psycopg-c python3-psycopg-pool \
+    python3-coloredlogs python3-flask python3-nacl python3-pendulum python3-psycopg python3-psycopg-c python3-psycopg-pool \
     uwsgi-emperor uwsgi-plugin-python3 \
     postgresql postgresql-contrib pgbackrest \
     python3-session-util \

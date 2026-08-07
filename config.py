@@ -16,7 +16,7 @@ import pendulum
 
 import base
 
-log = logging.getLogger('PRO')
+log = logging.getLogger('pro')
 
 
 class ConfigError(ValueError):
@@ -47,7 +47,6 @@ class ParsedArgs:
     with_provider_app_store: bool = False
     with_provider_google_play: bool = False
 
-    provider_testing_env: bool = False
     provider_dry_run: bool = False
 
     dev_endpoints: bool = False
@@ -60,6 +59,12 @@ class ParsedArgs:
     # How long a renewing subscription is honoured past its paid-through instant while we wait to learn
     # whether it renewed. Ours, not a store's — see base.RENEWAL_LATENCY_ALLOWANCE.
     renewal_latency_allowance: pendulum.Duration = base.RENEWAL_LATENCY_ALLOWANCE
+    # `[logging] level` -- the level every logger gets unless named individually below. INFO rather
+    # than DEBUG so a fresh deploy is production-shaped: DEBUG adds a line per provider notification.
+    log_level: int = logging.INFO
+    # `[logging] level-<name>` -- per-logger overrides, keyed by the name in the log line. Not
+    # restricted to this application's categories, so `level-werkzeug = error` works too.
+    log_levels: dict[str, int] = dataclasses.field(default_factory=dict)
 
     session_webhooks: list[SessionWebhook] = dataclasses.field(default_factory=list)
 
@@ -101,13 +106,11 @@ def parse_args() -> ParsedArgs:
         base_section: configparser.SectionProxy = ini_parser['base']
         result.db_url = base_section.get(option='db_url', fallback='')
         result.backend_key_path = base_section.get(option='backend_key_path', fallback='')
-        result.log_path = base_section.get(option='log_path', fallback='')
         result.unsafe_logging = base_section.getboolean(option='unsafe_logging', fallback=False)
 
         result.with_provider_app_store = base_section.getboolean(option='with_provider_app_store', fallback=False)
         result.with_provider_google_play = base_section.getboolean(option='with_provider_google_play', fallback=False)
 
-        result.provider_testing_env = base_section.getboolean(option='provider_testing_env', fallback=False)
         result.provider_dry_run = base_section.getboolean(option='provider_dry_run', fallback=False)
 
         result.dev_endpoints = base_section.getboolean(option='dev_endpoints', fallback=False)
@@ -136,6 +139,39 @@ def parse_args() -> ParsedArgs:
                 errors.append(f'voucher_processing_window must not be negative, got {window_s}')
             else:
                 result.voucher_processing_window = base.duration_from_seconds(window_s)
+
+        if ini_parser.has_section('logging'):
+            logging_section: configparser.SectionProxy = ini_parser['logging']
+
+            def parse_level(key: str, raw: str) -> int | None:
+                # `getLevelName` maps a name to its number, but for anything it does not recognise it
+                # returns the STRING 'Level <name>' rather than raising -- so an unrecognised value has to
+                # be rejected here or it silently becomes a non-level and filters nothing.
+                level = logging.getLevelName(raw.strip().upper())
+                if isinstance(level, int):
+                    return level
+                errors.append(f'[logging] {key} must be one of DEBUG, INFO, WARNING, ERROR, CRITICAL; got "{raw}"')
+                return None
+
+            for key, raw in logging_section.items():
+                if key == 'level':
+                    level = parse_level(key, raw)
+                    if level is not None:
+                        result.log_level = level
+                elif key == 'path':
+                    result.log_path = raw.strip()
+                elif key.startswith('level-'):
+                    # The logger NAME, verbatim after the prefix. configparser lower-cases keys, which is
+                    # why the categories are lowercase: `level-google_play` has to be able to name the
+                    # logger that writes the line.
+                    name = key[len('level-') :]
+                    level = parse_level(key, raw)
+                    if not name:
+                        errors.append('[logging] "level-" needs a logger name after the dash')
+                    elif level is not None:
+                        result.log_levels[name] = level
+                else:
+                    errors.append(f'[logging] unrecognised option "{key}" (expected level, level-<name> or path)')
 
         webhook_index = 0
         while True:
@@ -205,9 +241,6 @@ def parse_args() -> ParsedArgs:
     result.with_provider_google_play = base.os_get_boolean_env(
         'SESH_PRO_BACKEND_WITH_PROVIDER_GOOGLE_PLAY', result.with_provider_google_play
     )
-    result.provider_testing_env = base.os_get_boolean_env(
-        'SESH_PRO_BACKEND_PROVIDER_TESTING_ENV', result.provider_testing_env
-    )
     result.provider_dry_run = base.os_get_boolean_env('SESH_PRO_BACKEND_PROVIDER_DRY_RUN', result.provider_dry_run)
     result.dev_endpoints = base.os_get_boolean_env('SESH_PRO_BACKEND_DEV_ENDPOINTS', result.dev_endpoints)
 
@@ -243,14 +276,6 @@ def parse_args() -> ParsedArgs:
                     'Provider app_store was enabled in production mode (e.g. not sandbox mode)'
                     ' but the production_app_id was not specified'
                 )
-
-        if result.apple_sandbox_env:
-            if not result.provider_testing_env:
-                log.warning(
-                    'Provider app_store was enabled in sandbox mode but provider_testing_env was not set to true.'
-                    ' You want to set this to true, overriding the flag to true'
-                )
-                result.provider_testing_env = True
 
         if not errors:
             try:
