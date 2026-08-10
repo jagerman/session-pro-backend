@@ -155,6 +155,19 @@ class ProSubscriptionProof:
     # Left at the default on any proof built without a user context (none today). ---
     account_expiry_at: pendulum.DateTime = base.EPOCH
 
+    # --- How much longer we keep serving PAST `account_expiry_at` — the store's dunning window plus our
+    # renewal-latency allowance, exactly as `get_pro_status` reports it. Zero when the subscription is not
+    # auto-renewing, because neither span applies to a term that is simply ending.
+    #
+    # Why it rides along with the expiry rather than only on get_pro_status: clients persist the account
+    # expiry into synced config from BOTH responses and hold this beside it, because coverage ends at
+    # `account_expiry_ts + account_grace_period_duration` and neither value means anything without the
+    # other. A proof fetch that refreshed the expiry alone would leave a span measured from a different
+    # instant sitting next to it, and the pair would silently disagree about when service stops.
+    #
+    # Display/state only, unsigned, like the expiry it qualifies. ---
+    account_grace_period: pendulum.Duration = dataclasses.field(default_factory=pendulum.duration)
+
     def to_dict(self) -> dict[str, str | int]:
         # `version` is a PLAINTEXT field, deliberately NOT bound into the signature. It is the
         # external indicator a verifier reads to pick the domain prefix + layout it must use to
@@ -175,6 +188,10 @@ class ProSubscriptionProof:
             # Advisory, UNSIGNED (see field comment): the account's true entitlement end, distinct from
             # the clamped proof `expiry_ts` above. Lets a proof fetch refresh the client's cached expiry.
             "account_expiry_ts": base.unix_seconds_from_datetime(self.account_expiry_at),
+            # Advisory, UNSIGNED: how much longer service continues past `account_expiry_ts`, so a client
+            # holding both knows coverage ends at their sum. Sent alongside the expiry so the two can
+            # never be persisted out of step with each other.
+            "account_grace_period_duration": base.seconds_from_duration(self.account_grace_period),
         }
         return result
 
@@ -2618,6 +2635,11 @@ def build_current_entitlement_proof(
     # over-provisioned; this is when the subscription actually ends. Confirmed with both client teams before
     # breaking it — libsession schedules renewal one hour before PROOF expiry, so nothing keys on this.
     proof.account_expiry_at = get_user.user.expiry_at
+    # The span we serve past that expiry, derived from the SAME snapshot so the pair a client persists
+    # cannot describe two different instants. `account_coverage_end` already returns the bare expiry for a
+    # subscription that is not auto-renewing, so this is zero there rather than needing a gate of its own —
+    # the same arithmetic get_pro_status reports, asked of the same row.
+    proof.account_grace_period = account_coverage_end(get_user.user) - get_user.user.expiry_at
     return proof
 
 
