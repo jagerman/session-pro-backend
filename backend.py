@@ -168,6 +168,20 @@ class ProSubscriptionProof:
     # Display/state only, unsigned, like the expiry it qualifies. ---
     account_grace_period: pendulum.Duration = dataclasses.field(default_factory=pendulum.duration)
 
+    # --- Whether the subscription behind `account_expiry_at` renews itself, from the same snapshot.
+    # Mirrors what get_pro_status reports as `auto_renewing`.
+    #
+    # It rides along for the same reason the grace period does: clients persist the account expiry into
+    # synced config from BOTH responses and persist the renewal flag beside it. If only get_pro_status
+    # carried it, a proof fetch would write a fresh expiry and leave the flag untouched -- and because
+    # config stores that flag presence-only (absent reads as "not renewing"), an account whose expiry has
+    # only ever been written by a proof reads back as terminal. Clients gate their startup status fetch on
+    # exactly that pair, so the config state saying "no need to check" would be the one reached by never
+    # having checked.
+    #
+    # Display/state only, unsigned, like the two fields above. ---
+    account_auto_renewing: bool = False
+
     def to_dict(self) -> dict[str, str | int]:
         # `version` is a PLAINTEXT field, deliberately NOT bound into the signature. It is the
         # external indicator a verifier reads to pick the domain prefix + layout it must use to
@@ -192,6 +206,10 @@ class ProSubscriptionProof:
             # holding both knows coverage ends at their sum. Sent alongside the expiry so the two can
             # never be persisted out of step with each other.
             "account_grace_period_duration": base.seconds_from_duration(self.account_grace_period),
+            # Advisory, UNSIGNED: whether the subscription behind `account_expiry_ts` renews. Sent
+            # alongside the expiry for the same reason the grace period is -- a client that persists the
+            # expiry from this response persists this with it, rather than leaving a stale flag.
+            "account_auto_renewing": self.account_auto_renewing,
         }
         return result
 
@@ -2640,6 +2658,10 @@ def build_current_entitlement_proof(
     # subscription that is not auto-renewing, so this is zero there rather than needing a gate of its own —
     # the same arithmetic get_pro_status reports, asked of the same row.
     proof.account_grace_period = account_coverage_end(get_user.user) - get_user.user.expiry_at
+    # The renewal flag from that same snapshot, so a client persisting the expiry above out of this
+    # response persists the flag that qualifies it at the same time, instead of leaving whatever a
+    # previous get_pro_status left behind.
+    proof.account_auto_renewing = get_user.user.auto_renewing
     return proof
 
 
