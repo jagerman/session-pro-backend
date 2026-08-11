@@ -2631,10 +2631,28 @@ def build_current_entitlement_proof(
             f'({base.readable(get_user.user.expiry_at)} + {get_user.user.grace_period} store grace '
             f'+ {base.RENEWAL_LATENCY_ALLOWANCE} allowance)',
             code=base.ErrorCode.subscription_expired,
-            # Advisory, same as the success path: carry the (now-past) account entitlement end so the
-            # client can refresh its cached horizon without a separate get_pro_status. Only on this slug —
-            # not_subscribed has no expiry, and revoked is a distinct state (its expiry may be future).
-            data={'account_expiry_ts': base.unix_seconds_from_datetime(get_user.user.expiry_at)},
+            # Advisory, same as the success path, and the same THREE values rather than the expiry alone:
+            # a client persists these into synced config and reads them back later — offline, at cold
+            # start, on another device — long after this error code is gone, so a response that refreshes
+            # one member of the trio has to refresh the others or leave durable state describing two
+            # different instants.
+            #
+            # This path needs that most, not least. The transition that produces the refusal is typically a
+            # cancel, which collapses the grace and the renewal flag while leaving the expiry exactly where
+            # it was (`update_payment_renewal_info` writes `grace_period=None, auto_renewing=False` and
+            # never touches `expiry_at`) — so the expiry is the one value here that did NOT change, and a
+            # client left holding its cached grace reads itself as covered for the remainder of a store
+            # dunning window we have already stopped honouring.
+            #
+            # Only on this slug — not_subscribed has no expiry, and revoked is a distinct state (its expiry
+            # may be future).
+            data={
+                'account_expiry_ts': base.unix_seconds_from_datetime(get_user.user.expiry_at),
+                'account_grace_period_duration': base.seconds_from_duration(
+                    account_coverage_end(get_user.user) - get_user.user.expiry_at
+                ),
+                'account_auto_renewing': get_user.user.auto_renewing,
+            },
         )
 
     proof = build_proof(
