@@ -587,6 +587,21 @@ def account_coverage_end(user: UserRow) -> pendulum.DateTime:
     return subscription_coverage_end(user.expiry_at, user.grace_period, user.auto_renewing)
 
 
+def account_grace_span(user: UserRow) -> pendulum.Duration:
+    """How much longer the account is served past `user.expiry_at` — the store's dunning window plus our
+    renewal-latency allowance, as one span.
+
+    The value every response reports beside the account expiry (`get_pro_status`'s account-level
+    `grace_period_duration`, and `account_grace_period_duration` on a proof response and on a
+    `subscription_expired` failure). It lives here, in one place, because a client adds it to the expiry to
+    learn when service stops: two endpoints deriving it separately could drift, and the pair would then say
+    two different things about the same instant depending on which one a client happened to call.
+
+    Zero for a subscription that is not auto-renewing, out of `account_coverage_end`'s gate rather than a
+    second test of the flag here."""
+    return account_coverage_end(user) - user.expiry_at
+
+
 @dataclasses.dataclass
 class CreditToDrain:
     """One live credit as the drain sees it: its row id and how much length it still has to give."""
@@ -2651,9 +2666,7 @@ def build_current_entitlement_proof(
             # may be future).
             data={
                 'account_expiry_ts': base.unix_seconds_from_datetime(get_user.user.expiry_at),
-                'account_grace_period_duration': base.seconds_from_duration(
-                    account_coverage_end(get_user.user) - get_user.user.expiry_at
-                ),
+                'account_grace_period_duration': base.seconds_from_duration(account_grace_span(get_user.user)),
                 'account_auto_renewing': get_user.user.auto_renewing,
             },
         )
@@ -2675,10 +2688,8 @@ def build_current_entitlement_proof(
     # breaking it — libsession schedules renewal one hour before PROOF expiry, so nothing keys on this.
     proof.account_expiry_at = get_user.user.expiry_at
     # The span we serve past that expiry, derived from the SAME snapshot so the pair a client persists
-    # cannot describe two different instants. `account_coverage_end` already returns the bare expiry for a
-    # subscription that is not auto-renewing, so this is zero there rather than needing a gate of its own —
-    # the same arithmetic get_pro_status reports, asked of the same row.
-    proof.account_grace_period = account_coverage_end(get_user.user) - get_user.user.expiry_at
+    # cannot describe two different instants.
+    proof.account_grace_period = account_grace_span(get_user.user)
     # The renewal flag from that same snapshot, so a client persisting the expiry above out of this
     # response persists the flag that qualifies it at the same time, instead of leaving whatever a
     # previous get_pro_status left behind.
