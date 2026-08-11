@@ -18,6 +18,7 @@ import base
 import db
 
 from tests.helpers import (
+    _CreditFixture,
     _grant_voucher,
     _redeem_and_prove,
     TestingContext,
@@ -56,6 +57,10 @@ def test_proof_reports_account_expiry(pg_database):
         wire = proof.to_dict()
         assert wire['account_expiry_ts'] == base.unix_seconds_from_datetime(account_expiry)
         assert wire['expiry_ts'] != wire['account_expiry_ts']
+        # A voucher never renews, so nothing is being waited for and the account is covered to its expiry
+        # exactly. Both spans are gated on the renewal flag, so this is zero rather than the allowance.
+        assert wire['account_grace_period_duration'] == 0
+        assert wire['account_auto_renewing'] is False
 
         # account_expiry_ts is advisory: it is NOT part of the signed message the verifier reconstructs.
         proof_hash = backend.build_proof_message(proof.revocation_tag, proof.rotating_pkey, proof.expiry_at)
@@ -65,8 +70,9 @@ def test_proof_reports_account_expiry(pg_database):
 
 def test_expired_proof_fail_carries_account_expiry(pg_database):
     # A proof request against a lapsed entitlement fails with subscription_expired AND carries the
-    # account's (now-past) expiry as account_expiry_ts on the error, so the client can refresh its cached
-    # horizon without a separate get_pro_status.
+    # account's (now-past) state on the error -- expiry, grace and renewal flag -- so the client can
+    # refresh its cached horizon without a separate get_pro_status. All three, because they are persisted
+    # together and coverage is the sum: see test_expired_proof_fail_reports_a_cancel_the_expiry_cannot.
     pool = backend.bootstrap_db(database_url=pg_database())
     assert pool
     backend_key = nacl.signing.SigningKey.generate()
@@ -89,7 +95,106 @@ def test_expired_proof_fail_carries_account_expiry(pg_database):
                     tx, master_key.verify_key, rotating_key.verify_key, request_at, backend_key
                 )
         assert excinfo.value.code == base.ErrorCode.subscription_expired
-        assert excinfo.value.data == {'account_expiry_ts': base.unix_seconds_from_datetime(account_expiry)}
+        # A voucher is not renewing and has no store grace, so the qualifying pair is zero/false rather
+        # than absent -- the wire states them either way (wire spec §2.2).
+        assert excinfo.value.data == {
+            'account_expiry_ts': base.unix_seconds_from_datetime(account_expiry),
+            'account_grace_period_duration': 0,
+            'account_auto_renewing': False,
+        }
+    pool.close()
+
+
+def test_proof_and_status_report_the_same_account_state(pg_database):
+    # The property the trio exists for: a client can persist the account's expiry, grace and renewal flag
+    # from EITHER response and end up with the same three values. If they could disagree, which endpoint a
+    # client happened to call last would decide what its synced config says about when service stops.
+    #
+    # Anchored on the wall clock rather than a chosen instant, because get_pro_status signs a timestamp and
+    # rejects one outside the replay window -- so the scenario is "renewal failed an hour ago, in grace".
+    with TestingContext(db_url_factory=pg_database) as ctx:
+        rotating_key = nacl.signing.SigningKey.generate()
+        now = base.utc_now()
+        term_end = now - base.HOUR
+
+        with ctx.connection() as conn:
+            f = _CreditFixture(conn, now)
+            f.subscribe(expiry_at=term_end, purchased_at=term_end - 30 * base.DAY, grace=16 * base.DAY)
+            wire = _prove_at(conn, ctx.backend_key, f.master_key, rotating_key, now).to_dict()
+
+        request_at = int(base.unix_seconds_from_datetime(now))
+        hash_to_sign = backend.make_get_pro_status_message(
+            master_pkey=f.pkey, request_at=base.datetime_from_unix_seconds(request_at)
+        )
+        response = ctx.flask_client.post(
+            '/get_pro_status',
+            json={
+                'master_pkey': bytes(f.pkey).hex(),
+                'master_sig': bytes(f.master_key.sign(hash_to_sign).signature).hex(),
+                'ts': request_at,
+            },
+        )
+        body = response.get_json()
+        assert body['status'] == 'ok', body
+        status = body['result']
+
+        # In grace, so the pair is load-bearing on both sides: the expiry is an hour past and coverage runs
+        # 16 days beyond it. An account whose values were all zero would pass this test vacuously.
+        assert status['user_status'] == 'active', status
+        assert status['expiry_ts'] == base.unix_seconds_from_datetime(term_end)
+        assert status['grace_period_duration'] == base.seconds_from_duration(
+            16 * base.DAY + base.RENEWAL_LATENCY_ALLOWANCE
+        )
+
+        assert wire['account_expiry_ts'] == status['expiry_ts']
+        assert wire['account_grace_period_duration'] == status['grace_period_duration']
+        assert wire['account_auto_renewing'] == status['auto_renewing'] is True
+
+
+def test_expired_proof_fail_reports_a_cancel_the_expiry_cannot(pg_database):
+    # Why the refusal carries all three and not just the expiry. A cancel mid-billing-retry collapses the
+    # grace and the renewal flag and leaves `expiry_at` exactly where it was, so the expiry is precisely
+    # the value that CANNOT report what happened. A client that persisted the in-grace pair and then
+    # refreshed only the expiry off this failure would go on reading itself as covered for the remainder of
+    # a 16-day dunning window we have already stopped honouring.
+    pool = backend.bootstrap_db(database_url=pg_database())
+    assert pool
+    backend_key = nacl.signing.SigningKey.generate()
+    rotating_key = nacl.signing.SigningKey.generate()
+
+    with db.connection() as conn:
+        T = round_datetime_to_next_day(base.utc_now())
+        f = _CreditFixture(conn, T)
+        term_end = T + 30 * base.DAY
+        sub = f.subscribe(expiry_at=term_end, grace=16 * base.DAY)
+
+        # In grace: a proof hands back a pair that says "covered until term_end + 16d + allowance".
+        in_grace = _prove_at(conn, backend_key, f.master_key, rotating_key, term_end + base.DAY)
+        assert in_grace.account_expiry_at == term_end
+        assert in_grace.account_grace_period == 16 * base.DAY + base.RENEWAL_LATENCY_ALLOWANCE
+        assert in_grace.account_auto_renewing
+
+        # The customer turns auto-renew off. Coverage collapses to the paid term; the expiry does not move.
+        err = base.ErrorSink()
+        with db.transaction(conn) as tx:
+            assert backend.update_payment_renewal_info(
+                tx, payment_tx=sub, grace_period=None, auto_renewing=False, err=err
+            )
+        assert not err.msg_list, err.msg_list
+        assert backend.account_coverage_end(backend.get_user(conn, f.pkey)) == term_end
+
+        with pytest.raises(base.FailError) as excinfo:
+            _prove_at(
+                conn, backend_key, f.master_key, rotating_key, term_end + base.PROOF_EXPIRY_SHAPE.max_proof_lifetime
+            )
+        assert excinfo.value.code == base.ErrorCode.subscription_expired
+        # The expiry is byte-for-byte what the successful proof above already reported: refreshing it alone
+        # would tell the client nothing, and the two values that DID change are the ones that carry it.
+        assert excinfo.value.data == {
+            'account_expiry_ts': base.unix_seconds_from_datetime(in_grace.account_expiry_at),
+            'account_grace_period_duration': 0,
+            'account_auto_renewing': False,
+        }
     pool.close()
 
 
@@ -313,7 +418,11 @@ def test_lapsed_account_keeps_proofs_through_the_over_provision(pg_database):
         with pytest.raises(base.FailError) as excinfo:
             _prove_at(conn, backend_key, master_key, rotating_key, expiry + pendulum.duration(seconds=1))
         assert excinfo.value.code == base.ErrorCode.subscription_expired
-        assert excinfo.value.data == {'account_expiry_ts': base.unix_seconds_from_datetime(true_expiry)}
+        assert excinfo.value.data == {
+            'account_expiry_ts': base.unix_seconds_from_datetime(true_expiry),
+            'account_grace_period_duration': 0,
+            'account_auto_renewing': False,
+        }
     pool.close()
 
 

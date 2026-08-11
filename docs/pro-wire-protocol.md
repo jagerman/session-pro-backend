@@ -109,13 +109,15 @@ verified offline**; it carries **no user identity**.
 
 **Wire (JSON):**
 ```
-{ "version": 0,                   // plaintext; selects the domain prefix (see below). NOT hashed.
-  "revocation_tag": "<64 hex>",   // opaque 32-byte value; see §2.1
-  "rotating_pkey":  "<64 hex>",   // Ed25519 public key the proof entitles
-  "expiry_ts": <int>,             // seconds; PROOF validity (clamped, rolling ~30d) — NOT the sub end;
-                                  //   see §2.3 before reading anything into its value
-  "sig": "<128 hex>",             // Ed25519 over the message below (§1.1)
-  "account_expiry_ts": <int> }    // advisory, UNSIGNED; see §2.2
+{ "version": 0,                            // plaintext; selects the domain prefix (see below). NOT hashed.
+  "revocation_tag": "<64 hex>",            // opaque 32-byte value; see §2.1
+  "rotating_pkey":  "<64 hex>",            // Ed25519 public key the proof entitles
+  "expiry_ts": <int>,                      // seconds; PROOF validity (clamped, rolling ~30d) — NOT the
+                                           //   sub end; see §2.3 before reading anything into its value
+  "sig": "<128 hex>",                      // Ed25519 over the message below (§1.1)
+  "account_expiry_ts": <int>,              // advisory, UNSIGNED; see §2.2
+  "account_grace_period_duration": <int>,  // advisory, UNSIGNED; see §2.2
+  "account_auto_renewing": <bool> }        // advisory, UNSIGNED; see §2.2
 ```
 `version` is a **plaintext data element**, deliberately **not** a byte in the signed message (§1).
 Verification is a mapping from the transmitted **data → (domain prefix, message)**: the verifier reads
@@ -147,7 +149,12 @@ entitlement). Clients treat it as an **opaque blob compared for equality** again
 entries — nothing derives or interprets it: it is not a hash of anything the client can or should
 compute, just an opaque stored random value.
 
-### 2.2 `account_expiry_ts` (advisory, unsigned)
+### 2.2 The account fields (advisory, unsigned)
+Three fields describing the **account** rather than the proof: `account_expiry_ts`,
+`account_grace_period_duration` and `account_auto_renewing`. None is part of the signed message; all three
+come from one snapshot, taken at the same instant as the proof beside them.
+
+#### `account_expiry_ts`
 The account's **true entitlement end** in integer seconds — the same value `get_pro_status` reports as
 `expiry_ts`. This is the end of the term that was *paid for*: it carries neither the store's grace period
 nor the backend's renewal-latency allowance, both of which describe how long service continues past that
@@ -165,8 +172,25 @@ different questions and are allowed to cross: in the final stretch of a subscrip
 overtakes the account's true end (§2.3), and a proof issued during a store grace period or the backend's
 renewal-latency allowance runs past it by construction. `account_expiry_ts` is exact in every case — it is
 the one value here with no over-provision and no random offset on it, which is what makes it the right
-thing to show a user and the wrong thing to make a serving decision on. The `subscription_expired`
-failure (§5.1) carries the same value, then in the past.
+thing to show a user and the wrong thing to make a serving decision on.
+
+#### `account_grace_period_duration` and `account_auto_renewing`
+How much longer the account is served **past** `account_expiry_ts`, and whether the subscription behind it
+renews itself. They are the **same two quantities** `get_pro_status` reports as its account-level
+`grace_period_duration` and `auto_renewing` (§5.2): the store's dunning window plus the backend's
+renewal-latency allowance, and `0` when the subscription is not auto-renewing, since neither span applies
+to a term that is simply ending. Service stops at `account_expiry_ts + account_grace_period_duration`, and
+that is the same instant `get_pro_status` flips `user_status` from `active` to `expired`.
+
+`account_grace_period_duration` is **not** the payment-item field of that name, which is what one store
+declared about one transaction and carries no allowance (§5.2).
+
+#### The three travel together
+Every response that carries any of the three carries **all** of them, so a client can persist them from
+whichever it received and never hold two values describing different instants. That is both the proof
+response above and the `subscription_expired` failure (§5.1), where `account_expiry_ts` is in the past —
+and where the other two are the fields that can have changed, since a cancellation collapses coverage to
+the paid term without moving the expiry.
 
 ### 2.3 `expiry_ts` (proof validity)
 The proof's own validity window, and **nothing else**. It is the earlier of the subscription end and a
@@ -291,7 +315,7 @@ Non-`ok` responses carry two fields:
 | `invalid_request` | fail | malformed JSON, missing/wrong-type field, bad hex, out-of-range value, unsupported/disabled provider. A correct client never sees this. |
 | `bad_signature` | fail | a request signature failed to verify. A correct client never sees this. |
 | `stale_request` | fail | request timestamp outside the replay-tolerance window. The client may re-fetch server time (`/status`) and retry. |
-| `subscription_expired` | fail | the user's entitlement has lapsed → "renew" CTA. (Named to stay disjoint from `user_status: expired` — §5.2 — so no token belongs to two fields.) A `subscription_expired` fail on `generate_pro_proof` additionally carries a top-level **`account_expiry_ts`** (the now-past account entitlement end, §2.2) so the client can refresh its cached horizon without a separate `get_pro_status`; other slugs do not. |
+| `subscription_expired` | fail | the user's entitlement has lapsed → "renew" CTA. (Named to stay disjoint from `user_status: expired` — §5.2 — so no token belongs to two fields.) A `subscription_expired` fail on `generate_pro_proof` additionally carries the three top-level account fields — **`account_expiry_ts`** (now in the past), **`account_grace_period_duration`** and **`account_auto_renewing`** (§2.2) — so the client can refresh its cached state without a separate `get_pro_status`; other slugs do not. |
 | `not_subscribed` | fail | no entitlement on record (never subscribed, or pruned after long inactivity) → "subscribe" CTA. |
 | `revoked` | fail | the user's current entitlement was revoked. Treat as `subscription_expired` (renew) on clients today; the distinct slug is reserved for a future revoked-specific flow. |
 | `internal_error` | error | backend fault; not the client's doing. |
@@ -349,6 +373,9 @@ must not treat them interchangeably:
 - On **`get_pro_status`** it is how much longer the *account* is served past `expiry_ts` — the store's grace
   plus the backend's renewal-latency allowance, and `0` when the subscription is not auto-renewing (nothing
   is in flight, so nothing is being waited for).
+- On a **proof response** (and on a `subscription_expired` failure) the same account-level value rides under
+  the `account_`-prefixed name `account_grace_period_duration` (§2.2), because the proof carries an
+  `expiry_ts` of its own. Same quantity as the `get_pro_status` one, not a third meaning.
 
 The account-level pair is self-consistent: `expiry_ts + grace_period_duration` is exactly the instant the
 backend stops serving, and is the same instant `user_status` flips from `active` to `expired`. A client that

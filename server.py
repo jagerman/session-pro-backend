@@ -326,14 +326,13 @@ def get_pro_status():
                 coverage_end = backend.account_coverage_end(user)
                 user_pro_status = UserProStatus.Active if request_at <= coverage_end else UserProStatus.Expired
 
-                # Derived from the same instant the status is judged against, so `expiry_ts +
+                # The span behind the same instant the status is judged against, so `expiry_ts +
                 # grace_period_duration` is exactly when we stop serving and a client can reconcile the two
                 # rather than finding `active` next to numbers that say otherwise. This is how much longer
                 # we serve past the expiry shown — the account's state — and NOT the same quantity as the
                 # payment-level field of this name, which reports what a store declared about one
-                # transaction. `account_coverage_end` already returns the bare expiry when the subscription
-                # is not renewing, so the gate is in the arithmetic rather than bolted on after it.
-                grace_period_duration = base.seconds_from_duration(coverage_end - user.expiry_at)
+                # transaction.
+                grace_period_duration = base.seconds_from_duration(backend.account_grace_span(user))
                 if backend.is_generation_revoked(tx.conn, user.current_generation_id, request_at):
                     user_pro_status = UserProStatus.Expired
 
