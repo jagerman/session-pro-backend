@@ -182,7 +182,7 @@ class ProSubscriptionProof:
     # Display/state only, unsigned, like the two fields above. ---
     account_auto_renewing: bool = False
 
-    def to_dict(self) -> dict[str, str | int]:
+    def to_dict(self) -> dict[str, str | int | bool]:
         # `version` is a PLAINTEXT field, deliberately NOT bound into the signature. It is the
         # external indicator a verifier reads to pick the domain prefix + layout it must use to
         # reconstruct and check the signed message; v0's domain prefix is BUILD_PROOF_DOMAIN
@@ -191,7 +191,10 @@ class ProSubscriptionProof:
         # refuses a version it doesn't understand, so nothing old breaks. The version is thus a
         # verification *input*, never discovered through the signature; tampering with it just makes the
         # verifier pick the wrong domain prefix → signature fails.
-        result: dict[str, str | int] = {
+        # `bool` in the annotation earns its keep: mypy accepts a bool wherever an int is declared, so
+        # `account_auto_renewing` type-checked silently under `str | int` while serialising as JSON `true`,
+        # not `1`. The annotation is the only place this response's wire types are written down.
+        result: dict[str, str | int | bool] = {
             "version": self.version,
             "revocation_tag": self.revocation_tag.hex(),
             "rotating_pkey": bytes(self.rotating_pkey).hex(),
