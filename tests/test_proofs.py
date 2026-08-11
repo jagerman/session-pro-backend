@@ -57,6 +57,10 @@ def test_proof_reports_account_expiry(pg_database):
         wire = proof.to_dict()
         assert wire['account_expiry_ts'] == base.unix_seconds_from_datetime(account_expiry)
         assert wire['expiry_ts'] != wire['account_expiry_ts']
+        # A voucher never renews, so nothing is being waited for and the account is covered to its expiry
+        # exactly. Both spans are gated on the renewal flag, so this is zero rather than the allowance.
+        assert wire['account_grace_period_duration'] == 0
+        assert wire['account_auto_renewing'] is False
 
         # account_expiry_ts is advisory: it is NOT part of the signed message the verifier reconstructs.
         proof_hash = backend.build_proof_message(proof.revocation_tag, proof.rotating_pkey, proof.expiry_at)
@@ -99,6 +103,52 @@ def test_expired_proof_fail_carries_account_expiry(pg_database):
             'account_auto_renewing': False,
         }
     pool.close()
+
+
+def test_proof_and_status_report_the_same_account_state(pg_database):
+    # The property the trio exists for: a client can persist the account's expiry, grace and renewal flag
+    # from EITHER response and end up with the same three values. If they could disagree, which endpoint a
+    # client happened to call last would decide what its synced config says about when service stops.
+    #
+    # Anchored on the wall clock rather than a chosen instant, because get_pro_status signs a timestamp and
+    # rejects one outside the replay window -- so the scenario is "renewal failed an hour ago, in grace".
+    with TestingContext(db_url_factory=pg_database) as ctx:
+        rotating_key = nacl.signing.SigningKey.generate()
+        now = base.utc_now()
+        term_end = now - base.HOUR
+
+        with ctx.connection() as conn:
+            f = _CreditFixture(conn, now)
+            f.subscribe(expiry_at=term_end, purchased_at=term_end - 30 * base.DAY, grace=16 * base.DAY)
+            wire = _prove_at(conn, ctx.backend_key, f.master_key, rotating_key, now).to_dict()
+
+        request_at = int(base.unix_seconds_from_datetime(now))
+        hash_to_sign = backend.make_get_pro_status_message(
+            master_pkey=f.pkey, request_at=base.datetime_from_unix_seconds(request_at)
+        )
+        response = ctx.flask_client.post(
+            '/get_pro_status',
+            json={
+                'master_pkey': bytes(f.pkey).hex(),
+                'master_sig': bytes(f.master_key.sign(hash_to_sign).signature).hex(),
+                'ts': request_at,
+            },
+        )
+        body = response.get_json()
+        assert body['status'] == 'ok', body
+        status = body['result']
+
+        # In grace, so the pair is load-bearing on both sides: the expiry is an hour past and coverage runs
+        # 16 days beyond it. An account whose values were all zero would pass this test vacuously.
+        assert status['user_status'] == 'active', status
+        assert status['expiry_ts'] == base.unix_seconds_from_datetime(term_end)
+        assert status['grace_period_duration'] == base.seconds_from_duration(
+            16 * base.DAY + base.RENEWAL_LATENCY_ALLOWANCE
+        )
+
+        assert wire['account_expiry_ts'] == status['expiry_ts']
+        assert wire['account_grace_period_duration'] == status['grace_period_duration']
+        assert wire['account_auto_renewing'] == status['auto_renewing'] is True
 
 
 def test_expired_proof_fail_reports_a_cancel_the_expiry_cannot(pg_database):
