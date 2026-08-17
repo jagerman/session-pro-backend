@@ -43,6 +43,15 @@ services:
     ports:
       - '8090:80'
     restart: unless-stopped
+    # uWSGI's HTTP router allocates one pointer per POSSIBLE file descriptor at startup, sized from
+    # the SOFT RLIMIT_NOFILE it finds ("detected max file descriptor number" in the boot log). The
+    # container runtime's default is 2147483584, which makes that one table 16 GiB of resident
+    # memory in the `uWSGI http 1` process — the whole container's footprint, next to ~35 MB per
+    # worker. At 8192 it is 64 KB, and still far more connections than this backend ever serves.
+    ulimits:
+      nofile:
+        soft: 8192
+        hard: 65536
     volumes:
       # Declarative Pro grants applied on boot; mounted so it can be edited without a rebuild.
       - ./vouchers.tsv:/etc/session-pro-backend/vouchers.tsv:ro
