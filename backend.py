@@ -553,9 +553,13 @@ def subscription_coverage_end(
 
     Two spans, both applied HERE and neither stored:
 
-    * `store_grace` — a dunning window the store granted and stated separately (Apple). NULL where the
-      store folds it into its own expiry instead (Play extends `expiryTime`), and where grace is not a
-      concept for the payment at all (a credit, a one-shot).
+    * `store_grace` — the dunning window the store granted, reached by a different route per provider but
+      meaning the same span in both. Apple states it directly. Play does not: it extends `expiryTime`
+      instead, so `google_converge_payment` keeps the stored paid term as `expiry_at` and records the
+      extension here rather than letting one overwrite the other. NULL only where grace is not a concept
+      for the payment (a credit, a one-shot), or where Play's first notification for a row already
+      carried the extension — there being no earlier paid term to measure it against, that expiry is
+      stored as-is and the grace reads zero.
     * `base.RENEWAL_LATENCY_ALLOWANCE` — ours, config, covering the gap between a term ending and us
       learning whether it renewed. Read at call time rather than captured, so raising the setting ahead of
       maintenance moves accounts that already have payments; a stored copy would fossilise and protect
