@@ -89,18 +89,12 @@
     parser reads it **once** to `(count, unit)` — unit enum `second`/`day`/`week`/`month`/`year`/`lifetime`;
     clients own localized display. Backend groups by the raw code.
   - A `nil`/unset value is never valid on the wire — every stored row has a real code.
-- **No version byte in any signed message; no `version` field on requests/responses**.
-  Requests are domain-separated by their **domain prefix** (§1.1) and their **endpoint**; a new *request*
-  shape earns a **new endpoint**, so requests carry no version at all. The **proof** is the exception: it
-  is free-floating and offline-verified (no endpoint), so it keeps a **plaintext `version` field** — but
-  that field is a verification *input*, not a signed byte. The verifier reads it and maps the proof
-  **data → (domain prefix, message)**: `version` selects the domain prefix for that version (v0 →
-  `ProProof_v0_____`; the map is arbitrary per-version, so a future version may pick any prefix),
-  which is what binds the version into the signature. You can't learn a version
-  *through* a signature you haven't verified — you must already know it to reconstruct the message — so the
-  version rides in the clear as data and a version byte inside the message would be redundant. The
-  version→domain-prefix map is per-version and arbitrary — a future version may choose any
-  domain prefix; a verifier refuses versions it doesn't know, so nothing old breaks.
+- **No version byte in any signed message, and no `version` field anywhere on this wire** — requests,
+  responses and the proof alike. A format version is carried by the **domain prefix** (§1.1) and by the
+  **endpoint**: a new request or response shape earns a new endpoint, so the caller has already selected
+  the format by the time it gets an answer, and an integer echoed back tells it nothing it did not
+  already know. A version a peer must act on belongs where that peer can read it — for the proof, the
+  protobuf envelope clients attach it to (below).
 
 ## 2. The Pro proof (signed by the backend)
 
@@ -109,8 +103,7 @@ verified offline**; it carries **no user identity**.
 
 **Wire (JSON):**
 ```
-{ "version": 0,                            // plaintext; selects the domain prefix (see below). NOT hashed.
-  "revocation_tag": "<64 hex>",            // opaque 32-byte value; see §2.1
+{ "revocation_tag": "<64 hex>",            // opaque 32-byte value; see §2.1
   "rotating_pkey":  "<64 hex>",            // Ed25519 public key the proof entitles
   "expiry_ts": <int>,                      // seconds; PROOF validity (clamped, rolling ~30d) — NOT the
                                            //   sub end; see §2.3 before reading anything into its value
@@ -119,23 +112,28 @@ verified offline**; it carries **no user identity**.
   "account_grace_period_duration": <int>,  // advisory, UNSIGNED; see §2.2
   "account_auto_renewing": <bool> }        // advisory, UNSIGNED; see §2.2
 ```
-`version` is a **plaintext data element**, deliberately **not** a byte in the signed message (§1).
-Verification is a mapping from the transmitted **data → (domain prefix, message)**: the verifier reads
-`version`, looks up the domain prefix + field layout for that version (v0 → `ProProof_v0_____`),
-reconstructs the message, and checks `sig`. So the version is a verification **input**, known before
-verification — never something discovered *through* a signature (you must already know it to reconstruct
-the message at all). It needs no signing: tampering with it just makes the verifier use the wrong
-prefix and the signature fails. A verifier that doesn't recognise a `version` **refuses to
-interpret the proof** — it *cannot* verify a format it doesn't know. The version→prefix map is
-arbitrary and per-version: a future version may pick **any** prefix (or reshape the proof
-entirely), and no existing verifier breaks because it never attempts an unknown version. (A version byte
-*inside* the message would be pure redundancy — "extra bits for nothing" — since the version is already
-the plaintext input that picks the prefix.)
+**There is no `version` field in this response.** The format version is bound into the signature by the
+**domain prefix** — v0 signs under `ProProof_v0_____` — so a proof of one version cannot verify as
+another, and the map from version to prefix is arbitrary and per-version (a future version may pick any
+prefix, or reshape the proof entirely).
+
+A future proof version is served from a **new endpoint**, per §1. `generate_pro_proof` keeps the shape
+above: fields are added to it, never removed or retyped, and it never begins answering in another format.
+A client may therefore parse this response strictly and treat an unexpected shape as an error rather than
+as a version it has to detect.
+
+The client fetching this response already knows the version: it chose the endpoint that produced it. The
+party that does *not* know is an **offline peer verifier**, which never made this request — and it reads
+the version from the **protobuf envelope** the fetching client attaches the proof to, not from here. A
+verifier that meets a version it does not recognise **refuses to interpret the proof** rather than
+reporting it invalid: it cannot check a format it does not know, and treating an unrecognised version as a
+failed signature would make a client-upgrade rollout look like a wave of forgeries. That distinction is a
+property of the envelope layer; this response is not where it lives.
 
 **Signed message** — `sig = Ed25519(backend_key, M)` over the message **directly** (no pre-hash; §1.1);
-the verifier picks the 16-byte domain prefix from the plaintext `version` (`0` → `ProProof_v0_____`), then:
+the verifier picks the 16-byte domain prefix for the version it is holding (v0 → `ProProof_v0_____`), then:
 ```
-M =  "ProProof_v0_____"        # 16-byte domain prefix; the "_v0" is the version, chosen from the data
+M =  "ProProof_v0_____"        # 16-byte domain prefix; the "_v0" is where the version is bound
   ‖  revocation_tag            # 32 bytes, raw
   ‖  rotating_pkey             # 32 bytes, raw
   ‖  dec(expiry_ts)            # canonical decimal ASCII seconds (trailing field → no separator)
@@ -160,7 +158,7 @@ The account's **true entitlement end** in integer seconds — the same value `ge
 nor the backend's renewal-latency allowance, both of which describe how long service continues past that
 point rather than what the subscription ran to. It is **not** part of the signed message `M` and carries no
 signature of
-its own: a verifier reconstructs `M` from `version`/`revocation_tag`/`rotating_pkey`/`expiry_ts` only and
+its own: a verifier reconstructs `M` from `revocation_tag`/`rotating_pkey`/`expiry_ts` only and
 MUST NOT feed `account_expiry_ts` into that check. It is **distinct from the proof's `expiry_ts`**, which
 is the clamped, rolling (~30 d) proof-validity window; `account_expiry_ts` is the subscription horizon
 and may be far later. It rides on the proof response so a proof fetch also refreshes the client's cached
