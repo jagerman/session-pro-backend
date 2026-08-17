@@ -137,7 +137,6 @@ class GoogleNotificationMessageIDInDB:
 
 @dataclasses.dataclass
 class ProSubscriptionProof:
-    version: int = 0
     revocation_tag: bytes = b''  # the generation's stored random 32-byte token
     rotating_pkey: nacl.signing.VerifyKey = nacl.signing.VerifyKey(ZERO_BYTES32)
     expiry_at: pendulum.DateTime = base.EPOCH
@@ -183,19 +182,15 @@ class ProSubscriptionProof:
     account_auto_renewing: bool = False
 
     def to_dict(self) -> dict[str, str | int | bool]:
-        # `version` is a PLAINTEXT field, deliberately NOT bound into the signature. It is the
-        # external indicator a verifier reads to pick the domain prefix + layout it must use to
-        # reconstruct and check the signed message; v0's domain prefix is BUILD_PROOF_DOMAIN
-        # (`ProProof_v0_____`). The version→domain-prefix map is per-version and arbitrary — a future
-        # version may choose any domain prefix (or reshape the proof entirely); a verifier simply
-        # refuses a version it doesn't understand, so nothing old breaks. The version is thus a
-        # verification *input*, never discovered through the signature; tampering with it just makes the
-        # verifier pick the wrong domain prefix → signature fails.
+        # The proof's format version is NOT here: it is bound into the signature through the domain prefix
+        # (BUILD_PROOF_DOMAIN, `ProProof_v0_____`), and a peer learns which version it is holding from the
+        # protobuf envelope that carries the proof between clients — which is the layer where an offline
+        # verifier that never made this request can actually read it.
+        #
         # `bool` in the annotation earns its keep: mypy accepts a bool wherever an int is declared, so
         # `account_auto_renewing` type-checked silently under `str | int` while serialising as JSON `true`,
         # not `1`. The annotation is the only place this response's wire types are written down.
         result: dict[str, str | int | bool] = {
-            "version": self.version,
             "revocation_tag": self.revocation_tag.hex(),
             "rotating_pkey": bytes(self.rotating_pkey).hex(),
             # Whole seconds by construction — a store expiry (µs-capable) only reaches here through
