@@ -1040,6 +1040,17 @@ def _update_user_expiry_grace_and_renew_flag_from_payment_list(
     their latest known expiry time"""
     master_pkey_bytes: bytes = bytes(master_pkey)
     lookup: LookupUserExpiry = _lookup_user_expiry(tx, nacl.signing.VerifyKey(master_pkey_bytes))
+
+    # No payment left to compute from — every one the account had is revoked or expired. `users.expiry_at`
+    # is NOT NULL, so the absence has to be written as an instant rather than as NULL, and the instant that
+    # says it is the recompute's own: coverage ends here, nothing beyond it is owed.
+    #
+    # Leaving the previous value instead would keep a refunded account entitled until its original term ran
+    # out, since `get_pro_status` reads this column. Writing it forward is a SHRINK in the same sense the
+    # offset helper below already means by it — it declines to redraw for exactly this case, which is how we
+    # know a `None` expiry was expected here and only its write was not.
+    expiry_at = lookup.best_expiry if lookup.best_expiry is not None else base.utc_now()
+
     # NOTE: We have the latest expiry value, now update the user
     db.query(
         tx.conn,
@@ -1050,7 +1061,7 @@ def _update_user_expiry_grace_and_renew_flag_from_payment_list(
                proof_expiry_offset = {_offset_redrawn_if_expiry_extends(lookup.best_expiry)}
         WHERE  master_pkey = %(pkey)s
     ''',
-        expiry=lookup.best_expiry,
+        expiry=expiry_at,
         grace=lookup.best_grace,
         renewing=lookup.best_auto_renewing,
         proof_random_offset=new_proof_expiry_offset(),
@@ -2288,7 +2299,7 @@ def _ensure_active_generation(
     ''',
         gen_id=result.generation_id,
         user_id=user.id,
-        expiry=lookup.best_expiry,
+        expiry=expiry_at,
         grace=lookup.best_grace,
         auto_renewing=lookup.best_auto_renewing,
         proof_random_offset=new_proof_expiry_offset(),
