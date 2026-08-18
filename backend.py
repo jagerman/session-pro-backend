@@ -2299,7 +2299,7 @@ def _ensure_active_generation(
     ''',
         gen_id=result.generation_id,
         user_id=user.id,
-        expiry=expiry_at,
+        expiry=lookup.best_expiry,
         grace=lookup.best_grace,
         auto_renewing=lookup.best_auto_renewing,
         proof_random_offset=new_proof_expiry_offset(),

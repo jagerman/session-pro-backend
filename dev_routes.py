@@ -176,22 +176,6 @@ def dev_revoke() -> flask.Response:
 
     with db.connection() as conn:
         with db.transaction(conn) as tx:
-            if raw_revoke_payments:
-                # The same rows and the same internal the Apple and Google refund handlers use; they
-                # differ from this only in selecting by a provider identifier rather than by account.
-                # It marks the payments revoked, clears auto_renewing, and recomputes the entitlement,
-                # revoking any proof that now overreaches it.
-                rows = db.query(
-                    tx.conn,
-                    f'''
-                    SELECT p.id, u.master_pkey, p.expiry_at
-                    FROM   {backend.PAYMENTS_FROM}
-                    WHERE  u.master_pkey = %(master_pkey)s AND p.revoked_at IS NULL
-                ''',
-                    master_pkey=bytes(verify_key),
-                ).fetchall()
-                backend.revoke_payments_by_id_internal(tx, rows, revoke_at=now)
-
             revoked = db.query_one(
                 tx.conn,
                 '''
@@ -211,10 +195,31 @@ def dev_revoke() -> flask.Response:
                     f'(unknown account, or its current generation is already revoked)'
                 )
 
-            # Roll any still-usable payments onto a fresh generation, as production does — without this
-            # the account has no generation to issue future proofs under, which is a different state to
-            # the one a revocation produces.
-            allocated = backend._ensure_active_generation(tx, verify_key, issued_at=now)
+            # Order matters, and it is the whole reason the generation write is first. Revoking the
+            # payments recomputes the entitlement and revokes any proof that now overreaches it — which
+            # revokes the generation too, stamped with the server's own clock. Let that run first and the
+            # revocation is effective in 26 hours, which is the thing this endpoint exists to avoid. With
+            # the backdated write already in place, production's own attempt is a no-op on the
+            # `revoked_at IS NULL` guard and the backdated instant survives.
+            if raw_revoke_payments:
+                # The same rows and the same internal the Apple and Google refund handlers use; they
+                # differ from this only in selecting by a provider identifier rather than by account.
+                rows = db.query(
+                    tx.conn,
+                    f'''
+                    SELECT p.id, u.master_pkey, p.expiry_at
+                    FROM   {backend.PAYMENTS_FROM}
+                    WHERE  u.master_pkey = %(master_pkey)s AND p.revoked_at IS NULL
+                ''',
+                    master_pkey=bytes(verify_key),
+                ).fetchall()
+                backend.revoke_payments_by_id_internal(tx, rows, revoke_at=now)
+                # Nothing left to be entitled by, so nothing to roll onto.
+                allocated = backend.AllocatedGenID()
+            else:
+                # Still-paid account: roll it onto a fresh generation as production does, so its old proof
+                # is dead while it remains Pro.
+                allocated = backend._ensure_active_generation(tx, verify_key, issued_at=now)
 
     log.warning(
         f'DEV: revoked generation {revoked[0]} for {base.maybe_obfuscate_bytes(master_pkey_bytes)}, '
