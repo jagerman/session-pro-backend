@@ -133,6 +133,11 @@ def dev_revoke() -> flask.Response:
                            a test asserting enforcement needs; a positive value lands inside the grace
                            window instead, for a test asserting a revoked-but-not-yet-effective proof
                            is still honoured.
+      revoke_payments      optional, default true. True models a REFUND: the account's payments are
+                           revoked first, so the entitlement is gone and no fresh generation is issued
+                           — the account stops being Pro. False revokes only the generation, which
+                           leaves a still-paid account entitled and rolls it onto a new one, so its old
+                           proof dies while it remains Pro.
 
     Why this mirrors `backend.revoke_master_pkey_proofs_and_allocate_new_gen_id` rather than calling it:
     that function stamps `revoked_at` from its own clock deliberately and refuses to take it as a
@@ -160,6 +165,10 @@ def dev_revoke() -> flask.Response:
     if isinstance(raw_effective_in, bool) or not isinstance(raw_effective_in, int) or raw_effective_in < 0:
         raise base.FailError('effective_in_seconds must be a non-negative integer number of seconds')
 
+    raw_revoke_payments = get_json.get('revoke_payments', True)
+    if not isinstance(raw_revoke_payments, bool):
+        raise base.FailError('revoke_payments must be a boolean')
+
     now = base.utc_now()
     # Work backwards from when we want peers to enforce: the served list adds the delay to whatever is
     # stored, so storing `target - delay` puts the effective instant exactly where the caller asked.
@@ -167,6 +176,22 @@ def dev_revoke() -> flask.Response:
 
     with db.connection() as conn:
         with db.transaction(conn) as tx:
+            if raw_revoke_payments:
+                # The same rows and the same internal the Apple and Google refund handlers use; they
+                # differ from this only in selecting by a provider identifier rather than by account.
+                # It marks the payments revoked, clears auto_renewing, and recomputes the entitlement,
+                # revoking any proof that now overreaches it.
+                rows = db.query(
+                    tx.conn,
+                    f'''
+                    SELECT p.id, u.master_pkey, p.expiry_at
+                    FROM   {backend.PAYMENTS_FROM}
+                    WHERE  u.master_pkey = %(master_pkey)s AND p.revoked_at IS NULL
+                ''',
+                    master_pkey=bytes(verify_key),
+                ).fetchall()
+                backend.revoke_payments_by_id_internal(tx, rows, revoke_at=now)
+
             revoked = db.query_one(
                 tx.conn,
                 '''
@@ -200,6 +225,9 @@ def dev_revoke() -> flask.Response:
     result: dict[str, typing.Any] = {
         'revoked_generation_id': revoked[0],
         'effective_ts': base.unix_seconds_from_datetime(now + pendulum.duration(seconds=raw_effective_in)),
+        # False here is the refund outcome: no usable payment remained, so nothing was rolled onto a
+        # fresh generation and the account is no longer entitled.
         'new_generation_allocated': allocated.found,
+        'payments_revoked': raw_revoke_payments,
     }
     return server.make_success_response(dict_result=result)
