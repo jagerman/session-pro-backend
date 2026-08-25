@@ -24,7 +24,9 @@ import typing
 import flask
 import nacl.bindings
 import nacl.signing
+import pendulum
 
+import backend
 import base
 import db
 import minting
@@ -113,5 +115,124 @@ def dev_add_payment() -> flask.Response:
             base.unix_seconds_from_datetime(minted.account_expiry_at) if minted.account_expiry_at else 0
         ),
         'redeemed': minted.redeemed,
+    }
+    return server.make_success_response(dict_result=result)
+
+
+FLASK_ROUTE_DEV_REVOKE = '/dev/revoke'
+
+
+@flask_blueprint.route(FLASK_ROUTE_DEV_REVOKE, methods=['POST'])
+def dev_revoke() -> flask.Response:
+    '''Revoke `master_pkey`'s current generation, optionally already past its effective instant.
+
+    Request:
+      master_pkey          64-hex Ed25519 master Pro public key (required)
+      effective_in_seconds optional, default 0. Seconds from now until peers should begin rejecting
+                           proofs carrying the revoked tag. 0 means "already effective", which is what
+                           a test asserting enforcement needs; a positive value lands inside the grace
+                           window instead, for a test asserting a revoked-but-not-yet-effective proof
+                           is still honoured.
+      revoke_payments      optional, default true. True models a REFUND: the account's payments are
+                           revoked first, so the entitlement is gone and no fresh generation is issued
+                           — the account stops being Pro. False revokes only the generation, which
+                           leaves a still-paid account entitled and rolls it onto a new one, so its old
+                           proof dies while it remains Pro.
+
+    Why this mirrors `backend.revoke_master_pkey_proofs_and_allocate_new_gen_id` rather than calling it:
+    that function stamps `revoked_at` from its own clock deliberately and refuses to take it as a
+    parameter, because a real revocation broadcast already-effective would have peers rejecting a
+    sender before it could have polled and learnt of it. The served list then reads
+    `effective_ts = revoked_at + REVOCATION_EFFECTIVE_DELAY`, a fixed 26 hours, and the DB forbids
+    re-stamping `revoked_at` once set. So an effective revocation is unreachable from the production
+    path within a test, and the only lever is the first write of that column.
+
+    Both triggers still apply and both still matter: the first NULL -> value write bumps the revocation
+    ticket exactly as production does, and `generations_revoked_at_is_terminal` still forbids a second
+    change, so a double-revoke through here fails the same way it would in production.
+    '''
+    get_json = server.get_json_from_flask_request(flask.request)
+
+    master_pkey = base.json_dict_require_str(get_json, 'master_pkey')
+    master_pkey_bytes = base.hex_to_bytes(
+        hex=master_pkey, label='Master public key', hex_len=nacl.bindings.crypto_sign_PUBLICKEYBYTES * 2
+    )
+    verify_key = nacl.signing.VerifyKey(master_pkey_bytes)
+
+    raw_effective_in = get_json.get('effective_in_seconds', 0)
+    # `bool` subclasses `int`, so a bare isinstance would read `true` as 1 second — same trap the
+    # `duration` field above documents.
+    if isinstance(raw_effective_in, bool) or not isinstance(raw_effective_in, int) or raw_effective_in < 0:
+        raise base.FailError('effective_in_seconds must be a non-negative integer number of seconds')
+
+    raw_revoke_payments = get_json.get('revoke_payments', True)
+    if not isinstance(raw_revoke_payments, bool):
+        raise base.FailError('revoke_payments must be a boolean')
+
+    now = base.utc_now()
+    # Work backwards from when we want peers to enforce: the served list adds the delay to whatever is
+    # stored, so storing `target - delay` puts the effective instant exactly where the caller asked.
+    revoked_at = now + pendulum.duration(seconds=raw_effective_in) - base.REVOCATION_EFFECTIVE_DELAY
+
+    with db.connection() as conn:
+        with db.transaction(conn) as tx:
+            revoked = db.query_one(
+                tx.conn,
+                '''
+                UPDATE generations
+                SET    revoked_at = %(revoked_at)s
+                WHERE  id = (SELECT current_generation_id FROM users WHERE master_pkey = %(master_pkey)s)
+                  AND  revoked_at IS NULL
+                RETURNING id
+            ''',
+                master_pkey=bytes(verify_key),
+                revoked_at=revoked_at,
+            )
+
+            if revoked is None:
+                raise base.FailError(
+                    f'No live generation to revoke for {master_pkey} '
+                    f'(unknown account, or its current generation is already revoked)'
+                )
+
+            # Order matters, and it is the whole reason the generation write is first. Revoking the
+            # payments recomputes the entitlement and revokes any proof that now overreaches it — which
+            # revokes the generation too, stamped with the server's own clock. Let that run first and the
+            # revocation is effective in 26 hours, which is the thing this endpoint exists to avoid. With
+            # the backdated write already in place, production's own attempt is a no-op on the
+            # `revoked_at IS NULL` guard and the backdated instant survives.
+            if raw_revoke_payments:
+                # The same rows and the same internal the Apple and Google refund handlers use; they
+                # differ from this only in selecting by a provider identifier rather than by account.
+                rows = db.query(
+                    tx.conn,
+                    f'''
+                    SELECT p.id, u.master_pkey, p.expiry_at
+                    FROM   {backend.PAYMENTS_FROM}
+                    WHERE  u.master_pkey = %(master_pkey)s AND p.revoked_at IS NULL
+                ''',
+                    master_pkey=bytes(verify_key),
+                ).fetchall()
+                backend.revoke_payments_by_id_internal(tx, rows, revoke_at=now)
+                # Nothing left to be entitled by, so nothing to roll onto.
+                allocated = backend.AllocatedGenID()
+            else:
+                # Still-paid account: roll it onto a fresh generation as production does, so its old proof
+                # is dead while it remains Pro.
+                allocated = backend._ensure_active_generation(tx, verify_key, issued_at=now)
+
+    log.warning(
+        f'DEV: revoked generation {revoked[0]} for {base.maybe_obfuscate_bytes(master_pkey_bytes)}, '
+        f'effective {base.readable(now + pendulum.duration(seconds=raw_effective_in))} '
+        f'(revoked_at backdated to {base.readable(revoked_at)}) — no payment provider was involved'
+    )
+
+    result: dict[str, typing.Any] = {
+        'revoked_generation_id': revoked[0],
+        'effective_ts': base.unix_seconds_from_datetime(now + pendulum.duration(seconds=raw_effective_in)),
+        # False here is the refund outcome: no usable payment remained, so nothing was rolled onto a
+        # fresh generation and the account is no longer entitled.
+        'new_generation_allocated': allocated.found,
+        'payments_revoked': raw_revoke_payments,
     }
     return server.make_success_response(dict_result=result)
